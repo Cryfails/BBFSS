@@ -434,6 +434,10 @@ target_include_directories(motion-history-test PRIVATE ..)
 add_executable(lamp-fog-lights-test EXCLUDE_FROM_ALL ../tests/test_lamp_fog_lights.cpp)
 target_compile_options(lamp-fog-lights-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(lamp-fog-lights-test PRIVATE ..)
+# bbport (r41_lamp-shadows): the tuning of the ray traced lamp shadow pass (lamp_shadow_tune.h)
+add_executable(lamp-shadow-tune-test EXCLUDE_FROM_ALL ../tests/test_lamp_shadow_tune.cpp)
+target_compile_options(lamp-shadow-tune-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(lamp-shadow-tune-test PRIVATE ..)
 foreach(effect_test
         "motion-blur-shader-test;test_motion_blur.cpp"
         "directional-shadow-test;test_directional_shadows.cpp"
@@ -449,6 +453,8 @@ foreach(effect_test
     target_link_libraries(${effect_test_name} PRIVATE Vulkan::Vulkan)
     add_dependencies(${effect_test_name} host_shaders)
 endforeach()
+# bbport (r41_lamp-shadows): the lab runs the lamp pass with lamp_shadow_tune.h's words
+target_include_directories(rt-shadow-test PRIVATE ..)
 add_executable(native-local-shadows-test EXCLUDE_FROM_ALL ../tests/test_native_local_shadows.cpp
     shim/engine/graphics.cpp shim/engine/native_sss.cpp shim/engine/engine_hooks.cpp shim/bbport_settings.cpp shim/bbport_menu_i18n.cpp)
 target_include_directories(native-local-shadows-test PRIVATE shim)

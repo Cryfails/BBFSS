@@ -25,6 +25,13 @@ class SunVsm;
 // RtShadow::PrepareDraw's memos, Rasterizer's sun atlas early return and Motion block reuse.
 inline constexpr u64 R19DrawCostOffBit = 17592186044416ull;
 
+// bbport (r41_lamp-shadows): experiment bit 45: set = ray traced lamp shadows as before their
+// repair (read at every lamp pass and every scene build): the old weights, a point lamp, no
+// grazing self skip (PointShadow::Flush, point_shadow_ray.comp MODE_REPAIR), and moving shared
+// copies with an old pose still in lamp rays (RtShadow::PrepareScene, Entry::lamp_out). Set
+// brings picture faults back, so it is not one of BbSettings::PreviousPathsBits.
+inline constexpr u64 LampRepairOffBit = 35184372088832ull;
+
 // Two layers:
 //  1. Caster capture and cache (needs ray tracing on at launch): the game's sun shadow pass draws
 //     (and camera pass draws) are keyed into `entries`; a position capture vertex shader variant
@@ -196,6 +203,12 @@ private:
         u64 shadow_frame = 0;
         u8 cascades = 0;
         bool held = false;
+        // bbport (r41_lamp-shadows): a moving shared copy (rebuilt and dynamic): draws in a row
+        // that went without a rebuild (PrepareDraw's skip, up to LampStaleSkips + 1), rebuilds
+        // in a row since it was left out, and whether lamp rays leave it out (PrepareScene).
+        u8 lamp_skips = 0;
+        u8 lamp_builds = 0;
+        bool lamp_out = false;
     };
     struct Build {
         Entry* entry;

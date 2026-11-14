@@ -17,6 +17,7 @@
 #include "video_core/host_shaders/point_shadow_ray_comp.h"
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/host_shaders/ssgi_gather_ray_comp.h"
+#include "gpu/shadps4/video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r41_lamp-shadows)
 
 namespace {
 #define CHECK(call) do { if (VkResult r_ = (call); r_ != VK_SUCCESS) { std::fprintf(stderr, "%s failed: %d\n", #call, int(r_)); std::exit(1); } } while (false)
@@ -892,7 +893,9 @@ int main(int argc, char** argv) {
             CHECK(vk.create_as(vk.device, &ci, nullptr, &t.handle));
             return t;
         };
-        const auto build_tlas = [&](Tlas& t, const Mat4& view, VkBuildAccelerationStructureFlagsKHR flags, bool doubled) {
+        // bbport (r41_lamp-shadows): more_mask: more instance mask bits (4: lamp rays hit)
+        const auto build_tlas = [&](Tlas& t, const Mat4& view, VkBuildAccelerationStructureFlagsKHR flags, bool doubled,
+                                    unsigned more_mask = 0) {
             auto* out = static_cast<VkAccelerationStructureInstanceKHR*>(t.instances.data);
             for (unsigned copy = 0; copy < (doubled ? 2u : 1u); ++copy) {
                 for (unsigned i = 0; i < n; ++i) {
@@ -903,7 +906,7 @@ int main(int argc, char** argv) {
                     const Mat4 m = view * model;
                     VkAccelerationStructureInstanceKHR inst{};
                     std::memcpy(inst.transform.matrix, m.m.data(), 12 * sizeof(float));
-                    inst.mask = doubled ? (copy ? 2 : 1) : 3;
+                    inst.mask = (doubled ? (copy ? 2 : 1) : 3) | more_mask;
                     inst.accelerationStructureReference = scene.blas[i].address;
                     out[copy * n + i] = inst;
                 }
@@ -965,6 +968,16 @@ int main(int argc, char** argv) {
         std::vector<std::array<double, 3>> lamp_ms(variants.size()), sun_ms(variants.size());
         std::array<double, 3> per_tile_ms{}, pick_ms{}, reuse_ms{}, reuse_error{};
         std::array<std::array<double, 2>, 3> pick_error{};
+        // bbport (r41_lamp-shadows): per camera, on casters a lamp ray can hit, for the street
+        // lamps and for the torch lamps: ms of mode 0 and of the default repair (picked lamps);
+        // mean lamp light kept by mode 0, by the repair with a point lamp and by the repair
+        // (every lamp traced). Pixels on which two runs of mode 0 differ and on which the old
+        // tuning under MODE_REPAIR differs from mode 0 (picked); mean lamp light kept with the
+        // inverse-square weights; pixels a torch leaves dark as a point lamp and repaired.
+        std::array<std::array<double, 2>, 3> repair_ms{}, torch_ms{};
+        std::array<std::array<double, 3>, 3> repair_kept{}, torch_kept{};
+        std::array<std::array<std::size_t, 2>, 3> repair_differ{}, torch_dark{};
+        std::array<double, 3> inverse_kept{};
         std::vector<double> tlas_ms(variants.size());
         double lit_sum = 0;
         unsigned tile_sum = 0;
@@ -1043,7 +1056,31 @@ int main(int argc, char** argv) {
                     sun_samples.push_back(vk.End());
                 }
                 const unsigned history_at = used;
-                const auto run_lamps = [&](bool per_tile, unsigned pick = 0, unsigned frame = 0, int parity = -1) {
+                // bbport (r41_lamp-shadows): more ways to run the pass. tune: with MODE_REPAIR:
+                // its words go after the history block, their place into the mode word, and the
+                // world's axes come from this camera's view matrix (as PointShadow::Flush does);
+                // without it the mode word is 0, as before. inverse_square: the weights' curve.
+                // engine_bias: the ray start offset the engine pushes (the tuning's, 0.03 without
+                // one) in place of the lab's 0.02. torch: the torch lamps (written after the
+                // tuning words by the block that uses them) in place of the street lamps.
+                struct LampRun {
+                    const Vulkan::LampShadowTune* tune = nullptr;
+                    bool inverse_square = false;
+                    bool engine_bias = false;
+                    bool torch = false;
+                };
+                constexpr unsigned MaxTorches = 8;
+                const unsigned tune_at = used + 32;
+                const unsigned torch_at = tune_at + Vulkan::LampTuneWordCount;
+                unsigned torch_count = 0;
+                const auto run_lamps = [&](bool per_tile, unsigned pick = 0, unsigned frame = 0, int parity = -1,
+                                           LampRun more = {}) {
+                    if (more.tune) {
+                        const auto tune_words =
+                            Vulkan::LampTuneWords(*more.tune, more.inverse_square, 0.05f, views.view.m.data());
+                        std::memcpy(reinterpret_cast<std::uint32_t*>(words) + tune_at, tune_words.data(),
+                                    sizeof(tune_words));
+                    }
                     if (parity >= 0) {
                         auto* block = reinterpret_cast<std::uint32_t*>(words) + history_at;
                         block[0] = frame == 0 ? 2u : 3u;
@@ -1059,7 +1096,8 @@ int main(int argc, char** argv) {
                     vkCmdClearColorImage(vk.cmd, lamp_images[0].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
                     vkCmdClearColorImage(vk.cmd, lamp_images[2].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
                     vk.Barrier();
-                    VkDescriptorBufferInfo data{lights.buffer, 0, (used + 32) * 4};
+                    VkDescriptorBufferInfo data{lights.buffer, 0,
+                                                (used + 32 + Vulkan::LampTuneWordCount + MaxTorches * 24) * 4};
                     VkDescriptorImageInfo depth{vk.sampler, lab.depth.view, VK_IMAGE_LAYOUT_GENERAL};
                     std::array<VkDescriptorImageInfo, 4> images{};
                     for (int k = 0; k < 4; ++k) images[k] = {{}, lamp_images[k].view, VK_IMAGE_LAYOUT_GENERAL};
@@ -1116,6 +1154,18 @@ int main(int argc, char** argv) {
                         push.steps = pick;
                         push.frame = frame;
                         if (parity >= 0) std::memcpy(&push.length, &history_at, 4);
+                        if (more.torch) { // bbport (r41_lamp-shadows)
+                            push.first_light = torch_at + torch_count * 16;
+                            push.count = torch_count;
+                            push.rect = {0, 0, int(W), int(H)};
+                        }
+                        if (more.engine_bias) {
+                            push.bias = more.tune ? more.tune->bias_m : 0.03f;
+                        }
+                        if (more.tune) { // MODE_REPAIR | place << 8
+                            const unsigned mode = 16u | tune_at << 8;
+                            std::memcpy(&push.thickness, &mode, 4);
+                        }
                         dispatch(push);
                     }
                     vk.Stamp(1);
@@ -1167,6 +1217,140 @@ int main(int argc, char** argv) {
                     double reuse_sum = 0;
                     for (std::size_t k = 0; k < exact.size(); ++k) reuse_sum += std::abs(double(reuse_average[k]) - exact[k]);
                     reuse_error[cam] = reuse_sum / double(exact.size());
+                    // bbport (r41_lamp-shadows): MODE_REPAIR, on casters a lamp ray can hit. The
+                    // lab's instances carry masks 1 to 3 and a lamp ray asks for 4 (vk_rt_shadow.cpp
+                    // LampMask): no lamp ray of the runs above and below hits anything, and they
+                    // stay as they are. For these runs the instances get the lamp bit as well.
+                    //  - The old weights, a point lamp and no self skip under MODE_REPAIR give the
+                    //    very numbers of mode 0 when every lamp is traced. With picked lamps the
+                    //    second lamp depends on the order in which a workgroup's invocations list
+                    //    its tiles, which is not fixed (two runs of mode 0 differ on some pixels),
+                    //    so there the difference is bounded, not zero.
+                    //  - A lamp with a radius never darkens a pixel that a point lamp lights (a
+                    //    free rim ray only ever lights).
+                    //  - The torch lamps: one beside each character (a capsule 1.8 m tall and 0.6 m
+                    //    wide), 0.45 m from its side at 1.4 m, reaching 5 m, as a hand torch is
+                    //    held: the caster is near the lamp, which is where a point lamp magnifies
+                    //    it and where the rim rays are spent (the street lamps stand metres from
+                    //    what they shadow). The same checks, and the body keeps most of its
+                    //    shadow.
+                    //  - What the default repair costs against mode 0 of this same shader (the
+                    //    experiment bit's path; the shader before r41 is not in this build), with
+                    //    the engine's ray start offset, runs taken in turn.
+                    {
+                        build_tlas(tlas, views.view, variant.flags, variant.doubled, 4);
+                        {
+                            auto* raw = reinterpret_cast<std::uint32_t*>(words);
+                            torch_count = 0;
+                            for (unsigned i = 0; i < n && torch_count < MaxTorches; ++i) {
+                                if (!scene.meshes[i].skinned) continue;
+                                const Vec3 world{scene.meshes[i].position.x + 0.75f, 1.4f, scene.meshes[i].position.z};
+                                std::array<float, 16> light{};
+                                for (int r = 0; r < 3; ++r)
+                                    light[r] = views.view.at(r, 0) * world.x + views.view.at(r, 1) * world.y +
+                                               views.view.at(r, 2) * world.z + views.view.at(r, 3);
+                                light[3] = 1.0f / 25.0f;
+                                light[4] = 1.0f; light[5] = 0.8f; light[6] = 0.6f;
+                                std::memcpy(raw + torch_at + torch_count * 16, light.data(), sizeof(light));
+                                ++torch_count;
+                            }
+                            for (unsigned t = 0; t < torch_count; ++t) {
+                                const std::array<std::uint32_t, 8> row{0u, 0u, unsigned(W), unsigned(H),
+                                                                       torch_at + t * 16, 1u, 0u, 0u};
+                                std::memcpy(raw + torch_at + torch_count * 16 + t * 8, row.data(), sizeof(row));
+                            }
+                        }
+                        if (torch_count == 0) {
+                            std::fprintf(stderr, "the lab scene has no character for a torch lamp\n");
+                            return 1;
+                        }
+                        Vulkan::LampShadowTune same;
+                        same.weights = false;
+                        same.radius_m = 0.0f;
+                        same.self_m = 0.0f;
+                        const auto differing = [&](unsigned pick, const Vulkan::LampShadowTune* tune, bool torch) {
+                            run_lamps(false, pick, 0, -1, {.torch = torch});
+                            const auto before = lamp_values();
+                            run_lamps(false, pick, 0, -1, {.tune = tune, .torch = torch});
+                            const auto after = lamp_values();
+                            std::size_t differ = 0;
+                            for (std::size_t k = 0; k < before.size(); ++k) differ += before[k] != after[k] ? 1 : 0;
+                            return differ;
+                        };
+                        for (const bool torch : {false, true}) {
+                            if (const std::size_t differ = differing(0, &same, torch); differ != 0) {
+                                std::fprintf(stderr, "every lamp traced: lamp repair with the old tuning differs from "
+                                                     "mode 0 on %zu pixels (camera %zu, %s lamps)\n",
+                                             differ, cam, torch ? "torch" : "street");
+                                return 1;
+                            }
+                        }
+                        const std::size_t noise = differing(1, nullptr, false);
+                        const std::size_t picked = differing(1, &same, false);
+                        if (picked > 4 * noise + 64) {
+                            std::fprintf(stderr, "picked lamps: lamp repair with the old tuning differs from mode 0 on "
+                                                 "%zu pixels, two runs of mode 0 on %zu (camera %zu)\n", picked, noise, cam);
+                            return 1;
+                        }
+                        const auto kept = [](const std::vector<float>& values) {
+                            double sum = 0;
+                            for (const float v : values) sum += v;
+                            return sum / double(values.size());
+                        };
+                        Vulkan::LampShadowTune repaired, point;
+                        point.radius_m = 0.0f;
+                        for (const bool torch : {false, true}) {
+                            run_lamps(false, 0, 0, -1, {.torch = torch});
+                            const double kept_before = kept(lamp_values());
+                            run_lamps(false, 0, 0, -1, {.tune = &point, .torch = torch});
+                            const auto with_point = lamp_values();
+                            run_lamps(false, 0, 0, -1, {.tune = &repaired, .torch = torch});
+                            const auto with_radius = lamp_values();
+                            std::size_t darker = 0, dark_point = 0, dark_radius = 0;
+                            for (std::size_t k = 0; k < with_point.size(); ++k) {
+                                darker += with_radius[k] < with_point[k] ? 1 : 0;
+                                dark_point += with_point[k] < 0.25f ? 1 : 0;
+                                dark_radius += with_radius[k] < 0.25f ? 1 : 0;
+                            }
+                            if (darker != 0) {
+                                std::fprintf(stderr, "a lamp with a radius left %zu pixels darker than a point lamp "
+                                                     "(camera %zu, %s lamps)\n", darker, cam, torch ? "torch" : "street");
+                                return 1;
+                            }
+                            (torch ? torch_kept : repair_kept)[cam] = {kept_before, kept(with_point), kept(with_radius)};
+                            if (torch) {
+                                torch_dark[cam] = {dark_point, dark_radius};
+                                if (dark_radius * 2 < dark_point) {
+                                    std::fprintf(stderr, "torch lamps: the default radius left %zu dark pixels of the "
+                                                         "point lamp's %zu (camera %zu)\n", dark_radius, dark_point, cam);
+                                    return 1;
+                                }
+                            }
+                            std::vector<double> plain, fixed;
+                            for (int i = 0; i < 40; ++i) {
+                                plain.push_back(run_lamps(false, 1, unsigned(i), -1, {.engine_bias = true, .torch = torch}));
+                                fixed.push_back(run_lamps(false, 1, unsigned(i), -1,
+                                                          {.tune = &repaired, .engine_bias = true, .torch = torch}));
+                            }
+                            // The fastest run of each: this lab's lamp pass times jump between runs
+                            // by several times, and the median moves with them.
+                            (torch ? torch_ms : repair_ms)[cam] = {*std::min_element(plain.begin(), plain.end()),
+                                                                   *std::min_element(fixed.begin(), fixed.end())};
+                        }
+                        // The inverse-square weights (startup_local_inverse_square): they run and
+                        // give a ratio.
+                        run_lamps(false, 0, 0, -1, {.tune = &repaired, .inverse_square = true});
+                        const auto inverse = lamp_values();
+                        for (const float v : inverse) {
+                            if (!(v >= 0.0f && v <= 1.0001f)) {
+                                std::fprintf(stderr, "inverse-square weights: a pixel holds %g (camera %zu)\n", double(v), cam);
+                                return 1;
+                            }
+                        }
+                        inverse_kept[cam] = kept(inverse);
+                        repair_differ[cam] = {noise, picked};
+                        build_tlas(tlas, views.view, variant.flags, variant.doubled); // as it was
+                    }
                 }
                 for (int i = 0; i < 15; ++i) lamp_samples.push_back(run_lamps(false));
                 sun_ms[at][cam] = Median(sun_samples);
@@ -1195,6 +1379,29 @@ int main(int argc, char** argv) {
         std::printf("Lamps, picked, reusing still 8x8 blocks (still camera, frames 8-23): %.3f %.3f %.3f ms; mean error "
                     "against every lamp over 16 frames %.4f %.4f %.4f\n",
                     reuse_ms[0], reuse_ms[1], reuse_ms[2], reuse_error[0], reuse_error[1], reuse_error[2]);
+        // bbport (r41_lamp-shadows)
+        std::printf("Lamps that hit (instances with the lamp bit), picked, repaired (r41, default tuning): %.3f %.3f "
+                    "%.3f ms against %.3f %.3f %.3f ms of mode 0 of this shader (the experiment bit's path; the "
+                    "fastest of 40 runs taken in turn, the engine's ray start offset); mean lamp light kept with "
+                    "every lamp traced: mode 0 "
+                    "%.4f %.4f %.4f, repaired with a point lamp %.4f %.4f %.4f, repaired %.4f %.4f %.4f, repaired "
+                    "with inverse-square weights %.4f %.4f %.4f; the old "
+                    "tuning under MODE_REPAIR gave mode 0's numbers with every lamp traced, and with picked lamps "
+                    "differed on %zu %zu %zu pixels where two runs of mode 0 differed on %zu %zu %zu\n",
+                    repair_ms[0][1], repair_ms[1][1], repair_ms[2][1], repair_ms[0][0], repair_ms[1][0],
+                    repair_ms[2][0], repair_kept[0][0], repair_kept[1][0], repair_kept[2][0], repair_kept[0][1],
+                    repair_kept[1][1], repair_kept[2][1], repair_kept[0][2], repair_kept[1][2], repair_kept[2][2],
+                    inverse_kept[0], inverse_kept[1], inverse_kept[2],
+                    repair_differ[0][1], repair_differ[1][1], repair_differ[2][1], repair_differ[0][0],
+                    repair_differ[1][0], repair_differ[2][0]);
+        std::printf("Torch lamps (0.45 m from a character's side, reach 5 m), picked, repaired: %.3f %.3f %.3f ms "
+                    "against %.3f %.3f %.3f ms of mode 0 of this shader; mean lamp light kept with every lamp traced: "
+                    "mode 0 %.4f %.4f %.4f, repaired with a point lamp %.4f %.4f %.4f, repaired %.4f %.4f %.4f; dark "
+                    "pixels repaired %zu %zu %zu, with a point lamp %zu %zu %zu\n",
+                    torch_ms[0][1], torch_ms[1][1], torch_ms[2][1], torch_ms[0][0], torch_ms[1][0], torch_ms[2][0],
+                    torch_kept[0][0], torch_kept[1][0], torch_kept[2][0], torch_kept[0][1], torch_kept[1][1],
+                    torch_kept[2][1], torch_kept[0][2], torch_kept[1][2], torch_kept[2][2], torch_dark[0][1],
+                    torch_dark[1][1], torch_dark[2][1], torch_dark[0][0], torch_dark[1][0], torch_dark[2][0]);
         std::printf("%-36s %9s %21s %21s\n", "", "TLAS ms", "sun 2 rays ms", "lamp rays ms");
         for (std::size_t at = 0; at < variants.size(); ++at) {
             std::printf("%-36s %9.3f   %5.3f %5.3f %5.3f   %5.3f %5.3f %5.3f\n", variants[at].name, tlas_ms[at],

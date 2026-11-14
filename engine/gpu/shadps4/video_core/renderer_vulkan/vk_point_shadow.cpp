@@ -58,6 +58,12 @@ constexpr u32 WholeImageBatches = 4;
 constexpr u32 SnapshotCell = 16;
 constexpr u32 HistoryWords = 2 + 12 + 16; // what Flush adds for the first ray traced pass of a frame
 constexpr u32 ModeApart = 1;              // point_shadow_ray.comp MODE_APART
+// bbport (r41_lamp-shadows): MODE_REPAIR, and where the place of the pass's tuning words
+// (LampTuneWords) goes in the same word: bits 8-31. The shader only tests single bits below
+// that; with DataWords 2^18 the word stays below 2^27.
+constexpr u32 ModeRepair = 16;
+constexpr u32 TuneAtShift = 8;
+static_assert(DataWords <= 1u << (32 - TuneAtShift));
 // bbport (r32_lamp-half): more bits of the same word, read only by point_shadow_ray_half_comp
 // (MODE_HALF_*); its counters (HALF_SLOTS words used); the experiment bit that turns it off.
 constexpr u32 ModeHalfFirst = 2, ModeHalfFill = 4, ModeHalfCount = 8;
@@ -139,6 +145,8 @@ PointShadow::PointShadow(const Instance& instance_, Scheduler& scheduler_,
       runtime{runtime_}, scene_targets{scene_targets_}, rt_shadow{rt_shadow_},
       camera_motion{camera_motion_} {
     fade_start_m = fade_end_m * 0.6f;
+    // bbport (r41_lamp-shadows): BB_LAMP_SHADOW_*, read once
+    tune = ReadLampShadowTune([](const char* name) -> const char* { return std::getenv(name); });
     if (const char* env = std::getenv("LANTERN_RT_LAMPS_EXACT"); env && env[0] == '1') {
         lamp_pick = 0;
     }
@@ -187,6 +195,18 @@ bool PointShadow::Ready() {
                              eStorageImage},
                             sizeof(Push), POINT_SHADOW_RAY_COMP, "Ray traced lamps", true)) {
         std::printf("Ray traced lamps: off - the pass could not be made\n");
+    }
+    if (ray_pipeline) { // bbport (r41_lamp-shadows)
+        std::printf("Ray traced lamps (r41): weights %s (wrap %.2f, floor %.2f, inverse-square "
+                    "%s), lamp radius %.2f m with %u rim rays from share %.2f for casters within "
+                    "%.2f of the way from the lamp, clearance %.2f m, bias %.3f m, self skip %.2f "
+                    "m, view %u (BB_LAMP_SHADOW_*); experiment 35184372088832 set = the path "
+                    "before\n",
+                    tune.weights ? "as the game's falloff and facing" : "as before", tune.wrap,
+                    tune.facing_floor,
+                    BbSettings::Get().startup_local_inverse_square ? "on" : "off", tune.radius_m,
+                    tune.rim, tune.share, tune.near_part, tune.clearance_m, tune.bias_m,
+                    tune.self_m, tune.view);
     }
     // bbport (r37_menu-options): the half-resolution build is made by HalfReady, when first wanted.
     constexpr auto Drawn = vk::FormatFeatureFlagBits::eColorAttachment |
@@ -593,7 +613,8 @@ void PointShadow::OnLightDraw(VideoCore::ImageId color0, VideoCore::ImageId colo
                                   pending_uid[1] == targets[1]->image_uid;
         // (An apart batch's pass always has the history words after the tiles.)
         const bool room = data.size() + words + TileWords * (tiles.size() + 1) +
-                              (apart || merged ? HistoryWords : 0) <= DataWords;
+                              (apart || merged ? HistoryWords + LampTuneWordCount : 0) <=
+                          DataWords; // bbport (r41_lamp-shadows): and the tuning words
         const OwnImage& before = apart ? lamp[0] : snapshot[0];
         const bool same_size = before.width == width && before.height == height;
         if (same_targets && same_size && apart == can_apart && (merged || !one_tile_batches) &&
@@ -945,6 +966,10 @@ void PointShadow::Flush(bool animate_noise) {
     }
     std::array<s32, 4> covered{s32(width), s32(height), 0, 0};
     u32 table = 0;
+    // bbport (r41_lamp-shadows): the repair, unless experiment 35184372088832 is set (read at
+    // every pass): the tuning words go after the tile table, their place into the mode word.
+    bool repair = false;
+    u32 tune_at = 0;
     if (use_rays) {
         table = u32(data.size());
         for (const Tile& tile : batch) {
@@ -952,6 +977,23 @@ void PointShadow::Flush(bool animate_noise) {
                        std::max(covered[2], tile.rect[2]), std::max(covered[3], tile.rect[3])};
             data.insert(data.end(), {u32(tile.rect[0]), u32(tile.rect[1]), u32(tile.rect[2]),
                                      u32(tile.rect[3]), tile.first_light, tile.count, 0u, 0u});
+        }
+        repair = !BbToggle::Experiment(LampRepairOffBit);
+        if (repair) {
+            const auto& settings = BbSettings::Get();
+            // The scene the rays cross is in this camera's view space (RtShadow::PrepareScene,
+            // true above, wrote its instances with this matrix): the world's axes for the rim
+            // pattern, so that it does not turn with the camera.
+            const auto camera = camera_motion.PassMatrices();
+            const auto tune_words = LampTuneWords(tune, settings.startup_local_inverse_square,
+                                                  settings.startup_local_light_core,
+                                                  camera.valid ? camera.view.data() : nullptr);
+            tune_at = u32(data.size());
+            data.insert(data.end(), tune_words.begin(), tune_words.end());
+        }
+        if (int(repair) != std::exchange(repair_state, int(repair))) {
+            std::printf("Ray traced lamps (r41): repair %s (experiment 35184372088832 %s)\n",
+                        repair ? "on" : "off", repair ? "clear" : "set");
         }
         if (data.size() > DataWords || covered[0] >= covered[2] || covered[1] >= covered[3]) {
             data.clear();
@@ -1097,13 +1139,17 @@ void PointShadow::Flush(bool animate_noise) {
         .frame_index = animate_noise ? frame_index : 0u,
         .size = {float(width), float(height)},
         .length_m = use_rays ? std::bit_cast<float>(history_at) : length_m,
-        .thickness_m = use_rays ? std::bit_cast<float>(batch_apart ? ModeApart : 0u) : thickness_m,
+        // bbport (r41_lamp-shadows): MODE_REPAIR and the place of its words
+        .thickness_m = use_rays ? std::bit_cast<float>((batch_apart ? ModeApart : 0u) |
+                                                       (repair ? ModeRepair | tune_at << TuneAtShift
+                                                               : 0u))
+                                : thickness_m,
         .strength = use_rays ? 1.0f : strength,
         .fade_start_m = use_rays ? 60.0f : fade_start_m,
         .fade_end_m = use_rays ? 100.0f : fade_end_m,
         .light_count = 0,
         .steps = use_rays ? lamp_pick : steps,
-        .bias_m = bias_m,
+        .bias_m = repair ? tune.bias_m : bias_m, // bbport (r41_lamp-shadows): BB_LAMP_SHADOW_BIAS
         .rect = {},
     };
     // bbport: counted here. As a capture after `batch = std::move(batch)` it was the size of the

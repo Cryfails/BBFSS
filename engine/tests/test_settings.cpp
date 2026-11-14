@@ -712,7 +712,8 @@ int main(int argc, char** argv) {
             bits += int(BbSettings::PreviousPathsMask >> bit & 1);
         }
         assert(bits == 42);
-        for (const int bit : {0, 1, 2, 3, 4, 8, 14, 23, 28, 51}) { // left out on purpose
+        // bbport (r41_lamp-shadows): 45 (the lamp shadow repair off) brings faults back, as 14
+        for (const int bit : {0, 1, 2, 3, 4, 8, 14, 23, 28, 45, 51}) { // left out on purpose
             assert(!(BbSettings::PreviousPathsMask >> bit & 1));
         }
         for (const int bit : {7, 9, 13, 20, 39, 40, 42, 54, 56, 58}) {

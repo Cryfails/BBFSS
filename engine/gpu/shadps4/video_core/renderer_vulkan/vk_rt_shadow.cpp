@@ -71,6 +71,22 @@ constexpr u8 ShadowMask = 1, CameraMask = 2;
 // cards the shadow pass draws (Entry::shadow_card) stay out and cast no lamp shadow, as in the
 // game; skinned meshes keep theirs (cloth).
 constexpr u8 LampMask = 4;
+// bbport (r41_lamp-shadows): a moving copy of a mesh drawn more than once in a pass (a "shared"
+// entry, see PrepareDraw) is never refit, only rebuilt, within RebuiltTrianglesPerFrame and in
+// draw order. Where a frame's copies hold more triangles than that, the same ones go without
+// every frame: they keep the pose of their last build and stay in the scene, beside the live
+// copy of the same mesh. A lamp ray then finds two casters, the second one displaced: a second
+// hard shadow. Such a copy is left out of lamp rays (Entry::lamp_out) once it was drawn and went
+// without more than LampStaleSkips times in a row, and comes back once it was rebuilt on
+// LampFreshBuilds draws in a row: a copy at the edge of the budget does not blink in and out
+// (and each change of an instance's mask makes the TLAS a full build). Counted in draws that
+// went without, not in the age of the BLAS: a copy the far cascades hold undrawn
+// (graphics_sun_far_shadows) ages without being starved and keeps its lamp shadow. A copy whose
+// draw is known to read what its BLAS was built from (Draw::inputs, with BB_RT_UNCHANGED set)
+// holds the right pose and stays in. The sun's rays keep every copy, as before. Experiment
+// LampRepairOffBit set: all stay in lamp rays (the counting goes on).
+constexpr u32 LampStaleSkips = 2;
+constexpr u32 LampFreshBuilds = 3;
 
 // bbport: experiment mask 256 (a diagnostic): copies of a mesh drawn more than once in a pass
 // ("shared" entries, see PrepareDraw) are built once and then not refreshed, which shows what
@@ -1287,6 +1303,17 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             ++missed;
             return 0u;
         }
+        // bbport (r41_lamp-shadows): a moving shared copy drawn without a rebuild (see
+        // LampStaleSkips); at most once a frame (a second draw of an entry returns above).
+        if (entry.rebuilt && entry.dynamic) {
+            entry.lamp_builds = 0;
+            if (draw.inputs != 0 && draw.inputs == entry.r17_inputs) {
+                entry.lamp_skips = 0; // the BLAS holds this very pose
+                entry.lamp_out = false;
+            } else if (entry.lamp_skips > LampStaleSkips || ++entry.lamp_skips > LampStaleSkips) {
+                entry.lamp_out = true;
+            }
+        }
         entry.seen_frame = frame;
         frame_entries.push_back(&entry);
         return 0u;
@@ -1392,6 +1419,12 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
         if (!update) {
             entry.built_frame = frame;
+            // bbport (r41_lamp-shadows): rebuilt: back in lamp rays after LampFreshBuilds in a row
+            entry.lamp_skips = 0;
+            if (entry.lamp_out && ++entry.lamp_builds >= LampFreshBuilds) {
+                entry.lamp_out = false;
+                entry.lamp_builds = 0;
+            }
         }
         stats.dynamic_draws += entry.dynamic ? 1 : 0;
     }
@@ -1641,6 +1674,7 @@ bool RtShadow::PrepareScene() {
     u64 triangles = 0;
     // Entries kept stale over budget since the scene was last skipped have no BLAS yet.
     u32 built = 0;
+    const bool lamp_repair = !BbToggle::Experiment(LampRepairOffBit); // bbport (r41_lamp-shadows)
     for (u32 i = 0; i < count; ++i) {
         // bbport (r14_cascade_rt): a held entry, or a held one drawn only by the camera pass while
         // its cascades are not drawn, keeps casting the sun's shadow (rt_shadow.comp's ray mask 1).
@@ -1654,8 +1688,12 @@ bool RtShadow::PrepareScene() {
         const u8 mask =
             kept ? ShadowMask
                  : u8(entry->mask | (entry->held && Holds(*entry) ? ShadowMask : 0));
+        // bbport (r41_lamp-shadows): a moving shared copy in an old pose casts no lamp shadow
+        // (Entry::lamp_out, kept by PrepareDraw; a changed mask makes the TLAS a full build,
+        // not a refit).
+        const bool stale = lamp_repair && entry->lamp_out && entry->rebuilt && entry->dynamic;
         vk::AccelerationStructureInstanceKHR record{
-            .mask = u8(mask | (card ? 0 : LampMask)),
+            .mask = u8(mask | (card || stale ? 0 : LampMask)),
             .accelerationStructureReference = entry->address,
         };
         std::memcpy(&record.transform, camera.view.data(), sizeof(camera.view));
@@ -2237,6 +2275,10 @@ void RtShadow::OnFrameEnd() {
         // PrepareDraw).
         u64 shared = 0, shared_triangles = 0, shared_moving = 0, shared_palette = 0,
             shared_camera = 0, shared_rebuilt = 0, shared_rebuilt_triangles = 0;
+        // bbport (r41_lamp-shadows): moving copies left out of lamp rays for their old pose
+        // (Entry::lamp_out), and the oldest moving copy's BLAS in frames.
+        u64 shared_no_lamp = 0, shared_oldest = 0;
+        const bool lamp_repair = !BbToggle::Experiment(LampRepairOffBit);
         std::unordered_set<u64> shared_meshes;
         for (const auto& item : entries) {
             const Entry* e = item.second.get();
@@ -2253,18 +2295,24 @@ void RtShadow::OnFrameEnd() {
                 ++shared_rebuilt;
                 shared_rebuilt_triangles += e->triangles;
             }
+            if (e->dynamic) { // bbport (r41_lamp-shadows)
+                shared_oldest = std::max(shared_oldest, frame - e->built_frame);
+                shared_no_lamp += lamp_repair && e->lamp_out ? 1 : 0;
+            }
         }
         std::printf("Ray tracing: %.0f triangles refit a frame; shared copies drawn on the last "
                     "frame: %llu of %zu meshes, %llu triangles, %llu moving, %llu with a palette, "
                     "%llu in the camera pass, %llu (%llu triangles) rebuilt on it; rebuilt budget "
-                    "%u\n",
+                    "%u; %llu left out of lamp rays (oldest %llu frames)\n",
                     double(stats.refit_triangles) / f, static_cast<unsigned long long>(shared),
                     shared_meshes.size(), static_cast<unsigned long long>(shared_triangles),
                     static_cast<unsigned long long>(shared_moving),
                     static_cast<unsigned long long>(shared_palette),
                     static_cast<unsigned long long>(shared_camera),
                     static_cast<unsigned long long>(shared_rebuilt),
-                    static_cast<unsigned long long>(shared_rebuilt_triangles), RebuiltBudget());
+                    static_cast<unsigned long long>(shared_rebuilt_triangles), RebuiltBudget(),
+                    static_cast<unsigned long long>(shared_no_lamp),
+                    static_cast<unsigned long long>(shared_oldest));
         stats = {};
     }
     // bbport (r17_rt-upkeep): one line every 600 frames

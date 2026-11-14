@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r41_lamp-shadows)
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
@@ -231,6 +232,11 @@ private:
     float fade_end_m = 30.0f;
     float bias_m = 0.03f;
     u32 steps = 16;
+    // bbport (r41_lamp-shadows): the ray traced pass's tuning (BB_LAMP_SHADOW_*, read once), which
+    // Flush hands the shader while experiment 35184372088832 (LampRepairOffBit) is clear; whether
+    // the last ray traced pass had it (-1: none yet), for the log line at each change.
+    LampShadowTune tune;
+    int repair_state = -1;
     bool tried = false;
     bool failed = false;
     // bbport (r32_lamp-half, r37_menu-options): the lamps-apart pass traces pixel (2x, 2y) of
