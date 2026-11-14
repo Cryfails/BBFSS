@@ -563,6 +563,17 @@ struct Budget {
 };
 } // namespace BbPendingOps
 
+// bbport (r43_copy-turns): the rebuilds of the ray tracing scene's shared copies take turns, the
+// oldest build first, moving copies four times as often as those that do not move (RtShadow,
+// renderer_vulkan/rt_copy_turns.h).
+namespace BbCopyTurns {
+/// Experiment bit 60: set = the rebuild budget goes to the first copies in draw order, as
+/// before (the same late copies are never rebuilt, keep the pose of their first build and cast
+/// lamp shadows that do not move). Read at every draw and every frame end. Not bit 60 of the
+/// other mask (BbToggle::CameraOwnInverse).
+inline constexpr std::uint64_t OldBit = 1152921504606846976ull;
+} // namespace BbCopyTurns
+
 namespace BbSpike {
 /// Liverpool::SubmitGfx, under submit_mutex.
 inline void NoteStageAQueued() {

@@ -438,6 +438,10 @@ target_include_directories(lamp-fog-lights-test PRIVATE ..)
 add_executable(lamp-shadow-tune-test EXCLUDE_FROM_ALL ../tests/test_lamp_shadow_tune.cpp)
 target_compile_options(lamp-shadow-tune-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(lamp-shadow-tune-test PRIVATE ..)
+# bbport (r43_copy-turns): the turns of the ray tracing scene's shared copies (rt_copy_turns.h)
+add_executable(rt-copy-turns-test EXCLUDE_FROM_ALL ../tests/test_rt_copy_turns.cpp)
+target_compile_options(rt-copy-turns-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(rt-copy-turns-test PRIVATE ..)
 foreach(effect_test
         "motion-blur-shader-test;test_motion_blur.cpp"
         "directional-shadow-test;test_directional_shadows.cpp"

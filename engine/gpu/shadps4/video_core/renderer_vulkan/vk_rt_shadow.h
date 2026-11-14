@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "common/types.h"
+#include "video_core/renderer_vulkan/rt_copy_turns.h" // bbport (r43_copy-turns)
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_sun_vsm.h"
 
@@ -204,11 +205,23 @@ private:
         u8 cascades = 0;
         bool held = false;
         // bbport (r41_lamp-shadows): a moving shared copy (rebuilt and dynamic): draws in a row
-        // that went without a rebuild (PrepareDraw's skip, up to LampStaleSkips + 1), rebuilds
-        // in a row since it was left out, and whether lamp rays leave it out (PrepareScene).
+        // that went without a rebuild (PrepareDraw's skip, up to one more than counts as
+        // starved), rebuilds in a row since it was left out, and whether it is starved: with
+        // BB_LAMP_SHADOW_STALE=1 lamp rays leave it out (PrepareScene).
         u8 lamp_skips = 0;
         u8 lamp_builds = 0;
         bool lamp_out = false;
+        // bbport (r43_copy-turns): a shared copy's turn to be rebuilt (rt_copy_turns.h): the
+        // ticket the end of a frame gave it for its next draw, and the frames from its draw
+        // before to its last (1: drawn every frame; CopyTurnGapUnknown: never before, or long
+        // ago). For a moving copy, the draws in a row without a rebuild: on frames in a row
+        // (turn_run; it starts again at a draw after frames undrawn) and after frames undrawn
+        // (turn_back_run). Both feed the 600-frame line only. turn_listed: it is in turn_drawn.
+        CopyTurnTicket turn;
+        u8 turn_gap = 1;
+        bool turn_listed = false;
+        u16 turn_run = 0;
+        u16 turn_back_run = 0;
     };
     struct Build {
         Entry* entry;
@@ -375,6 +388,23 @@ private:
     u32 positions_used = 0;
     u32 new_triangles = 0;
     u32 rebuilt_triangles = 0;
+    // bbport (r43_copy-turns): the turns of the shared copies. PrepareDraw takes them,
+    // PlanCopyTurns hands them out at the end of a frame. turn_drawn: the shared copies drawn
+    // on this frame, in draw order, each once (Entry::turn_listed); like frame_entries it holds
+    // entries only until the frame's end, where PlanCopyTurns empties it before the evictions.
+    // turn_items is filled and emptied inside PlanCopyTurns (it points into entries).
+    // turn_stats, since the last 600-frame line: the most frames in a row a moving copy drawn
+    // every frame went without a rebuild, the most draws in a row one drawn again after frames
+    // undrawn did, draws of copies after frames undrawn, and the turns (and their triangles)
+    // that went past the budget for the bound.
+    CopyTurns copy_turns;
+    std::vector<Entry*> turn_drawn;
+    std::vector<CopyTurnItem> turn_items;
+    void PlanCopyTurns();
+    struct TurnStats {
+        u64 back = 0, past = 0, past_triangles = 0;
+        u32 worst_run = 0, worst_back_run = 0;
+    } turn_stats;
     u64 scratch_used = 0;
     u64 entry_bytes = 0;
     u32 missed = 0;

@@ -86,6 +86,17 @@ constexpr u8 LampMask = 4;
 // draw is known to read what its BLAS was built from (Draw::inputs, with BB_RT_UNCHANGED set)
 // holds the right pose and stays in. The sun's rays keep every copy, as before. Experiment
 // LampRepairOffBit set: all stay in lamp rays (the counting goes on).
+// bbport (r43_copy-turns): "the same ones go without every frame" was the budget's first-come
+// rule, and is repaired where it arose: the copies take turns (rt_copy_turns.h; CopyTurnsOn
+// below), and a moving copy that is drawn every frame is rebuilt before it was drawn more than
+// CopyWait() frames in a row without. With turns on a copy therefore counts as starved only
+// past that many draws (LampStaleAfter), and no longer at the first rebuild that came in time
+// (no more draws than that went without since the rebuild before): a copy that takes turns is
+// never rebuilt on LampFreshBuilds draws in a row. One whose turns come too late every time
+// (more copies than two budgets a frame keep within the bound) stays starved between them: it
+// does not change sides at every turn, and neither does its instance's mask. With
+// BB_RT_COPY_WAIT=0 no bound is asked for, and a copy counts as starved only past
+// CopyTurnWaitMost draws. With BbCopyTurns::OldBit set both rules are as r41 made them.
 constexpr u32 LampStaleSkips = 2;
 constexpr u32 LampFreshBuilds = 3;
 // bbport (r42_lamp-soft): BB_LAMP_SHADOW_STALE, read once. 1: such copies are left out of lamp
@@ -103,8 +114,38 @@ bool LampStaleOut() {
 // bbport: experiment mask 256 (a diagnostic): copies of a mesh drawn more than once in a pass
 // ("shared" entries, see PrepareDraw) are built once and then not refreshed, which shows what
 // their refresh costs and whether anything visibly depends on it.
+// bbport (r43_copy-turns): BB_RT_COPY_BUDGET, read once: the triangles of shared copies rebuilt
+// a frame (default RebuiltTrianglesPerFrame, at most CopyTurnBudgetMost; 0: none, as experiment
+// 256). A tool to prove a picture fault on the budget: far above what a scene's copies hold,
+// every copy is rebuilt on every draw.
 u32 RebuiltBudget() {
-    return BbToggle::Experiment(256) ? 0u : RebuiltTrianglesPerFrame;
+    static const u32 budget = ReadCopyTurnKnob(std::getenv("BB_RT_COPY_BUDGET"),
+                                               RebuiltTrianglesPerFrame, CopyTurnBudgetMost);
+    return BbToggle::Experiment(256) ? 0u : budget;
+}
+// bbport (r43_copy-turns): experiment BbCopyTurns::OldBit clear = the shared copies take turns
+// at being rebuilt, the oldest build first (rt_copy_turns.h); set = the first in draw order
+// take the budget, as before. Read at each use.
+bool CopyTurnsOn() {
+    return !BbToggle::Experiment(BbCopyTurns::OldBit);
+}
+// BB_RT_COPY_WAIT, read once: the most frames in a row a moving copy that is drawn every frame
+// goes without a rebuild; past that its turn comes whatever the budget says, up to two budgets
+// a frame (default CopyTurnWait, 4; at most CopyTurnWaitMost; 0: no turn goes past the budget,
+// and the wait is what the budget gives).
+u32 CopyWait() {
+    static const u32 wait =
+        ReadCopyTurnKnob(std::getenv("BB_RT_COPY_WAIT"), CopyTurnWait, CopyTurnWaitMost);
+    return wait;
+}
+// Draws in a row without a rebuild past which a moving copy counts as starved (LampStaleSkips).
+// With turns on: the bound the turns keep, never fewer than r41's 2; with no bound asked for
+// (BB_RT_COPY_WAIT=0, the wait is what the budget gives) the longest that can be asked for.
+u32 LampStaleAfter() {
+    if (!CopyTurnsOn()) {
+        return LampStaleSkips;
+    }
+    return CopyWait() != 0 ? std::max(LampStaleSkips, CopyWait()) : CopyTurnWaitMost;
 }
 
 // bbport: only the sun VSM reads the casters' world copies (Record's VSM branch, the kept
@@ -1299,6 +1340,18 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
     }
     entry.rebuilt = entry.rebuilt || shared;
+    // bbport (r43_copy-turns): the frames since a shared copy's draw before (seen_frame is still
+    // that draw's here): a copy that is not drawn every frame takes its turn another way. And
+    // the copy is listed for the plan at the frame's end (PlanCopyTurns), once.
+    if (entry.rebuilt) {
+        entry.turn_gap = entry.seen_frame == 0
+                             ? u8(CopyTurnGapUnknown)
+                             : u8(std::min<u64>(frame - entry.seen_frame, CopyTurnGapUnknown));
+        if (!entry.turn_listed) {
+            entry.turn_listed = true;
+            turn_drawn.push_back(&entry);
+        }
+    }
     if (entry.palette != draw.palette) {
         entry.palette = draw.palette;
         entry.dynamic = true;
@@ -1319,11 +1372,27 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         // LampStaleSkips); at most once a frame (a second draw of an entry returns above).
         if (entry.rebuilt && entry.dynamic) {
             entry.lamp_builds = 0;
+            const u32 stale_after = LampStaleAfter(); // bbport (r43_copy-turns)
             if (draw.inputs != 0 && draw.inputs == entry.r17_inputs) {
                 entry.lamp_skips = 0; // the BLAS holds this very pose
                 entry.lamp_out = false;
-            } else if (entry.lamp_skips > LampStaleSkips || ++entry.lamp_skips > LampStaleSkips) {
-                entry.lamp_out = true;
+                entry.turn_run = entry.turn_back_run = 0;
+            } else {
+                if (entry.lamp_skips > stale_after || ++entry.lamp_skips > stale_after) {
+                    entry.lamp_out = true;
+                }
+                // bbport (r43_copy-turns): for the 600-frame line, the wait the turns bound:
+                // frames in a row without a rebuild while drawn every frame, and draws in a
+                // row without one after frames undrawn.
+                if (entry.turn_gap == 1) {
+                    entry.turn_run += entry.turn_run != 0xffff ? 1 : 0;
+                    turn_stats.worst_run = std::max<u32>(turn_stats.worst_run, entry.turn_run);
+                } else {
+                    entry.turn_run = 0;
+                    entry.turn_back_run += entry.turn_back_run != 0xffff ? 1 : 0;
+                    turn_stats.worst_back_run =
+                        std::max<u32>(turn_stats.worst_back_run, entry.turn_back_run);
+                }
             }
         }
         entry.seen_frame = frame;
@@ -1373,7 +1442,20 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         const bool recapture = !need_scene && entry.built && !refresh;
         const u64 stored = u64(entry.vertices) * entry.instances;
         const u64 needed = need_scene ? (update ? entry.update_scratch : entry.scratch) + 256 : 0;
-        const bool over = refresh ? rebuilt_triangles >= RebuiltBudget()
+        // bbport (r43_copy-turns): a shared copy's refresh takes its turn. With a ticket of the
+        // last frame's end (PlanCopyTurns) it is rebuilt; without one only with what the ticket
+        // holders still to come leave of the budget. The ticket is used up here, whatever the
+        // limits below say: a holder they cut gets a new one by its age. Experiment
+        // BbCopyTurns::OldBit set: the first copies in draw order take the budget, as before.
+        bool refresh_over = false;
+        if (refresh) {
+            const u32 budget = RebuiltBudget();
+            refresh_over = CopyTurnsOn() ? !copy_turns.Take(entry.turn, entry.triangles, frame,
+                                                            rebuilt_triangles, budget)
+                                         : rebuilt_triangles >= budget;
+            turn_stats.back += entry.turn_gap != 1 ? 1 : 0;
+        }
+        const bool over = refresh ? refresh_over
                                   : !update && !recapture && new_triangles >= NewTrianglesPerFrame;
         if (positions_used + stored > MaxPositions || scratch_used + needed > ScratchBytes || over) {
             return skip();
@@ -1432,8 +1514,14 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         if (!update) {
             entry.built_frame = frame;
             // bbport (r41_lamp-shadows): rebuilt: back in lamp rays after LampFreshBuilds in a row
+            // bbport (r43_copy-turns): with turns on at the first rebuild that came in time: no
+            // more draws went without since the rebuild before than count as starved. A copy
+            // whose every turn comes too late stays starved (see LampStaleSkips).
+            const bool in_time = entry.lamp_skips <= LampStaleAfter();
             entry.lamp_skips = 0;
-            if (entry.lamp_out && ++entry.lamp_builds >= LampFreshBuilds) {
+            entry.turn_run = entry.turn_back_run = 0;
+            if (entry.lamp_out &&
+                (CopyTurnsOn() ? in_time : ++entry.lamp_builds >= LampFreshBuilds)) {
                 entry.lamp_out = false;
                 entry.lamp_builds = 0;
             }
@@ -2243,6 +2331,37 @@ bool RtShadow::R26FrameEnd() {
     return hold;
 }
 
+// bbport (r43_copy-turns): the end of a frame hands out the turns of the next
+// (rt_copy_turns.h): tickets for the built shared copies drawn on this frame, the oldest build
+// first, so that no moving copy that is drawn every frame goes more than CopyWait() frames in a
+// row without a rebuild. The tickets are kept in the entries themselves; turn_drawn and
+// turn_items point into the entries only up to the end of this call, which runs before the
+// frame end's evictions (no entry is destroyed during a frame). A turn leads to the rebuild
+// every refresh of a shared copy is: in place, recorded by RecordBuilds before the top-level
+// build of the frame that traces it (PrepareScene), nothing created or freed.
+void RtShadow::PlanCopyTurns() {
+    const bool on = CopyTurnsOn();
+    turn_items.clear();
+    for (Entry* entry : turn_drawn) {
+        entry->turn_listed = false;
+        // (Listed and then not drawn after all, not built yet, or promoted to an instance's
+        // entry on this frame: no turn.)
+        if (on && entry->rebuilt && entry->built && entry->seen_frame == frame) {
+            turn_items.push_back({&entry->turn, entry->built_frame, entry->triangles,
+                                  u32(entry->turn_gap), entry->dynamic});
+        }
+    }
+    turn_drawn.clear();
+    if (!on) {
+        copy_turns.Clear();
+        return;
+    }
+    const CopyTurnPlan plan = copy_turns.Plan(turn_items, frame, RebuiltBudget(), CopyWait());
+    turn_items.clear();
+    turn_stats.past += plan.past;
+    turn_stats.past_triangles += plan.past_triangles;
+}
+
 void RtShadow::OnFrameEnd() {
     if (!capturing) {
         return;
@@ -2284,13 +2403,14 @@ void RtShadow::OnFrameEnd() {
                     static_cast<unsigned long long>(stats.promoted), candidates.size(),
                     static_cast<unsigned long long>(stats.incomplete));
         // bbport: what the shared entries are: copies of a mesh drawn more than once in a pass,
-        // known by draw order and fully rebuilt every frame within RebuiltTrianglesPerFrame (see
-        // PrepareDraw).
+        // known by draw order and fully rebuilt within RebuiltBudget() triangles a frame, in turn
+        // (r43_copy-turns; before, the first in draw order every frame; see PrepareDraw).
         u64 shared = 0, shared_triangles = 0, shared_moving = 0, shared_palette = 0,
             shared_camera = 0, shared_rebuilt = 0, shared_rebuilt_triangles = 0;
         // bbport (r41_lamp-shadows): moving copies left out of lamp rays for their old pose
         // (Entry::lamp_out), and the oldest moving copy's BLAS in frames.
         u64 shared_no_lamp = 0, shared_oldest = 0;
+        u64 shared_oldest_still = 0; // bbport (r43_copy-turns)
         const bool lamp_repair = LampStaleOut() && !BbToggle::Experiment(LampRepairOffBit);
         // bbport (r42_lamp-soft): the moving copies starved of rebuilds (Entry::lamp_out is kept
         // whatever BB_LAMP_SHADOW_STALE says), and the four of them with the most triangles.
@@ -2312,6 +2432,11 @@ void RtShadow::OnFrameEnd() {
                 ++shared_rebuilt;
                 shared_rebuilt_triangles += e->triangles;
             }
+            // bbport (r43_copy-turns): the copies that do not move take turns too, four times
+            // as slowly (CopyTurnStill): their oldest build, for the 600-frame line
+            if (!e->dynamic) {
+                shared_oldest_still = std::max(shared_oldest_still, frame - e->built_frame);
+            }
             if (e->dynamic) { // bbport (r41_lamp-shadows)
                 shared_oldest = std::max(shared_oldest, frame - e->built_frame);
                 shared_no_lamp += lamp_repair && e->lamp_out ? 1 : 0;
@@ -2329,10 +2454,29 @@ void RtShadow::OnFrameEnd() {
                 }
             }
         }
+        // bbport (r43_copy-turns): whether the copies take turns, and the bound on the frames a
+        // moving copy drawn every frame goes without a rebuild
+        const bool turns = CopyTurnsOn();
+        char turn_bound[96];
+        if (turns && CopyWait() != 0) {
+            std::snprintf(turn_bound, sizeof(turn_bound),
+                          "the bound is %u, BB_RT_COPY_WAIT, kept while a frame's turns fit two "
+                          "budgets",
+                          CopyWait());
+        } else {
+            std::snprintf(turn_bound, sizeof(turn_bound), "%s",
+                          turns ? "no bound: BB_RT_COPY_WAIT=0, the budget alone decides"
+                                : "no bound without turns");
+        }
         std::printf("Ray tracing: %.0f triangles refit a frame; shared copies drawn on the last "
                     "frame: %llu of %zu meshes, %llu triangles, %llu moving, %llu with a palette, "
                     "%llu in the camera pass, %llu (%llu triangles) rebuilt on it; rebuilt budget "
-                    "%u; %llu left out of lamp rays (oldest %llu frames); %llu moving copies "
+                    "%u; %llu left out of lamp rays (oldest %llu frames); copies take turns: %s; "
+                    "worst age of a moving copy since the last line: %u frames without a rebuild "
+                    "while drawn every frame (%s), %u draws in a row without one for a copy drawn "
+                    "again after frames undrawn; %.1f copies a frame were drawn again so; %llu "
+                    "turns (%llu triangles) went past the budget; oldest build of a copy that "
+                    "does not move: %llu frames; %llu moving copies "
                     "starved of rebuilds, %s (BB_LAMP_SHADOW_STALE=%d)%s",
                     double(stats.refit_triangles) / f, static_cast<unsigned long long>(shared),
                     shared_meshes.size(), static_cast<unsigned long long>(shared_triangles),
@@ -2343,6 +2487,14 @@ void RtShadow::OnFrameEnd() {
                     static_cast<unsigned long long>(shared_rebuilt_triangles), RebuiltBudget(),
                     static_cast<unsigned long long>(shared_no_lamp),
                     static_cast<unsigned long long>(shared_oldest),
+                    turns ? "on (experiment 1152921504606846976 clear), the oldest build first"
+                          : "off (experiment 1152921504606846976 set), the first in draw order as "
+                            "before r43",
+                    turn_stats.worst_run, turn_bound, turn_stats.worst_back_run,
+                    double(turn_stats.back) / f,
+                    static_cast<unsigned long long>(turn_stats.past),
+                    static_cast<unsigned long long>(turn_stats.past_triangles),
+                    static_cast<unsigned long long>(shared_oldest_still),
                     static_cast<unsigned long long>(shared_starved),
                     lamp_repair ? "left out of lamp rays" : "kept in lamp rays",
                     LampStaleOut() ? 1 : 0, starved[0] ? ", the largest:" : "");
@@ -2358,6 +2510,7 @@ void RtShadow::OnFrameEnd() {
         }
         std::printf("\n");
         stats = {};
+        turn_stats = {}; // bbport (r43_copy-turns)
     }
     // bbport (r17_rt-upkeep): one line every 600 frames
     ++r17_stats.frames;
@@ -2414,6 +2567,9 @@ void RtShadow::OnFrameEnd() {
             return item.second.last + CandidateFrames < frame + 1;
         });
     }
+    // bbport (r43_copy-turns): the next frame's turns, while frame_entries still holds this
+    // frame's entries and before the evictions below (no pointer to an entry is kept past it)
+    PlanCopyTurns();
     UpdateHeld(); // bbport (r14_cascade_rt): before the evictions, which spare held entries
     ++frame;
     // bbport (r26_upkeep-probe): BB_RT_UPKEEP_FREEZE set: true while the TLAS traced as it was
