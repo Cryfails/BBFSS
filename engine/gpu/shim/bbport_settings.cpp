@@ -25,8 +25,13 @@ namespace BbSettings {
 namespace {
 
 const char* Path() {
-    const char* env = std::getenv("BB_CONFIG");
-    return env && env[0] ? env : "lantern.ini";
+    return IniPath(); // bbport (r39_master-debug): the file the early debug_* reader uses too
+}
+
+// bbport (r39_master-debug): before the program's ordinary static initializers (they run at
+// priority 65535, this at 101), so a debug_* key is its variable before any of them can read it.
+__attribute__((constructor(101))) void DebugSwitchesBeforeStatics() {
+    DebugSwitchesAtStart();
 }
 
 float Clamp(float v, float lo, float hi) {
@@ -68,6 +73,16 @@ int CheatChoice(const std::string& key, const std::string& value, const int (&ch
     }
     std::printf("Settings: unknown %s '%s' (expected %s); %d\n", key.c_str(), value.c_str(), expected, choices[0]);
     return choices[0];
+}
+
+// bbport (r37_menu-options): a 0/1 key; any other value is the default, with a note.
+bool ZeroOrOne(const std::string& key, const std::string& value, bool fallback) {
+    if (value == "0" || value == "1") {
+        return value == "1";
+    }
+    std::printf("Settings: unknown %s '%s' (expected 0 or 1); %d\n", key.c_str(), value.c_str(),
+                int(fallback));
+    return fallback;
 }
 
 void Set(Values& v, const std::string& key, const std::string& value) {
@@ -393,6 +408,38 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.graphics_shadow_resolution=std::clamp(i,0,2);
     } else if (key == "graphics_local_shadow_resolution") {
         v.graphics_local_shadow_resolution=std::clamp(i,0,2);
+    } else if (key == "graphics_sun_far_shadows") { // bbport (r15_far-shadow-setting)
+        int mode = -1;
+        for (int m = 0; m < SunFarShadowsCount; ++m) {
+            if (value == SunFarShadowsNames[m]) mode = m;
+        }
+        if (mode < 0) {
+            std::printf("Settings: unknown graphics_sun_far_shadows '%s' (expected game, alternate or rare); "
+                        "game\n", value.c_str());
+        }
+        v.graphics_sun_far_shadows = mode < 0 ? SunFarGame : mode;
+    } else if (key == "graphics_lamp_shadow_half") { // bbport (r37_menu-options)
+        v.graphics_lamp_shadow_half = ZeroOrOne(key, value, false);
+    } else if (key == "graphics_gi_reflections_fewer_rays") {
+        v.graphics_gi_reflections_fewer_rays = ZeroOrOne(key, value, false);
+    } else if (key == "graphics_rt_sun_half") {
+        v.graphics_rt_sun_half = ZeroOrOne(key, value, false);
+    } else if (key == "graphics_rt_far_refit") {
+        v.graphics_rt_far_refit = ZeroOrOne(key, value, false);
+    } else if (key == "engine_previous_paths") { // bbport (r39_master-debug)
+        v.engine_previous_paths = ZeroOrOne(key, value, false);
+    } else if (const int debug = DebugSwitchOfKey(key); debug >= 0) { // bbport (r39_master-debug)
+        v.debug_switches[debug] = ZeroOrOne(key, value, false);
+    } else if (key == "object_motion_store") { // bbport (r37_menu-options)
+        int mode = -1;
+        for (int m = 0; m < MotionStoreCount; ++m) {
+            if (value == MotionStoreNames[m]) mode = m;
+        }
+        if (mode < 0) {
+            std::printf("Settings: unknown object_motion_store '%s' (expected auto, large or small); "
+                        "auto\n", value.c_str());
+        }
+        v.object_motion_store = mode < 0 ? MotionStoreAuto : mode;
     } else if (key == "graphics_motion_blur_quality") {
         v.graphics_motion_blur_quality=std::clamp(i,0,1);
     } else if (key == "graphics_ao_quality") {
@@ -578,6 +625,9 @@ std::string SavedValue(const char* key, const char* fallback) {
 
 void Load() {
     auto& v = Get();
+    // bbport (r39_master-debug): in the engine the debug_* keys became environment variables
+    // before main (bbport_toggles.h asks first); here for a program that does not include it.
+    const DebugSwitchState& debug_at_start = DebugSwitchesAtStart();
     for (int e = 0; e < EffectCount; ++e) {
         v.effects[e] = Effects[e].default_on;
     }
@@ -687,6 +737,19 @@ void Load() {
     v.startup_ao_quality = v.graphics_ao_quality;
     v.startup_shadow_resolution = v.graphics_shadow_resolution;
     v.startup_local_shadow_resolution = v.graphics_local_shadow_resolution;
+    v.startup_sun_far_shadows = v.graphics_sun_far_shadows; // bbport (r15_far-shadow-setting)
+    v.startup_object_motion_store = v.object_motion_store; // bbport (r37_menu-options)
+    v.startup_engine_previous_paths = v.engine_previous_paths; // bbport (r39_master-debug)
+    for (int d = 0; d < DebugSwitchCount; ++d) {
+        v.startup_debug_switches[d] = v.debug_switches[d];
+        if (debug_at_start.applied[d]) {
+            std::printf("Settings: %s=1: %s=%s for this run\n", DebugSwitches[d].key, DebugSwitches[d].env,
+                        DebugSwitchValue);
+        } else if (debug_at_start.ini[d] && debug_at_start.env_set[d]) {
+            std::printf("Settings: %s=1, but %s is set: the variable decides\n", DebugSwitches[d].key,
+                        DebugSwitches[d].env);
+        }
+    }
     v.startup_object_motion = v.object_motion;
     for (int e = 0; e < EffectCount; ++e) {
         v.startup_effects[e] = v.effects[e];
@@ -803,6 +866,7 @@ void Save() {
     put("jitter", flag(v.jitter));
     put("reactive", flag(v.reactive));
     put("object_motion", flag(v.object_motion));
+    put("object_motion_store", MotionStoreNames[std::clamp(v.object_motion_store.load(), 0, MotionStoreCount - 1)]); // r37
     put("reactive_scale", fixed(v.reactive_scale, 2));
     put("reactive_threshold", fixed(v.reactive_threshold, 2));
     put("reactive_max", fixed(v.reactive_max, 2));
@@ -906,6 +970,16 @@ void Save() {
     put("graphics_dof_intensity",fixed(v.graphics_dof_intensity,2));
     put("graphics_shadow_resolution",std::to_string(std::clamp(v.graphics_shadow_resolution.load(),0,2)));
     put("graphics_local_shadow_resolution",std::to_string(std::clamp(v.graphics_local_shadow_resolution.load(),0,2)));
+    put("graphics_sun_far_shadows",
+        SunFarShadowsNames[std::clamp(v.graphics_sun_far_shadows.load(),0,SunFarShadowsCount-1)]); // r15
+    put("graphics_lamp_shadow_half",flag(v.graphics_lamp_shadow_half)); // bbport (r37_menu-options)
+    put("graphics_gi_reflections_fewer_rays",flag(v.graphics_gi_reflections_fewer_rays));
+    put("graphics_rt_sun_half",flag(v.graphics_rt_sun_half));
+    put("graphics_rt_far_refit",flag(v.graphics_rt_far_refit));
+    put("engine_previous_paths", flag(v.engine_previous_paths)); // bbport (r39_master-debug)
+    for (int d = 0; d < DebugSwitchCount; ++d) {
+        put(DebugSwitches[d].key, flag(v.debug_switches[d]));
+    }
     put("graphics_motion_blur_quality",std::to_string(std::clamp(v.graphics_motion_blur_quality.load(),0,1)));
     put("graphics_ao_quality",std::to_string(std::clamp(v.graphics_ao_quality.load(),0,1)));
     put("graphics_shadow_scale",fixed(v.graphics_shadow_scale,2));

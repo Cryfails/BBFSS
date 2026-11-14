@@ -48,6 +48,9 @@ public:
         bool gated = false;
         bool restart = false;
         bool indices_valid = false;
+        /// bbport (r34_motion-store): Skinned, GpuPalette or Other; a gated draw's kind (Moved
+        /// or Held) is set by Evaluate.
+        Motion::Kind kind = Motion::Kind::Other;
     };
     u32 Draw(const DrawJob& job);
     void Sync();
@@ -123,8 +126,14 @@ private:
     static constexpr u32 ParamsPerFrame = 8192;
     static_assert(1 + FrameSlots * ParamsPerFrame == Shader::MotionVectors::ParamsCapacity);
     // Positions (device local): two halves (current/previous frame) of vec4; element 0 is reserved.
+    /// bbport (r34_motion-store, r37_menu-options): the small store (object_motion_store=small,
+    /// and the fallback when the large one cannot be made) and the large one (the default, and
+    /// what an unreadable BB_OBJECT_MOTION_VERTICES gives).
     static constexpr u32 PositionsPerFrame = 4u << 20;
+    static constexpr u32 PositionsPerFrameLarge = 8u << 20;
+    u32 positions_per_frame = PositionsPerFrame;      ///< bbport (r34_motion-store)
     Motion::History history{PositionsPerFrame};
+    std::vector<u64> used_bits; ///< bbport (r34_motion-store): Motion::UsedVertices scratch
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
     vk::Buffer params_buffer{};

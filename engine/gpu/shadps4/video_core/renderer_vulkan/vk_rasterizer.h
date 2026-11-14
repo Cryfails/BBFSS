@@ -397,6 +397,40 @@ private:
     void UpdateViewportScissorState() const;
     vk::Rect2D DrawScissor(u32 viewport) const;
     void EffectsOnFrameEnd();
+    /// bbport (r7_cascades): far sun cascades kept from an earlier frame (sun_hold,
+    /// vk_rasterizer_effects.cpp). All run on the thread recording draws (stage B).
+    bool SunHoldEarly(const GraphicsPipeline* pipeline);
+    void SunHoldBeforePass(RenderState& state);
+    void SunHoldInPass(const RenderState& state);
+    void SunHoldDrawn();
+    void SunHoldOther(const Shader::Info* first, const Shader::Info* second, bool graphics);
+    void SunHoldFlush();
+    void SunHoldClear(u32 quadrants);
+    bool SunHoldImageIntact();
+    void SunHoldOff(const char* why);
+    void SunHoldFrameEnd();
+    /// bbport (r14_cascade_keep): the atlas quadrants of cascades the game left undrawn keep their
+    /// depth (sun_keep, vk_rasterizer_effects.cpp). On the thread recording draws.
+    bool SunKeepGate() const;
+    void SunKeepBeforePass(RenderState& state, bool indirect);
+    void SunKeepInPass(const RenderState& state);
+    /// bbport: the game's sun shadow atlas (sun_atlas, vk_rasterizer_effects.cpp).
+    void SunAtlasResolve(const Shader::Info& ps);
+    bool SunAtlasSkipDraw(const GraphicsPipeline* pipeline, const RenderState& state);
+    void SunAtlasReader(const char* what, u64 hash);
+    void SunAtlasFrameEnd();
+    /// bbport (r12_atlas_skip_live): readers of the atlas while far cascades are left out.
+    bool SunAtlasLiveReader(const GraphicsPipeline* pipeline, const RenderState& state,
+                            u64 ps_hash);
+    void SunAtlasReaderQuery(vk::QueryPool& pool, u32& index);
+    void SunAtlasQueriesFrameEnd();
+    /// r7 diagnostics of the sun atlas (vk_rasterizer_effects.cpp); they change nothing drawn.
+    void SunAtlasLight(const GraphicsPipeline* pipeline, u32 cascade, float width, float height);
+    void SunAtlasDescribeReader(const GraphicsPipeline* pipeline, const RenderState& state);
+    void SunAtlasStatsFrameEnd();
+    void SunAtlasStatsReport(double frames);
+    /// Lamps apart (vk_point_shadow.h): something that is not a draw may touch the light targets.
+    void EffectsEndLampBatch();
     void EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                             u32 index_offset);
     void EffectsBeforeTargets(const GraphicsPipeline* pipeline);
@@ -619,6 +653,204 @@ private:
     u32 ssr_frame = 0;
     u32 shadow_frame = 0;
     vk::Rect2D effect_tile{};
+    /// bbport: of the draw EffectsBeforeBind is called for: its pass's size, and whether its first
+    /// two colour targets are cleared when the pass begins (lamps apart, vk_point_shadow.h).
+    vk::Extent2D effect_pass{};
+    bool effect_plain_pair = false;
+    bool effect_skip_draw = false; ///< bbport: EffectsBeforeBind left this draw out
+    /// bbport: the game's sun shadow atlas while the ray traced sun or the VSM replaces the
+    /// game's sun shadow: draws into cascades nothing samples are left out (SunAtlasSkipDraw;
+    /// experiment 8192 draws them all, as before).
+    struct SunAtlas {
+        VAddr address = 0;             ///< the shadow resolve's image 1 (0: none seen)
+        std::array<float, 3> splits{}; ///< the resolve's cascade splits (constants 80..82)
+        bool splits_valid = false;
+        float coverage = 0.0f;         ///< the resolve's uniforms 72 (shadow distance)
+        float reach = 0.0f;            ///< the volumetric march's this frame (0: not sampled)
+        bool resolved = false;         ///< a resolve was seen this frame
+        bool other_reader = false;     ///< sampled by something else: never left out again
+        bool any_skipped = false;      ///< a draw was left out this frame
+        u32 steady = 0;                ///< frames in a row whose sun shadow was replaced
+        u32 needed = 4;                ///< cascades the volumetric march samples
+        u32 skip_from = 4;             ///< first cascade left out (4: none)
+        u32 skipped_mask = 0;          ///< cascades with draws left out since the last resolve
+        u32 drawn_mask = 0;            ///< cascades with draws this frame
+        u32 frames = 0, left_out_frames = 0;
+        std::array<u64, 4> cascade_draws{}, cascade_skipped{}, cascade_frames{};
+        // r7 (diagnostics only): every draw into the atlas is counted, whatever is left out.
+        u64 reader_vs = 0, reader_ps = 0; ///< the other reader's shaders (0: none, or a dispatch)
+        u64 reader_draws = 0;             ///< its draws since the last report
+        u64 last_pass = ~0ull;            ///< Scheduler::PassesBegun at the last atlas draw
+        const GraphicsPipeline* last_pipeline = nullptr;
+        u64 atlas_draws = 0, atlas_passes = 0, clear_passes = 0, clear_draws = 0;
+        u64 no_viewport = 0, spanning = 0, same_pipeline = 0, no_constants = 0;
+        struct PassNote {
+            u8 cascade = 0; ///< 0..3; 4 across cascades, 5 no single viewport, 6 mixed
+            u8 clear = 0;   ///< 1: the pass begins with a clear, 2: a DB clear draw in it
+            u16 draws = 0;
+            s16 x = 0, y = 0;
+            u16 w = 0, h = 0;
+        };
+        std::array<PassNote, 64> pass_notes{};
+        u32 pass_count = 0, pass_logs = 0;
+        bool pass_log = false, note_open = false, check_frame = false;
+        u64 stats_frame = 0;
+        struct Light {
+            std::array<float, 28> m{};         ///< projection (4x4 rows), view to world (3x4 rows)
+            float width = 0.0f, height = 0.0f; ///< the cascade's viewport
+            bool valid = false;
+        };
+        std::array<Light, 4> light{}, previous_light{};
+        u32 light_mask = 0; ///< cascades whose light matrix was read this frame
+        struct LightStats {
+            u64 compared = 0, same = 0, turned = 0, moved = 0, measured = 0, whole = 0;
+            u64 checked = 0, other_matrix = 0;
+            double sum_texels = 0.0, max_texels = 0.0, max_delta = 0.0;
+        };
+        std::array<LightStats, 4> light_stats{};
+    } sun_atlas;
+    /// bbport (r19_draw-cost): what this draw's Motion block found (DrawRecord), for
+    /// EffectsCaptureDraw of the same draw: its index range check and, when its buffer walk met
+    /// no skeleton and no GPU-written palette (complete), its bone palette hash.
+    struct R19Motion {
+        bool valid = false;
+        bool indices_valid = false;
+        bool palette_complete = false;
+        u64 palette = 0;
+    } r19_motion;
+    /// bbport (r19_draw-cost): short path counters, printed every 600 frames (EffectsOnFrameEnd).
+    struct R19Stats {
+        u64 frames = 0, sun_short = 0, motion_indices = 0, motion_palettes = 0;
+    } r19_stats;
+    /// bbport (r12_atlas_skip_live, experiment bit 549755813888 clear): who else samples the sun
+    /// atlas. The water (ps e3021062) is measured by occlusion queries of its own around its draws,
+    /// read without waiting once the GPU is past the frame; far cascades are left out only while it
+    /// showed no samples for QuietFrames frames. Any other draw reader, or a dispatch or indirect
+    /// draw using the atlas, keeps every cascade for the rest of the session (as before).
+    struct SunReader {
+        static constexpr u32 Groups = 8;      ///< frames of water queries in flight at most
+        static constexpr u32 PerGroup = 8;    ///< water draws measured in a frame at most
+        static constexpr u64 QuietFrames = 8; ///< frames without water samples before leaving out
+        static constexpr u64 MaxLag = 4;      ///< an answer later than this: the water counts as seen
+        vk::UniqueQueryPool pool{};
+        bool pool_tried = false;
+        bool measure_now = false; ///< the draw being recorded is a water draw (SunAtlasSkipDraw)
+        bool latched = false;     ///< another reader: every cascade is drawn from now on
+        bool water_noted = false;
+        bool cleared = false; ///< this frame's atlas pass began with a clear of the whole image
+        VideoCore::ImageId cleared_image{}; ///< the image that clear was of
+        bool quiet = false;   ///< no water samples (nor unmeasured water draws) lately
+        bool blocked = false; ///< this frame's query group still waits for its answer
+        bool water_now = false, unmeasured_now = false; ///< this frame
+        bool water_before = false; ///< the frame before drew the water
+        u32 group = 0;                    ///< this frame's group of queries
+        std::array<u32, Groups> used{};   ///< queries begun in a group's frame
+        std::array<u64, Groups> tick{};   ///< the scheduler tick at that frame's end
+        std::array<u64, Groups> frame{};  ///< that frame's frame_index
+        std::array<bool, Groups> pending{}; ///< its answers not read yet
+        u64 frame_index = 0;
+        u64 last_seen = 0; ///< the last frame whose water had samples or was not measured
+        // Report (every 600 frames, with the "Sun atlas:" lines).
+        u64 water_draws = 0, measured = 0, unmeasured = 0, water_frames = 0;
+        u64 seen_frames = 0, hidden_frames = 0, late = 0, blocked_frames = 0, other_draws = 0;
+        u64 clear_kept = 0, colour_kept = 0, motion_kept = 0;
+        std::array<u64, 4> capture_kept{};
+    } sun_reader;
+    /// bbport (r7_cascades): far sun cascades kept from an earlier frame. A cascade whose caster
+    /// draws carry the light matrix, viewport and scissor its quadrant was drawn with is not drawn
+    /// again (BB_SUN_CASCADE_EVERY; experiment 268435456 draws every cascade every frame).
+    struct SunHold {
+        struct Light {
+            std::array<float, 28> m{}; ///< projection (4x4 rows), view to world (3x4 rows)
+            u64 view = 0;              ///< SunViewKey of its draws (viewport, scissor registers)
+            bool valid = false;
+        };
+        struct ViewEntry {
+            u64 key = 0;
+            u8 cascade = 4; ///< 0..3; 4: more than one quadrant, or no single viewport
+            bool used = false;
+        };
+        bool active = false;       ///< asked for, experiment 268435456 clear, not off for good
+        bool off_for_good = false; ///< something it does not handle was seen (printed)
+        std::array<u32, 4> every{1, 1, 1, 1}; ///< BB_SUN_CASCADE_EVERY
+        VAddr atlas = 0;     ///< sun_atlas.address at the last frame end
+        VAddr z_address = 0; ///< the atlas's depth base register (learned from its passes)
+        VideoCore::ImageId image{};
+        u64 image_uid = 0;
+        const void* backing = nullptr;
+        VideoCore::SubresourceRange range{};
+        u32 width = 0, height = 0;
+        RenderState last_state{}; ///< an atlas pass drawing depth, loading it (SunHoldFlush)
+        bool last_state_valid = false;
+        std::array<ViewEntry, 16> views{};
+        u32 next_view = 0;
+        // The draw being recorded (SunHoldEarly, SunHoldInPass, SunHoldDrawn).
+        u64 draw_key = 0;
+        u8 draw_cascade = 4; ///< a classified atlas draw going to be drawn (4: none)
+        u8 draw_learned = 4;
+        bool draw_known = false;
+        bool atlas_pass = false;
+        // This frame.
+        u32 plan = 0, plan_start = 0; ///< cascades to keep (drawn after all if their matrix moved)
+        u32 decided = 0, confirmed = 0, spared = 0, pending_clear = 0, stale = 0;
+        float clear_depth = 1.0f;
+        bool image_checked = false, force = false;
+        const char* why = "";
+        u32 atlas_draws = 0, unknown_draws = 0, spanning_draws = 0;
+        std::array<u32, 4> arrived{}, drawn{};
+        std::array<Light, 4> frame_light{};
+        std::array<VAddr, 4> const_address{};
+        std::array<bool, 4> match{}, multi{}, special{}, no_constants{};
+        // Across frames.
+        std::array<Light, 4> held{}; ///< what each quadrant was last drawn in full with
+        std::array<u32, 4> age{};    ///< frames it has been kept since
+        std::array<float, 3> splits{};
+        bool splits_valid = false;
+        Light previous_c0{};
+        u32 steady = 0;
+        u64 frame = 0, frames_total = 0;
+        // Report (every 600 frames).
+        u32 frames = 0, kept_frames = 0, forced_frames = 0;
+        const char* last_why = "none";
+        std::array<u64, 4> skipped{}, kept{}, planned{}, broke{}, flushed{};
+        u64 converted = 0, unconverted = 0, flush_failed = 0, mismatched = 0, lost = 0;
+        u64 stale_draws = 0, unknown_total = 0, spanning_total = 0;
+    } sun_hold;
+    /// bbport (r14_cascade_keep): while the game leaves sun cascades undrawn on some frames
+    /// (BbSunCascades::skip_period > 1, experiment 1099511627776 clear) the atlas's clear of the
+    /// whole image is taken over: each quadrant is cleared right before the first draw into it, so
+    /// a quadrant its cascade did not draw into keeps its depth (the game keeps that cascade's
+    /// matrices too). Learned from the draws that arrive; an atlas frame runs from one clear of
+    /// the whole image to the next.
+    struct SunKeep {
+        bool active = false;  ///< at the last clear of the whole image: clears are taken over
+        bool open = false;    ///< this atlas frame's clear was taken over
+        bool tracked = false; ///< `image` was cleared whole or by quadrants since it was made
+        u32 linger = 0;       ///< atlas frames still taken over once the game stops skipping
+        u32 period = 0;       ///< skip_period when last asked
+        VideoCore::ImageId image{}; ///< the atlas image at the last atlas draw
+        u64 image_uid = 0;
+        const void* backing = nullptr;
+        u64 write_seq = 0;         ///< its write_seq then (one count per pass begun on it)
+        u32 width = 0, height = 0; ///< the size of the pass the clear was taken over in
+        float clear_depth = 1.0f;
+        u64 clear_pass = ~0ull; ///< PassesBegun() of the pass whose clear was taken over
+        // The draw being recorded (SunKeepBeforePass, SunKeepInPass).
+        bool atlas_pass = false, indirect = false, take_clear = false;
+        // This atlas frame.
+        u32 cleared = 0xFu;     ///< quadrants cleared (or owed a clear: pending) since its clear
+        u32 drawn = 0;          ///< quadrants with draws
+        u32 pending = 0;        ///< clears owed: recorded with the next draw in a pass that can
+        bool whole_now = false; ///< a fallback cleared every quadrant: nothing kept
+        // Across atlas frames.
+        std::array<u32, 4> age{}; ///< atlas frames in a row a quadrant kept its depth
+        u32 blank = 0;            ///< quadrants holding only the clear value
+        // Report (every 600 atlas frames).
+        u32 frames = 0, mode_frames = 0;
+        u64 taken = 0, whole = 0, rects = 0, deferred = 0;
+        const char* last_whole = "none";
+        std::array<u64, 4> clears{}, expired{}, kept{};
+    } sun_keep;
     bool scene_started = false;
     /// bbport: the scene depth of the frame before (SkipUncompiledDraw).
     VideoCore::ImageId previous_scene_depth{};
@@ -747,6 +979,60 @@ private:
         u64 offset;
         vk::IndexType type;
     };
+    /// bbport (r21_draw-sort): experiment bit: set = the old binds (every draw records its
+    /// vertex input, vertex buffers and index buffer) and nothing counted for "Draw order (r21)".
+    static constexpr u64 R21DrawSortOffBit = 70368744177664ull;
+    /// bbport (r21_draw-sort): the vertex input, vertex buffers and index buffer last recorded;
+    /// in force while Scheduler::R21Serial() and R21Epoch() are still `serial` and `epoch`.
+    struct R21Bound {
+        u64 serial = ~0ull;
+        u64 epoch = ~0ull;
+        bool input_known = false, buffers_known = false, index_known = false;
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::Buffer> buffers;
+        VertexInputs<vk::DeviceSize> offsets;
+        u32 num_buffers = 0;
+        IndexBind index{};
+    } r21_bound;
+    /// What the current draw's binds did: 0 nothing to bind (or experiment set), 1 left out
+    /// (equal to the bind in force), 2 recorded (another in force), 3 recorded (unknown what).
+    struct R21Outcome {
+        u8 input = 0, buffers = 0, index = 0;
+    } r21_outcome;
+    struct R21Row {
+        u64 draws = 0, descriptors = 0;
+        std::array<std::array<u64, 4>, 3> binds{}; ///< vertex input, vertex buffers, index buffer
+    };
+    struct R21Stats {
+        u32 frame = 0;
+        u64 frames = 0;
+        bool window_off = false; ///< the experiment bit for every frame of this window
+        u64 pass = ~0ull;        ///< Scheduler::R21FreshPasses of the last counted draw
+        bool atlas_pass = false; ///< that pass draws into the sun atlas
+        const GraphicsPipeline* atlas_last = nullptr;
+        std::array<const GraphicsPipeline*, 64> pass_seen{};
+        u32 pass_seen_n = 0;
+        std::array<const GraphicsPipeline*, 256> frame_seen{};
+        u32 frame_seen_n = 0;
+        struct Counts {
+            R21Row all, atlas;
+            u64 atlas_passes = 0, atlas_changes = 0, atlas_pass_distinct = 0,
+                atlas_frame_distinct = 0;
+        } c;
+    } r21_stats;
+    /// bbport (r21_draw-sort): BB_DRAW_ORDER=1: R21AfterDraw counts and prints "Draw order
+    /// (r21)". Off: nothing counted (the bind skip does not depend on it).
+    static bool R21Counting() noexcept {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_DRAW_ORDER");
+            return env && env[0] == '1';
+        }();
+        return on;
+    }
+    bool R21Begin(bool dynamic_input);
+    void R21End(bool on, u64 serial, u64 epoch);
+    void R21AfterDraw(const GraphicsPipeline* pipeline, bool is_indexed);
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
     struct DrawInputs {
         const GraphicsPipeline* pipeline;
@@ -909,6 +1195,8 @@ private:
     std::array<VertexMemo, 4096> vertex_memo{};
     BbEngine::Batch::Mode vertex_memo_mode = BbEngine::Batch::Off;
     std::pair<const VideoCore::Buffer*, u64> BindVertexMemo(VAddr base, u64 size);
+    /// bbport: the vertex memo is used (on unless LANTERN_VERTEX_MEMO=0; experiment 2097152: off).
+    [[nodiscard]] bool VertexMemoOn() const;
     struct SealedBind {
         VAddr base = 0;
         u64 size = 0;

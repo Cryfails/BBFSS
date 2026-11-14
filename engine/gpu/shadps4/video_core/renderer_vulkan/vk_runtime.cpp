@@ -114,6 +114,42 @@ void Runtime::TickFrame() {
     if (BbStats::enabled) {
         GpuSavings::Report();
     }
+    // bbport (r22_barriers): "Barriers (r22):" every 600 frames, counts per frame. Only with
+    // BB_FRAME_STATS=1 (BbStats::enabled), like the counters.
+    if (BbStats::enabled) {
+        static u64 r22_first = BbStats::gpu_frames.load(std::memory_order_relaxed);
+        const u64 r22_frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
+        if (r22_frame - r22_first >= 600) {
+            const double f = double(r22_frame - r22_first);
+            r22_first = r22_frame;
+            const auto take = [f](std::atomic<u64>& count) {
+                return double(count.exchange(0, std::memory_order_relaxed)) / f;
+            };
+            auto& c = r22_counts;
+            const double flushes = take(c.flushes), flush_images = take(c.flush_images);
+            const double texture_issued = take(c.texture_issued);
+            const double texture_skipped = take(c.texture_skipped);
+            const double proxy_issued = take(c.proxy_issued);
+            const double merged_flush = take(c.proxy_merged_flush);
+            const double merged_pair = take(c.proxy_merged_pair);
+            const double skipped_resolve = take(c.proxy_skipped_resolve);
+            const double skipped_copy = take(c.proxy_skipped_copy);
+            const double skipped_read = take(c.proxy_skipped_read);
+            std::printf(
+                "Barriers (r22): experiment 140737488355328 %s; a frame: FlushBarriers recorded "
+                "%.1f calls holding %.1f image barriers; texture cache image barriers issued "
+                "%.1f, skipped as a read after a covering read %.1f; scene proxy barriers in "
+                "calls of their own %.1f, merged into another call %.1f (into the flush of a "
+                "resolve or fill %.1f, into the other barrier of a proxy copy %.1f), skipped "
+                "%.1f (resolve source %.1f, proxy copy source %.1f, effect read after a barrier "
+                "%.1f)\n",
+                BbToggle::Experiment(R22BarriersOffBit) ? "set (old barriers)" : "clear", flushes,
+                flush_images, texture_issued, texture_skipped, proxy_issued,
+                merged_flush + merged_pair, merged_flush, merged_pair,
+                skipped_resolve + skipped_copy + skipped_read, skipped_resolve, skipped_copy,
+                skipped_read);
+        }
+    }
 }
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
@@ -244,7 +280,7 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     BeforeImageAccess();
-    if (scene_targets) scene_targets->NativeAccess(*image, dst_access);
+    if (scene_targets) scene_targets->NativeAccess(*image, dst_access, dst_layout);
     constexpr vk::AccessFlags2 ImageWrites =
         vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderStorageWrite |
         vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
@@ -255,6 +291,10 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     }
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    if (BbStats::enabled && image_barriers.size() != prev_num_barriers) { // bbport (r22)
+        r22_counts.texture_issued.fetch_add(image_barriers.size() - prev_num_barriers,
+                                            std::memory_order_relaxed);
+    }
     return image_barriers.size() != prev_num_barriers;
 }
 
@@ -287,6 +327,7 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image upload", *dst};
+    const SceneUseScope scene_use{"image upload (CPU data)"};
 
     bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -319,6 +360,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
     SetBackingSamples(src, src->info.num_samples);
     scheduler.EndRendering();
     const TransferMark mark{*this, "image download", *src};
+    const SceneUseScope scene_use{"image download (readback)"};
 
     bool needs_flush =
         Transit(src, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
@@ -345,6 +387,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    const SceneUseScope scene_use{"image copy (render-target copy HLE or texture cache)"};
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -691,11 +734,23 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
 
 void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRange& range,
                          const vk::ClearValue& clear_value) {
+    const SceneUseScope scene_use{"image clear (fast-clear eliminate or clear HLE)"};
     scheduler.EndRendering();
+    BeforeImageAccess(); // the bind helper is joined before scene-target state changes
+    // bbport (r9_clear): a clear of every layer overwrites these levels, so their scene proxies
+    // are not resolved into them first (a 1080p -> 4K blit thrown away), and are cleared too.
+    const bool proxy_clear = scene_targets && range.base.layer == 0 &&
+                             range.extent.layers >= dst->info.resources.layers &&
+                             scene_targets->NativeClearBegin(*dst, range.base.level,
+                                                             range.extent.levels);
 
     const bool needs_flush =
         Transit(dst, vk::ImageLayout::eTransferDstOptimal, vk::PipelineStageFlagBits2::eClear,
                 vk::AccessFlagBits2::eTransferWrite, range);
+    if (scene_targets) { // the level window NativeClearBegin set for that Transit
+        scene_targets->native_level_begin = 0;
+        scene_targets->native_level_end = 16;
+    }
     if (needs_flush) {
         FlushBarriers();
     }
@@ -711,6 +766,10 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
                       vk_range](vk::CommandBuffer cmdbuf) {
         cmdbuf.clearColorImage(image, vk::ImageLayout::eTransferDstOptimal, color, vk_range);
     });
+    if (proxy_clear) {
+        scene_targets->NativeClearEnd(*dst, range.base.level, range.extent.levels,
+                                      clear_value.color);
+    }
 
     dst->flags |= VideoCore::ImageFlagBits::GpuModified;
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
@@ -957,6 +1016,11 @@ void Runtime::FlushBarriers() {
         });
     }
 
+    if (BbStats::enabled) { // bbport (r22_barriers): a recorded barrier call, its image barriers
+        r22_counts.flushes.fetch_add(1, std::memory_order_relaxed);
+        r22_counts.flush_images.fetch_add(dep_info.imageMemoryBarrierCount,
+                                          std::memory_order_relaxed);
+    }
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 

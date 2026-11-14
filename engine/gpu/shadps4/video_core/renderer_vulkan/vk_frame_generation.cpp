@@ -2,6 +2,7 @@
 // bbport: frame generation, FSR 3.1 frame interpolation (vk_frame_generation.h).
 
 #include "video_core/renderer_vulkan/vk_frame_generation.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 
 #include <algorithm>
 #include <cmath>
@@ -120,6 +121,16 @@ void FrameGenerator::CaptureInputs(Scheduler& scheduler, vk::ImageView source_de
     input_fov = vertical_fov;
     input_camera = camera;
     inputs_frame = true;
+    // bbport: BB_GPU_PROFILE: a label of its own (inside the upscaler's run, resumed after it).
+    GpuProfiler* const profiler =
+        GpuProfiler::Get() && GpuProfiler::Get()->Records(&scheduler) ? GpuProfiler::Get()
+                                                                       : nullptr;
+    const u64 resume = profiler ? profiler->Current() : 0;
+    if (profiler) {
+        profiler->Mark(0xF6E0'0001ull, [] {
+            return std::string{"frame generation: depth and motion capture"};
+        });
+    }
     scheduler.Record([source_depth, motion, w, h, target_depth = *depth_view,
                       target_motion = vk::Image(motion_image), sampler = *sampler,
                       pipeline = *depth_pipeline,
@@ -147,6 +158,9 @@ void FrameGenerator::CaptureInputs(Scheduler& scheduler, vk::ImageView source_de
                          vk::ImageLayout::eGeneral, region);
         GlobalBarrier(cmdbuf);
     });
+    if (resume) {
+        profiler->Resume(resume);
+    }
 }
 
 void FrameGenerator::CaptureHudless(Scheduler& scheduler, vk::Image image, vk::Format format,
@@ -161,6 +175,15 @@ void FrameGenerator::CaptureHudless(Scheduler& scheduler, vk::Image image, vk::F
         return; // Prepare reports the mismatch
     }
     hudless_frame = true;
+    // bbport: BB_GPU_PROFILE: a label of its own (the label before it resumed after it).
+    GpuProfiler* const profiler =
+        GpuProfiler::Get() && GpuProfiler::Get()->Records(&scheduler) ? GpuProfiler::Get()
+                                                                       : nullptr;
+    const u64 resume = profiler ? profiler->Current() : 0;
+    if (profiler) {
+        profiler->Mark(0xF6E0'0002ull,
+                       [] { return std::string{"frame generation: HUD-less copy"}; });
+    }
     scheduler.Record([image, w, h, target = vk::Image(hudless_image)](vk::CommandBuffer cmdbuf) {
         GlobalBarrier(cmdbuf);
         const vk::ImageCopy region{
@@ -172,6 +195,9 @@ void FrameGenerator::CaptureHudless(Scheduler& scheduler, vk::Image image, vk::F
                          region);
         GlobalBarrier(cmdbuf);
     });
+    if (resume) {
+        profiler->Resume(resume);
+    }
 }
 
 void FrameGenerator::Idle(const char* reason) {

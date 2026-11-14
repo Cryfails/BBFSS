@@ -5,6 +5,7 @@
 // blue: the pixel has an object motion vector from its vertices, not camera motion).
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -13,18 +14,77 @@ layout(binding = 1, rgba16f) uniform image2D scene;
 layout(binding = 2, r8) uniform readonly image2D reactive;
 layout(binding = 3) uniform texture2D motion;  // render size, pixels
 layout(binding = 4) uniform texture2D objects; // render size, b = object vector written
+layout(binding = 5) uniform texture2D scene_proxy; // render size: alpha when alpha_source != 0
 
 layout(push_constant) uniform Params {
     uint mode;
+    float sharpen; // extra RCAS strength 0..2 (was TemporalUpscaler::ExtraSharpen); 0 = off
+    uint alpha_source; // 0: the scene's own alpha; 1/2: the proxy's, upscaled linear/nearest
 };
+
+// RCAS exactly as taa_sharpen.comp, reading the upscaler output (which this pass does not write).
+#define A_GPU 1
+#define A_GLSL 1
+#include "fsr/ffx_a.h"
+#define FSR_RCAS_F 1
+#define FSR_RCAS_DENOISE 1
+float color_scale;
+vec3 loadColor(ivec2 p) {
+    return max(imageLoad(upscaled, clamp(p, ivec2(0), imageSize(upscaled) - 1)).rgb, vec3(0));
+}
+AF4 FsrRcasLoadF(ASU2 p) { return vec4(loadColor(p) / color_scale, 1); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "fsr/ffx_fsr1.h"
+
+vec3 Sharpened(ivec2 p, float strength) {
+    const float amount = clamp(strength, 0.0, 2.0);
+    const vec3 center = loadColor(p);
+    if (amount == 0.0) {
+        return center;
+    }
+    // RCAS limits assume normalized color. A shared local scale also handles HDR input.
+    const vec3 left = loadColor(p + ivec2(-1, 0)), right = loadColor(p + ivec2(1, 0));
+    const vec3 top = loadColor(p + ivec2(0, -1)), bottom = loadColor(p + ivec2(0, 1));
+    const vec3 peak = max(center, max(max(left, right), max(top, bottom)));
+    color_scale = max(1.0, max(peak.r, max(peak.g, peak.b)));
+    const vec3 low = min(center, min(min(left, right), min(top, bottom)));
+    // RCAS's approximate reciprocal can shift constant color, especially in HDR.
+    if (all(lessThanEqual(peak - low, vec3(1e-6 * color_scale)))) {
+        return center;
+    }
+    const uvec4 constants = uvec4(floatBitsToUint(exp2(-2.0 * (1.0 - min(amount, 1.0)))), 0, 0, 0);
+    vec3 sharpened;
+    FsrRcasF(sharpened.r, sharpened.g, sharpened.b, uvec2(p), constants);
+    return clamp(mix(center, sharpened * color_scale, amount), vec3(0), vec3(color_scale));
+}
+
+// The alpha the scene proxy's resolve (vkCmdBlitImage to the native size, clamp to edge) would
+// have written at this pixel: linear (alpha_source 1) or nearest (2).
+float ProxyAlpha(ivec2 pixel) {
+    const ivec2 size = textureSize(scene_proxy, 0);
+    const vec2 u = (vec2(pixel) + 0.5) * vec2(size) / vec2(imageSize(scene));
+    if (alpha_source == 2u) {
+        return texelFetch(scene_proxy, min(ivec2(u), size - 1), 0).a;
+    }
+    const vec2 s = u - 0.5;
+    const vec2 base = floor(s);
+    const vec2 f = s - base;
+    const ivec2 a = clamp(ivec2(base), ivec2(0), size - 1);
+    const ivec2 b = clamp(ivec2(base) + 1, ivec2(0), size - 1);
+    const float top = mix(texelFetch(scene_proxy, a, 0).a,
+                          texelFetch(scene_proxy, ivec2(b.x, a.y), 0).a, f.x);
+    const float bottom = mix(texelFetch(scene_proxy, ivec2(a.x, b.y), 0).a,
+                             texelFetch(scene_proxy, b, 0).a, f.x);
+    return mix(top, bottom, f.y);
+}
 
 void main() {
     const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(pixel, imageSize(scene)))) {
         return;
     }
-    const vec4 original = imageLoad(scene, pixel);
-    vec3 color = imageLoad(upscaled, pixel).rgb;
+    const float alpha = alpha_source == 0u ? imageLoad(scene, pixel).a : ProxyAlpha(pixel);
+    vec3 color = sharpen > 0.0 ? Sharpened(pixel, sharpen) : imageLoad(upscaled, pixel).rgb;
     if (mode == 1) {
         const float mask = imageLoad(reactive, min(pixel * imageSize(reactive) / imageSize(scene), imageSize(reactive) - 1)).r;
         color = mix(color * 0.25, vec3(4.0, 0.0, 0.0), mask);
@@ -37,5 +97,5 @@ void main() {
         const float luma = dot(min(color, vec3(1.0)), vec3(0.3, 0.6, 0.1));
         color = vec3(luma * 0.3) + vec3(clamp(abs(mv) / 8.0, 0.0, 1.0), object ? 0.6 : 0.0);
     }
-    imageStore(scene, pixel, vec4(color, original.a));
+    imageStore(scene, pixel, vec4(color, alpha));
 }

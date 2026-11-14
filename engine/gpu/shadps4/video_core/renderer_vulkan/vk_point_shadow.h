@@ -5,6 +5,8 @@
 #include "common/types.h"
 #include <array>
 #include <memory>
+#include <optional>
+#include <utility>
 #include <vector>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_common.h"
@@ -34,15 +36,62 @@ public:
         const u32* lights = nullptr;
         u32 count = 0;
         vk::Rect2D tile{};
+        /// The draw only adds to its two targets and writes nothing outside `tile`, so it can be
+        /// drawn into images of its own (TakeLampTargets).
+        bool adds_in_tile = false;
+        /// The size of the draw's pass.
+        vk::Extent2D pass{};
     };
 
     void OnLightDraw(VideoCore::ImageId color0, VideoCore::ImageId color1, const Inputs& inputs);
+
+    /// Right after OnLightDraw: the two images its draw is to be drawn into in place of the light
+    /// targets (layout General), when the draw went into a batch that keeps the lamps' light
+    /// apart. Asked once per draw.
+    [[nodiscard]] std::optional<std::array<vk::ImageView, 2>> TakeLampTargets() noexcept {
+        if (!std::exchange(redirect_draw, false)) {
+            return std::nullopt;
+        }
+        return std::array<vk::ImageView, 2>{*lamp[0].view, *lamp[1].view};
+    }
+    /// A batch is collected whose lamps are drawn apart: a draw that only adds to the light
+    /// targets need not end it.
+    [[nodiscard]] bool Apart() const noexcept {
+        return apart && !tiles.empty();
+    }
+    void KeptAdding() noexcept {
+        ++kept_adding;
+    }
+    /// Something that is not a draw (a compute pass, a clear, a copy) may read or write the light
+    /// targets or the depth: a batch whose lamps are drawn apart ends here, so that they hold
+    /// the lamps' light.
+    void EndApart(bool animate_noise) {
+        if (Apart()) {
+            ++dispatch_flushes;
+            Flush(animate_noise);
+        }
+    }
 
     void Flush(bool animate_noise);
     [[nodiscard]] bool Pending() const noexcept {
         return !tiles.empty();
     }
     void Ended(u64 hash);
+    /// Statistics: Ended() was just called for a draw whose place on screen is not counted yet.
+    [[nodiscard]] bool EndingUncounted() const noexcept {
+        return ending_uncounted;
+    }
+    /// BB_RT_LAMP_TRACE=1: the first lamp draws and batch-ending draws of one frame are printed.
+    [[nodiscard]] bool Tracing() const noexcept {
+        return trace_left != 0;
+    }
+    /// Another draw begins: the one that ended a batch is past.
+    void NextDraw() noexcept {
+        ending_uncounted = false;
+    }
+    /// Statistics: where the draw that ended the batch draws, to count the ones that write none
+    /// of the cells the batch took.
+    void EndingDraw(const vk::Rect2D& area);
     [[nodiscard]] std::array<VAddr, 2> PendingAddresses() const;
     void Kept() noexcept {
         ++kept_draws;
@@ -51,6 +100,13 @@ public:
     void OnFrameEnd();
 
     void Drop();
+    /// At the end of a frame: a batch of lamps drawn apart that no draw ended loses its light.
+    void DropUnended() {
+        if (Apart()) {
+            ++unended;
+            Drop();
+        }
+    }
 
 private:
     bool Ready();
@@ -62,7 +118,20 @@ private:
         vk::UniqueImageView view;
         u32 width = 0, height = 0;
     };
-    bool EnsureImage(OwnImage& own, u32 width, u32 height, vk::Format format, const char* name);
+    bool EnsureImage(OwnImage& own, u32 width, u32 height, vk::Format format, const char* name,
+                     vk::ImageUsageFlags more_usage = {});
+    /// Whether a batch starting now can keep its lamps' light apart; the lamp images are then
+    /// there, all zero.
+    bool BeginApart(u32 width, u32 height);
+    /// Copies `regions` of both light targets to the same places in the snapshots. keep: the rest
+    /// of the snapshots keeps what earlier copies put there. False: the pass turned itself off.
+    bool CopySnapshot(const std::array<VideoCore::ImageId, 2>& ids,
+                      const std::array<VideoCore::Image*, 2>& targets, bool reduced,
+                      std::vector<vk::ImageCopy> regions, bool keep);
+    /// Marks the snapshot cells `rect` touches as taken by the batch being collected and returns
+    /// the ones that were not yet, as copy regions.
+    std::vector<vk::ImageCopy> TakeSnapshotCells(const std::array<s32, 4>& rect, u32 width,
+                                                 u32 height);
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -80,6 +149,52 @@ private:
     vk::UniquePipeline pipeline;
     vk::UniqueSampler sampler;
     OwnImage snapshot[2];
+    // bbport: ray traced lamps took a copy of both whole light targets at the start of every batch,
+    // though the pass reads the copy only inside the batch's tiles: several hundred batches a frame
+    // where another light's draw follows each tile's lamps, 7 ms of GPU time at 1920x1080. Now a
+    // tile's part is copied when the tile joins the batch, unless an earlier tile of the batch
+    // already took it. The parts are whole cells of SnapshotCell pixels, so a lamp draw is always
+    // preceded by the copy of every cell it can write. BB_RT_LAMP_SNAPSHOT=0 or experiment mask 64
+    // (BB_TOGGLE_FILE): whole-image copies again.
+    // bbport: lamps apart. The game draws each tile of its light grid as the tile's lamps and
+    // then another light's quad over the same tile, which ended the batch: one batch, one
+    // snapshot copy and one shadow pass per tile, 480 a frame (6.4 ms of GPU time at 1920x1080),
+    // and only the first of them reused last frame's result. A lamp quad only adds light, inside
+    // its scissor. So the lamps of a ray traced batch are drawn into two images of their own
+    // (lamp, all zero between batches) with the pipeline and depth they would have had; draws
+    // that only add to the light targets no longer end the batch (Rasterizer::
+    // EffectsBeforeTargets), and one pass adds the lamps' light, shadowed, to the light targets
+    // and zeroes it. No snapshots. BB_RT_LAMP_APART=0 or experiment mask 128 (BB_TOGGLE_FILE):
+    // snapshots again.
+    OwnImage lamp[2];
+    bool apart = false;          ///< the batch being collected draws its lamps into `lamp`
+    bool lamp_dirty = true;      ///< `lamp` holds something: to be cleared before the next batch
+    bool lamp_laid_out = false;
+    bool lamp_format = false;    ///< the light targets' format can be drawn into and blended
+    bool redirect_draw = false;  ///< OnLightDraw's draw goes into `lamp`
+    u32 apart_refused = ~0u;     ///< the frame in which a batch could not be started apart
+    u32 apart_draws = 0;         ///< this frame
+    u32 kept_adding = 0;         ///< this frame: adding draws that did not end a batch
+    bool apart_last_frame = false; ///< the last frame drew lamps apart
+    u32 flushed_in_draw = 0;     ///< since the last report: batches ended by a lamp draw
+    u32 unended = 0;             ///< since the last report: batches lost at the end of a frame
+    u32 lost_passes = 0;         ///< since the last report: apart batches whose pass was not run
+    u32 dispatch_flushes = 0;    ///< this frame: batches ended by a compute pass, a clear or a copy
+    u32 apart_passes = 0;        ///< this frame: passes run for lamps drawn apart
+    bool tile_snapshots = false;    ///< the batch being collected copies its snapshot by tile
+    bool snapshot_laid_out = false; ///< the snapshots have been through a copy since they were made
+    std::vector<u64> snapshot_cells; ///< one bit per cell: taken by the batch being collected
+    u32 snapshot_cells_wide = 0;
+    std::array<std::vector<u32>, 2> cell_rows; ///< scratch of TakeSnapshotCells
+    bool ending_uncounted = false;
+    u64 ending_hash = 0;
+    u32 trace_left = 0;
+    bool traced = false;
+    u32 batch_copies = 0;     ///< snapshot copies of the batch being collected
+    u32 ended_placed = 0;     ///< this frame: batch-ending draws whose place on screen is known
+    u32 ended_apart = 0;      ///< this frame: those of them that drew away from the batch's cells
+    u32 snapshot_copies = 0;  ///< this frame
+    u64 snapshot_pixels = 0;  ///< this frame, both images
     std::array<VideoCore::ImageId, 2> pending{};
     std::array<u64, 2> pending_uid{};
     struct Tile {
@@ -97,7 +212,7 @@ private:
     bool merged = false;
     u32 kept_draws = 0;
     u32 lamp_pick = 1;
-    bool lamp_reuse = true;
+    bool lamp_reuse = false; ///< LANTERN_RT_LAMP_REUSE=1
     OwnImage history[2];
     std::array<bool, 2> history_laid_out{};
     u32 history_index = 0;
@@ -118,6 +233,28 @@ private:
     u32 steps = 16;
     bool tried = false;
     bool failed = false;
+    // bbport (r32_lamp-half, r37_menu-options): the lamps-apart pass traces pixel (2x, 2y) of
+    // each 2x2 block first, then the other three where the answers around them differ
+    // (point_shadow_ray_half_comp; changes the picture). On while BB_LAMP_SHADOW_HALF=1 or, with
+    // the variable not set, while lantern.ini's graphics_lamp_shadow_half is (read every pass);
+    // HalfReady makes the pipeline the first time a pass wants it. Experiment 72057594037927936
+    // set: the full-resolution pass, as before.
+    int half_env = -1;        ///< BB_LAMP_SHADOW_HALF: -1 not set, 1 for "1", 0 for anything else
+    bool half_tried = false;  ///< HalfReady made its attempt
+    bool half_made = false;   ///< the half-resolution pipeline and its counters exist
+    bool HalfReady();
+    bool half_laid_out = false;
+    bool half_cleared = false;  ///< half_counts zeroed (by the first half pass's commands)
+    u32 half_passes = 0;        ///< half-resolution passes recorded
+    u32 half_frames = 0;        ///< frames since the last counter line
+    u32 half_line_passes = 0;   ///< since the last line: half-resolution passes
+    u32 half_line_full = 0;     ///< since the last line: apart passes at full resolution
+    OwnImage half_answers;
+    std::unique_ptr<VideoCore::Buffer> half_counts, half_readback;
+    std::array<u32, 16> half_last{};
+    vk::UniqueDescriptorSetLayout half_set_layout;
+    vk::UniquePipelineLayout half_layout;
+    vk::UniquePipeline half_pipeline;
 };
 
 }

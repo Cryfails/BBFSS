@@ -834,6 +834,7 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+        ++r21_serial; // bbport (r21_draw-sort): commands recorded on it are not seen
         ProducerScope producer{*this, "CommandBuffer"};
         if (!workers.empty() && !direct_mode) {
             EnterDirectMode();
@@ -886,6 +887,7 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
+        ++r21_serial; // bbport (r21_draw-sort): R21Serial()
         if (RecordSink* sink = thread_sink) [[unlikely]] {
             if (!sink->chunk->Push(std::forward<Func>(func))) {
                 RetireSinkChunk(*sink);
@@ -1107,6 +1109,53 @@ public:
         return passes_begun;
     }
 
+    /// bbport (r21_draw-sort): R21Serial() changes with every command recorded (Record(), and
+    /// CommandBuffer() for commands recorded on the command buffer itself) outside R21Neutral;
+    /// R21Epoch() changes whenever the next command goes to another command buffer (where
+    /// dynamic_state is invalidated: a cut, a direct segment begun or left, a submission). A bind
+    /// recorded when both had their current values is still in force (Rasterizer::R21Begin).
+    [[nodiscard]] u64 R21Serial() const noexcept {
+        return r21_serial;
+    }
+    [[nodiscard]] u64 R21Epoch() const noexcept {
+        return r21_epoch;
+    }
+    /// Render passes begun that do not resume one a cut (MaybeSplit, a direct segment) closed:
+    /// what "Draw order (r21)" counts as a pass (PassesBegun() counts the resumptions too).
+    [[nodiscard]] u64 R21FreshPasses() const noexcept {
+        return r21_fresh_passes;
+    }
+    /// Commands recorded inside this scope leave R21Serial() as it was: only for commands that
+    /// leave vertex input, vertex buffer and index buffer binds as they are.
+    class R21Neutral {
+    public:
+        explicit R21Neutral(Scheduler& scheduler_, bool active_ = true) noexcept
+            : scheduler{scheduler_}, serial{scheduler_.r21_serial}, active{active_} {}
+        ~R21Neutral() noexcept {
+            if (active) {
+                scheduler.r21_serial = serial;
+            }
+        }
+        R21Neutral(const R21Neutral&) = delete;
+        R21Neutral& operator=(const R21Neutral&) = delete;
+
+    private:
+        Scheduler& scheduler;
+        u64 serial;
+        bool active;
+    };
+    /// The same for a stretch: R21Restore(R21Serial() taken before it).
+    void R21Restore(u64 serial) noexcept {
+        r21_serial = serial;
+    }
+    /// The last Record() (one command closure) leaves those binds as they are.
+    void R21NeutralLast() noexcept {
+        --r21_serial;
+    }
+    u64 r21_serial = 0;
+    u64 r21_epoch = 0;
+    u64 r21_fresh_passes = 0;
+
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {
         return is_rendering && render_state == state;
@@ -1117,6 +1166,12 @@ public:
         return !(is_rendering && render_state == state);
     }
 
+    /// bbport (r11_depth_clear): whether BeginRendering(state) would begin a render pass that
+    /// runs its load ops (clears): neither the open pass nor the resumption of one a cut closed.
+    [[nodiscard]] bool WillRunLoadOps(const RenderState& state) const {
+        return !(render_state == state && (is_rendering || resume_rendering));
+    }
+
     /// CommandBuffer() calls that waited for a recording thread (BB_FRAME_STATS).
     static inline std::atomic<u64> direct_recordings{0};
     static inline std::atomic<u64> producer_wakes{0};
@@ -1125,6 +1180,20 @@ public:
     /// Command buffer segments submitted (BB_FRAME_STATS: segments per submission).
     static inline std::atomic<u64> recorded_segments{0};
     static inline std::atomic<u64> recorded_submissions{0};
+
+    /// bbport r8 (BbSubmitDiag): what is known of submission `tick` once it reached the queue:
+    /// its reason and whether the GPU had finished the one before. False: not known (yet).
+    bool SubmitDiagOf(u64 tick, u32& reason, bool& dry) const noexcept {
+        const u64 entry = submit_diag_ring[tick % SubmitDiagRing].load(std::memory_order_acquire);
+        if (tick == 0 || (entry >> 8) != tick) {
+            return false;
+        }
+        reason = u32(entry >> 1) & 0x7fu;
+        dry = (entry & 1) != 0;
+        return true;
+    }
+    /// bbport r8: once a frame (FramesRetired); every 600 frames prints the "Submit diag:" block.
+    static void SubmitDiagFrame();
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
@@ -1147,9 +1216,15 @@ public:
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
-    void DeferOperation(Common::UniqueFunction<void>&& func) {
+    /// bbport (r35_pending-ops): `kind` names it in the slow-frame trace (a string literal);
+    /// `carry`: a pure free nothing waits for, which may run in a later frame than the one the
+    /// GPU passed its tick in (BbPendingOps::Budget). Never for an operation whose effect a caller
+    /// waits for or reads (the fault buffer read, readbacks, anything ordered with other work).
+    void DeferOperation(Common::UniqueFunction<void>&& func, const char* kind = nullptr,
+                        bool carry = false, const char* where = __builtin_FILE()) {
         std::unique_lock lk(pending_ops_mutex);
-        pending_ops.emplace(std::move(func), CurrentTick());
+        // bbport (r36_followups): without a kind, the caller's source file is the kind.
+        pending_ops.emplace(std::move(func), CurrentTick(), kind ? kind : where, carry);
         num_pending_ops.fetch_add(1, std::memory_order_release);
     }
 
@@ -1306,10 +1381,25 @@ private:
     struct PendingOp {
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
+        const char* kind = nullptr; ///< bbport (r35_pending-ops): DeferOperation's kind
+        bool carry = false;         ///< bbport (r35_pending-ops): may run in a later frame
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
     u32 pending_polls = 0; // bbport
+    // bbport (r35_pending-ops): frees the GPU is past, carried to a later frame because the budget
+    // of the window they came in was spent; oldest first, run by PopPendingOperations.
+    struct R35Carried {
+        Common::UniqueFunction<void> callback;
+        const char* kind;
+        u64 frame; ///< BbStats::gpu_frames when carried
+    };
+    std::deque<R35Carried> r35_carried;
+    std::atomic<u32> r35_num_carried{0}; ///< r35_carried.size(), checked without the lock
+    /// The window whose budget was spent with frees left waiting (its frame and first tick):
+    /// until it ends, a call with nothing else to run returns at once.
+    std::atomic<u64> r35_closed_frame{~0ull}, r35_closed_tick{0};
+    BbPendingOps::Budget r35_budget; ///< under pending_ops_mutex
     std::atomic<u32> num_pending_ops{0}; ///< bbport: pending_ops.size(), checked without the lock
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
@@ -1332,6 +1422,12 @@ private:
     std::vector<SubmissionBatch*> free_batches; ///< guarded by recorder_mutex
     bool async_submit = false; ///< BB_ASYNC_SUBMIT (default on)
     std::atomic<u64> submitted_tick{0}; ///< the last tick handed to the queue (WaitSubmitted)
+    // bbport r8 (BbSubmitDiag): each submission's reason and dryness by tick; the producer's last
+    // submission time.
+    static constexpr u32 SubmitDiagRing = 256;
+    std::array<std::atomic<u64>, SubmitDiagRing> submit_diag_ring{};
+    u64 submit_diag_last_ns = 0;
+    void NoteSubmitDiag(u64 tick, u32 reason, bool dry, bool waits, u64 flush_ns, u64 since_ns);
     u32 current_segment = 0;
     std::atomic<u32> active_worker{0}; ///< the worker of current_segment (it spins for work)
     size_t segment_bytes = 0;          ///< closures of the current segment handed over or retired

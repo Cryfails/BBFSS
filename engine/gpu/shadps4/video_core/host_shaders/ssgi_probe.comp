@@ -600,6 +600,7 @@ vec4 traceReflection(vec3 pos, vec3 plane, vec3 dir, float noise, int steps, out
     return vec4(0.0);
 }
 
+#ifndef HALF
 void main() {
     const ivec2 hp = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(hp, raySize()))) {
@@ -646,6 +647,185 @@ void main() {
     imageStore(ray_img, hp, traceReflection(pos, plane, dir, noise, steps, hit_dist));
     imageStore(dist_img, hp, vec4(hit_dist));
 }
+#else
+// bbport (r30_ssgi-half): BB_SSGI_HALF=1 (the ssgi_probe_reflect_half_comp build, made only with
+// the variable set). Full-resolution rays (history bit 16 set by the caller), dispatched as one
+// workgroup per 16x16 pixels: invocation i classes 2x2 block i. A flat block traces one ray, from
+// the pixel the frame picks, and stores a = -1 at the other three, which RESOLVE (HALF) fills
+// from traced neighbours; any other block traces every glossy pixel as the default build does.
+// The rays are listed in shared memory first, so every wave that marches is full.
+layout(std430, binding = 6) buffer R30Counts {
+    uint n[];
+} r30_buf;
+
+const uint R30_COUNT = 0x8000000u; // history bit 27: count this frame (set on 1 frame in 8)
+const float R30_SHARP_ROUGHNESS = 0.2;
+const float R30_ROUGHNESS_SPREAD = 0.15;
+const float R30_NORMAL_AGREE = 0.9;
+// Block classes; R30_SHARP .. R30_MIXED trace every glossy pixel.
+const uint R30_NONE = 0u, R30_FLAT = 1u, R30_SHARP = 2u, R30_EDGE = 3u, R30_MIXED = 4u;
+
+shared uint r30_list[256];
+shared uint r30_rays;
+// r30_n: 0 rays of flat blocks, 1 pixels left to the resolve, 2 rays of sharp blocks, 3 rays of
+// edge blocks, 4 rays of mixed blocks, 5 rays with RAY_STEPS_SMOOTH steps.
+shared uint r30_n[6];
+
+// The glossy-ray roughness of a pixel, as the default build computes it; 2.0 = no ray (no
+// geometry, or rougher than RAY_MAX_ROUGHNESS).
+float r30Roughness(ivec2 pixel, out vec4 geo) {
+    geo = texelFetch(geo_tex, pixel, 0);
+    if (geo.w <= 0.0) {
+        return 2.0;
+    }
+    const float r =
+        wetRoughness(materialRoughness(texelFetch(material_tex, pixel, 0).r), geo.xyz);
+    return r > RAY_MAX_ROUGHNESS ? 2.0 : r;
+}
+
+// The block at pixel o (its top-left); glossy: bit i = pixel o + (i & 1, i >> 1) traces a ray.
+uint r30Class(ivec2 o, out uint glossy) {
+    glossy = 0u;
+    vec4 g[4];
+    float lo = 2.0, hi = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 p = o + ivec2(i & 1, i >> 1);
+        g[i] = vec4(0.0);
+        if (any(greaterThanEqual(p, ivec2(size)))) {
+            continue;
+        }
+        const float r = r30Roughness(p, g[i]);
+        if (r <= RAY_MAX_ROUGHNESS) {
+            glossy |= 1u << i;
+            lo = min(lo, r);
+            hi = max(hi, r);
+        }
+    }
+    if (glossy == 0u) {
+        return R30_NONE;
+    }
+    if (lo < R30_SHARP_ROUGHNESS) {
+        return R30_SHARP;
+    }
+    if (any(greaterThanEqual(o + 1, ivec2(size)))) {
+        return R30_EDGE; // the last row or column of an odd-sized image
+    }
+    if (glossy != 15u || hi - lo > R30_ROUGHNESS_SPREAD) {
+        return R30_MIXED;
+    }
+    // One plane: the resolve's own plane tolerance (0.03 + 0.01 z) and normal agreement.
+    const vec3 n0 = g[0].xyz;
+    const vec3 p0 = viewPos(vec2(o) + 0.5, g[0].w);
+    const float tolerance = 0.03 + 0.01 * g[0].w;
+    for (int i = 1; i < 4; ++i) {
+        const vec3 p = viewPos(vec2(o + ivec2(i & 1, i >> 1)) + 0.5, g[i].w);
+        if (abs(dot(n0, p - p0)) > tolerance || dot(n0, g[i].xyz) < R30_NORMAL_AGREE) {
+            return R30_EDGE;
+        }
+    }
+    return R30_FLAT;
+}
+
+// The ray of one glossy full-resolution pixel: the default build's main() with hp = pixel.
+// Returns true for a ray with RAY_STEPS_SMOOTH steps.
+bool r30Trace(ivec2 pixel) {
+    vec4 geo;
+    const float roughness = r30Roughness(pixel, geo);
+    const vec3 n = geo.xyz;
+    const vec3 pos = viewPos(vec2(pixel) + 0.5, geo.w);
+    const vec3 v = -normalize(pos);
+    const vec3 plane = geometricNormal(pixel, pos, n);
+    const bool mirror = roughness < MIRROR_ROUGHNESS;
+    const uint seed = hash(uint(pixel.x) * 73856093u ^ uint(pixel.y) * 19349663u);
+    const float k = mirror ? 0.0 : float(frame & 4095u);
+    vec2 u = fract(vec2(rand(seed), rand(seed ^ 0x9e3779b9u)) +
+                   k * vec2(0.75487766624669276, 0.56984029099805327));
+    u.x *= GGX_TAIL_TRIM;
+    const float noise = fract(rand(seed ^ 0x85ebca6bu) + k * 0.61803398875);
+    const float alpha = max(roughness * roughness, 0.002);
+    vec3 dir = mirror ? reflect(-v, n) : sampleGgxReflection(v, n, alpha, u);
+    const float below = dot(dir, plane);
+    if (below < 0.02) {
+        dir = normalize(dir + plane * (0.02 - below));
+    }
+    const int steps = roughness < 0.35 ? RAY_STEPS_SMOOTH : RAY_STEPS;
+    float hit_dist;
+    imageStore(ray_img, pixel, traceReflection(pos, plane, dir, noise, steps, hit_dist));
+    imageStore(dist_img, pixel, vec4(hit_dist));
+    return steps == RAY_STEPS_SMOOTH;
+}
+
+void main() {
+    const uint me = gl_LocalInvocationIndex;
+    const bool count = (history & R30_COUNT) != 0u;
+    if (me == 0u) {
+        r30_rays = 0u;
+    }
+    if (me < 6u) {
+        r30_n[me] = 0u;
+    }
+    barrier();
+    const ivec2 tile = ivec2(gl_WorkGroupID.xy) * 16;
+    const ivec2 local = ivec2(me & 7u, me >> 3) * 2;
+    const ivec2 o = tile + local;
+    const ivec2 isize = ivec2(size);
+    if (all(lessThan(o, isize))) {
+        uint glossy;
+        const uint cls = r30Class(o, glossy);
+        // The pixel a flat block traces: the half-resolution rays' rotation (rayPixelAt).
+        const ivec2 offsets[4] = ivec2[4](ivec2(0, 0), ivec2(1, 1), ivec2(1, 0), ivec2(0, 1));
+        const ivec2 pick = offsets[frame & 3u];
+        for (int i = 0; i < 4; ++i) {
+            const ivec2 d = ivec2(i & 1, i >> 1);
+            const ivec2 p = o + d;
+            if (any(greaterThanEqual(p, isize))) {
+                continue;
+            }
+            const bool ray = cls == R30_FLAT ? d == pick : (glossy & (1u << i)) != 0u;
+            if (ray) {
+                const uint at = atomicAdd(r30_rays, 1u);
+                r30_list[at] = uint(local.x + d.x) | (uint(local.y + d.y) << 4);
+                if (count) {
+                    atomicAdd(r30_n[cls == R30_FLAT ? 0u : cls], 1u);
+                }
+            } else {
+                // a = -1: left to the resolve; a = 0 (with rgb 0): no ray, as the default build.
+                imageStore(ray_img, p, vec4(0.0, 0.0, 0.0, cls == R30_FLAT ? -1.0 : 0.0));
+                imageStore(dist_img, p, vec4(0.0));
+                if (count && cls == R30_FLAT) {
+                    atomicAdd(r30_n[1], 1u);
+                }
+            }
+        }
+    }
+    barrier();
+    const uint rays = r30_rays;
+    for (uint k = me; k < rays; k += 64u) {
+        const uint e = r30_list[k];
+        const bool smooth_ray = r30Trace(tile + ivec2(e & 15u, e >> 4));
+        if (count && smooth_ray) {
+            atomicAdd(r30_n[5], 1u);
+        }
+    }
+    if (count) {
+        memoryBarrierShared();
+        barrier();
+        // r30_buf words: 0 frames counted, 1-6 r30_n, 7 tiles with a ray, 8 tiles.
+        if (me < 6u && r30_n[me] != 0u) {
+            atomicAdd(r30_buf.n[me + 1u], r30_n[me]);
+        }
+        if (me == 6u && rays != 0u) {
+            atomicAdd(r30_buf.n[7], 1u);
+        }
+        if (me == 7u) {
+            atomicAdd(r30_buf.n[8], 1u);
+        }
+        if (me == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+            atomicAdd(r30_buf.n[0], 1u);
+        }
+    }
+}
+#endif
 
 #elif defined(RESOLVE)
 
@@ -741,6 +921,16 @@ void main() {
     // Smoother surfaces share rays with fewer neighbours, keeping their reflections sharper.
     const float sigma = mix(0.8, 2.0, roughness / RAY_MAX_ROUGHNESS) *
                         (fullResRays() ? 1.5 : 1.0);
+#ifdef HALF
+    // bbport (r30_ssgi-half): a pixel the BB_SSGI_HALF=1 rays left to this filter (a = -1)
+    // takes the rays of other 2x2 blocks only from its own plane (within 2x the plane tolerance
+    // below) and normal (dot >= 0.8), so a smaller sample count near a depth or normal edge does
+    // not let the other side weigh more than it does today. Its own block's traced pixel always
+    // counts (the block passed the flat test).
+    const bool r30_untraced = texelFetch(ray_tex, hp, 0).a < 0.0;
+    const float R30_FILL_PLANE = 2.0;
+    const float R30_FILL_NORMAL = 0.8;
+#endif
     vec3 sum = vec3(0.0), m2 = vec3(0.0);
     float color_w = 0.0, hit_sum = 0.0, wsum = 0.0, moments = 0.0, dist_sum = 0.0;
     for (int y = -FILTER_RADIUS; y <= FILTER_RADIUS; ++y) {
@@ -749,6 +939,13 @@ void main() {
             if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, rsize))) {
                 continue;
             }
+#ifdef HALF
+            // bbport (r30_ssgi-half): a pixel the BB_SSGI_HALF=1 rays left to this filter
+            // (a = -1) is not a sample.
+            if (texelFetch(ray_tex, q, 0).a < 0.0) {
+                continue;
+            }
+#endif
             const ivec2 qp = rayPixel(q);
             const vec4 g = texelFetch(geo_tex, qp, 0);
             if (g.w <= 0.0) {
@@ -761,6 +958,13 @@ void main() {
             if (w < 1e-4) {
                 continue;
             }
+#ifdef HALF
+            if (r30_untraced && any(notEqual(q >> 1, hp >> 1)) &&
+                (abs(dot(n, qpos - pos)) > R30_FILL_PLANE * (0.03 + 0.01 * geo.w) ||
+                 dot(n, g.xyz) < R30_FILL_NORMAL)) {
+                continue;
+            }
+#endif
             const vec4 ray = texelFetch(ray_tex, q, 0);
             const vec3 c = compressColor(ray.rgb) * ray.a;
             wsum += w;

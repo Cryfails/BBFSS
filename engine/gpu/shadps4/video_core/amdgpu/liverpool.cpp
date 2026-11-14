@@ -203,6 +203,7 @@ void Liverpool::Process(std::stop_token stoken) {
                     // run dry (tens of ms in heavy scenes) held up the guest's next submission.
                     rasterizer->RequestSignalFlush();
                 } else {
+                    const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonStageAIdle}; // r8
                     rasterizer->Flush();
                 }
             }
@@ -210,6 +211,9 @@ void Liverpool::Process(std::stop_token stoken) {
         {
             const auto idle_start = std::chrono::steady_clock::now();
             BbTimeline::Note(BbTimeline::DecoderIdleBegin);
+            if (BbSpike::on) { // bbport (r23_spike-trace): stage A idle, read at each flip
+                BbSpike::stage_a_idle_since.store(BbSpike::NowNs(), std::memory_order_relaxed);
+            }
             // bbport: the game submits a frame in ~20 parts: waking from the condition variable for
             // each took tens of microseconds on the way to the GPU. Spins first, with cores to spare
             // (BB_GPU_SPIN_US, default 200 with 12+ hardware threads, else 0).
@@ -237,6 +241,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - idle_start).count(),
                 std::memory_order_relaxed);
+            if (BbSpike::on) { // bbport (r23_spike-trace)
+                BbSpike::NoteStageAPickup(); // bbport (r29_bursts): before idle_since is cleared
+                const u64 since = BbSpike::stage_a_idle_since.exchange(0, std::memory_order_relaxed);
+                BbSpike::stage_a_idle_ns.fetch_add(since ? BbSpike::NowNs() - since : 0,
+                                                   std::memory_order_relaxed);
+            }
             BbTimeline::Note(BbTimeline::DecoderIdleEnd);
         }
         if (stoken.stop_requested()) {
@@ -333,11 +343,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 static constexpr u8 none = 0;
                 rasterizer->RunInOrder(
                     [](Vulkan::Rasterizer& r, const u8*) {
+                        const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonSubmitDone}; // r8
                         r.OnSubmit();
                         r.Flush();
                     },
                     &none, 0, BbToggle::PipelinedTasks, true, "SubmitDone");
             } else if (rasterizer) {
+                const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonSubmitDone}; // r8
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
@@ -652,6 +664,7 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 }
 
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
+    const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFlip}; // bbport r8
     rasterizer.WaitDeferredSignals(BbStats::WaitFlip);
     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
 }
@@ -1998,11 +2011,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // BB_HONEST_LABELS: a fence from another queue may wait for work not
                     // submitted yet; this thread would spin on it forever.
                     if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                        // r8 (no Scope across the YIELD below: this is a coroutine)
+                        const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFenceSpin};
                         rasterizer->Flush();
                     }
                     // bbport: occlusion counts are written once the GPU has run their
                     // submission: a wait on a query block must not hold that submission back.
                     if (rasterizer && rasterizer->OcclusionUnsubmitted()) {
+                        const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFenceSpin};
                         rasterizer->Flush();
                     }
                     YIELD_GFX();
@@ -2374,6 +2390,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 // BB_HONEST_LABELS: the value may come from a fence waiting for work not
                 // submitted yet; this thread would spin on it forever.
                 if (rasterizer && rasterizer->HasUnsubmittedSignals()) {
+                    const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFenceSpin}; // r8
                     rasterizer->Flush();
                 }
                 YIELD_ASC(vqid);
@@ -2524,6 +2541,9 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     ++gfx_submitted;
     BbTimeline::Note(BbTimeline::GuestSubmit, 0, submissions_total);
     work_retired = false;
+    if (BbSpike::on) { // bbport (r29_bursts): queued while stage A idles (pickup delay)
+        BbSpike::NoteStageAQueued();
+    }
     submit_cv.notify_one();
 }
 
@@ -2552,14 +2572,22 @@ void Liverpool::SignalDecodedFrames() {
                 BbTimeline::Note(BbTimeline::PipeTask, 7, self.CurrentTick());
                 self.SignalAfterGpu(
                     [retired] { Libraries::GnmDriver::NoteFramesRetired(retired); });
-                self.Flush();
+                {
+                    const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFrameEnd}; // r8
+                    self.Flush();
+                }
+                Vulkan::Scheduler::SubmitDiagFrame();
             },
             &frame, sizeof(frame), BbToggle::PipelinedTasks, false, "FramesRetired");
         return;
     }
     rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
     rasterizer->SignalAfterGpu([frame] { Libraries::GnmDriver::NoteFramesRetired(frame); });
-    rasterizer->Flush();
+    {
+        const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFrameEnd}; // r8
+        rasterizer->Flush();
+    }
+    Vulkan::Scheduler::SubmitDiagFrame();
 }
 
 void Liverpool::SignalGpuIdle(u64 generation) {

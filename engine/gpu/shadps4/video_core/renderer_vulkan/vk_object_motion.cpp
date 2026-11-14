@@ -91,12 +91,63 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
         std::printf("Object motion: vertexPipelineStoresAndAtomics unsupported, off\n");
         return;
     }
+    // bbport (r34_motion-store, r37_menu-options): vertices the position store holds per frame
+    // half (16 bytes each, two halves). BB_OBJECT_MOTION_VERTICES=<n>, when set, decides:
+    // 1048576..16777216 (512 MiB in all); an unreadable value or 0 gives the large store. Not
+    // set, lantern.ini's object_motion_store (its start value): large 8388608 (256 MiB in all),
+    // small 4194304 (128 MiB), auto large except where Instance::IsLowVramAmd (an AMD card with
+    // 8.5 GB or less, or BB_AMD_LOW_VRAM=1). A large store the setting chose that cannot be
+    // made falls back to the small one.
+    u32 store_vertices = PositionsPerFrameLarge;
+    bool store_from_setting = false;
+    if (const char* value = std::getenv("BB_OBJECT_MOTION_VERTICES"); value && value[0]) {
+        const unsigned long long n = std::strtoull(value, nullptr, 10);
+        store_vertices = n ? u32(std::clamp<unsigned long long>(n, 1ull << 20, 16ull << 20))
+                           : PositionsPerFrameLarge;
+        std::printf("Object motion store: %u vertices a frame half (BB_OBJECT_MOTION_VERTICES)\n",
+                    store_vertices);
+    } else {
+        store_from_setting = true;
+        const int store = std::clamp(BbSettings::Get().startup_object_motion_store, 0,
+                                     BbSettings::MotionStoreCount - 1);
+        // bbport (r39_master-debug): engine_previous_paths on at the start: the small store, as
+        // before the large one became the default.
+        const bool previous = BbSettings::Get().startup_engine_previous_paths;
+        const bool low_amd = store == BbSettings::MotionStoreAuto && instance.IsLowVramAmd();
+        const bool small = previous || store == BbSettings::MotionStoreSmall || low_amd;
+        store_vertices = small ? PositionsPerFrame : PositionsPerFrameLarge;
+        std::printf("Object motion store: %u vertices a frame half (object_motion_store=%s%s%s)\n",
+                    store_vertices, BbSettings::MotionStoreNames[store],
+                    low_amd ? ", AMD card with little memory" : "",
+                    previous ? "; engine_previous_paths=1: the small store" : "");
+    }
+    positions_per_frame = store_vertices;
+    history.SetCapacity(positions_per_frame);
     void* mapped = nullptr;
     u64 params_address = 0, positions_address = 0;
-    if (!CreateBuffer(instance, vk::DeviceSize(1 + FrameSlots * ParamsPerFrame) * 32, true,
-                      params_buffer, params_allocation, &mapped, params_address) ||
-        !CreateBuffer(instance, vk::DeviceSize(1 + 2 * PositionsPerFrame) * 16, false,
-                      positions_buffer, positions_allocation, nullptr, positions_address)) {
+    const auto make_positions = [&] {
+        return CreateBuffer(instance, vk::DeviceSize(1 + 2 * u64(positions_per_frame)) * 16, false,
+                            positions_buffer, positions_allocation, nullptr, positions_address);
+    };
+    const bool params_made =
+        CreateBuffer(instance, vk::DeviceSize(1 + FrameSlots * ParamsPerFrame) * 32, true,
+                     params_buffer, params_allocation, &mapped, params_address);
+    bool positions_made = params_made && make_positions();
+    if (params_made && !positions_made && store_from_setting &&
+        positions_per_frame > PositionsPerFrame) {
+        // bbport (r37_menu-options): the large store could not be made: the small one, once.
+        if (positions_buffer) {
+            vmaDestroyBuffer(instance.GetAllocator(), positions_buffer, positions_allocation);
+            positions_buffer = vk::Buffer{};
+            positions_allocation = nullptr;
+        }
+        std::printf("Object motion store: %u vertices a frame half not made; %u instead\n",
+                    positions_per_frame, PositionsPerFrame);
+        positions_per_frame = PositionsPerFrame;
+        history.SetCapacity(positions_per_frame);
+        positions_made = make_positions();
+    }
+    if (!positions_made) {
         std::printf("Object motion: buffer creation failed, off\n");
         return;
     }
@@ -174,7 +225,7 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
     }
     std::printf("Object motion: on (%u vertices per frame, moved small skeletons held %u frames, "
                 "bookkeeping on %s)\n",
-                PositionsPerFrame, hold, async ? "its own thread" : "the recording thread");
+                positions_per_frame, hold, async ? "its own thread" : "the recording thread");
 }
 
 void ObjectMotion::StopWorker() {
@@ -217,7 +268,9 @@ void ObjectMotion::AdvanceHistory() {
         const auto& s = history.stats;
         // bbport: "held" counts small-skeleton draws kept in history though their palette did
         // not change this frame (BB_OBJECT_MOTION_HOLD); they are part of "draws".
-        std::printf("Object motion: %llu draws, %llu stored, %llu with history, %llu unmatched, "
+        // bbport (r34_motion-store): through BbReport like the line after it (stage B's
+        // BbReport::Capture when the bookkeeping runs there; printf on bb:Motion as before).
+        BbReport::Printf("Object motion: %llu draws, %llu stored, %llu with history, %llu unmatched, "
                     "%llu capacity skips, %llu invalid, %llu still, %llu held (600 frames); last frame "
                     "%u/%u vertices; index ranges %llu reused, %llu scanned (%llu found changed), "
                     "%zu cached\n",
@@ -225,9 +278,50 @@ void ObjectMotion::AdvanceHistory() {
                     (unsigned long long)s.loaded, (unsigned long long)s.unmatched,
                     (unsigned long long)s.exhausted, (unsigned long long)s.invalid,
                     (unsigned long long)s.still, (unsigned long long)s.held,
-                    history.Used(), PositionsPerFrame, (unsigned long long)index_ranges.stats.hits,
+                    history.Used(), positions_per_frame, (unsigned long long)index_ranges.stats.hits,
                     (unsigned long long)index_ranges.stats.scans,
                     (unsigned long long)index_ranges.stats.stale, index_ranges.Size());
+        // bbport (r34_motion-store): where the position store's room goes, per frame on average
+        // over the frames since the last report: vertices (x instances) stored / skipped for
+        // capacity, draws in brackets, by kind; of draws of more than one instance; of a draw
+        // identity seen again in the frame (another pass, or another object with the same mesh
+        // and vertex streams); for draws whose used vertices are known (index lists counted,
+        // non-indexed draws) the room given and how much of it is used, and the draws using
+        // under half their span; the room the second class took from the top and the reserve
+        // it left (both 0 with experiment 288230376151711744 set); vertices with history loaded;
+        // the store's fill; and at which motion draw of the frame the first skip came.
+        {
+            const auto& st = history.store;
+            const double n = st.frames ? double(st.frames) : 1.0;
+            static constexpr const char* kind_names[Motion::KindCount] = {
+                "other", "skinned", "gpu palette", "moved", "held", "held 1-4 frames after a change"};
+            char kinds[512];
+            kinds[0] = 0;
+            int at = 0;
+            for (size_t i = 0; i < Motion::KindCount && at >= 0 && at < int(sizeof(kinds)); ++i) {
+                const auto& k = st.kinds[i];
+                at += std::snprintf(kinds + at, sizeof(kinds) - size_t(at),
+                                    "%s%s %.0f/%.0f (%.1f/%.1f)", i ? ", " : "", kind_names[i],
+                                    k.stored / n, k.skipped / n, k.stored_draws / n,
+                                    k.skipped_draws / n);
+            }
+            BbReport::Printf(
+                "Object motion store (r34, %s): per frame over %llu frames, vertices stored/"
+                "skipped (draws): %s; instanced %.0f/%.0f; same draw again in the frame "
+                "%.0f/%.0f; known use: %.0f used of %.0f given, %.1f draws (%.0f vertices) use "
+                "under half their span (%.1f of them skinned, moved or gpu palette); second class %.0f from the top, reserve %.0f; loaded "
+                "%.0f; filled %.0f of %u; first capacity skip at motion draw %.0f of %.0f "
+                "(%llu frames with a skip)\n",
+                history.priority ? "room by priority" : "first come (old)",
+                (unsigned long long)st.frames, kinds, st.instanced_stored / n,
+                st.instanced_skipped / n, st.repeat_stored / n, st.repeat_skipped / n,
+                st.known_used / n, st.known_span / n, st.sparse_draws / n,
+                st.sparse_vertices / n, st.sparse_demoted / n, st.second / n, st.reserve / n, st.loaded / n,
+                st.used / n, positions_per_frame,
+                st.skip_frames ? double(st.first_skip) / double(st.skip_frames) : 0.0,
+                st.prepares / n, (unsigned long long)st.skip_frames);
+        }
+        history.store = {};
         index_ranges.stats = {};
         history.stats = {};
     }
@@ -261,6 +355,9 @@ void ObjectMotion::Post(const Job& job) {
     jobs[at % JobCapacity] = job;
     posted.store(at + 1, std::memory_order_seq_cst);
     if (worker_sleeping.load(std::memory_order_seq_cst)) {
+        if (BbSpike::on) { // bbport (r27_flush-split): bb:Motion's wake delay starts here
+            BbSpike::NoteMotionWakeCall();
+        }
         worker_wake.fetch_add(1, std::memory_order_seq_cst);
         worker_wake.notify_one();
     }
@@ -286,8 +383,14 @@ void ObjectMotion::WorkerLoop(std::stop_token stop) {
     static const auto spin_time =
         std::chrono::microseconds(BbThreads::CapSpinUs(BbThreads::Available() >= 12 ? 200 : 50));
     u64 next = 0;
+    u64 r27_busy_since = 0; // bbport (r27_flush-split): BB_SPIKE_TRACE=1: this busy run's start
     while (true) {
         if (posted.load(std::memory_order_acquire) == next) {
+            if (r27_busy_since != 0) { // bbport (r27_flush-split): caught up
+                BbSpike::motion_busy_ns.fetch_add(BbSpike::NowNs() - r27_busy_since,
+                                                  std::memory_order_relaxed);
+                r27_busy_since = 0;
+            }
             const auto spin_until = std::chrono::steady_clock::now() + spin_time;
             for (u32 spins = 1; posted.load(std::memory_order_acquire) == next; ++spins) {
                 if (stop.stop_requested()) {
@@ -296,13 +399,22 @@ void ObjectMotion::WorkerLoop(std::stop_token stop) {
                 __builtin_ia32_pause();
                 if (!(spins & 255) && std::chrono::steady_clock::now() >= spin_until) {
                     const u32 seen = worker_wake.load(std::memory_order_seq_cst);
+                    if (BbSpike::on) { // bbport (r27_flush-split): no stamp from an older sleep
+                        BbSpike::motion_wake_at.store(0, std::memory_order_relaxed);
+                    }
                     worker_sleeping.store(true, std::memory_order_seq_cst);
                     if (posted.load(std::memory_order_seq_cst) == next && !stop.stop_requested()) {
                         worker_wake.wait(seen, std::memory_order_seq_cst);
                     }
                     worker_sleeping.store(false, std::memory_order_relaxed);
+                    if (BbSpike::on) { // bbport (r27_flush-split): the delay stage B's wake took
+                        BbSpike::NoteMotionWake();
+                    }
                 }
             }
+        }
+        if (BbSpike::on && r27_busy_since == 0) { // bbport (r27_flush-split)
+            r27_busy_since = BbSpike::NowNs();
         }
         Run(jobs[next % JobCapacity]);
         ++next;
@@ -311,13 +423,22 @@ void ObjectMotion::WorkerLoop(std::stop_token stop) {
 }
 
 Motion::History::Allocation ObjectMotion::Evaluate(const DrawJob& job) {
-    if (job.gated && !history.Moving(job.gate, job.palette)) {
-        return {};
+    // bbport (r34_motion-store): experiment 288230376151711744 set = room first come, first
+    // served, and index lists not counted unless BB_FRAME_STATS=1, as before.
+    const bool r34_old = BbToggle::Experiment(288230376151711744ull);
+    history.priority = !r34_old;
+    Motion::History::Sort sort{job.kind, 0};
+    if (job.gated) {
+        if (!history.Moving(job.gate, job.palette)) {
+            return {};
+        }
+        sort.kind = history.LastKind(); // Moved, Recent or Held
     }
     Motion::Draw draw = job.draw;
     if (!job.index_size) {
         draw.vertices = {u32(job.base_vertex), draw.index_count};
-        return history.Prepare(draw);
+        sort.used = draw.index_count; // a non-indexed draw uses its whole range
+        return history.Prepare(draw, sort);
     }
     draw.vertices = {};
     if (job.indices_valid) {
@@ -327,12 +448,17 @@ Motion::History::Allocation ObjectMotion::Evaluate(const DrawJob& job) {
         BbRecoverBuf recover;
         if (BB_RECOVER_SET(recover)) {
             runtime_fault_recover = outer_recover;
-            return history.Prepare(draw);
+            return history.Prepare(draw, sort);
         }
         runtime_fault_recover = &recover;
+        // bbport (r28_motion-stagger): experiment 4503599627370496 set = every cached index
+        // list verified again on the same frame (the old burst once every 32 frames).
+        index_ranges.stagger = !BbToggle::Experiment(4503599627370496ull);
         const auto scanned = index_ranges.Get(
             {job.index_address, count, job.index_size, job.base_vertex, job.restart}, history_frame,
             [&] {
+                // bbport (r27_flush-split): rescans counted and timed (BB_SPIKE_TRACE=1)
+                const u64 r27_start = BbSpike::on ? BbSpike::NowNs() : 0;
                 const auto* data = reinterpret_cast<const void*>(job.index_address);
                 const auto range =
                     job.index_size == 2
@@ -340,13 +466,36 @@ Motion::History::Allocation ObjectMotion::Evaluate(const DrawJob& job) {
                                                job.base_vertex, job.restart)
                         : Motion::IndexedRange(std::span(static_cast<const u32*>(data), count),
                                                job.base_vertex, job.restart);
-                return Motion::IndexRangeCache::Result{range, XXH3_64bits(data, bytes)};
+                // bbport (r34_motion-store): the distinct vertices of the range (the report
+                // and the order of room); with experiment 288230376151711744 set only counted
+                // for BB_FRAME_STATS=1.
+                const u32 used =
+                    !r34_old || BbStats::enabled
+                        ? (job.index_size == 2
+                               ? Motion::UsedVertices(
+                                     std::span(static_cast<const u16*>(data), count),
+                                     job.base_vertex, job.restart, range, history.Capacity(),
+                                     used_bits)
+                               : Motion::UsedVertices(
+                                     std::span(static_cast<const u32*>(data), count),
+                                     job.base_vertex, job.restart, range, history.Capacity(),
+                                     used_bits))
+                        : 0u;
+                const Motion::IndexRangeCache::Result result{range, XXH3_64bits(data, bytes),
+                                                             used};
+                if (r27_start != 0) { // bbport (r27_flush-split)
+                    BbSpike::motion_scans.fetch_add(1, std::memory_order_relaxed);
+                    BbSpike::motion_scan_ns.fetch_add(BbSpike::NowNs() - r27_start,
+                                                      std::memory_order_relaxed);
+                }
+                return result;
             });
         runtime_fault_recover = outer_recover;
         draw.vertices = scanned.range;
         draw.topology = scanned.topology;
+        sort.used = scanned.used; // bbport (r34_motion-store)
     }
-    return history.Prepare(draw);
+    return history.Prepare(draw, sort);
 }
 
 void ObjectMotion::WriteParam(u32 index, const Motion::History::Allocation& allocation) {

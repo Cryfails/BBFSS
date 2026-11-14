@@ -59,11 +59,31 @@ uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
+void runtime_experiment_force(uint64_t bits); // bbport (r39_master-debug)
 void runtime_memory_set_note_write_hook(RuntimeGpuRange note);
 void runtime_memory_set_cpu_write_hook(RuntimeGpuRange hook);
 int runtime_memory_restore_access(void* context, uintptr_t address, int repeated);
 }
 namespace Shader { void RegisterSrtFaultHandler(); }
+
+// bbport (r39_master-debug): engine_previous_paths (lantern.ini, the menu's Debug tab) forces
+// BbSettings::PreviousPathsMask into the experiment bits; the runtime ORs the bits of
+// BB_TOGGLE_FILE in (runtime_experiment_force, src/sys/memory.c). Called at the start and when
+// the menu changes the setting. One log line when it is on at the start and at each change.
+namespace BbSettings {
+void ApplyPreviousPaths() {
+    static std::atomic<int> noted{-1};
+    const bool on = Get().engine_previous_paths.load(std::memory_order_relaxed);
+    runtime_experiment_force(on ? PreviousPathsMask : 0);
+    const int before = noted.exchange(on ? 1 : 0);
+    if (before != int(on) && (on || before >= 0)) {
+        std::printf("Engine: previous engine paths %s (engine_previous_paths=%d): experiment mask "
+                    "%llu %s\n",
+                    on ? "on" : "off", int(on), static_cast<unsigned long long>(PreviousPathsMask),
+                    on ? "forced" : "no longer forced");
+    }
+}
+}
 
 Frontend::WindowSDL* g_window = nullptr;
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -334,6 +354,7 @@ static void StartProfileWriter() {
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
     BbSettings::Load();
+    BbSettings::ApplyPreviousPaths(); // bbport (r39_master-debug): before anything renders
     Shader::RegisterSrtFaultHandler();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();

@@ -20,6 +20,15 @@ struct Hook {
 };
 bool Prepare(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
              std::span<const std::uint8_t> expected, Callback callback);
+/// bbport (r14_cascade-rotate): a hook inside a function body, where rsp is 16-byte aligned on
+/// arrival (a loop top, not a function entry). The callback also sees the callee-saved registers
+/// (saved[kSavedRbx..kSavedR15]). Returning 0 runs the moved instructions and goes on; non-zero
+/// restores every register as on that path, runs `taken` (at most 16 position-independent bytes)
+/// and jumps to image + taken_offset instead.
+enum : unsigned { kSavedRbx = 6, kSavedRbp, kSavedR12, kSavedR13, kSavedR14, kSavedR15 };
+bool PrepareBranch(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
+                   std::span<const std::uint8_t> expected, Callback callback,
+                   std::span<const std::uint8_t> taken, std::size_t taken_offset);
 std::uint8_t* OriginalStub(const Hook& hook);
 void Discard(Hook& hook);
 std::uint8_t* TailStub(Callback callback, std::uint64_t resume);

@@ -30,6 +30,11 @@ public:
     void Scene(VideoCore::ImageId color);
     void AddPointLights(const u32* constants, const u32* lights, u32 count);
     void SetCamera(const LampFog::Camera& camera) { fog_camera = camera; }
+    /// bbport: the sun atlas cascades drawn in full (the first `count`); the march treats the
+    /// others as outside the atlas (Rasterizer::SunAtlasSkipDraw).
+    void SetAtlasCascades(u32 count) noexcept { atlas_cascades = count; }
+    /// How far the last Integrate marched through the sun atlas (m); 0: it did not sample it.
+    [[nodiscard]] float AtlasReach() const noexcept { return atlas_reach; }
     void Composite(VideoCore::ImageId fallback = {}, const char* where = "HDR post");
 
 private:
@@ -81,6 +86,8 @@ private:
     float density = 0.025f;
     float anisotropy = 0.4f;
     u32 steps = 32;
+    u32 atlas_cascades = 4;
+    float atlas_reach = 0.0f;
     bool ready = false;
     bool tinted = false;
     bool tried = false;

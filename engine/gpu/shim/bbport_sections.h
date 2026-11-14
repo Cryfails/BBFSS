@@ -55,6 +55,11 @@ enum Id : std::uint32_t {
     Protect,
     WaitCopies,
     WaitSignals,
+    RtCapture,
+    RtPrepare,
+    RtBuilds,
+    EffectsBind,
+    AfterDraw,
     Count,
 };
 inline constexpr const char* Names[Count] = {
@@ -66,7 +71,8 @@ inline constexpr const char* Names[Count] = {
     "tex full", "samplers", "VRAM image sync", "VRAM written", "tex full empty",
     "refresh hash", "refresh obtain", "refresh detile", "refresh upload", "upscaler",
     "upscaler eval", "HLE batch", "HLE obtain", "HLE copy", "VRAM track", "VRAM upload",
-    "protect", "wait copies", "wait fences",
+    "protect", "wait copies", "wait fences", "rt capture", "rt prepare", "rt builds",
+    "effects bind", "after draw",
 };
 inline std::array<std::atomic<std::uint64_t>, Count> cycles{};
 

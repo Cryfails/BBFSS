@@ -409,7 +409,12 @@ const SysVideoOutHost host = {
         if (from_gpu) {
             presentation->Prepare(index, argument, true);
         } else {
-            liverpool->SendCommand([=] { presentation->Prepare(index, argument, false); });
+            // bbport: the frame's Reflex number, given on the game's thread (vk_streamline.cpp).
+            const u32 reflex_frame = index == -1 ? 0u : Vulkan::Streamline::OnGameFlip();
+            liverpool->SendCommand([=] {
+                Vulkan::Streamline::SetFlipFrame(reflex_frame);
+                presentation->Prepare(index, argument, false);
+            });
         }
     },
     [] { presentation->port.SignalVoLabel(); },
@@ -417,14 +422,46 @@ const SysVideoOutHost host = {
 
 } // namespace
 
+// bbport: BB_FRAME_STATS: flips that wait for their buffer label (up to 20 ms each, in the flip
+// step on the GPU command thread); printed every 300 flips when any did.
+static void NoteLabelWait(double ms) {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_FRAME_STATS");
+        return env && env[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::atomic<u32> flips{0}, waits{0};
+    static std::atomic<u64> total_us{0};
+    if (ms > 0.0) {
+        waits.fetch_add(1, std::memory_order_relaxed);
+        total_us.fetch_add(u64(ms * 1000.0), std::memory_order_relaxed);
+    }
+    if (flips.fetch_add(1, std::memory_order_relaxed) % 300 == 299) {
+        const u32 waited = waits.exchange(0, std::memory_order_relaxed);
+        const u64 us = total_us.exchange(0, std::memory_order_relaxed);
+        if (waited) {
+            std::printf("VideoOut: %u of the last 300 flips waited for their buffer label, %.2f ms "
+                        "a flip\n",
+                        waited, double(us) / 1000.0 / 300.0);
+        }
+    }
+}
+
 s32 SubmitEopFlip(s32 handle, u32 buffer, s64 argument) {
     if (handle != VideoHandle) {
         return ErrorHandle;
     }
+    // bbport: the frame's Reflex number, given on the game's thread (vk_streamline.cpp); the flip
+    // step on the GPU command thread hands it to PrepareFrame.
+    const u32 reflex_frame = Vulkan::Streamline::OnGameFlip();
     Platform::IrqC::Instance()->RegisterOnce(Platform::InterruptId::GfxFlip, [=](Platform::InterruptId) {
         volatile const u64& label = sys_video_out_labels()[buffer];
+        double waited_ms = 0.0; // bbport: NoteLabelWait
         if (label != 1) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            const auto start = std::chrono::steady_clock::now();
+            const auto deadline = start + std::chrono::milliseconds(20);
             while (label != 1 && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::yield();
             }
@@ -434,7 +471,10 @@ s32 SubmitEopFlip(s32 handle, u32 buffer, s64 argument) {
                     std::printf("VideoOut: flip IRQ for buffer %u before its label was set; flipping anyway\n", buffer);
                 }
             }
+            waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
+        NoteLabelWait(waited_ms);
+        Vulkan::Streamline::SetFlipFrame(reflex_frame);
         sys_video_out_queue_flip(s32(buffer), argument, 1);
     });
     return 0;

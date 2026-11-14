@@ -2928,6 +2928,7 @@ void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
 }
 
 void BufferCache::QueueCopyBacks(u64 submitted) {
+    const BbSpike::SplitScope r27_step{BbSpike::SplitCopyBacks}; // bbport (r27_flush-split)
     if (copy_back_blocks.Empty()) {
         return;
     }
@@ -3004,6 +3005,7 @@ void BufferCache::QueueCopyBacks(u64 submitted) {
 }
 
 void BufferCache::QueuePromotions(u64 submitted) {
+    const BbSpike::SplitScope r27_step{BbSpike::SplitPromotions}; // bbport (r27_flush-split)
     if (promote_candidates.Empty()) {
         promote_source.clear();
         return;
@@ -3724,6 +3726,11 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         bind_waits.fetch_add(wait_tick ? 1 : 0, std::memory_order_relaxed);
         bind_ranges.fetch_add(ranges, std::memory_order_relaxed);
         bind_ns.fetch_add(ns, std::memory_order_relaxed);
+        if (BbSpike::on) { // bbport (r23_spike-trace)
+            BbSpike::binds.fetch_add(1, std::memory_order_relaxed);
+            BbSpike::bind_waits.fetch_add(wait_tick ? 1 : 0, std::memory_order_relaxed);
+            BbSpike::bind_ns.fetch_add(ns, std::memory_order_relaxed);
+        }
         for (u64 longest = bind_max_ns.load(std::memory_order_relaxed);
              ns > longest && !bind_max_ns.compare_exchange_weak(longest, ns);) {
         }

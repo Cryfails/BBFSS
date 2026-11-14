@@ -9,6 +9,7 @@
 #include "bbport_toggles.h"
 
 #include <condition_variable>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <memory>
@@ -186,7 +187,14 @@ public:
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
     /// Retrieves image whose address matches provided
+    /// bbport: with several images there and none of `size` bytes, the one bound last (it
+    /// returned none before; experiment bit 16384 restores that).
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
+
+    /// bbport (test only): BB_TEST_DEPTH_ALIAS=1 (=N: after N s instead of 10) registers a stale
+    /// GPU-written alias of the depth image at the depth block copy's source, once.
+    [[nodiscard]] static bool TestDepthAliasOn();
+    void TestDepthAlias(VAddr address, u64 bytes);
 
     /// bbport: a FindView result remembered by the caller for the same image and view info.
     struct ViewMemo {
@@ -481,6 +489,12 @@ private:
     void NoteUiTexture(Image& image);
 public:
     Image* UiReplacement(const Image& image);
+    /// bbport: whether the replacement for `key` is being made on the UI worker or waits for its
+    /// upload (UiReplacement draws the game's own art meanwhile): a texture set with it is not
+    /// remembered, and its stage is not bound on the bind helper.
+    [[nodiscard]] bool UiReplacementPending(u64 key) const {
+        return !ui_jobs.empty() && ui_jobs.count(key) != 0;
+    }
     /// The HUD's sheet: its cleaned copy, as a replacement (UiReplacement). `sheet`: the bytes
     /// KeyPromptData left (the sheet with any key prompts drawn in).
     void CleanHud(Image& image, const std::vector<u8>& sheet);
@@ -488,11 +502,51 @@ public:
     /// (Rasterizer::SmoothUiSampler).
     static bool UiReplacementsLoaded();
 private:
-    /// A replacement's image from RGBA texels, with its mip chain, as ui_images[key].
-    Image* UploadUi(u64 key, std::vector<u8>& pixels, int w, int h, vk::Format format);
+    /// A replacement's image from RGBA texels, with its mip chain, as ui_images[key]. `chain`
+    /// (bbport): `pixels` holds every level already (UiJob::levels), else they are made here.
+    Image* UploadUi(u64 key, std::vector<u8>& pixels, int w, int h, vk::Format format, bool chain = false);
     std::unordered_map<u64, std::unique_ptr<Image>> ui_images;
     std::unordered_set<u64> ui_missing;
     u64 ui_bytes = 0;
+    /// bbport: a replacement made on the UI worker (UiReplacement): its file read and inflated,
+    /// and its mip chain made, there. The recording thread fills the inputs before queueing it and
+    /// reads the results once `done`; the worker touches nothing else.
+    struct UiJob {
+        std::filesystem::path path;
+        vk::Format format{};
+        bool opaque = false; ///< a BC1 the game reads as RGB: alpha 1
+        u32 game_width = 0, game_height = 0;
+        u64 reserved = 0; ///< the budget held for it (ui_reserved)
+        // The worker's results.
+        std::vector<u8> levels; ///< the mip chain, laid out as UploadUi's image
+        int w = 0, h = 0;       ///< level 0
+        bool ok = false;
+        u64 read_ns = 0, inflate_ns = 0, mips_ns = 0;
+        std::atomic<bool> done{false};
+        u32 done_frame = 0; ///< bbport: when SweepUiJobs first found it done (BbStats::frame_number)
+        bool swept = false;
+    };
+    using UiJobs = std::unordered_map<u64, std::unique_ptr<UiJob>>;
+    static void PrepareUi(UiJob& job);
+    Image* FinishUiJob(const Image& image, UiJobs::iterator it);
+    void UiWorker();
+    void StopUiWorker();
+    void ReportUiLoads();
+    void SweepUiJobs();
+    /// bbport: the jobs queued and not yet uploaded, by key (recording thread only), and the budget
+    /// they hold, counted with ui_bytes against the cap.
+    UiJobs ui_jobs;
+    u64 ui_reserved = 0;
+    /// bbport: the hand-off to the worker; the jobs stay owned by ui_jobs.
+    std::mutex ui_queue_mutex;
+    std::condition_variable ui_queue_cv;
+    std::deque<UiJob*> ui_queue;
+    bool ui_worker_stop = false;
+    std::thread ui_worker; ///< started at the first job, joined by ~TextureCache
+    /// bbport: totals for the "UI replacements:" line (ReportUiLoads), recording thread only.
+    u64 ui_loaded = 0, ui_reported = 0;
+    u32 ui_report_frame = 0;
+    u64 ui_read_ns = 0, ui_inflate_ns = 0, ui_mips_ns = 0, ui_upload_ns = 0;
     /// CleanHud's copies (key, bytes), oldest first: one per drawing of the key prompts.
     std::deque<std::pair<u64, u64>> hud_copies;
     /// The cleaned 4K art for the HUD's sheet (HudClean::kArtFile), read once; empty without it.

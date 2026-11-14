@@ -22,8 +22,16 @@ static_assert(kFrame == kSavedXmm, "SavedXmm() reads the stub's frame");
 static_assert(kReturnSlot + 8 == kFrame, "saved[-1] sits just below saved[0]");
 static_assert((8 + 6 * 8 + kFrame) % 16 == 0, "the host call needs a 16-byte aligned stack");
 
-enum Reg : std::uint8_t { RAX = 0, RCX = 1, RDX = 2, RSI = 6, RDI = 7, R8 = 8, R9 = 9 };
+enum Reg : std::uint8_t {
+    RAX = 0, RCX = 1, RDX = 2, RBX = 3, RBP = 5, RSI = 6, RDI = 7, R8 = 8, R9 = 9, R12 = 12, R13 = 13, R14 = 14, R15 = 15
+};
 constexpr Reg kArgs[] = {RDI, RSI, RDX, RCX, R8, R9};
+// bbport (r14_cascade-rotate): WriteBranchStub pushes these too, rbx last (saved[kSavedRbx]), above
+// an 8-byte pad that keeps the host call aligned where rsp arrives 16-byte aligned.
+constexpr Reg kBodyRegs[] = {R15, R14, R13, R12, RBP, RBX};
+constexpr std::uint32_t kBodyPad = 8;
+static_assert((kBodyPad + 6 * 8 + 6 * 8 + kFrame) % 16 == 0, "the host call needs a 16-byte aligned stack");
+static_assert(kSavedRbx == 6 && kSavedR15 == 11, "the body registers sit right above the six argument registers");
 
 class Emitter {
 public:
@@ -80,6 +88,45 @@ std::size_t WriteStub(std::uint8_t* at, Callback callback, std::uint64_t resume,
     e.Load(RAX, kSavedRax);
     e.AddRsp(kFrame);
     for (int i = 5; i >= 0; --i) e.Pop(kArgs[i]);
+    if (n) e.Copy(moved, n);
+    e.JumpTo(resume);
+    return std::size_t(e.Here() - at);
+}
+
+/// bbport (r14_cascade-rotate): WriteStub for a site inside a function body (rsp 16-byte aligned on
+/// arrival). Both ways out restore every register; a non-zero return runs `taken` and jumps to
+/// `target` instead of the moved instructions. The taken way is short enough for the rel8 jz
+/// (PrepareBranch allows at most 16 taken bytes: 112 bytes in all).
+std::size_t WriteBranchStub(std::uint8_t* at, Callback callback, std::uint64_t resume, const std::uint8_t* moved,
+                            std::size_t n, const std::uint8_t* taken, std::size_t taken_bytes,
+                            std::uint64_t target) {
+    Emitter e(at);
+    e.SubRsp(kBodyPad);
+    for (Reg r : kBodyRegs) e.Push(r);
+    for (Reg r : kArgs) e.Push(r);
+    e.SubRsp(kFrame);
+    e.Store(kSavedRax, RAX);
+    for (unsigned x = 0; x < 8; ++x) e.StoreXmm(std::uint8_t(16 * x), x);
+    e.StoreZero(kReturnSlot);
+    e.ZeroEdi();
+    e.LeaRsi(kFrame);
+    e.MovRax(reinterpret_cast<std::uint64_t>(callback));
+    e.CallRax();
+    e.TestRax();
+    std::uint8_t* run = e.Jz8();
+    const auto restore = [&e] {
+        for (unsigned x = 0; x < 8; ++x) e.LoadXmm(x, std::uint8_t(16 * x));
+        e.Load(RAX, kSavedRax);
+        e.AddRsp(kFrame);
+        for (int i = 5; i >= 0; --i) e.Pop(kArgs[i]);
+        for (int i = 5; i >= 0; --i) e.Pop(kBodyRegs[i]);
+        e.AddRsp(kBodyPad);
+    };
+    restore();
+    if (taken_bytes) e.Copy(taken, taken_bytes);
+    e.JumpTo(target);
+    e.Land(run);
+    restore();
     if (n) e.Copy(moved, n);
     e.JumpTo(resume);
     return std::size_t(e.Here() - at);
@@ -169,6 +216,25 @@ bool Prepare(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offs
     if (std::memcmp(site, expected.data(), n) != 0) return false;
     const auto resume = reinterpret_cast<std::uint64_t>(site + n);
     std::uint8_t* stub = Pages().Make([&](std::uint8_t* page) { WriteStub(page, callback, resume, expected.data(), n); });
+    if (!stub) return false;
+    hook = {site, stub, n};
+    return true;
+}
+
+bool PrepareBranch(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
+                   std::span<const std::uint8_t> expected, Callback callback,
+                   std::span<const std::uint8_t> taken, std::size_t taken_offset) {
+    hook = {};
+    const std::size_t n = expected.size();
+    if (!image || !callback || n < kJumpBytes || n > 128 || offset > size || n > size - offset ||
+        taken.size() > 16 || taken_offset >= size) return false;
+    std::uint8_t* site = image + offset;
+    if (std::memcmp(site, expected.data(), n) != 0) return false;
+    const auto resume = reinterpret_cast<std::uint64_t>(site + n);
+    const auto target = reinterpret_cast<std::uint64_t>(image + taken_offset);
+    std::uint8_t* stub = Pages().Make([&](std::uint8_t* page) {
+        WriteBranchStub(page, callback, resume, expected.data(), n, taken.data(), taken.size(), target);
+    });
     if (!stub) return false;
     hook = {site, stub, n};
     return true;

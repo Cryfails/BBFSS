@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "bbport_settings.h"
+#include "bbport_toggles.h" // bbport (r30_ssgi-half)
 #include "video_core/host_shaders/ssgi_composite_comp.h"
 #include "video_core/host_shaders/ssgi_denoise_comp.h"
 #include "video_core/host_shaders/ssgi_gather_comp.h"
@@ -17,7 +18,9 @@
 #include "video_core/host_shaders/ssgi_prep_comp.h"
 #include "video_core/host_shaders/ssgi_probe_composite_comp.h"
 #include "video_core/host_shaders/ssgi_probe_reflect_comp.h"
+#include "video_core/host_shaders/ssgi_probe_reflect_half_comp.h" // bbport (r30_ssgi-half)
 #include "video_core/host_shaders/ssgi_probe_resolve_comp.h"
+#include "video_core/host_shaders/ssgi_probe_resolve_half_comp.h" // bbport (r30_ssgi-half)
 #include "video_core/host_shaders/ssgi_probe_trace_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
@@ -48,6 +51,10 @@ struct Params {
     float step_size;
 };
 static_assert(sizeof(Params) == 128);
+// bbport (r30_ssgi-half): experiment bit: set = the full-resolution glossy rays as before (read
+// every frame); history bit 27 = count this frame (ssgi_probe.comp REFLECT HALF only).
+constexpr u64 SsgiHalfOffBit = 18014398509481984ull;
+constexpr u32 SsgiHalfCountBit = 0x8000000u;
 
 std::array<float, 12> Multiply(const std::array<float, 12>& a, const std::array<float, 12>& b) {
     std::array<float, 12> r{};
@@ -128,6 +135,17 @@ ScreenSpaceGI::ScreenSpaceGI(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_},
       runtime{runtime_}, scene_targets{scene_targets_}, rt_shadow{rt_shadow_},
       camera_motion{camera_motion_} {
+    // bbport (r30_ssgi-half, r37_menu-options): set, BB_SSGI_HALF decides ("1" on, else off);
+    // not set, graphics_gi_reflections_fewer_rays does (every frame).
+    if (const char* env = std::getenv("BB_SSGI_HALF"); env && env[0]) {
+        half_env = env[0] == '1' ? 1 : 0;
+    }
+    if (half_env == 1) {
+        std::printf("Indirect light (r30): BB_SSGI_HALF=1, full-resolution glossy reflection rays "
+                    "traced once per flat 2x2 block, per pixel at depth/normal edges and on sharp "
+                    "surfaces (changes the picture; experiment 18014398509481984 set = every "
+                    "pixel as before)\n");
+    }
 }
 
 bool ScreenSpaceGI::Ready() {
@@ -173,11 +191,70 @@ bool ScreenSpaceGI::Ready() {
         failed = true;
         std::printf("SSGI: off - this GPU cannot run the passes\n");
     }
+    // bbport (r37_menu-options): the half builds and counters are made by HalfReady, when first wanted.
     return made;
+}
+
+// bbport (r30_ssgi-half, r37_menu-options): the half builds and counters, made the first time a
+// frame wants them.
+bool ScreenSpaceGI::HalfReady() {
+    if (half_tried) {
+        return half_made;
+    }
+    half_tried = true;
+    const auto make = [&](HalfBuffer& out, bool host, VkBufferUsageFlags usage) {
+        const VkBufferCreateInfo buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = HalfSlots * sizeof(u32),
+            .usage = usage,
+        };
+        VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (host) {
+            alloc_ci.usage = VMA_MEMORY_USAGE_AUTO;
+            alloc_ci.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            alloc_ci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT |
+                             VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+        }
+        VkBuffer raw{};
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &raw,
+                            &out.allocation, &info) != VK_SUCCESS) {
+            return false;
+        }
+        out.buffer = raw;
+        out.mapped = info.pMappedData;
+        return !host || out.mapped != nullptr;
+    };
+    half_made =
+        CreatePass(probe_reflect_half,
+                   {SampledImage, SampledImage, SampledImage, SampledImage, StorageImage,
+                    StorageImage, vk::DescriptorType::eStorageBuffer},
+                   SSGI_PROBE_REFLECT_HALF_COMP, "SSGI glossy reflection rays (BB_SSGI_HALF)") &&
+        CreatePass(probe_resolve_half,
+                   {SampledImage, SampledImage, SampledImage, SampledImage, SampledImage,
+                    StorageImage, SampledImage},
+                   SSGI_PROBE_RESOLVE_HALF_COMP,
+                   "SSGI glossy reflection resolve (BB_SSGI_HALF)") &&
+        make(half_counts, false,
+             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+        make(half_readback, true, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (half_made) {
+        std::memset(half_readback.mapped, 0, HalfSlots * sizeof(u32));
+    }
+    std::printf("Indirect light (r30): fewer glossy rays (%s) %s\n",
+                half_env == 1 ? "BB_SSGI_HALF=1" : "graphics_gi_reflections_fewer_rays=1",
+                half_made ? "ready" : "ignored - no pipeline or counters");
+    return half_made;
 }
 
 ScreenSpaceGI::~ScreenSpaceGI() {
     const auto device = instance.GetDevice();
+    for (HalfBuffer* buffer : {&half_counts, &half_readback}) { // bbport (r30_ssgi-half)
+        if (buffer->buffer) {
+            vmaDestroyBuffer(instance.GetAllocator(), buffer->buffer, buffer->allocation);
+        }
+    }
     for (const auto& entry : view_cache) {
         if (entry.view) {
             device.destroyImageView(entry.view);
@@ -394,11 +471,12 @@ void ScreenSpaceGI::OnOpaqueScene(VideoCore::ImageId color_id, VideoCore::ImageI
             return;
         }
         color_view = c.view;
-        depth_view = scene_targets.Read(depth_id, depth_info).view;
+        // bbport (r22_barriers): right after the colour's barrier (its Read, compute stage)
+        depth_view = scene_targets.ReadNext(depth_id, depth_info).view;
         if (albedo && scene_targets.EligibleScene(*albedo)) {
             VideoCore::ImageViewInfo albedo_info;
             albedo_info.format = albedo->info.pixel_format;
-            albedo_view = scene_targets.Read(gbuffer_albedo, albedo_info).view;
+            albedo_view = scene_targets.ReadNext(gbuffer_albedo, albedo_info).view; // r22
         }
     } else {
         if (!(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
@@ -567,6 +645,49 @@ void ScreenSpaceGI::OnOpaqueScene(VideoCore::ImageId color_id, VideoCore::ImageI
                           probe_ray_dist.width == ray_width &&
                           probe_ray_dist.height == ray_height;
         const bool run_rays = rays && reflection_strength > 0.0f;
+        // bbport (r30_ssgi-half): BB_SSGI_HALF=1 applies to full-resolution glossy rays only;
+        // experiment 18014398509481984 set = every pixel traced as before (the old pipelines).
+        // One frame in 8 counts; every 600 the means per counted frame (u32 differences survive
+        // the wrap; read while the GPU may still copy a later frame's, which then fall in the
+        // next window).
+        // bbport (r37_menu-options): BB_SSGI_HALF when set, else graphics_gi_reflections_fewer_rays;
+        // the half pipelines are made the first time a frame would trace with them.
+        const bool half_wanted =
+            half_env >= 0 ? half_env == 1
+                          : BbSettings::Get().graphics_gi_reflections_fewer_rays.load(
+                                std::memory_order_relaxed);
+        const bool half_mode = half_wanted && run_rays && full_res_rays && HalfReady();
+        const bool half_off = half_mode && BbToggle::Experiment(SsgiHalfOffBit);
+        const bool half_rays = half_mode && run_rays && full_res_rays && !half_off;
+        const bool half_count = half_rays && (half_recorded++ & 7) == 0;
+        const bool half_clear = half_rays && !half_cleared;
+        half_cleared |= half_rays;
+        if (half_made && ++half_frames >= 600) {
+            half_frames = 0;
+            std::array<u32, HalfSlots> now{};
+            std::memcpy(now.data(), half_readback.mapped, sizeof(now));
+            const u32 counted = now[0] - half_last[0];
+            std::array<double, HalfSlots> d{};
+            for (u32 i = 0; i < HalfSlots && counted != 0; ++i) {
+                d[i] = double(u32(now[i] - half_last[i])) / double(counted);
+            }
+            half_last = now;
+            const double traced = d[1] + d[3] + d[4] + d[5];
+            const double glossy = traced + d[2];
+            std::printf("Indirect light (r30): fewer glossy rays %s, glossy rays %ux%u; a frame "
+                        "(mean of %u counted): glossy pixels %.0f (full resolution traces each), "
+                        "rays %.0f (%.0f%%): one per flat 2x2 block %.0f, every glossy pixel of "
+                        "the block %.0f sharp (roughness < 0.2) + %.0f depth/normal edge + %.0f "
+                        "mixed roughness or beside a non-glossy pixel; left to the resolve's "
+                        "depth/normal-aware filter %.0f; rays of 56 steps %.0f; 16x16 tiles with "
+                        "a ray %.0f of %.0f\n",
+                        half_rays  ? "on (experiment 18014398509481984 clear)"
+                        : half_off ? "off now (experiment 18014398509481984 set: every pixel)"
+                                   : "idle (mode off, or glossy rays off or at half resolution)",
+                        ray_width, ray_height, counted, glossy, traced,
+                        glossy > 0.0 ? 100.0 * traced / glossy : 0.0, d[1], d[3], d[4], d[5],
+                        d[2], d[6], d[7], d[8]);
+        }
         static bool printed_probes = false;
         if (!printed_probes) {
             printed_probes = true;
@@ -675,7 +796,13 @@ void ScreenSpaceGI::OnOpaqueScene(VideoCore::ImageId color_id, VideoCore::ImageI
              resolve_layout = *probe_resolve.layout,
              prep_layout = *prep.layout, trace_pipeline = *probe_trace.pipeline,
              trace_layout = *probe_trace.layout, composite_pipeline = *probe_composite.pipeline,
-             composite_layout = *probe_composite.layout](vk::CommandBuffer cmdbuf) mutable {
+             composite_layout = *probe_composite.layout, half_rays, half_count, half_clear,
+             reflect_half_pipeline = half_rays ? *probe_reflect_half.pipeline : vk::Pipeline{},
+             reflect_half_layout = half_rays ? *probe_reflect_half.layout : vk::PipelineLayout{},
+             resolve_half_pipeline = half_rays ? *probe_resolve_half.pipeline : vk::Pipeline{},
+             resolve_half_layout = half_rays ? *probe_resolve_half.layout : vk::PipelineLayout{},
+             half_counts = half_counts.buffer,
+             half_readback = half_readback.buffer](vk::CommandBuffer cmdbuf) mutable {
                 BeforeCompute(cmdbuf);
                 std::array<vk::ImageMemoryBarrier2, 24> barriers{};
                 u32 count = 0;
@@ -755,7 +882,36 @@ void ScreenSpaceGI::OnOpaqueScene(VideoCore::ImageId color_id, VideoCore::ImageI
                         for (u32 i = 0; i < writes.size(); ++i) {
                             writes[i] = Write(i, i < 4 ? SampledImage : StorageImage, &infos[i]);
                         }
-                        run(reflect_pipeline, reflect_layout, writes, half_x, half_y);
+                        if (!half_rays) {
+                            run(reflect_pipeline, reflect_layout, writes, half_x, half_y);
+                        } else {
+                            // bbport (r30_ssgi-half): BB_SSGI_HALF=1, one workgroup per 16x16
+                            // pixels (half_width x half_height is the full resolution here).
+                            if (half_clear) {
+                                cmdbuf.fillBuffer(half_counts, 0, VK_WHOLE_SIZE, 0);
+                                EffectPass::MemoryBarrier(
+                                    cmdbuf, vk::PipelineStageFlagBits2::eTransfer,
+                                    vk::AccessFlagBits2::eTransferWrite, Compute,
+                                    vk::AccessFlagBits2::eShaderRead |
+                                        vk::AccessFlagBits2::eShaderWrite);
+                            }
+                            const vk::DescriptorBufferInfo count_info{half_counts, 0,
+                                                                      VK_WHOLE_SIZE};
+                            std::array<vk::WriteDescriptorSet, 7> half_writes;
+                            std::copy(writes.begin(), writes.end(), half_writes.begin());
+                            half_writes[6] = vk::WriteDescriptorSet{
+                                .dstBinding = 6,
+                                .descriptorCount = 1,
+                                .descriptorType = vk::DescriptorType::eStorageBuffer,
+                                .pBufferInfo = &count_info};
+                            const u32 history = params.history;
+                            if (half_count) {
+                                params.history |= SsgiHalfCountBit;
+                            }
+                            run(reflect_half_pipeline, reflect_half_layout, half_writes,
+                                (half_width + 15) / 16, (half_height + 15) / 16);
+                            params.history = history;
+                        }
                     }
                     BetweenPasses(cmdbuf);
                     {
@@ -767,7 +923,27 @@ void ScreenSpaceGI::OnOpaqueScene(VideoCore::ImageId color_id, VideoCore::ImageI
                         for (u32 i = 0; i < writes.size(); ++i) {
                             writes[i] = Write(i, i == 5 ? StorageImage : SampledImage, &infos[i]);
                         }
-                        run(resolve_pipeline, resolve_layout, writes, half_x, half_y);
+                        run(half_rays ? resolve_half_pipeline : resolve_pipeline,
+                            half_rays ? resolve_half_layout : resolve_layout, writes, half_x,
+                            half_y);
+                        // bbport (r30_ssgi-half): a counted frame's counters to the host; later
+                        // counting waits for the copy.
+                        if (half_count) {
+                            EffectPass::MemoryBarrier(cmdbuf, Compute,
+                                                      vk::AccessFlagBits2::eShaderWrite,
+                                                      vk::PipelineStageFlagBits2::eCopy,
+                                                      vk::AccessFlagBits2::eTransferRead);
+                            const vk::BufferCopy region{0, 0, HalfSlots * sizeof(u32)};
+                            cmdbuf.copyBuffer(half_counts, half_readback, region);
+                            EffectPass::MemoryBarrier(
+                                cmdbuf, vk::PipelineStageFlagBits2::eCopy,
+                                vk::AccessFlagBits2::eTransferWrite |
+                                    vk::AccessFlagBits2::eTransferRead,
+                                vk::PipelineStageFlagBits2::eHost | Compute,
+                                vk::AccessFlagBits2::eHostRead |
+                                    vk::AccessFlagBits2::eShaderRead |
+                                    vk::AccessFlagBits2::eShaderWrite);
+                        }
                     }
                 }
                 BetweenPasses(cmdbuf);

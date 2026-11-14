@@ -75,7 +75,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     own_buffers_mode = BbEngine::Batch::Switch("LANTERN_GX_OWN_BUFFERS");
-    vertex_memo_mode = BbEngine::Batch::Switch("LANTERN_VERTEX_MEMO");
+    // bbport: the vertex memo is on unless LANTERN_VERTEX_MEMO=0 (see VertexMemoOn).
+    vertex_memo_mode = [] {
+        const char* env = std::getenv("LANTERN_VERTEX_MEMO");
+        return env && env[0] == '0' ? BbEngine::Batch::Off : BbEngine::Batch::On;
+    }();
     // Before the rasterizer is bound: Liverpool enqueues buffers only once it sees it.
     draw_prep = std::make_unique<DrawPreparation>(pipeline_cache);
     scene_targets = std::make_unique<SceneTargets>(instance, scheduler, runtime, texture_cache);
@@ -124,6 +128,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     if (DrawPipeWanted()) {
         constant_ring = std::make_unique<ConstantRing>(instance, scheduler);
         draw_pipe = std::make_unique<DrawPipe>(&RunDrawPacket, this);
+        BbSpike::stage_b_busy.store(&draw_pipe->busy_cycles, std::memory_order_release); // r23
+        BbSpike::stage_b_packets.store(draw_pipe->PacketCounter(), std::memory_order_release); // r29
         // bbport: the lookahead thread (docs/parallel-stageb.md), off unless asked for.
         if (LookaheadWanted()) {
             lookahead_thread = std::jthread([this](std::stop_token stop) { LookaheadLoop(stop); });
@@ -143,8 +149,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     // bbport: this thread joins the texture binding helper before it changes image state.
     runtime.SetImageAccessHook(&JoinBindHelper, this);
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
-        object_motion->Sync();
-        runtime.FlushBarriers();
+        // bbport (r27_flush-split): each part timed (BB_SPIKE_TRACE=1, stage B's tasks only)
+        const BbSpike::SplitScope r27_callback{BbSpike::SplitCallback};
+        {
+            const BbSpike::SplitScope r27_step{BbSpike::SplitMotionSync};
+            object_motion->Sync();
+        }
+        {
+            const BbSpike::SplitScope r27_step{BbSpike::SplitBarriers};
+            runtime.FlushBarriers();
+        }
+        const BbSpike::SplitScope r27_step{BbSpike::SplitArenaBinds};
         buffer_cache.SubmitPendingArenaBinds(info);
     });
 }
@@ -236,6 +251,7 @@ void Rasterizer::RequestSignalFlush() {
             self.signal_flush_requested.store(false, std::memory_order_release);
             self.PublishSignals();
             if (self.HasUnsubmittedSignals()) {
+                const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonStageAIdle}; // r8
                 self.Flush();
             }
         },
@@ -325,13 +341,72 @@ void Rasterizer::SubmitForSignals() {
     SubmitForSignalsNow();
 }
 
+namespace {
+/// bbport r8: an early submission at the end of a guest submission once the GPU has finished
+/// everything submitted (BB_NEAR_DRY_DEPTH=1, default; 2: every submission but the newest, it is
+/// about to run dry), so it does not wait for the next 2 ms batch (BB_HONEST_FLUSH_US), whatever
+/// the draw backlog (the 64 KiB rule). At most one per BB_NEAR_DRY_US (default 300), and
+/// only while the draw recording thread had slack: busy under BB_NEAR_DRY_BUSY percent (default
+/// 92) of the last >= 8 ms. When it is the limit, a submission costs it ~65 us and the GPU waits
+/// for it anyway. Experiment bit 8589934592 restores the old rule.
+bool NearDryFlush(Scheduler& scheduler, const DrawPipe* pipe, std::chrono::nanoseconds since) {
+    static const auto spacing = std::chrono::microseconds([] {
+        const char* env = std::getenv("BB_NEAR_DRY_US");
+        return env ? std::max(0ll, std::strtoll(env, nullptr, 10)) : 300ll;
+    }());
+    static const u64 busy_limit = [] {
+        const char* env = std::getenv("BB_NEAR_DRY_BUSY");
+        return env ? u64(std::clamp(std::atoi(env), 0, 100)) : u64{92};
+    }();
+    // 1: the GPU finished all of them (it idles already); 2: every submission but the newest.
+    static const u64 depth = [] {
+        const char* env = std::getenv("BB_NEAR_DRY_DEPTH");
+        return env ? u64(std::clamp(std::atoi(env), 1, 4)) : u64{1};
+    }();
+    if (!pipe || !DrawPipe::OnStageB() || since < spacing ||
+        BbToggle::Experiment(8589934592ull)) {
+        return false;
+    }
+    // The draw recording thread's share of the last window busy running packets (rdtsc cycles).
+    static u64 window_tsc = 0, window_busy = 0;
+    static std::chrono::steady_clock::time_point window_start{};
+    static bool slack = false;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - window_start >= std::chrono::milliseconds(8)) {
+        const u64 tsc = __rdtsc();
+        const u64 busy = pipe->busy_cycles.load(std::memory_order_relaxed);
+        if (window_tsc != 0 && tsc > window_tsc) {
+            slack = (busy - window_busy) * 100 < busy_limit * (tsc - window_tsc);
+        }
+        window_tsc = tsc;
+        window_busy = busy;
+        window_start = now;
+    }
+    if (!slack) {
+        if (BbSubmitDiag::On()) {
+            BbSubmitDiag::near_dry_busy.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    return tick > depth && scheduler.IsFree(tick - depth);
+}
+} // namespace
+
 void Rasterizer::SubmitForSignalsNow() {
     PublishSignals(); // the end of a guest submission
     static const auto interval = std::chrono::microseconds([] {
         const char* env = std::getenv("BB_HONEST_FLUSH_US");
         return env ? std::strtoll(env, nullptr, 10) : 2000ll;
     }());
+    const bool diag = BbSubmitDiag::On(); // bbport r8
+    if (diag) {
+        BbSubmitDiag::ends.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!HasUnsubmittedSignals()) {
+        if (diag) {
+            BbSubmitDiag::ends_no_fences.fetch_add(1, std::memory_order_relaxed);
+        }
         return;
     }
     // Batched (one submission per BB_HONEST_FLUSH_US) while the GPU still has work; at once when it
@@ -355,11 +430,25 @@ void Rasterizer::SubmitForSignalsNow() {
         std::chrono::steady_clock::now().time_since_epoch().count() -
         last_flush_ns.load(std::memory_order_relaxed));
     if (!gpu_idle && since_flush < interval) {
+        // bbport r8: the GPU about to run dry gets the work now (experiment bit 8589934592: not).
+        if (NearDryFlush(scheduler, draw_pipe.get(), since_flush)) {
+            const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonNearDry};
+            Flush();
+            return;
+        }
+        if (diag) {
+            BbSubmitDiag::ends_held.fetch_add(1, std::memory_order_relaxed);
+            if (scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+                BbSubmitDiag::ends_held_dry.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         return;
     }
     if (gpu_idle) {
         BbStats::idle_flushes.fetch_add(1, std::memory_order_relaxed);
     }
+    const BbSubmitDiag::Scope diag_reason{gpu_idle ? BbSubmitDiag::ReasonGpuIdle
+                                                   : BbSubmitDiag::ReasonBatched}; // r8
     Flush();
 }
 
@@ -511,6 +600,7 @@ bool Rasterizer::FilterDraw() {
     const auto& regs = Regs();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws
+        EffectsEndLampBatch(); // bbport: lamps apart: no draw, so nothing else ends the batch
         EliminateFastClear();
         return false;
     }
@@ -522,6 +612,7 @@ bool Rasterizer::FilterDraw() {
     }
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Resolve) {
         LOG_TRACE(Render_Vulkan, "Resolve pass");
+        EffectsEndLampBatch(); // bbport
         Resolve();
         return false;
     }
@@ -547,6 +638,7 @@ bool Rasterizer::FilterDraw() {
         // do a copy from one depth-stencil surface to another, without a pixel shader.
         // We need to detect this case and perform the copy, otherwise it will have no effect.
         LOG_TRACE(Render_Vulkan, "Performing depth-stencil override copy");
+        EffectsEndLampBatch(); // bbport: the pass that shadows the lamps reads the depth
         DepthStencilCopy(depth_copy, stencil_copy);
         return false;
     }
@@ -640,6 +732,9 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = Regs();
     EffectsBeforeTargets(pipeline);
+    // bbport: a Froyok composite whose pyramid waited since the DoF recombination (FroyokBloom::
+    // Generate) has it built here, before this draw's targets and resources.
+    froyok_bloom->BeforeComposite(pipeline->GetStages()[u32(Shader::SwStage::Fragment)]);
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -1459,7 +1554,7 @@ const char* TaskName(void* task) {
 
 bool Rasterizer::RunInOrder(OrderedTask task, const void* data, u32 size, u64 toggle,
                             bool reads_guest_memory, const char* name) {
-    if (name && BbSections::Enabled()) {
+    if (name && (BbSections::Enabled() || BbSpike::on)) { // r27_flush-split: also its kinds
         NoteTaskName(reinterpret_cast<void*>(task), name);
     }
     if (!UseDrawPipe() || BbToggle::Disabled(toggle)) {
@@ -1498,6 +1593,11 @@ void Rasterizer::RunDrawPacket(void* context, const u8* data, u32 size) {
         BB_SECTION(Task);
         self.buffer_cache.NewPacket();
         const auto& task = *reinterpret_cast<const TaskPacket*>(data);
+        // bbport (r27_flush-split): a stage B task is what the Flush split adds up (its kind:
+        // RunInOrder's name).
+        const BbSpike::SplitScope r27_split{
+            BbSpike::SplitTask, true,
+            BbSpike::on ? TaskName(reinterpret_cast<void*>(task.task)) : nullptr};
         if (BbSections::Enabled()) {
             const u64 t0 = __rdtsc();
             task.task(self, data + sizeof(TaskPacket));
@@ -1919,6 +2019,16 @@ void Rasterizer::PrintPipeStats() {
     if (seconds < 5.0) {
         return;
     }
+    // bbport (r23_spike-trace): this report's time on stage A
+    struct R23Report {
+        u64 start = BbSpike::on ? BbSpike::NowNs() : 0;
+        ~R23Report() {
+            if (start != 0) {
+                BbSpike::stage_a_print_ns.fetch_add(BbSpike::NowNs() - start,
+                                                    std::memory_order_relaxed);
+            }
+        }
+    } r23_report;
     const u64 tsc = __rdtsc();
     const double cycles = double(tsc - last_tsc);
     const u64 busy = draw_pipe->busy_cycles.load(std::memory_order_relaxed);
@@ -2386,6 +2496,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         upscaler->OnDisplayPass(regs.color_buffers[0].Address(), cb_descs[0].first);
         previous_scene_depth = camera_motion->Depth(); // the last G-buffer pass's (bbport)
         camera_motion->OnDisplayPass(cb_descs[0].first);
+        // bbport (r23_spike-trace): stage B's frame end, its 600-frame reports and the GPU
+        // profile print (NoteFrameStart) included
+        const u64 r23_end_start = BbSpike::on ? BbSpike::NowNs() : 0;
+        // bbport (r29_bursts): the reports printed with BbReport::Printf below are written on
+        // bb:Stats (experiment 9007199254740992 set: here, as before).
+        const BbReport::Capture r29_reports;
         EffectsOnFrameEnd();
         if (upscaler->OnFrameStart()) {
             object_motion->InvalidateHistory();
@@ -2394,9 +2510,18 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         camera_motion->SetJitter(upscaler->Jitter());
         object_motion->OnFrameStart();
         NoteFrameStart();
+        if (r23_end_start != 0) { // bbport (r23_spike-trace)
+            BbSpike::stage_b_end_ns.fetch_add(BbSpike::NowNs() - r23_end_start,
+                                              std::memory_order_relaxed);
+        }
         static const char* scene_debug = std::getenv("BB_SCENE_DEBUG");
         scene_debug_frame = scene_debug && std::remove(scene_debug) == 0;
         scene_targets->debug = scene_debug_frame;
+    }
+    // bbport (r7_cascades): a draw into a sun cascade kept from an earlier frame is left out
+    // before its targets, bindings, barriers and pass (SunHoldEarly, vk_rasterizer_effects.cpp).
+    if (sun_hold.active && SunHoldEarly(pipeline)) {
+        return;
     }
     dc.bind_prepared = used_prepared;
     dc.motion_draw = (pipeline->GetGraphicsKey().motion_vectors & Shader::MotionVectors::VertexOutputs) != 0;
@@ -2419,7 +2544,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     const bool sky_resolved =
         SkyBeforeRendering(regs, pipeline, is_indexed, index_offset, draw_prepared, inputs_resolved);
-    const auto state = BeginRendering(pipeline);
+    auto state = BeginRendering(pipeline);
     if (ProxyTraceOn()) {
         const auto target = cb_descs[0].first ? cb_descs[0].first : db_desc.first;
         FlushProxyReads(dc.push_data.scene_size != 0,
@@ -2446,6 +2571,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     dc.push_data.xoffset = dc.push_data.xoffset*target_scale[0]+target_offset[0];
     dc.push_data.yscale *= target_scale[1];
     dc.push_data.yoffset = dc.push_data.yoffset*target_scale[1]+target_offset[1];
+    r19_motion.valid = false; // bbport (r19_draw-cost): set by this draw's Motion block only
     if (dc.motion_draw && dc.motion_geometry) {
         BB_SECTION(Motion);
         const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -2463,6 +2589,8 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             return value && value[0] == '1';
         }();
         bool gated = !all_motion;
+        Motion::Kind r34_kind = Motion::Kind::Other; // bbport (r34_motion-store)
+        bool r19_complete = true; // bbport (r19_draw-cost): the walk below ran to its end
         u64 palette = 0;
         for (const auto& resource : vs.buffers) {
             if (resource.IsSpecial()) continue;
@@ -2472,12 +2600,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             const auto role = Motion::ClassifyBuffer(size);
             if (role == Motion::BufferRole::Skeleton) {
                 gated = false;
+                r34_kind = Motion::Kind::Skinned; // bbport (r34_motion-store)
+                r19_complete = false;
                 break;
             }
             const VAddr address = buffer.base_address;
             if (role == Motion::BufferRole::SmallSkeleton &&
                 buffer_cache.IsRegionGpuModified(address, size)) {
                 gated = false;
+                r34_kind = Motion::Kind::GpuPalette; // bbport (r34_motion-store)
+                r19_complete = false;
                 break;
             }
             if (role == Motion::BufferRole::SmallSkeleton &&
@@ -2489,6 +2621,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         }
         const u32 instances = regs.num_instances.NumInstances();
         const u64 index_bytes = u64(regs.num_indices) * index_size;
+        const bool indices_valid = is_indexed && index_address &&
+                                   memory->IsValidGpuMapping(index_address, 0) &&
+                                   memory->ClampRangeSize(index_address, index_bytes) == index_bytes;
+        r19_motion = {true, indices_valid, r19_complete, palette}; // bbport (r19_draw-cost)
         dc.push_data.motion_param = object_motion->Draw({
             .draw = {.shader = vs.pgm_hash,
                      .geometry = dc.motion_geometry,
@@ -2508,21 +2644,39 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             .index_size = is_indexed ? index_size : 0u,
             .gated = gated,
             .restart = regs.enable_primitive_restart != 0,
-            .indices_valid = is_indexed && index_address &&
-                             memory->IsValidGpuMapping(index_address, 0) &&
-                             memory->ClampRangeSize(index_address, index_bytes) == index_bytes,
+            .indices_valid = indices_valid,
+            .kind = r34_kind, // bbport (r34_motion-store)
         });
     }
     if (dc.capture_draw) {
+        BB_SECTION(RtCapture);
         EffectsCaptureDraw(regs, pipeline, is_indexed, index_offset);
     }
+    effect_skip_draw = false;
     if (effects_wanted) {
         const auto [effect_first_vertex, effect_first_instance] =
             GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex), pipeline->GetFetchShader());
+        effect_pass = vk::Extent2D{state.width, state.height};
+        // Two single-layer colour attachments, neither cleared by this pass.
+        effect_plain_pair = state.num_color_attachments == 2 && state.num_layers == 1 &&
+                            !state.color_attachments[0].is_clear &&
+                            !state.color_attachments[1].is_clear;
+        BbSections::Scope effects_bind_scope{BbSections::EffectsBind};
         EffectsBeforeBind(regs, pipeline, is_indexed, index_offset, effect_first_vertex);
+        effects_bind_scope.End();
+        // bbport: lamps apart (vk_point_shadow.h): this lamp quad goes into the lamp images, with
+        // the pipeline, depth and pass size it has.
+        if (const auto lamps = point_shadow->TakeLampTargets()) {
+            for (u32 i = 0; i < 2; ++i) {
+                state.color_attachments[i].image_view = (*lamps)[i];
+                state.color_attachments[i].image_layout = vk::ImageLayout::eGeneral;
+            }
+        }
     }
     const auto* fragment = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const float froyok_blend = fragment ? froyok_bloom->Composite(*fragment, dc.image_infos) : 0.0f;
+    BbSections::Scope descriptor_scope{BbSections::PipelineBind};
+    const u64 r21_serial = scheduler.R21Serial(); // bbport (r21_draw-sort): R21Restore below
     pipeline->BindResources(dc.set_writes, dc.push_data, {dc.image_infos.data(), dc.image_infos.size()},
                             {dc.buffer_infos.data(), dc.buffer_infos.size()}, froyok_blend);
     if (dc.capture_draw) {
@@ -2530,6 +2684,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     } else if (dc.motion_draw) {
         object_motion->BindAddresses(pipeline->GetLayout());
     }
+    descriptor_scope.End();
+    // bbport (r21_draw-sort): push constants and descriptor binds leave vertex input, vertex
+    // buffer and index buffer binds as they are.
+    scheduler.R21Restore(r21_serial);
     // bbport: jitter geometry drawn with the scene depth, not full-screen passes (a shifted
     // full-screen quad leaves an edge column unwritten).
     dc.draw_jitter = {};
@@ -2539,7 +2697,35 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
+    if (sun_hold.active) {
+        SunHoldBeforePass(state); // bbport (r7_cascades): may narrow the atlas's clear
+    }
+    if (SunKeepGate()) {
+        // bbport (r14_cascade_keep): may take the atlas's clear of the whole image over.
+        SunKeepBeforePass(state, false);
+    }
     scheduler.BeginRendering(state);
+    if (sun_hold.atlas_pass) {
+        SunHoldInPass(state);
+    }
+    if (sun_keep.atlas_pass) {
+        SunKeepInPass(state); // r14: the draw's quadrant cleared before the first draw into it
+    }
+    if (effect_skip_draw) {
+        // bbport: as for a pipeline still compiling (below): targets, barriers and the pass ran,
+        // only the draw is left out (SsrTemporal::OnSsrDraw).
+        effect_skip_draw = false;
+        ResetBindings(false);
+        scheduler.KickRecording();
+        return;
+    }
+    if (SunAtlasSkipDraw(pipeline, state)) {
+        // bbport: a sun atlas cascade nothing samples this frame (vk_rasterizer_effects.cpp):
+        // as above, only the draw is left out.
+        ResetBindings(false);
+        scheduler.KickRecording();
+        return;
+    }
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -2572,9 +2758,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     };
     // bbport: after a ZPASS dump the draw is measured by an occlusion query around just this
     // vkCmdDraw (inside the open render pass; vk_occlusion.h).
-    const auto query = occlusion ? occlusion->BeginDraw(dc.push_data.scene_size)
-                                 : Occlusion::DrawQuery{};
-    if (query.pool) {
+    auto query = occlusion ? occlusion->BeginDraw(dc.push_data.scene_size)
+                           : Occlusion::DrawQuery{};
+    if (sun_reader.measure_now) {
+        // bbport (r12_atlas_skip_live): a water draw sampling the sun atlas gets an occlusion
+        // query of its own (SunAtlasReaderQuery, vk_rasterizer_effects.cpp).
+        SunAtlasReaderQuery(query.pool, query.index);
     }
     scheduler.RecordCrumb(crumb, [=](vk::CommandBuffer cmdbuf) {
         if (handle) { // null: bound by the command before (BindWhenCompiled)
@@ -2592,6 +2781,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             cmdbuf.endQuery(query.pool, query.index);
         }
     });
+    // bbport (r21_draw-sort): the draw command (a pipeline whose vertex input is dynamic, a query,
+    // the draw) leaves vertex input, vertex buffer and index buffer binds as they are.
+    scheduler.R21NeutralLast();
+    if (R21Counting()) {
+        R21AfterDraw(pipeline, is_indexed); // BB_DRAW_ORDER=1
+    }
+    if (sun_hold.draw_cascade < 4) {
+        SunHoldDrawn(); // bbport (r7_cascades)
+    }
+    BbSections::Scope after_draw_scope{BbSections::AfterDraw};
     // The Froyok pyramid must see the defocused image, so DOF's recombination goes first.
     const auto* epilogue_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     if (epilogue_ps && epilogue_ps->pgm_hash == DofRecombinePixelShaderHash) {
@@ -2604,6 +2803,7 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (spatial_ao->Enabled()) {
         HqAoAfterDraw(pipeline, state);
     }
+    after_draw_scope.End();
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
         FrameCapture::Draw(vs_info.pgm_hash, ps ? ps->pgm_hash : 0, num_indices, num_instances);
@@ -2679,12 +2879,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     dc.motion_draw = false;
     dc.capture_draw = false;
     dc.motion_geometry = 0;
+    if (sun_hold.active) { // r7_cascades
+        SunHoldOther(&pipeline->GetStage(Shader::SwStage::Vertex),
+                     pipeline->GetStages()[u32(Shader::SwStage::Fragment)], true);
+    }
     PrepareRenderState(pipeline);
     NotifyUiDraw(pipeline);
     if (!BindResources(pipeline)) {
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    auto state = BeginRendering(pipeline); // (SunKeepBeforePass may take its clear over)
     if (ProxyTraceOn()) {
         const auto target = cb_descs[0].first ? cb_descs[0].first : db_desc.first;
         FlushProxyReads(dc.push_data.scene_size != 0,
@@ -2746,7 +2950,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
+    if (SunKeepGate()) {
+        SunKeepBeforePass(state, true); // bbport (r14_cascade_keep): never taken over here
+    }
     scheduler.BeginRendering(state);
+    if (sun_keep.atlas_pass) {
+        SunKeepInPass(state); // an indirect draw into the atlas: every quadrant cleared first
+    }
+    // bbport: an indirect draw sampling the sun atlas (vk_rasterizer_effects.cpp).
+    const auto* atlas_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    SunAtlasReader("the indirect draw ps", atlas_ps ? atlas_ps->pgm_hash : 0);
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -2820,6 +3033,59 @@ void Rasterizer::DispatchDirect() {
     DispatchRecord(pipeline);
 }
 
+// bbport (r11_native_compute): cs a040875f is the game's rectangle copy between two images. Its
+// GCN code (33 dwords): x = group x * 8 + thread x, y likewise; image_load_mip of the source (T#
+// in user data 4-11) at (x + cb[0], y + cb[1]); image_store of all four channels to the
+// destination (T# read through the pointer in user data 2-3) at (x + cb[4], y + cb[5]) where
+// x + cb[4] < cb[8] and y + cb[5] < cb[9] (unsigned); cb = the constant buffer whose V# is user
+// data 12-15. The destination is only written. With reduced scene targets it is a proxied image (a
+// proxy r10 made for a render-target copy) whose proxy is dirty, and the storage binding's Transit
+// resolved it to the native size for the dispatch to overwrite it. A direct dispatch whose stores
+// cover every texel of a single-level, single-layer destination (cb[4] = cb[5] = 0, groups * 8 and
+// cb[8], cb[9] at least its size) drops the proxy contents without that resolve
+// (SceneTargets::NativeOverwritten), as the render-target copy HLE does before its whole-image
+// copy: the native image ends with the same bytes, the proxy in the same state (invalid).
+// Indirect dispatches (GPU group counts) keep the resolve. Experiment bit 137438953472: resolved
+// first, as before.
+namespace {
+constexpr u64 R11CopyRectHash = 0xa040875full;
+/// This thread's direct dispatch of cs a040875f while it binds its images: its stores cover
+/// [0, width) x [0, height) of the destination's level 0 when armed.
+struct R11Store {
+    bool armed = false;
+    u32 width = 0, height = 0;
+};
+thread_local R11Store r11_store;
+/// "Scene proxies:" line every 600 dispatches of cs a040875f at the reduced size. Dispatches are
+/// recorded by one thread at a time (the draw recording thread, or the GPU command thread after a
+/// drain).
+struct R11Stats {
+    u32 dispatches = 0, indirect = 0, unreadable = 0, not_armed = 0, proxied = 0, whole = 0,
+        dropped = 0, clean = 0, not_whole = 0;
+    u32 last[6]{}; ///< cb[4], cb[5], cb[8], cb[9], groups x and y of the last direct dispatch
+    u32 last_w = 0, last_h = 0; ///< the last proxied destination's size
+};
+R11Stats r11_stats;
+void R11Report() {
+    auto& s = r11_stats;
+    if (++s.dispatches < 600) {
+        return;
+    }
+    std::printf("Scene proxies: of the last %u dispatches of cs a040875f at the reduced size (r11, "
+                "rectangle copy), %u indirect (resolve kept), %u with unreadable constants, %u not "
+                "storing from 0,0 in 8x8 groups; %u proxied destinations of the others: %u stored "
+                "whole with a dirty proxy, %u of those resolves left out (experiment 137438953472 "
+                "%s), %u without a dirty proxy, %u not covered (more levels or layers, a view of "
+                "another level, or larger than the stores); last: destination offset %u,%u end "
+                "%u,%u, groups %ux%u, destination %ux%u\n",
+                s.dispatches, s.indirect, s.unreadable, s.not_armed, s.proxied, s.whole, s.dropped,
+                BbToggle::Experiment(137438953472ull) ? "set: resolved first" : "clear", s.clean,
+                s.not_whole, s.last[0], s.last[1], s.last[2], s.last[3], s.last[4], s.last[5],
+                s.last_w, s.last_h);
+    s = {};
+}
+} // namespace
+
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     auto& dc = Dc();
     BB_SECTION(DispatchRecord);
@@ -2828,6 +3094,14 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     gbuffer_draw = false;
 
     scheduler.PopPendingOperations();
+    // bbport: lamps apart (vk_point_shadow.h): a compute pass may read or write the light targets
+    // or the depth (as an image, through a buffer over their memory, as a copy done for it), and
+    // only draws are looked at. The batch ends here. (In Bloodborne that is how every frame's
+    // batch ends: a compute pass takes the light targets.)
+    EffectsEndLampBatch();
+    if (sun_hold.active) { // r7_cascades
+        SunHoldOther(&pipeline->GetStage(Shader::SwStage::Compute), nullptr, false);
+    }
 
     const auto& cs_program = CsRegs();
 
@@ -2843,19 +3117,67 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         }
     };
     if (upscaler->Enabled()) {
+        // bbport: engine effects run before the upscaler's trigger (SceneUse; the upscaler
+        // names itself inside OnDispatch).
+        const SceneUseScope effects_use{"engine effects before the upscaler, at dispatch cs",
+                                        cs.pgm_hash};
         EffectsBeforeUpscaler(cs.pgm_hash);
         upscaler->OnDispatch(cs.pgm_hash);
     }
     bool hle;
     {
         BB_SECTION(ShaderHle);
+        // bbport: copy and clear HLEs (SceneUse; Runtime's copy and clear name themselves).
+        const SceneUseScope hle_use{"shader HLE (copy or clear shader), cs", cs.pgm_hash};
         hle = ExecuteShaderHLE(cs, Regs(), cs_program, *this);
     }
     if (hle) {
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    // bbport (r11_native_compute): whether this dispatch of cs a040875f stores every texel of
+    // its destination from 0,0 (R11Store; BindTextures checks the destination's size).
+    const bool r11 = cs.pgm_hash == R11CopyRectHash && scene_targets->Reduced();
+    r11_store = {};
+    if (r11) {
+        const auto cb = cs.FlatUserData().size() >= 16 ? cs.ReadUdSharp<AmdGpu::Buffer>(12)
+                                                       : AmdGpu::Buffer{};
+        const VAddr cb_address = cb.base_address;
+        constexpr u32 cb_bytes = 10 * sizeof(u32);
+        if (cb_address == 0 || cb.GetSize() < cb_bytes ||
+            !memory->IsValidGpuMapping(cb_address, cb_bytes) ||
+            buffer_cache.IsRegionGpuModified(cb_address, cb_bytes)) {
+            ++r11_stats.unreadable;
+        } else {
+            std::array<u32, 10> c{};
+            std::memcpy(c.data(), reinterpret_cast<const void*>(cb_address), cb_bytes);
+            r11_stats.last[0] = c[4];
+            r11_stats.last[1] = c[5];
+            r11_stats.last[2] = c[8];
+            r11_stats.last[3] = c[9];
+            r11_stats.last[4] = cs_program.dim_x;
+            r11_stats.last[5] = cs_program.dim_y;
+            // The code's thread layout: 16 user SGPRs, then the group ids x and y (s16, s17),
+            // x = group x * 8 + thread x (and y): groups of at least 8x8 threads leave no gap.
+            const bool layout = cs_program.settings.num_user_regs == 16 &&
+                                cs_program.IsTgidEnabled(0) && cs_program.IsTgidEnabled(1) &&
+                                cs_program.num_thread_x.full >= 8 &&
+                                cs_program.num_thread_y.full >= 8 && cs_program.dim_z != 0;
+            if (layout && c[4] == 0 && c[5] == 0) {
+                r11_store.armed = true;
+                r11_store.width = u32(std::min<u64>(u64(cs_program.dim_x) * 8, c[8]));
+                r11_store.height = u32(std::min<u64>(u64(cs_program.dim_y) * 8, c[9]));
+            } else {
+                ++r11_stats.not_armed;
+            }
+        }
+    }
+    const bool r11_bound = BindResources(pipeline);
+    r11_store = {};
+    if (r11) {
+        R11Report();
+    }
+    if (!r11_bound) {
         return;
     }
 
@@ -2889,7 +3211,16 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         }
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
+    SunAtlasReader("the dispatch cs", cs.pgm_hash);
     DebugState.IncDispatch();
+    // bbport BB_GPU_PROFILE_SPLIT=1: what is recorded after the dispatch without a label of its
+    // own (barriers, transfers before the next pass or dispatch) gets its own row.
+    if (auto* profiler = GpuProfiler::Get(); profiler && GpuProfiler::SplitMarks()) {
+        profiler->Mark(cs.pgm_hash ^ 0xAF7Eull, [&] {
+            return fmt::format("after dispatch cs {:016x}: unlabelled work until the next label",
+                               cs.pgm_hash);
+        });
+    }
 
     ResetBindings(true);
     scheduler.KickRecording();
@@ -3011,7 +3342,18 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     auto& dc = Dc();
     buffer_cache.NewPacket();
     scheduler.PopPendingOperations();
+    EffectsEndLampBatch(); // bbport: as in DispatchRecord
+    if (sun_hold.active) { // r7_cascades
+        SunHoldOther(&pipeline->GetStage(Shader::SwStage::Compute), nullptr, false);
+    }
     const u32 offset = 0;
+    // bbport (r11_native_compute): an indirect dispatch of cs a040875f keeps the resolve of its
+    // destination (its group counts are GPU data).
+    if (pipeline->GetStage(Shader::SwStage::Compute).pgm_hash == R11CopyRectHash &&
+        scene_targets->Reduced()) {
+        ++r11_stats.indirect;
+        R11Report();
+    }
 
     if (!BindResources(pipeline)) {
         return;
@@ -3025,6 +3367,14 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
     }
 
     scheduler.EndRendering();
+    // bbport BB_GPU_PROFILE: indirect dispatches had no label, so their time was charged to the
+    // label before them (the game's 1x1x1 "dispatch cs a954e79d" writes such arguments).
+    if (auto* profiler = GpuProfiler::Get()) {
+        const u64 indirect_hash = pipeline->GetStage(Shader::SwStage::Compute).pgm_hash;
+        profiler->Mark(indirect_hash ^ 0x1D1E'C700ull, [&] {
+            return fmt::format("dispatch indirect cs {:016x}", indirect_hash);
+        });
+    }
     // bbport: the counts clamped before the game's pipeline and descriptors are bound (the clamp
     // binds its own); the crash report keeps reading the game's counts (CopyArgs).
     static const bool clamp = [] {
@@ -3061,6 +3411,7 @@ void Rasterizer::DispatchIndirectRecord(const ComputePipeline* pipeline, VAddr a
         }
         cmdbuf.dispatchIndirect(dispatch_args, dispatch_offset);
     });
+    SunAtlasReader("the dispatch cs", cs_crumb.pgm_hash);
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -3178,8 +3529,18 @@ void Rasterizer::OcclusionSubmissionStart() {
 
 u64 Rasterizer::Flush() {
     BB_SECTION(Flush);
-    DrainDrawPipe();
-    PublishSignals(); // the recording thread's (it is idle here, or this is it)
+    // bbport (r27_flush-split): timed inside a stage B task, or as its own on stage B
+    const BbSpike::SplitScope r27_split{BbSpike::SplitFlush,
+                                        BbSpike::on && DrawPipe::OnStageB(),
+                                        "Flush outside a task"};
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitDrain};
+        DrainDrawPipe();
+    }
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitPublish};
+        PublishSignals(); // the recording thread's (it is idle here, or this is it)
+    }
     last_flush_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(),
                         std::memory_order_relaxed);
     const u64 current_tick = scheduler.CurrentTick();
@@ -3197,13 +3558,25 @@ void Rasterizer::Finish() {
 
 void Rasterizer::OnSubmit() {
     DrainDrawPipe();
+    // bbport (r27_flush-split): each call timed (BB_SPIKE_TRACE=1, stage B's tasks only)
     if (fault_process_pending) {
         fault_process_pending = false;
+        const BbSpike::SplitScope r27_step{BbSpike::SplitFaultBuffer};
         buffer_cache.ProcessFaultBuffer();
     }
-    texture_cache.ProcessDownloadImages();
-    texture_cache.UpdateKeyPrompts();
-    texture_cache.RunGarbageCollector();
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitDownloads};
+        texture_cache.ProcessDownloadImages();
+    }
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitKeyPrompts};
+        texture_cache.UpdateKeyPrompts();
+    }
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitCollector};
+        texture_cache.RunGarbageCollector();
+    }
+    const BbSpike::SplitScope r27_step{BbSpike::SplitTickFrame};
     runtime.TickFrame();
 }
 
@@ -3299,9 +3672,12 @@ bool Rasterizer::TexturesBindableOnHelper(const Shader::Info& stage,
             image_id = depth_image_id;
             image = &texture_cache.GetImage(image_id);
         }
+        // bbport: a UI replacement made on the UI worker is uploaded by the GPU thread
+        // (TextureCache::UiReplacement).
         if (image->binding.needs_rebind || !texture_cache.IsUpToDate(image_id) ||
             scene_targets->Tracks(image->image_uid) ||
-            (upscaler->Enabled() && upscaler->RedirectsSampled(image_id))) {
+            (upscaler->Enabled() && upscaler->RedirectsSampled(image_id)) ||
+            (image->ui_key && texture_cache.UiReplacementPending(image->ui_key))) {
             return false;
         }
     }
@@ -3481,6 +3857,133 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline, const Prepa
     EmitVertexBuffers();
 }
 
+// bbport (r21_draw-sort): whether this draw's vertex input, vertex buffer and index buffer binds
+// may be left out when equal to those in force (experiment 70368744177664 clear; the vertex input
+// dynamic in every graphics pipeline). What r21_bound holds is forgotten when a command that may
+// have changed it was recorded since (Scheduler::R21Serial), or commands go to another command
+// buffer since (R21Epoch).
+bool Rasterizer::R21Begin(bool dynamic_input) {
+    auto& m = r21_bound;
+    const bool on = dynamic_input && !BbToggle::Experiment(R21DrawSortOffBit);
+    if (!on || m.serial != scheduler.R21Serial() || m.epoch != scheduler.R21Epoch()) {
+        m.input_known = m.buffers_known = m.index_known = false;
+    }
+    return on;
+}
+
+// bbport (r21_draw-sort): after the binds just recorded (`serial`, `epoch`: R21Serial() and
+// R21Epoch() before them). A vertex input, vertex buffer or index buffer bind leaves the other two
+// as they are: R21Serial() is put back.
+void Rasterizer::R21End(bool on, u64 serial, u64 epoch) {
+    auto& m = r21_bound;
+    if (on) {
+        scheduler.R21Restore(serial);
+    }
+    m.serial = scheduler.R21Serial();
+    m.epoch = epoch;
+    if (!on || scheduler.R21Epoch() != epoch) { // off, or the binds went into two command buffers
+        m.input_known = m.buffers_known = m.index_known = false;
+    }
+}
+
+// bbport (r21_draw-sort): a direct draw reached its draw command. Counts what its binds did
+// (r21_outcome) for all draws and sun atlas draws; for the atlas also its pipeline against the
+// atlas draw before it in the same render pass (a pass a cut resumed is the same pass). "Draw
+// order (r21)" every 600 frames; a window holds frames of one experiment setting only.
+// BB_DRAW_ORDER=1 only (R21Counting).
+void Rasterizer::R21AfterDraw(const GraphicsPipeline* pipeline, bool is_indexed) {
+    auto& s = r21_stats;
+    const R21Outcome outcome = std::exchange(r21_outcome, R21Outcome{});
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (frame != s.frame) {
+        s.frame = frame;
+        s.frame_seen_n = 0;
+        if (const bool off = BbToggle::Experiment(R21DrawSortOffBit); off != s.window_off) {
+            // The bit changed: the counts so far are dropped, a new window starts.
+            s.window_off = off;
+            s.frames = 0;
+            s.c = {};
+            s.pass = ~0ull;
+        } else if (++s.frames >= 600) {
+            const double f = double(s.frames);
+            const auto& c = s.c;
+            const auto x = [f](u64 value) { return double(value) / f; };
+            const auto& a = c.atlas.binds;
+            const auto& d = c.all.binds;
+            if (off) {
+                std::printf("Draw order (r21): experiment 70368744177664 set (every bind recorded "
+                            "as before, nothing counted)\n");
+            } else {
+                std::printf(
+                    "Draw order (r21): experiment 70368744177664 clear (equal binds left out); a "
+                    "frame: sun atlas %.1f draws in %.1f passes, pipeline changes %.1f (a pass's "
+                    "first draw counts), fewest with each pass grouped by pipeline %.1f, distinct "
+                    "pipelines %.1f; atlas binds: vertex input left out %.1f, recorded %.1f "
+                    "(another in force %.1f, unknown %.1f), vertex buffers left out %.1f, recorded "
+                    "%.1f (%.1f, %.1f), index buffer left out %.1f, recorded %.1f (%.1f, %.1f), "
+                    "descriptor binds %.1f (each recorded); all %.1f direct draws: vertex input "
+                    "left out %.1f, recorded %.1f (%.1f, %.1f), vertex buffers left out %.1f, "
+                    "recorded %.1f (%.1f, %.1f), index buffer left out %.1f, recorded %.1f (%.1f, "
+                    "%.1f), descriptor binds %.1f\n",
+                    x(c.atlas.draws), x(c.atlas_passes), x(c.atlas_changes),
+                    x(c.atlas_pass_distinct), x(c.atlas_frame_distinct), x(a[0][1]),
+                    x(a[0][2] + a[0][3]), x(a[0][2]), x(a[0][3]), x(a[1][1]),
+                    x(a[1][2] + a[1][3]), x(a[1][2]), x(a[1][3]), x(a[2][1]),
+                    x(a[2][2] + a[2][3]), x(a[2][2]), x(a[2][3]), x(c.atlas.descriptors),
+                    x(c.all.draws), x(d[0][1]), x(d[0][2] + d[0][3]), x(d[0][2]), x(d[0][3]),
+                    x(d[1][1]), x(d[1][2] + d[1][3]), x(d[1][2]), x(d[1][3]), x(d[2][1]),
+                    x(d[2][2] + d[2][3]), x(d[2][2]), x(d[2][3]), x(c.all.descriptors));
+            }
+            s.frames = 0;
+            s.c = {};
+        }
+    }
+    if (s.window_off) {
+        return;
+    }
+    const u64 pass = scheduler.R21FreshPasses();
+    if (pass != s.pass) {
+        s.pass = pass;
+        s.atlas_pass = sun_atlas.address && db_desc.first &&
+                       texture_cache.GetImage(db_desc.first).info.guest_address == sun_atlas.address;
+        s.atlas_last = nullptr;
+        s.pass_seen_n = 0;
+        s.c.atlas_passes += s.atlas_pass ? 1u : 0u;
+    }
+    const bool descriptors = !Dc().set_writes.empty();
+    const auto count = [&](R21Row& row) {
+        ++row.draws;
+        ++row.binds[0][outcome.input];
+        ++row.binds[1][outcome.buffers];
+        ++row.binds[2][is_indexed ? outcome.index : 0u];
+        row.descriptors += descriptors ? 1u : 0u;
+    };
+    count(s.c.all);
+    if (!s.atlas_pass) {
+        return;
+    }
+    count(s.c.atlas);
+    if (pipeline == s.atlas_last) {
+        return; // already in both lists below
+    }
+    s.atlas_last = pipeline;
+    ++s.c.atlas_changes;
+    // Distinct pipelines (a full list counts every later one as new: an upper bound).
+    const auto note = [pipeline](auto& seen, u32& n, u64& distinct) {
+        for (u32 i = 0; i < n; ++i) {
+            if (seen[i] == pipeline) {
+                return;
+            }
+        }
+        if (n < seen.size()) {
+            seen[n++] = pipeline;
+        }
+        ++distinct;
+    };
+    note(s.pass_seen, s.pass_seen_n, s.c.atlas_pass_distinct);
+    note(s.frame_seen, s.frame_seen_n, s.c.atlas_frame_distinct);
+}
+
 void Rasterizer::EmitVertexBuffers() {
     auto& dc = Dc();
     BB_SECTION(EmitVertexBuffers);
@@ -3489,18 +3992,56 @@ void Rasterizer::EmitVertexBuffers() {
     auto& v = dc.vertex_binds;
     const bool dynamic_input = instance.IsVertexInputDynamicState();
     const u32 num_buffers = v.num_buffers;
+    // bbport (r21_draw-sort): a vertex input or vertex buffer bind equal to the one in force is
+    // left out (R21Begin); the binds recorded here leave each other and the index buffer's alone.
+    auto& m = r21_bound;
+    const bool r21 = R21Begin(dynamic_input);
+    const u64 r21_serial = scheduler.R21Serial();
+    const u64 r21_epoch = scheduler.R21Epoch();
+    const bool same_input =
+        r21 && m.input_known &&
+        std::equal(v.bindings.begin(), v.bindings.end(), m.bindings.begin(), m.bindings.end(),
+                   [](const auto& a, const auto& b) {
+                       return !a.pNext && !b.pNext && a.binding == b.binding &&
+                              a.stride == b.stride && a.inputRate == b.inputRate &&
+                              a.divisor == b.divisor;
+                   }) &&
+        std::equal(v.attributes.begin(), v.attributes.end(), m.attributes.begin(),
+                   m.attributes.end(), [](const auto& a, const auto& b) {
+                       return !a.pNext && !b.pNext && a.location == b.location &&
+                              a.binding == b.binding && a.format == b.format &&
+                              a.offset == b.offset;
+                   });
+    const bool same_buffers =
+        r21 && num_buffers != 0 && m.buffers_known && m.num_buffers == num_buffers &&
+        std::equal(v.host_buffers.begin(), v.host_buffers.begin() + num_buffers,
+                   m.buffers.begin(), m.buffers.end()) &&
+        std::equal(v.host_offsets.begin(), v.host_offsets.begin() + num_buffers,
+                   m.offsets.begin(), m.offsets.end());
+    r21_outcome.input = !r21 ? 0 : same_input ? 1 : m.input_known ? 2 : 3;
+    r21_outcome.buffers =
+        !r21 || num_buffers == 0 ? 0 : same_buffers ? 1 : m.buffers_known ? 2 : 3;
+    if (same_input && (num_buffers == 0 || same_buffers)) {
+        return; // r21: nothing to record; r21_bound is still in force
+    }
     scheduler.ReserveRecordData(
         v.bindings.size() * sizeof(v.bindings[0]) + v.attributes.size() * sizeof(v.attributes[0]) +
         num_buffers * (sizeof(vk::Buffer) + 3 * sizeof(vk::DeviceSize)) + 128);
-    if (dynamic_input) {
+    if (dynamic_input && !same_input) {
         scheduler.Record([bindings = scheduler.RecordData(std::span<const vk::VertexInputBindingDescription2EXT>{v.bindings.data(), v.bindings.size()}),
                           attributes = scheduler.RecordData(std::span<const vk::VertexInputAttributeDescription2EXT>{
                               v.attributes.data(), v.attributes.size()})](
                              vk::CommandBuffer cmdbuf) {
             cmdbuf.setVertexInputEXT(bindings, attributes);
         });
+        if (r21) {
+            m.bindings.assign(v.bindings.begin(), v.bindings.end());
+            m.attributes.assign(v.attributes.begin(), v.attributes.end());
+            m.input_known = true;
+        }
     }
-    if (num_buffers == 0) {
+    if (num_buffers == 0 || same_buffers) {
+        R21End(r21, r21_serial, r21_epoch);
         return;
     }
     const auto buffers = scheduler.RecordData(std::span<const vk::Buffer>{v.host_buffers.data(), num_buffers});
@@ -3509,6 +4050,13 @@ void Rasterizer::EmitVertexBuffers() {
         scheduler.Record([num_buffers, buffers, offsets](vk::CommandBuffer cmdbuf) {
             cmdbuf.bindVertexBuffers(0, num_buffers, buffers.data(), offsets.data());
         });
+        if (r21) {
+            m.buffers.assign(v.host_buffers.begin(), v.host_buffers.begin() + num_buffers);
+            m.offsets.assign(v.host_offsets.begin(), v.host_offsets.begin() + num_buffers);
+            m.num_buffers = num_buffers;
+            m.buffers_known = true;
+        }
+        R21End(r21, r21_serial, r21_epoch);
         return;
     }
     const auto sizes = scheduler.RecordData(std::span<const vk::DeviceSize>{v.host_sizes.data(), num_buffers});
@@ -3517,6 +4065,7 @@ void Rasterizer::EmitVertexBuffers() {
         cmdbuf.bindVertexBuffers2(0, num_buffers, buffers.data(), offsets.data(), sizes.data(),
                                   strides.data());
     });
+    R21End(r21, r21_serial, r21_epoch);
 }
 
 void Rasterizer::ResolveVertexBuffers(const GraphicsPipeline* pipeline,
@@ -3776,13 +4325,21 @@ std::pair<const VideoCore::Buffer*, u64> Rasterizer::BindVertexRange(u64 key, VA
         ++range_binds;
         return BindByObject(RangeBindKey, base, size);
     }
-    if (vertex_memo_mode != BbEngine::Batch::Off && size != 0 && buffer_cache.MemoAllowed()) {
+    if (VertexMemoOn() && size != 0 && buffer_cache.MemoAllowed()) {
         return BindVertexMemo(base, size);
     }
     return buffer_cache.ObtainBuffer(base, u32(size), false);
 }
 
+bool Rasterizer::VertexMemoOn() const {
+    // bbport: experiment 2097152 is the old default (memo off).
+    return vertex_memo_mode != BbEngine::Batch::Off && !BbToggle::Experiment(2097152);
+}
+
 std::pair<const VideoCore::Buffer*, u64> Rasterizer::BindVertexMemo(VAddr base, u64 size) {
+    // bbport: what a miss runs first in EnsureResident (pending unmaps, demotions, late writes),
+    // before the generation check: a hit must not return a binding such work would replace.
+    buffer_cache.MaintainPacket();
     auto& memo = vertex_memo[((base ^ (size << 40)) * 0x9E3779B97F4A7C15ull) >> 52];
     const bool hit = memo.base == base && memo.size == size &&
                      memo.generation == buffer_cache.StructureGeneration() &&
@@ -3841,10 +4398,27 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
 void Rasterizer::EmitIndexBuffer() {
     auto& dc = Dc();
+    // bbport (r21_draw-sort): an index buffer bind equal to the one in force is left out.
+    auto& m = r21_bound;
+    const bool r21 = R21Begin(instance.IsVertexInputDynamicState());
+    const u64 r21_serial = scheduler.R21Serial();
+    const u64 r21_epoch = scheduler.R21Epoch();
+    const IndexBind& bind = dc.index_bind;
+    const bool same = r21 && m.index_known && m.index.handle == bind.handle &&
+                      m.index.offset == bind.offset && m.index.type == bind.type;
+    r21_outcome.index = !r21 ? 0 : same ? 1 : m.index_known ? 2 : 3;
+    if (same) {
+        return; // r21: r21_bound is still in force
+    }
     scheduler.Record([handle = dc.index_bind.handle, offset = dc.index_bind.offset,
                       type = dc.index_bind.type](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindIndexBuffer(handle, offset, type);
     });
+    if (r21) {
+        m.index = bind;
+        m.index_known = true;
+    }
+    R21End(r21, r21_serial, r21_epoch);
 }
 
 void Rasterizer::ResolveIndexBuffer(u32 index_offset) {
@@ -4019,8 +4593,21 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
     // Image clear must be valid
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
-    if (image1.info.guest_size != buf1.GetSize() || image1.info.num_bits != buf1_bpp ||
-        image1.info.props.is_depth) {
+    // bbport: a clear of the first level of a mip chain only. Each frame the game clears level 0
+    // (0x2000000 bytes: 1920x1080 padded to 2048x2048 at 8 bytes) of an R16G16B16A16 chain of 11
+    // levels (44.7 MB) with this shader. That is not the image's size, so the shader ran over
+    // buffers: the write marked the image GPU-dirty and its next binding detiled all of it and
+    // uploaded every level from the buffer cache (BB_GPU_PROFILE "image upload R16G16B16A16Sfloat
+    // 1920x1080", ~0.38 ms a frame, plus the detile before it). Here level 0 is cleared as an
+    // image. The other levels keep what the GPU last wrote there, as the console's memory does
+    // (the upload put the buffer cache's older bytes there). Experiment mask 262144: the shader.
+    const bool level0_only =
+        image1.info.guest_size != buf1.GetSize() && !BbToggle::Experiment(262144) &&
+        image1.info.resources.levels > 1 && image1.info.resources.layers == 1 &&
+        !image1.info.props.is_volume && image1.info.mips_layout[0].offset == 0 &&
+        image1.info.mips_layout[0].size == buf1.GetSize();
+    if ((image1.info.guest_size != buf1.GetSize() && !level0_only) ||
+        image1.info.num_bits != buf1_bpp || image1.info.props.is_depth) {
         return false;
     }
 
@@ -4035,9 +4622,28 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
                 .level = 0,
                 .layer = 0,
             },
-        .extent = image1.info.resources,
+        .extent = level0_only ? VideoCore::SubresourceExtent{1, 1} : image1.info.resources,
     };
-    runtime.ClearImage(&image1, range, clear);
+    // BB_GPU_PROFILE: the level-0 clear has its own label ("image clear HLE level 0 <format>
+    // WxH"); the segment it interrupts continues after it (as for uploads).
+    std::optional<Runtime::TransferMark> clear_mark;
+    if (level0_only) {
+        // A pending upload first: the levels this clear leaves must keep it.
+        texture_cache.UpdateImage(image1_id);
+        clear_mark.emplace(runtime, "image clear HLE level 0", texture_cache.GetImage(image1_id));
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            const auto& cleared = texture_cache.GetImage(image1_id).info;
+            std::printf("Image clear HLE: level 0 of image %#llx %s %ux%u (%u levels, %#x bytes) "
+                        "cleared as an image, %#x bytes (experiment mask 262144: the shader)\n",
+                        static_cast<unsigned long long>(cleared.guest_address),
+                        vk::to_string(cleared.pixel_format).c_str(), cleared.size.width,
+                        cleared.size.height, cleared.resources.levels, cleared.guest_size,
+                        static_cast<u32>(buf1.GetSize()));
+        }
+    }
+    runtime.ClearImage(&texture_cache.GetImage(image1_id), range, clear);
     return true;
 }
 
@@ -4045,6 +4651,16 @@ namespace {
 // bbport: BB_TRACE_SHADER=hash[,hash...] (diagnostics) — the buffers those shaders bind: address,
 // size, written or read, where the data is (in place: the game's memory over PCIe on a discrete
 // GPU; VRAM; partly), how often; printed every 5 s.
+// Whether BB_TRACE_SHADER is set (its hash list below is then non-empty): without it, callers
+// skip the in-place lookups they would only pass as arguments.
+bool TraceShaderOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_TRACE_SHADER");
+        return env != nullptr && env[0] != 0;
+    }();
+    return on;
+}
+
 void TraceShaderBinding(const Shader::Info& stage, VAddr addr, u64 size, bool written,
                         bool in_place, bool any_in_place) {
     static const std::vector<u64> hashes = [] {
@@ -4231,16 +4847,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     }
                 }
                 const bool memo_read = !view_key && !desc.is_written && !desc.is_formatted &&
-                                       vertex_memo_mode != BbEngine::Batch::Off && size != 0 &&
+                                       VertexMemoOn() && size != 0 &&
                                        buffer_cache.MemoAllowed();
                 const auto [buffer, offset] =
                     view_key    ? BindByObject(view_key, vsharp.base_address, size)
                     : memo_read ? BindVertexMemo(vsharp.base_address, size)
                                 : buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
                                                             desc.is_formatted);
-                TraceShaderBinding(stage, vsharp.base_address, size, desc.is_written,
-                                   buffer_cache.IsInPlace(vsharp.base_address, size),
-                                   buffer_cache.IsAnyInPlace(vsharp.base_address, size));
+                // bbport: IsInPlace/IsAnyInPlace are only the trace's arguments; without
+                // BB_TRACE_SHADER they are not looked up. Experiment bit 32768 = old behaviour
+                // (looked up on every binding).
+                if (BbToggle::Experiment(32768) || TraceShaderOn()) {
+                    TraceShaderBinding(stage, vsharp.base_address, size, desc.is_written,
+                                       buffer_cache.IsInPlace(vsharp.base_address, size),
+                                       buffer_cache.IsAnyInPlace(vsharp.base_address, size));
+                }
                 // bbport: a uniform buffer's offset follows the uniform alignment (64 on NVIDIA);
                 // the shader adds the remainder (push data, at most 255 bytes).
                 const u64 offset_aligned =
@@ -4278,6 +4899,33 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     const VideoCore::InvalidateReason reason{"storage buffer"};
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    // bbport (BB_FRAME_STATS diagnostics): the shaders that write a large image
+                    // through a buffer, which makes its next binding detile and upload all of it.
+                    // Each shader and address is looked up once, 64 at most.
+                    if (size >= (4ull << 20) && BbStats::enabled) {
+                        static std::mutex said_mutex;
+                        static std::vector<std::pair<u64, VAddr>> said;
+                        const std::pair<u64, VAddr> said_key{stage.pgm_hash, vsharp.base_address};
+                        std::scoped_lock said_lock{said_mutex};
+                        if (said.size() < 64 && std::ranges::find(said, said_key) == said.end()) {
+                            said.push_back(said_key);
+                            if (const auto written_id = texture_cache.FindImageFromRange(
+                                    vsharp.base_address, size, false)) {
+                                const auto& written = texture_cache.GetImage(written_id).info;
+                                std::printf(
+                                    "Image written through a buffer: shader %016llx writes "
+                                    "%#llx+%#llx over image %s %ux%u, %u levels, %#x bytes "
+                                    "(level 0 %#x): uploaded whole at its next binding\n",
+                                    static_cast<unsigned long long>(stage.pgm_hash),
+                                    static_cast<unsigned long long>(vsharp.base_address),
+                                    static_cast<unsigned long long>(size),
+                                    vk::to_string(written.pixel_format).c_str(),
+                                    written.size.width, written.size.height,
+                                    written.resources.levels, written.guest_size,
+                                    written.mips_layout[0].size);
+                            }
+                        }
+                    }
                 }
                 dc.needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -4505,6 +5153,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     }
     const u32 first_image_idx = dc.image_infos.size();
     TextureSet* set_slot = nullptr;
+    // bbport: this stage is the consumer of a resolve its native reads cause (SceneUse; after
+    // the return of stages without images, which are most vertex stages).
+    const SceneUseScope scene_use{stage.sw_stage == Shader::SwStage::Compute
+                                      ? "dispatch textures, cs"
+                                      : "draw textures, stage",
+                                  stage.pgm_hash};
     // bbport: a stage the draw-preparation workers did not reach reads its T#s and their
     // description hashes here, as PrepareResources does, so it can take the memoized texture set
     // too: in heavy scenes ~40% of draws were unprepared and their full lookups were two thirds of
@@ -4580,6 +5234,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     const bool sample_proxies = !BbToggle::Disabled(BbToggle::SampleSceneProxies) &&
                                 !on_helper && scene_targets->Reduced() &&
                                 !PointReadsNative(stage, prepared);
+    const SceneUseScope point_use{
+        !on_helper && scene_targets->Reduced() && !sample_proxies &&
+                !BbToggle::Disabled(BbToggle::SampleSceneProxies)
+            ? (stage.sw_stage == Shader::SwStage::Compute
+                   ? "dispatch textures, point sampler in the stage (PointReadsNative), cs"
+                   : "draw textures, point sampler in the stage (PointReadsNative), stage")
+            : SceneUseScope::current.what,
+        stage.pgm_hash};
     // bbport BB_SECTIONS: a full lookup over 0.3 ms is reported (the first 30) with the time of
     // each texture in both passes, to see which image and which step costs it.
     const bool time_slow = BbSections::Enabled() && BbSections::recording_thread &&
@@ -4796,6 +5458,38 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                     set_ok = false;
                     ui_replaced = true;
                     continue;
+                }
+                // bbport: the replacement is still being made (UiReplacement): the game's own art
+                // now, and no remembered set, so a later bind takes the replacement.
+                if (texture_cache.UiReplacementPending(image.ui_key)) {
+                    set_ok = false;
+                }
+            }
+            // bbport (r11_native_compute): the destination of a whole-image store of cs a040875f
+            // (R11Store), bound once, drops its proxy contents without the resolve the store
+            // would overwrite; the Transit below then finds nothing dirty to resolve.
+            if (r11_store.armed && is_storage && !on_helper && image.scene_proxy &&
+                !binding.force_general && !binding.is_target &&
+                stage.sw_stage == Shader::SwStage::Compute && stage.pgm_hash == R11CopyRectHash) {
+                ++r11_stats.proxied;
+                r11_stats.last_w = image.info.size.width;
+                r11_stats.last_h = image.info.size.height;
+                const bool whole =
+                    image.info.resources == VideoCore::SubresourceExtent{1, 1} &&
+                    image.info.size.depth <= 1 && !image.info.props.is_depth &&
+                    desc.view_info.range.base.level == 0 && desc.view_info.range.base.layer == 0 &&
+                    image.info.size.width <= r11_store.width &&
+                    image.info.size.height <= r11_store.height;
+                if (!whole) {
+                    ++r11_stats.not_whole;
+                } else if (!scene_targets->NativeStale(image)) {
+                    ++r11_stats.clean;
+                } else {
+                    ++r11_stats.whole;
+                    if (!BbToggle::Experiment(137438953472ull)) {
+                        scene_targets->NativeOverwritten(image);
+                        ++r11_stats.dropped;
+                    }
                 }
             }
             // The image is either bound as storage in a separate descriptor or bound as render
@@ -5217,6 +5911,14 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
     }
     check_scope.End();
     ++texture_set_hits;
+    // bbport: a hit keeps proxied images native only for point-sampler stages (point_native,
+    // else the set is refused above): the resolves of its Transits are theirs (SceneUse).
+    const SceneUseScope set_use{
+        point_native ? (stage.sw_stage == Shader::SwStage::Compute
+                            ? "dispatch textures (texture set), point sampler in the stage (PointReadsNative), cs"
+                            : "draw textures (texture set), point sampler in the stage (PointReadsNative), stage")
+                     : SceneUseScope::current.what,
+        SceneUseScope::current.hash};
     slot = nullptr;
     BB_SECTION(TexSetApply);
     for (u32 i = 0; i < count; ++i) {
@@ -5477,6 +6179,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
     // target size: reduced proxies warp the projection shared by SSAO and both GTAO variants.
     const auto* fragment = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const bool ao_pass = fragment && fragment->pgm_hash == EffectShaders::SsaoHash;
+    // bbport: this pass is the consumer of the resolves and fills of its targets (SceneUse).
+    const SceneUseScope pass_use{
+        fragment ? "pass ps" : "pass without ps, vs",
+        fragment ? fragment->pgm_hash : pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash};
     bool reduced = scene_started && upscaler->RasterScaling() && key.num_samples == 1 && !ao_pass;
     // BB_SCENE_DEBUG=<file>: once the file exists, why the passes of one frame keep the
     // native size (see NoteFrameStart).
@@ -5564,6 +6270,10 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
 
+        // bbport: names a clear in the resolve/fill table: a resolve before it is overwritten.
+        const SceneUseScope clear_use{is_clear ? "pass, color attachment cleared by the pass, ps"
+                                               : SceneUseScope::current.what,
+                                      SceneUseScope::current.hash};
         if (reduced) {
             // The native image is resolved lazily when a shader/copy actually reads it.
         } else if (image->binding.is_bound) {
@@ -5600,7 +6310,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         attachment.is_clear = is_clear;
 
         if (reduced) {
-            const auto target = scene_targets->Attachment(image_id, desc.view_info);
+            // bbport: the pass clears all of the proxy (load op clear; a reduced pass has the
+            // proxy's size): a proxy a native write dropped needs no fill first. Not for a
+            // display buffer, which the upscaler may redirect (SceneTargets::Attachment).
+            const bool cleared =
+                is_clear && !FrameCapture::IsDisplayBuffer(image->info.guest_address);
+            const auto target = scene_targets->Attachment(image_id, desc.view_info, cleared);
             attachment.image_view = target.view;
             attachment.image_layout = target.layout;
         }
@@ -5645,6 +6360,15 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
+        // bbport: a depth attachment in a read-only layout that neither the pass nor a clear
+        // writes leaves the native image as the proxy's resolve made it: the proxy stays current
+        // (SceneUse::keep_proxy; experiment bit 1073741824: dropped as before).
+        const SceneUseScope depth_use{is_depth_clear || is_stencil_clear
+                                          ? "pass depth, cleared by the pass, ps/vs"
+                                          : "pass depth, ps/vs",
+                                      SceneUseScope::current.hash,
+                                      !desc.view_info.is_storage && !stencil_write &&
+                                          !is_depth_clear && !is_stencil_clear};
         if (!reduced) dc.needs_barrier |= runtime.Transit(&image, new_layout,
                                          vk::PipelineStageFlagBits2::eEarlyFragmentTests |
                                              vk::PipelineStageFlagBits2::eLateFragmentTests,
@@ -5674,7 +6398,12 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
         }
 
         if (reduced) {
-            const auto target = scene_targets->Attachment(image_id, desc.view_info);
+            // bbport: as for colour: the pass clears depth and, if the image has it, stencil.
+            const bool cleared =
+                attachment.has_depth && attachment.depth_clear &&
+                (!(image.aspect_mask & vk::ImageAspectFlagBits::eStencil) ||
+                 (attachment.has_stencil && attachment.stencil_clear));
+            const auto target = scene_targets->Attachment(image_id, desc.view_info, cleared);
             attachment.image_view = target.view;
             attachment.image_layout = target.layout;
         }
@@ -5746,6 +6475,30 @@ RenderState Rasterizer::BeginRenderingFull(const GraphicsPipeline* pipeline) {
 
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
+    }
+    // bbport (r11_depth_clear): a native pass whose load ops clear a proxied depth image (the
+    // game's depth clear, vs 89cda9e4, comes before the G-buffer pass starts the scene, so it is
+    // never reduced) clears the proxy too when all of the image ends as the clear values, so the
+    // next reduced pass needs no fill (SceneTargets::NativeDepthClear; experiment bit
+    // 68719476736: filled as before).
+    if (!reduced && db_desc.first && !color_redirected && !depth_redirected &&
+        (state.depth_stencil_attachment.depth_clear ||
+         state.depth_stencil_attachment.stencil_clear)) {
+        const auto& clear_depth = texture_cache.GetImage(db_desc.first);
+        const auto& clear_range = db_desc.second.view_info.range;
+        const auto& ds = state.depth_stencil_attachment;
+        // As UpdateDepthStencilState: a DB clear turns the draws' depth writes off.
+        const bool depth_written = regs.depth_control.depth_enable &&
+                                   regs.depth_control.depth_write_enable &&
+                                   !regs.depth_render_control.depth_clear_enable;
+        const bool whole = clear_range.base.layer == 0 && clear_range.base.level == 0 &&
+                           state.width >= clear_depth.info.size.width &&
+                           state.height >= clear_depth.info.size.height;
+        scene_targets->NativeDepthClear(
+            clear_depth, ds.has_depth && ds.depth_clear, depth_written,
+            ds.has_stencil && ds.stencil_clear,
+            vk::ClearDepthStencilValue{std::bit_cast<float>(ds.clear_value[0]), ds.clear_value[1]},
+            whole, scheduler.WillRunLoadOps(state));
     }
 
     if (reduced) {
@@ -6085,6 +6838,8 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
     BB_SECTION(UpdateDynamicState);
+    // bbport (r21_draw-sort): dynamic state commands leave every bind as it is.
+    Scheduler::R21Neutral r21_neutral{scheduler};
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
@@ -6446,7 +7201,11 @@ namespace Vulkan {
 
 void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& state) {
     auto* profiler = GpuProfiler::Get();
-    if (!profiler || !scheduler.WillBeginRendering(state)) {
+    if (!profiler) {
+        return;
+    }
+    if (!scheduler.WillBeginRendering(state)) {
+        profiler->NoteDraw(); // one more draw in the open pass
         return;
     }
     const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -6477,6 +7236,7 @@ void Rasterizer::MarkPass(const GraphicsPipeline* pipeline, const RenderState& s
                                          : std::string{"-"},
                            vs.pgm_hash, ps ? ps->pgm_hash : 0);
     });
+    profiler->NoteDraw();
 }
 
 void Rasterizer::ReportUboStats() {
@@ -6486,7 +7246,7 @@ void Rasterizer::ReportUboStats() {
         return;
     }
     const auto& s = ubo_stats;
-    std::printf("Uniform buffers per frame: %.0f from the constant ring, %.0f in place, %.0f in "
+    BbReport::Printf("Uniform buffers per frame: %.0f from the constant ring, %.0f in place, %.0f in "
                 "place with an offset, %.0f copied by the CPU and %.0f by the GPU to an aligned "
                 "place\n",
                 s.ring / double(frames), s.in_place / double(frames), s.offset / double(frames),
