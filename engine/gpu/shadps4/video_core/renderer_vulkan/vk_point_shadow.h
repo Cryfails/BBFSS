@@ -237,6 +237,26 @@ private:
     // the last ray traced pass had it (-1: none yet), for the log line at each change.
     LampShadowTune tune;
     int repair_state = -1;
+    // bbport (r42_lamp-soft): the area lamp. The lamps of the pass that takes the history, told
+    // apart and followed from frame to frame (TrackLamps; track_index: the lamp of each record
+    // of that pass, track_frame: the frame it last ran on); whether the history written on this
+    // frame, and the one the frame before left, hold ratios averaged over the frames
+    // (HistoryBlend) and not LANTERN_RT_LAMP_REUSE's; what the lamps were on the last pass that
+    // could take the history (-1: none yet), for the log line at each change; frames since the
+    // line that says where the lamps are (the first one comes two seconds in).
+    LampTrack track;
+    std::vector<s8> track_index;
+    u32 track_frame = ~0u;
+    bool history_blend = false, history_blended = false;
+    int soft_state = -1;
+    u32 soft_lines = 0;       ///< lines that said what the lamps are (at most SoftLines)
+    u32 blend_unread = 0;     ///< frames in a row on which the averaging pass could not read its history
+    // Since the last line that says where the lamps are: frames the pass averaged on, those of
+    // them on which it read its history, camera cuts it did not read across, and ray traced
+    // lamp passes that ran beside it with point lamps.
+    u32 line_blend = 0, line_read = 0, line_cuts = 0, line_beside = 0;
+    u32 lamp_line_frames = 480;
+    void TrackLamps(u32 end, bool blend, bool read, bool line);
     bool tried = false;
     bool failed = false;
     // bbport (r32_lamp-half, r37_menu-options): the lamps-apart pass traces pixel (2x, 2y) of

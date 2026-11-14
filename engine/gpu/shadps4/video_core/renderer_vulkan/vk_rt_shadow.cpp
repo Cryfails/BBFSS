@@ -21,6 +21,7 @@
 #include "video_core/host_shaders/rt_shadow_filter_r25_comp.h" // bbport (r25_rt-sun-trace)
 #include "video_core/host_shaders/rt_shadow_half_comp.h"       // bbport (r25_rt-sun-trace)
 #include "video_core/host_shaders/rt_unproject_comp.h"
+#include "video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r42_lamp-soft)
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -87,6 +88,17 @@ constexpr u8 LampMask = 4;
 // LampRepairOffBit set: all stay in lamp rays (the counting goes on).
 constexpr u32 LampStaleSkips = 2;
 constexpr u32 LampFreshBuilds = 3;
+// bbport (r42_lamp-soft): BB_LAMP_SHADOW_STALE, read once. 1: such copies are left out of lamp
+// rays, as r41 did. 0, the default: they stay in, as before r41. Nothing here shows that a
+// starved copy is never the only caster a lamp ray would find where it stands (the live copy
+// "beside it" is another draw of the same mesh, not known to be the same object), and in the
+// game the band the rule was aimed at stayed with 18 copies left out. The counting goes on
+// either way, and the 600-frame line names the copies.
+bool LampStaleOut() {
+    static const bool out =
+        ReadLampShadowTune([](const char* name) -> const char* { return std::getenv(name); }).stale;
+    return out;
+}
 
 // bbport: experiment mask 256 (a diagnostic): copies of a mesh drawn more than once in a pass
 // ("shared" entries, see PrepareDraw) are built once and then not refreshed, which shows what
@@ -1674,7 +1686,8 @@ bool RtShadow::PrepareScene() {
     u64 triangles = 0;
     // Entries kept stale over budget since the scene was last skipped have no BLAS yet.
     u32 built = 0;
-    const bool lamp_repair = !BbToggle::Experiment(LampRepairOffBit); // bbport (r41_lamp-shadows)
+    // bbport (r41_lamp-shadows, r42_lamp-soft): with BB_LAMP_SHADOW_STALE=1 only
+    const bool lamp_repair = LampStaleOut() && !BbToggle::Experiment(LampRepairOffBit);
     for (u32 i = 0; i < count; ++i) {
         // bbport (r14_cascade_rt): a held entry, or a held one drawn only by the camera pass while
         // its cascades are not drawn, keeps casting the sun's shadow (rt_shadow.comp's ray mask 1).
@@ -2278,7 +2291,11 @@ void RtShadow::OnFrameEnd() {
         // bbport (r41_lamp-shadows): moving copies left out of lamp rays for their old pose
         // (Entry::lamp_out), and the oldest moving copy's BLAS in frames.
         u64 shared_no_lamp = 0, shared_oldest = 0;
-        const bool lamp_repair = !BbToggle::Experiment(LampRepairOffBit);
+        const bool lamp_repair = LampStaleOut() && !BbToggle::Experiment(LampRepairOffBit);
+        // bbport (r42_lamp-soft): the moving copies starved of rebuilds (Entry::lamp_out is kept
+        // whatever BB_LAMP_SHADOW_STALE says), and the four of them with the most triangles.
+        u64 shared_starved = 0;
+        std::array<const Entry*, 4> starved{};
         std::unordered_set<u64> shared_meshes;
         for (const auto& item : entries) {
             const Entry* e = item.second.get();
@@ -2298,12 +2315,25 @@ void RtShadow::OnFrameEnd() {
             if (e->dynamic) { // bbport (r41_lamp-shadows)
                 shared_oldest = std::max(shared_oldest, frame - e->built_frame);
                 shared_no_lamp += lamp_repair && e->lamp_out ? 1 : 0;
+                if (e->lamp_out) { // bbport (r42_lamp-soft)
+                    ++shared_starved;
+                    const Entry* held = e;
+                    for (const Entry*& slot : starved) {
+                        if (!slot || held->triangles > slot->triangles) {
+                            std::swap(slot, held);
+                        }
+                        if (!held) {
+                            break;
+                        }
+                    }
+                }
             }
         }
         std::printf("Ray tracing: %.0f triangles refit a frame; shared copies drawn on the last "
                     "frame: %llu of %zu meshes, %llu triangles, %llu moving, %llu with a palette, "
                     "%llu in the camera pass, %llu (%llu triangles) rebuilt on it; rebuilt budget "
-                    "%u; %llu left out of lamp rays (oldest %llu frames)\n",
+                    "%u; %llu left out of lamp rays (oldest %llu frames); %llu moving copies "
+                    "starved of rebuilds, %s (BB_LAMP_SHADOW_STALE=%d)%s",
                     double(stats.refit_triangles) / f, static_cast<unsigned long long>(shared),
                     shared_meshes.size(), static_cast<unsigned long long>(shared_triangles),
                     static_cast<unsigned long long>(shared_moving),
@@ -2312,7 +2342,21 @@ void RtShadow::OnFrameEnd() {
                     static_cast<unsigned long long>(shared_rebuilt),
                     static_cast<unsigned long long>(shared_rebuilt_triangles), RebuiltBudget(),
                     static_cast<unsigned long long>(shared_no_lamp),
-                    static_cast<unsigned long long>(shared_oldest));
+                    static_cast<unsigned long long>(shared_oldest),
+                    static_cast<unsigned long long>(shared_starved),
+                    lamp_repair ? "left out of lamp rays" : "kept in lamp rays",
+                    LampStaleOut() ? 1 : 0, starved[0] ? ", the largest:" : "");
+        // bbport (r42_lamp-soft): which they are
+        for (const Entry* e : starved) {
+            if (!e) {
+                break;
+            }
+            std::printf(" mesh %016llx, %u triangles, %s, built %llu frames ago;",
+                        static_cast<unsigned long long>(e->mesh), e->triangles,
+                        (e->mask & CameraMask) != 0 ? "in the camera pass" : "not in the camera pass",
+                        static_cast<unsigned long long>(frame - e->built_frame));
+        }
+        std::printf("\n");
         stats = {};
     }
     // bbport (r17_rt-upkeep): one line every 600 frames

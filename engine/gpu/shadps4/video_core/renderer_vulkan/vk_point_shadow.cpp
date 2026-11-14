@@ -56,7 +56,11 @@ constexpr u32 DataWords = 256 * 1024;
 constexpr u32 UpdateWords = 16 * 1024;
 constexpr u32 WholeImageBatches = 4;
 constexpr u32 SnapshotCell = 16;
-constexpr u32 HistoryWords = 2 + 12 + 16; // what Flush adds for the first ray traced pass of a frame
+// What Flush adds for the first ray traced pass of a frame. bbport (r42_lamp-soft): four more
+// words (LampHistoryTail): the most frames a texel of the history may hold, how far a moving
+// lamp's shadows may trail, how near a moving lamp a caster is taken to move with it, and how
+// far the history may lie from the answers around a pixel (point_shadow_ray.comp HISTORY_BLEND).
+constexpr u32 HistoryWords = 2 + 12 + 16 + LampHistoryTailWords;
 constexpr u32 ModeApart = 1;              // point_shadow_ray.comp MODE_APART
 // bbport (r41_lamp-shadows): MODE_REPAIR, and where the place of the pass's tuning words
 // (LampTuneWords) goes in the same word: bits 8-31. The shader only tests single bits below
@@ -72,6 +76,15 @@ constexpr u64 HalfOffBit = 72057594037927936ull;
 constexpr u32 TileWords = 8;
 constexpr auto HistoryFormat = vk::Format::eR16G16B16A16Sfloat;
 constexpr u32 HistoryRead = 1, HistoryWrite = 2;
+// bbport (r42_lamp-soft): the history holds the shadow ratio averaged over the frames
+// (point_shadow_ray.comp HISTORY_BLEND); frames between two lines that say where the lamps are.
+constexpr u32 HistoryBlend = 4;
+constexpr u32 LampLineFrames = 600;
+// A pass that averages shows bare single rays on a frame on which it cannot read what the frame
+// before left (the first frame, a new size, a cut). After this many such frames in a row its
+// lamps are points until it can (Flush).
+constexpr u32 UnreadMost = 8;
+constexpr u32 SoftLines = 24; // the most "Ray traced lamps (r42): <state>" lines
 
 std::array<float, 16> Invert(const u32* words, bool& ok) {
     std::array<double, 32> t{};
@@ -196,16 +209,20 @@ bool PointShadow::Ready() {
                             sizeof(Push), POINT_SHADOW_RAY_COMP, "Ray traced lamps", true)) {
         std::printf("Ray traced lamps: off - the pass could not be made\n");
     }
-    if (ray_pipeline) { // bbport (r41_lamp-shadows)
-        std::printf("Ray traced lamps (r41): weights %s (wrap %.2f, floor %.2f, inverse-square "
-                    "%s), lamp radius %.2f m with %u rim rays from share %.2f for casters within "
-                    "%.2f of the way from the lamp, clearance %.2f m, bias %.3f m, self skip %.2f "
-                    "m, view %u (BB_LAMP_SHADOW_*); experiment 35184372088832 set = the path "
-                    "before\n",
+    if (ray_pipeline) { // bbport (r41_lamp-shadows, r42_lamp-soft)
+        std::printf("Ray traced lamps (r42): weights %s (wrap %.2f, floor %.2f, inverse-square "
+                    "%s); area lamp radius %.2f m, one ray a lamp a frame, history %.2f (up to "
+                    "%.1f frames), kept within %.1f deviations of the answers around a pixel, "
+                    "reject %.2f, trail %.2f m, follows moving lamps %s (what blocks one within "
+                    "%.2f m of it moves with it); starved moving copies %s lamp rays; clearance "
+                    "%.2f m, bias %.3f m, self skip %.2f m, view %u (BB_LAMP_SHADOW_*); "
+                    "experiment 35184372088832 set = the path before r41\n",
                     tune.weights ? "as the game's falloff and facing" : "as before", tune.wrap,
                     tune.facing_floor,
                     BbSettings::Get().startup_local_inverse_square ? "on" : "off", tune.radius_m,
-                    tune.rim, tune.share, tune.near_part, tune.clearance_m, tune.bias_m,
+                    tune.history, LampHistoryFrames(tune), tune.around, tune.reject, tune.trail_m,
+                    tune.follow ? "yes" : "no", tune.carry_m,
+                    tune.stale ? "are left out of" : "stay in", tune.clearance_m, tune.bias_m,
                     tune.self_m, tune.view);
     }
     // bbport (r37_menu-options): the half-resolution build is made by HalfReady, when first wanted.
@@ -245,7 +262,10 @@ bool PointShadow::HalfReady() {
             half_made = true;
         }
     }
-    std::printf("Ray traced lamps (r32): half resolution (%s) %s\n",
+    // bbport (r42_lamp-soft): and what it does to the area lamp (see Flush)
+    std::printf("Ray traced lamps (r32): half resolution (%s) %s; at half resolution the lamps "
+                "stay points without a history (r42: BB_LAMP_SHADOW_SOFT and "
+                "BB_LAMP_SHADOW_HISTORY act on the full-resolution pass only)\n",
                 half_env == 1 ? "BB_LAMP_SHADOW_HALF=1" : "graphics_lamp_shadow_half=1",
                 half_made ? "ready" : "ignored - no pipeline");
     return half_made;
@@ -360,6 +380,10 @@ bool PointShadow::EnsureImage(OwnImage& own, u32 width, u32 height, vk::Format f
 }
 
 void PointShadow::OnFrameEnd() {
+    // bbport (r42_lamp-soft): this frame's lamps are "the frame before" of the next one when
+    // its pass left an averaged history
+    track.End(history_written && history_blend && track_frame == frame_index);
+    ++lamp_line_frames;
     ++frame_index;
     if (history_written) {
         history_index ^= 1u;
@@ -367,6 +391,7 @@ void PointShadow::OnFrameEnd() {
         last_proj = pending_proj;
         last_valid = pending_valid;
         history_fresh = true;
+        history_blended = history_blend; // bbport (r42_lamp-soft)
     } else {
         history_fresh = false;
     }
@@ -906,6 +931,95 @@ bool PointShadow::CopySnapshot(const std::array<VideoCore::ImageId, 2>& ids,
     return true;
 }
 
+// bbport (r42_lamp-soft): the lamps of the pass that takes the history: its records are
+// data[ConstantWords, end), LightWords each. blend: the pass averages over the frames; then
+// every record gets, in words 12 to 14 (the pass reads words 0 to 6 of a record and nothing
+// else; the game's records hold other things there, so they are always written), how far its
+// lamp moved since the frame before, in that frame's view space, or zero
+// (BB_LAMP_SHADOW_FOLLOW=0): the pass looks a pixel's history up where its strongest lamp's
+// motion puts it (LampTrack); and in word 15 that distance in metres, which shortens the
+// history under a moving lamp (BB_LAMP_SHADOW_TRAIL). read: there is a frame before to follow
+// the lamps from. line: the log line that says where the lamps are.
+void PointShadow::TrackLamps(u32 end, bool blend, bool read, bool line) {
+    const auto camera = camera_motion.PassMatrices();
+    const u32 records = end > ConstantWords ? (end - ConstantWords) / LightWords : 0u;
+    track.Begin(camera.valid ? camera.inv_view.data() : nullptr);
+    track_index.resize(records);
+    // The lamps near the camera first: with more than LampTrack::Most lamps in a pass those
+    // are the ones told apart and followed (a hand torch is always near). untold: records of
+    // lamps beyond that number.
+    u32 untold = 0;
+    for (const bool close_first : {true, false}) {
+        for (u32 k = 0; k < records; ++k) {
+            const u32* record = data.data() + ConstantWords + k * LightWords;
+            if ((LampTrack::Away(record) <= LampTrack::Near) != close_first) {
+                continue;
+            }
+            track_index[k] = s8(track.Add(record));
+            untold += track_index[k] < 0 && std::bit_cast<float>(record[3]) > 0.0f ? 1 : 0;
+        }
+    }
+    if (blend) {
+        if (read) {
+            track.Follow();
+        }
+        for (u32 k = 0; k < records; ++k) {
+            std::array<float, 3> shift{};
+            if (read && tune.follow) {
+                shift = track.Shift(track_index[k], last_view.data());
+            }
+            const float step = read ? track.Step(track_index[k]) : 0.0f;
+            u32* record = data.data() + ConstantWords + k * LightWords;
+            for (u32 c = 0; c < 3; ++c) {
+                record[12 + c] = std::bit_cast<u32>(shift[c]);
+            }
+            record[15] = std::bit_cast<u32>(step);
+        }
+    }
+    if (!line) {
+        return;
+    }
+    lamp_line_frames = 0;
+    u32 close = 0;
+    for (u32 i = 0; i < track.Count(); ++i) {
+        close += track.Lamp(i).away <= LampTrack::Near ? 1 : 0;
+    }
+    // (A lamp is told apart by its place, reach and colour: two lights of one torch at one
+    // place are two lamps here. The steps: a flame whose lamp wobbles shows a mean step while
+    // its carrier stands.)
+    std::printf("Ray traced lamps (r42): %u lamp records in the pass, %u lamps told apart (the "
+                "near ones first, %u at most; %u records are of more lamps than that), %u "
+                "within %.0f m of the camera; since the last such line the pass averaged on %u "
+                "frames and read its history on %u of them (%u camera cuts), and %u ray traced "
+                "lamp passes beside it had point lamps; the brightest near lamps (%s, reach, "
+                "luminance, distance to the camera, records, moved since the frame before; "
+                "then over the frames it was followed since the last line: how many, its mean "
+                "step and its largest):",
+                records, track.Count(), LampTrack::Most, untold, close, double(LampTrack::Near),
+                line_blend, line_read, line_cuts, line_beside,
+                camera.valid ? "world x y z" : "view space x y z, the camera is not known");
+    for (const int index : track.Strongest()) {
+        if (index < 0) {
+            break;
+        }
+        const LampSeen& lamp = track.Lamp(u32(index));
+        std::printf(" (%.2f %.2f %.2f) %.1f m, %.2f, %.2f m, %u", lamp.world[0], lamp.world[1],
+                    lamp.world[2], lamp.radius, lamp.luma, lamp.away, lamp.records);
+        if (lamp.followed) {
+            std::printf(", %.3f m (%u frames, mean %.4f m, most %.4f m);",
+                        std::sqrt(lamp.moved[0] * lamp.moved[0] + lamp.moved[1] * lamp.moved[1] +
+                                  lamp.moved[2] * lamp.moved[2]),
+                        lamp.steps, lamp.steps ? lamp.step_sum / float(lamp.steps) : 0.0f,
+                        lamp.step_most);
+        } else {
+            std::printf(", not followed;");
+        }
+    }
+    std::printf("\n");
+    line_blend = line_read = line_cuts = line_beside = 0;
+    track.ClearSteps();
+}
+
 void PointShadow::Flush(bool animate_noise) {
     if (tiles.empty()) {
         return;
@@ -970,6 +1084,53 @@ void PointShadow::Flush(bool animate_noise) {
     // every pass): the tuning words go after the tile table, their place into the mode word.
     bool repair = false;
     u32 tune_at = 0;
+    // One pass a frame can use the history. While the lamps are drawn apart that is their pass, the
+    // one that covers the screen: a small batch before it (a lamp quad that could not go apart)
+    // does not take it.
+    const bool history_ours = batch_apart || (apart_draws == 0 && !apart_last_frame);
+    // bbport (r37_menu-options): BB_LAMP_SHADOW_HALF when set, else graphics_lamp_shadow_half.
+    const bool half_on = half_env >= 0 ? half_env == 1
+                                       : BbSettings::Get().graphics_lamp_shadow_half.load(
+                                             std::memory_order_relaxed);
+    // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 and experiment 72057594037927936 clear: the
+    // lamps-apart pass in two halves (point_shadow_ray_half_comp), with the block answers in an
+    // image of half the size.
+    // bbport (r37_menu-options): half_on, above: BB_LAMP_SHADOW_HALF when set, else
+    // graphics_lamp_shadow_half.
+    // bbport (r42_lamp-soft): decided here, before the pass's tuning, which depends on it (it
+    // was decided after: a pass that asked for the half resolution and did not get it, no
+    // pipeline or no room, ran at full resolution with point lamps and said "half resolution").
+    bool use_half = use_rays && batch_apart && half_on && HalfReady();
+    if (use_half && BbToggle::Experiment(HalfOffBit)) {
+        use_half = false;
+        ++half_line_full;
+    }
+    if (use_half) {
+        const u32 half_width = (width + 1) / 2, half_height = (height + 1) / 2;
+        if (half_answers.width != half_width || half_answers.height != half_height) {
+            if (!EffectPass::HasRoom(instance, 8ull * half_width * half_height)) {
+                use_half = false;
+            } else if (EnsureImage(half_answers, half_width, half_height, HistoryFormat,
+                                   "Ray traced lamp half answers")) {
+                half_laid_out = false;
+            }
+        }
+    }
+    // bbport (r42_lamp-soft): the tuning of this pass. The area lamp shows one ray's answer a
+    // frame, which is noise until the history has averaged it, so only the pass that takes the
+    // history has it (with the lamps drawn apart, the default, that is the one pass that covers
+    // the screen); another ray traced pass of the frame (`beside`) keeps the point lamp. So does
+    // the pass at half resolution (r32): one area-lamp ray for a 2x2 block would show as noise
+    // in blocks, and its second half traces at full resolution wherever the block answers
+    // around a pixel differ, which in a penumbra of single rays is everywhere: the saving would
+    // be gone. BB_LAMP_SHADOW_HISTORY=0 asks for the bare rays: then every full-resolution
+    // pass has the area lamp.
+    const bool history_pass = use_rays && !history_written && history_ours;
+    const bool beside = use_rays && !use_half && !history_pass && LampHistoryFrames(tune) > 0.0f;
+    LampShadowTune pass_tune = tune;
+    if (use_half || beside) {
+        pass_tune.radius_m = 0.0f;
+    }
     if (use_rays) {
         table = u32(data.size());
         for (const Tile& tile : batch) {
@@ -979,15 +1140,18 @@ void PointShadow::Flush(bool animate_noise) {
                                      u32(tile.rect[3]), tile.first_light, tile.count, 0u, 0u});
         }
         repair = !BbToggle::Experiment(LampRepairOffBit);
+        line_beside += repair && beside ? 1 : 0; // bbport (r42_lamp-soft): for the lamp line
         if (repair) {
             const auto& settings = BbSettings::Get();
             // The scene the rays cross is in this camera's view space (RtShadow::PrepareScene,
-            // true above, wrote its instances with this matrix): the world's axes for the rim
-            // pattern, so that it does not turn with the camera.
+            // true above, wrote its instances with this matrix): the world's axes for the
+            // lamp's disc, so that it does not turn with the camera. bbport (r42_lamp-soft): and
+            // the frame counter, which moves the point of the disc a ray goes to.
             const auto camera = camera_motion.PassMatrices();
-            const auto tune_words = LampTuneWords(tune, settings.startup_local_inverse_square,
+            const auto tune_words = LampTuneWords(pass_tune, settings.startup_local_inverse_square,
                                                   settings.startup_local_light_core,
-                                                  camera.valid ? camera.view.data() : nullptr);
+                                                  camera.valid ? camera.view.data() : nullptr,
+                                                  frame_index);
             tune_at = u32(data.size());
             data.insert(data.end(), tune_words.begin(), tune_words.end());
         }
@@ -1019,38 +1183,111 @@ void PointShadow::Flush(bool animate_noise) {
     u32 history_at = 0;
     bool clear_history = false;
     std::array<bool, 2> lay_out{};
-    // One pass a frame can use the history. While the lamps are drawn apart that is their pass, the
-    // one that covers the screen: a small batch before it (a lamp quad that could not go apart)
-    // does not take it.
-    const bool history_ours = batch_apart || (apart_draws == 0 && !apart_last_frame);
+    // (history_ours: above.)
     if (use_rays && !history_written && history_ours) {
         const auto camera = camera_motion.PassMatrices();
         bool ok = false;
         const auto proj = Invert(data.data(), ok);
-        u32 flags = lamp_reuse ? HistoryWrite : 0u;
-        if (lamp_reuse && history_fresh && last_valid && camera.valid && ok) {
-            flags |= HistoryRead;
+        // bbport (r42_lamp-soft): the area lamp's history: the pass averages each pixel's shadow
+        // ratio over the frames (HistoryBlend; `keep`: the most frames a texel may hold), which
+        // takes the place of LANTERN_RT_LAMP_REUSE's history for as long as it is on. A history
+        // of the other kind (the experiment bit or a setting changed) is not read.
+        const float keep = repair ? LampHistoryFrames(pass_tune) : 0.0f;
+        const bool blend = keep > 0.0f;
+        const bool kept = blend || lamp_reuse;
+        u32 flags = blend ? HistoryWrite | HistoryBlend : lamp_reuse ? HistoryWrite : 0u;
+        constexpr std::array<float, 12> Identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+        auto reproject = Identity;
+        if (kept && history_fresh && history_blended == blend && last_valid && camera.valid &&
+            ok) {
+            reproject = Multiply(last_view, camera.inv_view);
+            // bbport (r42_lamp-soft): an averaged history is not read across a cut (the camera
+            // jumped: what of the frame before passes the depth test there does so by chance)
+            if (blend && LampCameraCut(reproject.data())) {
+                reproject = Identity;
+                ++line_cuts;
+            } else {
+                flags |= HistoryRead;
+            }
+        }
+        // bbport (r42_lamp-soft): a pass that averages and cannot read its history shows bare
+        // single rays. For a frame or two that passes (the first frame, a new size, a cut); when
+        // it goes on (no camera for the pass, or two ray passes of different size in every
+        // frame, which make the history anew every time) the lamps are points until it can
+        // read again: the tuning words are in `data` already, so their radius is zeroed there
+        // (the pass still writes its history, so the first frame that can read it does).
+        bool unread = false;
+        if (blend) {
+            blend_unread = (flags & HistoryRead) ? 0u : std::min(blend_unread + 1u, UnreadMost + 1u);
+            ++line_blend;
+            line_read += (flags & HistoryRead) ? 1 : 0;
+            unread = blend_unread > UnreadMost;
+            if (unread) {
+                data[tune_at + 2] = std::bit_cast<u32>(0.0f);
+            }
+        }
+        // What the lamps are on this pass, logged at each change (SoftLines times at most).
+        const int soft = !repair                                ? 0
+                         : use_half                             ? 1
+                         : !(tune.radius_m > 0.0f)              ? 2
+                         : !(LampHistoryFrames(tune) > 0.0f)    ? 3
+                         : unread                               ? 5
+                                                                : 4;
+        if (soft != std::exchange(soft_state, soft) && soft_lines < SoftLines) {
+            static constexpr std::array<const char*, 6> What{
+                "point lamps: experiment 35184372088832 is set, the pass of before r41",
+                "point lamps without a history: the pass runs at half resolution "
+                "(graphics_lamp_shadow_half or BB_LAMP_SHADOW_HALF), which keeps them",
+                "point lamps without a history (BB_LAMP_SHADOW_SOFT=0)",
+                "area lamps, one ray a lamp a frame, not averaged (BB_LAMP_SHADOW_HISTORY=0)",
+                "area lamps, one ray a lamp a frame, averaged over the frames in the pass's "
+                "history",
+                "point lamps for now: the pass could not read its history for 8 frames (no "
+                "camera for the pass, or the history is made anew every frame)",
+            };
+            ++soft_lines;
+            std::printf("Ray traced lamps (r42): %s%s\n", What[std::size_t(soft)],
+                        soft_lines == SoftLines ? " (the last time this is logged)" : "");
+        }
+        // (Before the lamps' records are written to: a batch without room for the block is
+        // dropped as it was.)
+        if (data.size() + HistoryWords > DataWords) {
+            data.clear();
+            return;
+        }
+        // The lamps of this pass, once a frame: followed for the history, and for the log line.
+        // A pass that averages and comes after the frame's TrackLamps (the history was made
+        // anew for it) has its lamps standing: words 12 to 15 of its records must not stay
+        // what the game left there.
+        if (const bool line = lamp_line_frames >= LampLineFrames; blend || line) {
+            if (track_frame != frame_index) {
+                track_frame = frame_index;
+                TrackLamps(table, blend, (flags & HistoryRead) != 0, line);
+            } else if (blend) {
+                for (u32 at = ConstantWords; at + LightWords <= table; at += LightWords) {
+                    std::fill_n(data.begin() + at + 12, 4, 0u);
+                }
+            }
         }
         history_at = u32(data.size());
         data.push_back(flags);
         data.push_back(frame_index);
-        constexpr std::array<float, 12> Identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-        const auto reproject = (flags & HistoryRead) ? Multiply(last_view, camera.inv_view) : Identity;
         for (const float v : reproject) {
             data.push_back(std::bit_cast<u32>(v));
         }
         for (const float v : last_proj) {
             data.push_back(std::bit_cast<u32>(v));
         }
-        if (data.size() > DataWords) {
-            data.clear();
-            return;
-        }
+        // bbport (r42_lamp-soft): words 30 to 33 (the first: 0 unless the pass averages)
+        auto tail = LampHistoryTail(pass_tune);
+        tail[0] = std::bit_cast<u32>(keep);
+        data.insert(data.end(), tail.begin(), tail.end());
         pending_view = camera.view;
         pending_proj = proj;
         pending_valid = camera.valid && ok;
-        history_written = lamp_reuse;
-        clear_history = lamp_reuse;
+        history_written = kept;
+        history_blend = blend;
+        clear_history = kept;
     }
     if (use_rays) {
         lay_out = {!history_laid_out[0], !history_laid_out[1]};
@@ -1107,29 +1344,7 @@ void PointShadow::Flush(bool animate_noise) {
         runtime.FlushBarriers();
     }
 
-    // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 and experiment 72057594037927936 clear: the
-    // lamps-apart pass in two halves (point_shadow_ray_half_comp), with the block answers in an
-    // image of half the size.
-    // bbport (r37_menu-options): BB_LAMP_SHADOW_HALF when set, else graphics_lamp_shadow_half.
-    const bool half_on = half_env >= 0 ? half_env == 1
-                                       : BbSettings::Get().graphics_lamp_shadow_half.load(
-                                             std::memory_order_relaxed);
-    bool use_half = use_rays && batch_apart && half_on && HalfReady();
-    if (use_half && BbToggle::Experiment(HalfOffBit)) {
-        use_half = false;
-        ++half_line_full;
-    }
-    if (use_half) {
-        const u32 half_width = (width + 1) / 2, half_height = (height + 1) / 2;
-        if (half_answers.width != half_width || half_answers.height != half_height) {
-            if (!EffectPass::HasRoom(instance, 8ull * half_width * half_height)) {
-                use_half = false;
-            } else if (EnsureImage(half_answers, half_width, half_height, HistoryFormat,
-                                   "Ray traced lamp half answers")) {
-                half_laid_out = false;
-            }
-        }
-    }
+    // bbport (r32_lamp-half): the half resolution (use_half: decided above, r42_lamp-soft)
     const bool half_lay_out = use_half && !std::exchange(half_laid_out, true);
     const bool half_count = use_half && (half_passes++ & 7u) == 0;
     const bool half_clear = use_half && !std::exchange(half_cleared, true);

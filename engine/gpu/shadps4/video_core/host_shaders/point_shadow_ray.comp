@@ -59,25 +59,40 @@ vec4 row(uint i) { return vec4(word(i), word(i + 1u), word(i + 2u), word(i + 3u)
 // LampTuneWords). Clear (experiment 35184372088832 set, or a caller that knows nothing of it):
 // the values below stay as they are here, which is the pass of before: the old weights, a point
 // lamp, LAMP_CLEARANCE, the ray's start where it was, no view.
+// bbport (r42_lamp-soft): the lamp is an area light. A flame is not a point: a point lamp
+// magnifies a torch stick, an arm or a weapon handle next to the flame into a long hard band,
+// and r41's answer (rays to the lamp's rim, one free ray = lit) could not tell a stick from a
+// body: a radius that removed the stick's band ate the body's shadow. Now every traced lamp
+// gets one ray a frame to a point of its disc (radius t_radius, facing the surface), the point
+// taken from a sequence that covers the disc evenly over the frames (samplePoint), and the
+// pixel's shadow ratio is averaged over the frames in the history image (HISTORY_BLEND). A thin
+// caster near the lamp then covers a small part of the disc from every place: a faint wide
+// smear. A body covers all of it in its core and less towards its rim: a penumbra that widens
+// with the distance behind the caster. No more rays than a point lamp casts. t_radius 0: the
+// point lamp, the same ray every frame, no history (BB_LAMP_SHADOW_SOFT=0; and always in the
+// half-resolution build, whose block answers must agree to be shared).
 const uint MODE_REPAIR = 16u;
 bool new_w = false;             // weights follow the game's falloff and the surface's facing
 bool inv_sq = false;            // the game's lamps use the inverse-square curve
-uint t_rim = 0u;                // rays to the rim of a strong lamp whose centre is blocked
 uint t_view = 0u;               // debug view (BB_LAMP_SHADOW_VIEW)
 float t_clear = LAMP_CLEARANCE; // blind sphere at the lamp, m
-float t_radius = 0.0;           // the lamp's radius, m
-float t_share = 2.0;            // least share of the pixel's weight for rim rays
+float t_radius = 0.0;           // the lamp's radius, m; 0: a point
+uint t_frame = 0u;              // the frame counter (the sample points' sequence)
 float t_self = 0.0;             // grazing self skip, m
 float t_wrap = 0.0;             // N.L tolerance of the weights; 1: no N.L
 float t_core2 = 0.0;            // the inverse-square curve's core, squared
 float t_gain = 1.0;             // brightness of the view
 float t_floor = 0.0;            // least facing factor of the weights
-float t_near = 1.0;             // rim rays for a caster this near the lamp (share of the way)
-// Two axes of the world, in view space (this pass works in view space): the rim pattern is laid
-// out against them, so it stays put in the world when the camera turns.
+float t_reject = 0.0;           // the history is dropped where the last frames differ this much
+// Two axes of the world, in view space (this pass works in view space): the lamp's disc is laid
+// out against them.
 vec3 t_axis_a = vec3(1.0, 0.0, 0.0);
 vec3 t_axis_b = vec3(0.0, 1.0, 0.0);
 uint rays_cast = 0u;            // rays this invocation cast (view 3)
+// bbport (r42_lamp-soft): of the ray cast last, if it was blocked: from its start to the hit and
+// from the hit on to its target, m (ray_left below 0: it was free, or not cast).
+float ray_went = 0.0;
+float ray_left = -1.0;
 
 // Called once a workgroup has a tile (an empty one reads nothing).
 void loadTune() {
@@ -88,19 +103,21 @@ void loadTune() {
     const uint f = data.d[at];
     new_w = (f & 1u) != 0u;
     inv_sq = (f & 2u) != 0u;
-    t_rim = (f >> 4u) & 7u;
-    t_view = (f >> 8u) & 3u;
+    t_view = (f >> 8u) & 7u;
     t_clear = word(at + 1u);
     t_radius = word(at + 2u);
-    t_share = word(at + 3u);
+    t_frame = data.d[at + 3u];
     t_self = word(at + 4u);
     t_wrap = word(at + 5u);
     t_core2 = word(at + 6u);
     t_gain = word(at + 7u);
     t_floor = word(at + 8u);
-    t_near = word(at + 9u);
+    t_reject = word(at + 9u);
     t_axis_a = vec3(word(at + 10u), word(at + 11u), word(at + 12u));
     t_axis_b = vec3(word(at + 13u), word(at + 14u), word(at + 15u));
+#ifdef HALF
+    t_radius = 0.0; // bbport (r42_lamp-soft): the half-resolution build keeps the point lamp
+#endif
 }
 
 // The views' colour for a count: 0 blue, 1 green, 2 yellow, 3 or more red.
@@ -165,7 +182,7 @@ vec3 surfaceNormal(vec2 uv, vec3 P) {
 }
 
 // bbport (r41_lamp-shadows): one ray from `origin` towards `target` (the lamp's centre or a
-// point of its rim), blind within t_clear of the target. Below 0: free. Else blocked: how far
+// point of its disc), blind within t_clear of the target. Below 0: free. Else blocked: how far
 // along the way to the target the hit lies, 0 to 1 (a hit, not always the nearest: the ray stops
 // at its first). (Before: visibility(), 1 free and 0 blocked, with LAMP_CLEARANCE; with the
 // repair off t_clear is that constant and the query is the same.)
@@ -173,6 +190,7 @@ float ray(vec3 origin, float reach, vec3 target) {
     const vec3 ray_to = target - origin;
     const float ray_len = length(ray_to);
     const float tmax = ray_len - t_clear;
+    ray_left = -1.0;
     if (!(tmax > reach)) {
         return -1.0;
     }
@@ -188,91 +206,65 @@ float ray(vec3 origin, float reach, vec3 target) {
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
         return -1.0;
     }
-    return rayQueryGetIntersectionTEXT(query, true) / ray_len;
+    ray_went = rayQueryGetIntersectionTEXT(query, true);
+    ray_left = ray_len - ray_went;
+    return ray_went / ray_len;
 }
 
-// bbport (r41_lamp-shadows): whether the lamp at L lights the surface at P: 1 or 0, nothing
-// between (no noise, nothing to filter, and the half-resolution build's block answers keep
-// agreeing). The ray to the lamp's centre is cast here, in straight code as before; the rays to
-// its rim are cast later, in one loop for the pixel (rimLight): a ray query inside a loop that
-// every lamp goes through made the whole pass slower, also with the repair off.
+// bbport (r42_lamp-soft): a point of the unit square for this pixel and frame. Over the frames
+// a pixel walks the R2 sequence (steps of 1/1.3247 and 1/1.3247^2 of the square, in 32-bit
+// fixed point so that it never loses its place): any run of frames covers the square evenly,
+// which is what lets nine or so frames stand for the whole disc. Each pixel starts from a place
+// of its own (interleaved gradient noise in each direction), so neighbours hold different
+// points and what noise is left has no pattern the eye or the upscaler could follow.
+vec2 samplePoint(ivec2 p, uint frame) {
+    const vec2 q = vec2(p);
+    const vec2 start = vec2(fract(52.9829189 * fract(dot(q, vec2(0.06711056, 0.00583715)))),
+                            fract(52.9829189 * fract(dot(q.yx + vec2(19.0, 73.0), vec2(0.06711056, 0.00583715)))));
+    const uvec2 walked = frame * uvec2(3242174889u, 2447445414u);
+    return fract(start + vec2(walked >> 8u) * (1.0 / 16777216.0));
+}
+
+// bbport (r41_lamp-shadows, r42_lamp-soft): whether the lamp at L lights the surface at P, by
+// one ray: 1 or 0.
 //  - Grazing self skip: the ray starts reach off the surface along a normal worked out from
 //    depth, and at a flat angle it stays close to the surface it left for a long way: layered
 //    cloth and hair cards shadowed themselves in polygon-shaped patches. The start is lifted
 //    along the normal by t_self * (1 - N.L)^2 more. (Lifted, not "hits count from further along
 //    the ray": that would also pass a thin wall or prop standing next to the pixel.)
-//  - wide: the lamp is a disc of radius t_radius facing the surface, not a point. Where the ray
-//    to its centre is blocked, up to t_rim rays go to its rim, and one free ray means lit. A
-//    caster thinner than about 2 * t_radius * (1 - q) then casts nothing, q being its distance
-//    from the lamp over the receiver's: a point lamp magnified a torch stick, a weapon handle or
-//    the torch head next to the flame into a long hard band across the ground. A wide caster
-//    keeps its shadow, with each edge moved in by up to t_radius * (1 - q) / q on the receiver
-//    (between half of that and all of it, by the edge's angle to the three rim points).
-//  - t_near: all of that only where the caster is near the lamp, which is where a point lamp
-//    magnifies it: the radius is whole up to q = t_near / 2 and falls to nothing at q = t_near
-//    (q from the centre ray's hit). A caster further from the lamp keeps the point lamp's shadow
-//    and costs no rim ray. 1: everywhere.
-//  - The rim points are laid out against two axes of the world (t_axis_a, a horizontal one, and
-//    t_axis_b, up), not of the view: against the view's they turned with the camera and so did
-//    the eroded edges. Where the ray runs within 26 degrees of the first axis the second takes
-//    over; that seam is fixed in the world.
-// wide is asked only for a lamp that holds a share of the pixel's weight (w), so the extra rays
-// go where a strong lamp is blocked by something near it; at most MAX_RIM_LAMPS lamps a pixel.
-const uint MAX_RIM_LAMPS = 4u;
-vec3 rim_from[MAX_RIM_LAMPS];    // the ray's start
-vec3 rim_l[MAX_RIM_LAMPS];       // the lamp's centre
-float rim_radius[MAX_RIM_LAMPS]; // the lamp's radius for this caster
-float rim_w[MAX_RIM_LAMPS];      // the lamp's weight
-uint rim_n = 0u;
-
-float lampVisibility(vec3 P, vec3 n, vec3 origin, float reach, vec3 L, float w, bool wide) {
+//  - The lamp is a disc of radius t_radius that faces the surface, and the ray goes to the point
+//    of it that xi names (uniform over the disc's area). The disc is laid out against two axes
+//    of the world (t_axis_a, a horizontal one, and t_axis_b, up; where the ray runs within 26
+//    degrees of the first the second takes over). t_radius 0: the ray goes to L.
+//  - No point of the disc lies lower over the surface's own plane than the lamp's centre does
+//    (or than the ray's start, where the centre is higher than that): a lamp that sits closer
+//    to a floor, a table or a wall than its radius (a candle) would have part of its disc under
+//    that surface, and the surface would shadow itself there (a lamp 5 cm over bare ground lost
+//    a tenth of its light with a radius of 0.1 m, a quarter at 2 cm). Such a point is lifted
+//    along the normal. A lamp higher than its radius over the plane is not touched, and a lamp
+//    behind the surface keeps the part of its disc that looks over the edge (the soft rim of
+//    the lit side of a body).
+float lampVisibility(vec3 P, vec3 n, vec3 origin, float reach, vec3 L, vec2 xi) {
     vec3 from = origin;
     if (t_self > 0.0 && n != vec3(0.0)) {
         const float g = 1.0 - clamp(dot(n, normalize(L - P)), 0.0, 1.0);
         from += n * (t_self * g * g);
     }
-    const float hit = ray(from, reach, L);
-    if (hit < 0.0) {
-        return 1.0;
-    }
-    if (wide && rim_n < MAX_RIM_LAMPS) {
-        float radius = t_radius;
-        if (t_near < 1.0) {
-            radius *= clamp(2.0 - 2.0 * (1.0 - hit) / t_near, 0.0, 1.0);
-        }
-        if (radius > 0.0) {
-            rim_from[rim_n] = from;
-            rim_l[rim_n] = L;
-            rim_radius[rim_n] = radius;
-            rim_w[rim_n] = w;
-            ++rim_n;
-        }
-    }
-    return 0.0;
-}
-
-// bbport (r41_lamp-shadows): the weight of the lamps lampVisibility noted (centre blocked by
-// something near the lamp) that a ray to their rim reaches after all.
-float rimLight(float reach) {
-    float lit = 0.0;
-    for (uint j = 0u; j < rim_n; ++j) {
-        const vec3 dir = normalize(rim_l[j] - rim_from[j]);
+    vec3 target = L;
+    if (t_radius > 0.0) {
+        const vec3 dir = normalize(L - from);
         const vec3 across = cross(dir, abs(dot(dir, t_axis_a)) < 0.9 ? t_axis_a : t_axis_b);
         const float len2 = dot(across, across);
-        if (!(len2 > 1e-6)) {
-            continue;
-        }
-        const vec3 u = across * inversesqrt(len2);
-        const vec3 v = cross(dir, u);
-        for (uint i = 0u; i < t_rim; ++i) {
-            const float a = 6.2831853 * (float(i) + 0.25) / float(t_rim);
-            if (ray(rim_from[j], reach, rim_l[j] + rim_radius[j] * (cos(a) * u + sin(a) * v)) < 0.0) {
-                lit += rim_w[j];
-                break;
-            }
+        if (len2 > 1e-6) {
+            const vec3 u = across * inversesqrt(len2);
+            const vec3 v = cross(dir, u);
+            const float a = 6.2831853 * xi.y;
+            target += (t_radius * sqrt(xi.x)) * (cos(a) * u + sin(a) * v);
+            // (n zero: no normal, nothing is lifted)
+            target += n * max(min(reach, dot(n, L - P)) - dot(n, target - P), 0.0);
         }
     }
-    return lit;
+    return ray(from, reach, target) < 0.0 ? 1.0 : 0.0;
 }
 
 bool inside(uint tile, ivec2 lo, ivec2 hi) {
@@ -284,10 +276,94 @@ bool inside(uint tile, ivec2 lo, ivec2 hi) {
 const uint MODE_APART = 1u;
 const uint HISTORY_READ = 1u;
 const uint HISTORY_WRITE = 2u;
+// bbport (r42_lamp-soft): the history averages the shadow ratio over the frames (texel: the
+// ratio, view depth, frames it holds, the mean of the last few frames) in place of LANTERN_RT_
+// LAMP_REUSE's "copy what a settled block held" (the ratio, view depth, settled frames, 1).
+// Word 30 of the history block: the most frames a texel may hold; word 31: how far a moving
+// lamp's shadows may trail, m; word 32: what blocks a moving lamp within this distance of it is
+// taken to move with it, m; word 33: how many deviations of the answers around a pixel its
+// history may lie from their mean (0: any). With it, words 12 to 14 of every lamp record: how
+// far the lamp moved since the frame before, in that frame's view space (LampTrack::Shift;
+// zero: it stands, or the pass does not follow lamps), and word 15: that distance, m
+// (LampTrack::Step; very large: the lamp was not there the frame before).
+const uint HISTORY_BLEND = 4u;
+const float FAST_KEEP = 0.6; // the last frame's share in the mean of the last few frames
+// The reject sets in at this share of t_reject. One ray that disagrees with the history moves
+// the mean of the last few frames by 1 - FAST_KEEP = 0.4 at most, and must not drop the history
+// (in a penumbra every other ray disagrees): lamp_shadow_tune.h keeps t_reject at 0.45 or more.
+const float REJECT_FROM = 0.9;
+// The history against this frame's answers around the pixel (see main): the variance a pixel's
+// answers are taken to have at the least (over the answers counted; 0.25 is a coin's), and how
+// far the history may lie outside before it is given up (from, wholly).
+const float AROUND_FLOOR = 0.05;
+const float AROUND_FROM = 0.05;
+const float AROUND_ALL = 0.3;
 const float STABLE_FRAMES = 3.0;
 const float STABLE_CHANGE = 0.05;
 
+// bbport (r42_lamp-soft): what the averaging history (HISTORY_BLEND) of the frame before holds
+// for the surface at P: its shadow ratio, the frames in it (times the part of it that was
+// found) and the mean of its last few frames. False: nothing (the place was off the screen, or
+// held another surface).
+//  - The place: where the surface was in the view of the frame before, and from there back by
+//    `moved`, the motion of the pixel's strongest lamp: a torch's shadows of what is carried
+//    with it (its carrier, on the ground and on the carrier itself) move as the torch does, so
+//    that is where the frame before holds them. Zero for a lamp that stands.
+//  - The four texels around that place, each only if it held this surface (by its depth),
+//    weighted as a bilinear lookup and made whole again: an average carried over many frames
+//    must not snap to whole pixels while the camera moves, and must not take in a neighbour's
+//    history across a depth edge. (A still camera lands on its own texel: nothing is blurred.)
+// main() calls it after its rays: called before them, what it finds had to be kept across the
+// ray queries, and the pass measured slower for it even where nothing is averaged.
+bool blendHistory(vec3 P, uint history_at, vec3 moved, out float ratio, out float frames, out float fast) {
+    const vec4 v = vec4(P, 1.0);
+    const vec3 p = vec3(dot(row(history_at + 2u), v), dot(row(history_at + 6u), v), dot(row(history_at + 10u), v)) - moved;
+    const vec4 clip = vec4(dot(row(history_at + 14u), vec4(p, 1.0)), dot(row(history_at + 18u), vec4(p, 1.0)),
+                           dot(row(history_at + 22u), vec4(p, 1.0)), dot(row(history_at + 26u), vec4(p, 1.0)));
+    if (!(clip.w > 1e-4)) {
+        return false;
+    }
+    const vec2 ndc = clip.xy / clip.w;
+    const vec2 was = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+    if (any(lessThan(was, vec2(0.0))) || any(greaterThanEqual(was, size))) {
+        return false;
+    }
+    const vec2 centre = was - 0.5;
+    const ivec2 h0 = ivec2(floor(centre));
+    const vec2 part = centre - vec2(h0);
+    vec3 sum = vec3(0.0);
+    float found = 0.0;
+    for (int k = 0; k < 4; ++k) {
+        const ivec2 o = ivec2(k & 1, k >> 1);
+        const float w = (o.x == 0 ? 1.0 - part.x : part.x) * (o.y == 0 ? 1.0 - part.y : part.y);
+        const ivec2 q = h0 + o;
+        if (w > 0.004 && all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, ivec2(size)))) {
+            const vec4 h = imageLoad(history_prev, q);
+            if (h.g > 0.0 && abs(h.g - p.z) < 0.03 * p.z + 0.02) {
+                sum += w * h.rba;
+                found += w;
+            }
+        }
+    }
+    if (!(found > 0.01)) {
+        return false;
+    }
+    ratio = sum.x / found;
+    frames = sum.y;
+    fast = sum.z / found;
+    return true;
+}
+
 shared uint group_trace;
+#ifndef HALF
+// bbport (r42_lamp-soft): averaging (HISTORY_BLEND), what each pixel of the workgroup found on
+// this frame: its answer (the shadow ratio its rays gave; below 0: the pass does not shadow the
+// pixel), and what blocked the ray to its strongest lamp if that lamp moves: -1 nothing (or the
+// lamp stands), -2 something near the lamp (within word 32 of it), else how far the hit lies
+// from the pixel over how far it lies from the lamp.
+shared float group_answer[64];
+shared float group_cast[64];
+#endif
 
 #ifdef HALF
 // bbport (r32_lamp-half): more bits of `mode` (vk_point_shadow.cpp ModeHalf*).
@@ -500,12 +576,17 @@ void main() {
     }
 
     float wsum = 0.0;
-    // bbport (r41_lamp-shadows): rim rays wanted at all; for view 2, the lamp records with weight
-    // at the pixel (a lamp that two overlapping tiles of a batch list counts twice, as its
-    // weight does) and the largest weight (top_w is not kept when every lamp is traced).
-    const bool rim = t_rim > 0u && t_radius > 0.0;
+    // bbport (r41_lamp-shadows): for view 2, the lamp records with weight at the pixel (a lamp
+    // that two overlapping tiles of a batch list counts twice, as its weight does) and the
+    // largest weight (top_w is not kept when every lamp is traced).
     uint lamps = 0u;
     float view_top = 0.0;
+#ifdef HALF
+    const bool blend = false; // bbport (r42_lamp-soft): the point lamp, see loadTune
+#else
+    const bool blend = (history_flags & HISTORY_BLEND) != 0u;
+#endif
+    uint top_at = 0u; // blend: the record of the pixel's strongest lamp (0: none)
     const bool exact = steps == 0u;
     float top_w = 0.0;
     vec3 top_l = vec3(0.0);
@@ -515,11 +596,18 @@ void main() {
     vec3 n = vec3(0.0);
     float reach = 0.0;
     vec3 origin = vec3(0.0);
-    uint seed = (uint(px.x) * 1973u + uint(px.y) * 9277u + frame_index * 26699u) | 1u;
+    // bbport (r42_lamp-soft): an area lamp's pixel picks its second lamp anew every frame, jitter
+    // or not (the history averages the picks as it averages the disc's points).
+    const bool soft = t_radius > 0.0;
+    uint seed = (uint(px.x) * 1973u + uint(px.y) * 9277u + (soft ? t_frame : frame_index) * 26699u) | 1u;
+    vec2 xi = vec2(0.0);
     if (live) {
         n = surfaceNormal(uv, P);
         reach = bias_m + 0.0015 * P.z;
         origin = P + n * reach;
+        if (soft) {
+            xi = samplePoint(px, t_frame);
+        }
     }
     const ivec2 px_hi = px + 1;
     bool exact_pending = false;
@@ -550,7 +638,10 @@ void main() {
             }
             wsum += w;
             ++lamps;
-            view_top = max(view_top, w);
+            if (w > view_top) {
+                view_top = w;
+                top_at = at;
+            }
             if (exact) {
                 exact_pending = true;
                 continue;
@@ -579,7 +670,9 @@ void main() {
     float old_ratio = 1.0;
     float old_stable = 0.0;
     bool old_valid = false;
-    if (live && (history_flags & HISTORY_READ) != 0u) {
+    // bbport (r42_lamp-soft): LANTERN_RT_LAMP_REUSE's history; the averaging one is looked up
+    // after the rays (blendHistory)
+    if (live && !blend && (history_flags & HISTORY_READ) != 0u) {
         const vec4 v = vec4(P, 1.0);
         const vec3 p = vec3(dot(vec4(word(history_at + 2u), word(history_at + 3u), word(history_at + 4u),
                                      word(history_at + 5u)), v),
@@ -603,7 +696,8 @@ void main() {
         }
     }
     const uint refresh = data.d[history_at + 1u];
-    const bool due = history_flags == 0u ||
+    // bbport (r42_lamp-soft): averaging, every pixel casts its ray every frame
+    const bool due = history_flags == 0u || blend ||
                      ((gl_WorkGroupID.x & 1u) + 2u * (gl_WorkGroupID.y & 1u)) == (refresh & 3u);
     if (live && (due || !old_valid || old_stable < STABLE_FRAMES)) {
         atomicOr(group_trace, 1u);
@@ -625,14 +719,21 @@ void main() {
             imageStore(snap0, px, vec4(0.0));
             imageStore(snap1, px, vec4(0.0));
         }
-        return;
+        // bbport (r42_lamp-soft): averaging, every pixel of the workgroup goes on to the
+        // barrier below (which all of them must reach), this one with no answer
+        if (!blend) {
+            return;
+        }
     }
-    float ratio;
-    float stable;
+    float ratio = 1.0;
+    float stable = 0.0;
+    float top_went = 0.0, top_left = -1.0; // the ray to the strongest lamp (ray_went, ray_left)
 #ifdef HALF
     uint half_why = 0u; // traced: why (HalfAnswer, or HALF_FIRST_PIXEL); 0 not traced
 #endif
-    if (group_trace != 0u) {
+    if (!live) {
+        // (averaging: see above)
+    } else if (group_trace != 0u) {
 #ifdef HALF
         float taken = 1.0;
         half_why = fill ? HalfAnswer(px, P.z, n, taken) : HALF_FIRST_PIXEL;
@@ -642,6 +743,7 @@ void main() {
 #endif
         if (exact) {
             if (exact_pending) {
+                uint traced = 0u; // bbport (r42_lamp-soft): each lamp its own point of the disc
                 for (uint i = 0u; i < tile_count; ++i) {
                     const uint tile = overflow ? i : group_tiles[i];
                     if (!inside(tile, px, px_hi)) {
@@ -667,22 +769,25 @@ void main() {
                         if (!(w > 1e-5)) {
                             continue;
                         }
-                        vsum += w * lampVisibility(P, n, origin, reach, L, w, rim && w >= t_share * wsum);
+                        vsum += w * lampVisibility(P, n, origin, reach, L,
+                                                   fract(xi + float(traced++) * vec2(0.5545497, 0.3085170)));
+                        if (at == top_at) {
+                            top_went = ray_went;
+                            top_left = ray_left;
+                        }
                     }
                 }
             }
         } else {
-            // bbport (r41_lamp-shadows): rim rays for the strongest lamp and for the picked one
-            // (which stands for all the others), each only where it holds a share of the
-            // pixel's weight
-            vsum = top_w * lampVisibility(P, n, origin, reach, top_l, top_w, rim && top_w >= t_share * wsum);
+            // bbport (r42_lamp-soft): one ray for the strongest lamp and one for the picked one
+            // (which stands for all the others), each to its own point of the lamp's disc
+            vsum = top_w * lampVisibility(P, n, origin, reach, top_l, xi);
+            top_went = ray_went;
+            top_left = ray_left;
             if (rest_w > 0.0) {
-                vsum += rest_w *
-                        lampVisibility(P, n, origin, reach, rest_l, rest_w, rim && rest_w >= t_share * wsum);
+                vsum += rest_w * lampVisibility(P, n, origin, reach, rest_l,
+                                                fract(xi + vec2(0.5545497, 0.3085170)));
             }
-        }
-        if (rim_n != 0u) {
-            vsum += rimLight(reach); // bbport (r41_lamp-shadows): the rim rays of the noted lamps
         }
         ratio = clamp(vsum / wsum, 0.0, 1.0);
         stable = old_valid && abs(ratio - old_ratio) < STABLE_CHANGE ? min(old_stable + 1.0, 15.0) : 0.0;
@@ -690,6 +795,126 @@ void main() {
         ratio = old_ratio;
         stable = old_stable;
     }
+    // bbport (r42_lamp-soft): this frame's answer goes into the average of the frames before.
+    //  - A frame's share is 1 / (frames + 1): the first frames after a pixel comes into view (or
+    //    into a lamp's reach) are a plain mean, so it settles in a few frames in place of
+    //    holding its first ray's answer at 90%; later the share stays at 1 / (limit + 1).
+    //  - Ghosts: when a caster or the lamp moves, the history holds the shadow where it was.
+    //    One ray says little (in a penumbra it is lit or not by chance), but the 25 answers of
+    //    this frame around the pixel (5x5, inside its workgroup, which is what a compute pass
+    //    can see of its neighbours) say a lot where they agree: the history may lie no further
+    //    from their mean than word 33 times their deviation (and never less than a coin's
+    //    variance over their number allows, so a few answers that agree by chance bind little),
+    //    or than the pixel's own answer. Where the answers are mixed (a penumbra, an edge) that
+    //    binds nothing; where they agree (the ground a shadow has just left or just reached, in
+    //    whole or as one lamp's part of the light) the history is brought to them at once, and
+    //    given up by as much as it lay outside. That is what removes the wake of a moving
+    //    caster, with one lamp or several.
+    //  - Inside a penumbra the mean of the last few frames is kept beside the long one, and
+    //    where the two are apart by t_reject (from REJECT_FROM of it on) the long one is given
+    //    up: two or three frames that agree against the history do that, one stray ray does not.
+    //  - Under a lamp that moves (a hand torch), the shadows of what is carried with it move
+    //    as it does, and those of what stands still swing against it, by the lamp's step times
+    //    (hit to pixel) / (hit to lamp). The ray to the pixel's strongest lamp says which it is
+    //    where it is blocked: by something within word 32 of the lamp (the carrier's arm, body
+    //    and stick, which throw the wide penumbrae that need the history most), or by something
+    //    further off. The blocked rays around the pixel vote: more of the first kind, and the
+    //    history is looked up where the lamp's motion puts it (exact for what is carried);
+    //    else where the surface was, and it may hold no more frames than keep the swing within
+    //    word 31 (BB_LAMP_SHADOW_TRAIL). With BB_LAMP_SHADOW_FOLLOW=0 it is always looked up
+    //    where the surface was, and the first kind trails by the lamp's whole step. A lamp
+    //    that was not there the frame before (a very large step) has no history under its
+    //    shadows.
+    const float answer = ratio; // what this frame's rays said (view 1)
+    float frames = 0.0;         // the frames of history in the ratio (view 5)
+    vec3 looked = vec3(0.0, 0.0, 1.0); // view 6
+#ifndef HALF
+    if (blend) {
+        // Words 12 to 15 of the strongest lamp's record: its motion, and how far that is.
+        vec3 top_moved = vec3(0.0);
+        float top_step = 0.0;
+        if (live && top_at != 0u) {
+            top_moved = vec3(word(top_at + 12u), word(top_at + 13u), word(top_at + 14u));
+            top_step = word(top_at + 15u);
+        }
+        float blocker = -1.0;
+        if (top_step > 0.0 && top_left >= 0.0) {
+            blocker = top_left < word(history_at + 32u) ? -2.0 : min(top_went / max(top_left, 0.05), 64.0);
+        }
+        group_answer[gl_LocalInvocationIndex] = live ? answer : -1.0;
+        group_cast[gl_LocalInvocationIndex] = blocker;
+        barrier();
+        if (!live) {
+            return;
+        }
+        // The 5x5 answers around the pixel, moved in from the workgroup's rim so that every
+        // pixel has 25 places to ask (this pixel's own is always one of them).
+        const ivec2 around_lo = clamp(ivec2(gl_LocalInvocationID.xy) - 2, ivec2(0), ivec2(3));
+        float count = 0.0, sum = 0.0, sum2 = 0.0, near_n = 0.0, far_n = 0.0, swing = 0.0;
+        for (int y = around_lo.y; y < around_lo.y + 5; ++y) {
+            for (int x = around_lo.x; x < around_lo.x + 5; ++x) {
+                const float a = group_answer[y * 8 + x];
+                if (a >= 0.0) {
+                    count += 1.0;
+                    sum += a;
+                    sum2 += a * a;
+                    if (top_step > 0.0) {
+                        const float c = group_cast[y * 8 + x];
+                        if (c >= 0.0) {
+                            far_n += 1.0;
+                            swing += c;
+                        } else if (c < -1.5) {
+                            near_n += 1.0;
+                        }
+                    }
+                }
+            }
+        }
+        // carried: what shadows this place moves with the lamp. slip: how far the place the
+        // history is looked up at is off for every frame it holds, m.
+        const bool carried = near_n > far_n;
+        const bool follows = carried && top_moved != vec3(0.0);
+        float slip = 0.0;
+        if (top_step > 0.0) {
+            if (carried) {
+                slip = follows ? 0.0 : top_step;
+            } else if (far_n > 0.0) {
+                slip = top_step * swing / far_n;
+            }
+            looked = follows ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+        } else {
+            looked = vec3(0.0, 0.2, 0.2);
+        }
+        float fast = answer;
+        float held_ratio = 1.0, held_frames = 0.0, held_fast = 1.0;
+        if ((history_flags & HISTORY_READ) != 0u &&
+            blendHistory(P, history_at, follows ? top_moved : vec3(0.0), held_ratio, held_frames, held_fast)) {
+            fast = mix(answer, held_fast, FAST_KEEP);
+            frames = min(held_frames, word(history_at + 30u));
+            const float trail = word(history_at + 31u);
+            if (slip > 0.0 && trail > 0.0) {
+                frames = min(frames, trail / slip);
+            }
+            if (t_reject > 0.0 && frames > 1.5) {
+                // (A history of one frame is never dropped here: its ray and this one are all
+                // there is.)
+                frames *= 1.0 - smoothstep(REJECT_FROM * t_reject, t_reject, abs(fast - held_ratio));
+            }
+            const float around = word(history_at + 33u);
+            if (around > 0.0) {
+                const float mean = sum / count;
+                const float spread = around * sqrt(max(sum2 / count - mean * mean, 0.0) + AROUND_FLOOR / count);
+                const float fitted = clamp(held_ratio, min(mean - spread, answer), max(mean + spread, answer));
+                const float taken = smoothstep(AROUND_FROM, AROUND_ALL, abs(fitted - held_ratio));
+                frames *= 1.0 - taken;
+                held_ratio = fitted;
+                looked.r = taken;
+            }
+            ratio = mix(answer, held_ratio, frames / (frames + 1.0));
+        }
+        imageStore(history_cur, px, vec4(ratio, P.z, frames + 1.0, fast));
+    } else
+#endif
     if ((history_flags & HISTORY_WRITE) != 0u) {
         imageStore(history_cur, px, vec4(ratio, P.z, stable, 1.0));
     }
@@ -697,16 +922,31 @@ void main() {
     vec3 out0 = s0 + d0 * scale, out1 = s1 + d1 * scale;
     if (t_view != 0u) {
         // bbport (r41_lamp-shadows): BB_LAMP_SHADOW_VIEW, on pixels the pass shadows, in place of
-        // their light (the game multiplies it by the surface's colour). 1: the shadow ratio. 2:
-        // how many lamp records have weight here (1 blue, 2 green, 3 yellow, 4 or more red),
-        // dimmer the smaller the strongest one's share. 3: rays this pixel cast (0 blue, 1
-        // green, 2 yellow, 3 or more red). The history and the half-resolution answers hold the
-        // ratio as always.
-        vec3 shown = vec3(ratio);
+        // their light (the game multiplies it by the surface's colour). 1: the shadow ratio as
+        // this frame's rays gave it. 2: how many lamp records have weight here (1 blue, 2 green,
+        // 3 yellow, 4 or more red), dimmer the smaller the strongest one's share. 3: rays this
+        // pixel cast (0 blue, 1 green, 2 yellow, 3 or more red). bbport (r42_lamp-soft): 4: the
+        // ratio as it is used, averaged over the frames (the same as 1 without a history). 5:
+        // the frames of history in it, red none to green all it may hold (blue: this pass
+        // averages nothing). 6: where the history was looked up: green where a moving lamp's
+        // motion puts it, blue where the surface was under a moving lamp, dim under a lamp
+        // that stands; red: how much of it this frame's answers around the pixel took away.
+        // The history and the half-resolution answers hold the ratio as always.
+        vec3 shown = vec3(answer);
         if (t_view == 2u) {
             shown = stepColour(lamps - 1u) * (0.25 + 0.75 * view_top / wsum);
         } else if (t_view == 3u) {
             shown = stepColour(rays_cast);
+        } else if (t_view == 4u) {
+            shown = vec3(ratio);
+        } else if (t_view == 5u) {
+            shown = vec3(0.0, 0.0, 1.0);
+            if (blend) {
+                const float held = clamp(frames / max(word(history_at + 30u), 1.0), 0.0, 1.0);
+                shown = vec3(1.0 - held, held, 0.0);
+            }
+        } else if (t_view == 6u) {
+            shown = looked;
         }
         out0 = shown * t_gain;
         out1 = vec3(0.0);

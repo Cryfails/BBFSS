@@ -15,6 +15,7 @@
 #include "video_core/host_shaders/rt_shadow_filter_comp.h"
 #include "video_core/host_shaders/rt_lab_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_comp.h" // bbport (r42_lamp-soft)
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/host_shaders/ssgi_gather_ray_comp.h"
 #include "gpu/shadps4/video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r41_lamp-shadows)
@@ -128,6 +129,55 @@ Mesh Capsule(float height, float radius, unsigned triangles) {
             mesh.indices.insert(mesh.indices.end(), {a, c, b, b, c, d});
         }
     return mesh;
+}
+
+// bbport (r42_lamp-soft): a box from a to b, `thick` across (a stick, an arm).
+Mesh Beam(Vec3 a, Vec3 b, float thick) {
+    Mesh mesh;
+    const Vec3 dir = Norm(b + a * -1.0f);
+    const Vec3 side = Norm(Cross(dir, std::abs(dir.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0})) * (thick * 0.5f);
+    const Vec3 up = Norm(Cross(dir, side)) * (thick * 0.5f);
+    for (int k = 0; k < 8; ++k) {
+        mesh.vertices.push_back((k & 4 ? b : a) + side * (k & 1 ? 1.0f : -1.0f) + up * (k & 2 ? 1.0f : -1.0f));
+    }
+    mesh.indices = {0, 1, 3, 0, 3, 2, 4, 7, 5, 4, 6, 7, 0, 4, 5, 0, 5, 1,
+                    2, 3, 7, 2, 7, 6, 0, 2, 6, 0, 6, 4, 1, 5, 7, 1, 7, 3};
+    return mesh;
+}
+
+// bbport (r42_lamp-soft): the torch lab's scene (rt-shadow-test --lamps): a character with a
+// hand torch seen from above, as in the report the area lamp answers. The meshes, in this
+// order: the ground; the character (a capsule 1.8 m tall, 0.6 m wide); its arm, 8 cm thick,
+// from the shoulder to the raised hand; the torch's stick, 3.5 cm thick and 0.9 m long, from
+// the hand up towards the flame; a blade at its hip, 5 cm thick, down to knee height; a second
+// figure 1.5 m away; a post 8 cm thick; a low wall. The lamp sits at TorchFlame, 0.2 m off the
+// stick's line (a stick that points at its lamp casts a dot, not a band) and above the head;
+// the pass is blind within 0.35 m of a lamp. So the stick and the arm are thin casters near the
+// lamp, the blade is a thin caster near the ground, and the two figures are bodies near and far.
+constexpr unsigned TorchCharacter = 1, TorchArm = 2, TorchStick = 3, TorchBlade = 4, TorchOther = 5;
+constexpr Vec3 TorchFlame{-0.72f, 2.1f, 0.55f};
+std::vector<Mesh> MakeTorchScene() {
+    std::vector<Mesh> scene;
+    Mesh ground = Box({60, 1, 60}, 1200);
+    ground.position = {0, -1, 0};
+    scene.push_back(std::move(ground));
+    Mesh body = Capsule(1.8f, 0.3f, 30000);
+    body.skinned = true;
+    scene.push_back(std::move(body));
+    scene.push_back(Beam({-0.2f, 1.45f, -0.05f}, {-0.42f, 1.45f, -0.25f}, 0.08f));
+    scene.push_back(Beam({-0.42f, 1.4f, -0.29f}, {-0.6f, 1.98f, 0.38f}, 0.035f));
+    scene.push_back(Beam({0.35f, 0.9f, -0.1f}, {0.7f, 0.35f, -0.75f}, 0.05f));
+    Mesh other = Capsule(1.8f, 0.3f, 30000);
+    other.position = {1.5f, 0, 0.1f};
+    other.skinned = true;
+    scene.push_back(std::move(other));
+    Mesh post = Box({0.08f, 2.5f, 0.08f}, 600);
+    post.position = {-1.9f, 0, -0.5f};
+    scene.push_back(std::move(post));
+    Mesh wall = Box({5.0f, 1.2f, 0.3f}, 1200);
+    wall.position = {0.3f, 0, 1.9f};
+    scene.push_back(std::move(wall));
+    return scene;
 }
 
 std::vector<Mesh> MakeScene(unsigned total_triangles, unsigned draws) {
@@ -861,9 +911,12 @@ int main(int argc, char** argv) {
         {{{-4, 1.7f, 12}, {0.8f, -0.25f, 0.5f}}},
         {{{5, 3, 30}, {-0.5f, -0.5f, 1}}},
     }};
-    if (argc > 1 && std::strcmp(argv[1], "--speed") == 0) {
-        const unsigned total = argc > 2 ? unsigned(std::strtoul(argv[2], nullptr, 10)) : 1500000u;
-        Scene scene{vk, MakeScene(total, total / 1875)};
+    // bbport (r42_lamp-soft): --lamps [directory]: the torch lab (below), with the lamp pass's
+    // images and pipeline as --speed makes them.
+    const bool torch_lab = argc > 1 && std::strcmp(argv[1], "--lamps") == 0;
+    if (argc > 1 && (std::strcmp(argv[1], "--speed") == 0 || torch_lab)) {
+        const unsigned total = argc > 2 && !torch_lab ? unsigned(std::strtoul(argv[2], nullptr, 10)) : 1500000u;
+        Scene scene{vk, torch_lab ? MakeTorchScene() : MakeScene(total, total / 1875)};
         scene.Create(Trace | Update);
         scene.Allocate();
         scene.BuildAll(Trace | Update);
@@ -965,6 +1018,689 @@ int main(int argc, char** argv) {
             const unsigned e = (v >> 6) & 31u, m = v & 63u;
             return e == 0 ? float(m) / 64.0f * std::ldexp(1.0f, -14) : std::ldexp(1.0f + float(m) / 64.0f, int(e) - 15);
         };
+        if (torch_lab) {
+            // bbport (r42_lamp-soft): the torch lab. One torch lamp at the flame of a hand torch,
+            // the camera above and tilted down. It runs the lamp pass over many frames with its
+            // history (the words PointShadow::Flush hands it: flags, frame, the way back to the
+            // camera of the frame before, that camera's projection, the most frames a texel may
+            // hold), moves the scene and the camera between frames, and compares what the pass
+            // shows with the mean of many single frames (the area lamp's true picture). With a
+            // directory it writes the pictures there (PGM, the shadow ratio as grey).
+            const char* out_dir = argc > 2 ? argv[2] : nullptr;
+            Pipeline half = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                             VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+                                            64, POINT_SHADOW_RAY_HALF_COMP, sizeof(POINT_SHADOW_RAY_HALF_COMP),
+                                            VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+            Image half_answers = vk.MakeImage((W + 1) / 2, (H + 1) / 2, VK_FORMAT_R16G16B16A16_SFLOAT);
+            Buffer half_counts = vk.MakeBuffer(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+            std::memset(half_counts.data, 0, 64);
+            vk.Begin();
+            vk.ToGeneral(half_answers.image);
+            vk.Stamp(0); vk.Stamp(1);
+            vk.End();
+            Tlas tlas = make_tlas(n, Fast);
+            std::vector<Vec3> home;
+            for (const Mesh& mesh : scene.meshes) home.push_back(mesh.position);
+            auto* raw = static_cast<std::uint32_t*>(lights.data);
+            constexpr unsigned LampAt = 16, TableAt = 48, HistoryAt = 64, TuneAt = 100;
+            Vec3 flame = TorchFlame;
+            // A second lamp that stands (reach 6 m, as bright as the torch); none unless `second`.
+            // wobble: added to the torch lamp's place for one frame (a flame that flickers).
+            bool second = false;
+            constexpr Vec3 SecondLamp{1.2f, 2.3f, -1.6f};
+            Vec3 wobble{0, 0, 0};
+            const auto camera = [&](float pan, float along) {
+                return MakeViews({0.2f + pan, 4.5f, -1.2f + along}, {0.0f, -0.97f, 0.26f}, sun);
+            };
+            // The character with its torch `walk` metres towards the camera's foot (-z), the
+            // other figure `other` metres along z; stick false: without the torch's stick.
+            const auto place = [&](const Views& v, float walk, float other, bool stick = true) {
+                for (const unsigned i : {TorchCharacter, TorchArm, TorchStick, TorchBlade}) {
+                    scene.meshes[i].position = home[i] + Vec3{0, i == TorchStick && !stick ? -100.0f : 0.0f, -walk};
+                }
+                scene.meshes[TorchOther].position = home[TorchOther] + Vec3{0, 0, other};
+                flame = TorchFlame + Vec3{0, 0, -walk};
+                build_tlas(tlas, v.view, Fast, false, 4);
+                lab.Prepare(tlas.handle, v);
+            };
+            struct Pass {
+                const Vulkan::LampShadowTune* tune = nullptr; // null: mode 0 (the experiment bit's path)
+                unsigned frame = 0;
+                int parity = -1;               // the history image written; -1: no history
+                bool read = false;             // with a history: the frame before is read
+                const Views* before = nullptr; // with read: the camera of the frame before (null: this one)
+                bool follow = true;            // with read: the history is looked up where the lamp's motion puts it
+                bool half = false;             // the half-resolution build, in its two passes
+                bool again = false;            // the pass before once more (its lamps and history block as they
+                                               // are in the buffer), with this tuning: for a view of that frame
+            };
+            Vulkan::LampTrack track;
+            const auto run = [&](const Views& v, const Pass& pass) {
+                auto* words = static_cast<float*>(lights.data);
+                for (int r = 0; r < 4; ++r)
+                    for (int k = 0; k < 4; ++k) words[r * 4 + k] = v.inv_proj.at(r, k);
+                const unsigned lamps = second ? 2u : 1u;
+                for (unsigned l = 0; l < lamps && !pass.again; ++l) {
+                    const Vec3 at = l == 0 ? flame + wobble : SecondLamp;
+                    std::array<float, 16> light{};
+                    for (int r = 0; r < 3; ++r)
+                        light[r] = v.view.at(r, 0) * at.x + v.view.at(r, 1) * at.y + v.view.at(r, 2) * at.z + v.view.at(r, 3);
+                    light[3] = 1.0f / 36.0f;
+                    light[4] = 1.0f; light[5] = 0.8f; light[6] = l == 0 ? 0.6f : 0.7f;
+                    std::memcpy(raw + LampAt + 16 * l, light.data(), sizeof(light));
+                }
+                const std::array<std::uint32_t, 8> row{0u, 0u, W, H, LampAt, lamps, 0u, 0u};
+                std::memcpy(raw + TableAt, row.data(), sizeof(row));
+                unsigned mode = 0;
+                if (pass.tune) {
+                    const auto tune_words = Vulkan::LampTuneWords(*pass.tune, false, 0.05f, v.view.m.data(), pass.frame);
+                    std::memcpy(raw + TuneAt, tune_words.data(), sizeof(tune_words));
+                    mode = 16u | TuneAt << 8; // MODE_REPAIR | place << 8
+                }
+                if (pass.parity >= 0 && !pass.again) {
+                    // What PointShadow::Flush does for the pass that holds the history.
+                    const Views& was = pass.before ? *pass.before : v;
+                    const Mat4 back = was.view * Inverse(v.view), to_world = Inverse(v.view);
+                    track.Begin(to_world.m.data());
+                    std::array<int, 2> index{};
+                    for (unsigned l = 0; l < lamps; ++l) index[l] = track.Add(raw + LampAt + 16 * l);
+                    if (pass.read) track.Follow();
+                    for (unsigned l = 0; l < lamps; ++l) {
+                        const auto moved = pass.read && pass.follow && pass.tune->follow ? track.Shift(index[l], was.view.m.data())
+                                                                                         : std::array<float, 3>{};
+                        std::memcpy(raw + LampAt + 16 * l + 12, moved.data(), sizeof(moved));
+                        const float step = pass.read ? track.Step(index[l]) : 0.0f;
+                        std::memcpy(raw + LampAt + 16 * l + 15, &step, 4);
+                    }
+                    track.End(true);
+                    raw[HistoryAt] = 2u | 4u | (pass.read ? 1u : 0u); // HISTORY_WRITE | HISTORY_BLEND | HISTORY_READ
+                    raw[HistoryAt + 1] = pass.frame;
+                    std::memcpy(raw + HistoryAt + 2, back.m.data(), 48);
+                    std::memcpy(raw + HistoryAt + 14, was.proj.m.data(), 64);
+                    const auto tail = Vulkan::LampHistoryTail(*pass.tune); // words 30 to 33
+                    std::memcpy(raw + HistoryAt + 30, tail.data(), sizeof(tail));
+                    static_assert(HistoryAt + 30 + Vulkan::LampHistoryTailWords <= TuneAt);
+                }
+                vk.Begin();
+                VkClearColorValue one{};
+                one.float32[0] = one.float32[1] = one.float32[2] = 1.0f;
+                const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdClearColorImage(vk.cmd, lamp_images[0].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+                vkCmdClearColorImage(vk.cmd, lamp_images[2].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+                const VkImageCopy whole{.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {W, H, 1}};
+                vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[1].image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+                vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[3].image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+                vk.Barrier();
+                VkDescriptorBufferInfo data{lights.buffer, 0, (TuneAt + Vulkan::LampTuneWordCount) * 4};
+                VkDescriptorImageInfo depth{vk.sampler, lab.depth.view, VK_IMAGE_LAYOUT_GENERAL};
+                std::array<VkDescriptorImageInfo, 4> images{};
+                for (int k = 0; k < 4; ++k) images[k] = {{}, lamp_images[k].view, VK_IMAGE_LAYOUT_GENERAL};
+                VkWriteDescriptorSetAccelerationStructureKHR as{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+                    .accelerationStructureCount = 1, .pAccelerationStructures = &tlas.handle};
+                const int cur_history = pass.parity < 0 ? 0 : pass.parity;
+                VkDescriptorImageInfo history_prev{{}, history[cur_history ^ 1].view, VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorImageInfo history_cur{{}, history[cur_history].view, VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorImageInfo answers{{}, half_answers.view, VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorBufferInfo counts{half_counts.buffer, 0, 64};
+                std::array<VkWriteDescriptorSet, 11> writes{};
+                for (unsigned k = 0; k < 11; ++k) writes[k] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = k, .descriptorCount = 1};
+                writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[0].pBufferInfo = &data;
+                writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[1].pImageInfo = &depth;
+                for (int k = 0; k < 4; ++k) { writes[2 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2 + k].pImageInfo = &images[k]; }
+                writes[6].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; writes[6].pNext = &as;
+                writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[7].pImageInfo = &history_prev;
+                writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[8].pImageInfo = &history_cur;
+                writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[9].pImageInfo = &answers;
+                writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[10].pBufferInfo = &counts;
+                LampPush push;
+                push.first_light = TableAt;
+                push.count = 1;
+                push.rect = {0, 0, int(W), int(H)};
+                push.steps = 1;
+                push.frame = pass.frame;
+                push.bias = pass.tune ? pass.tune->bias_m : 0.03f;
+                if (pass.parity >= 0) {
+                    const unsigned history_at = HistoryAt;
+                    std::memcpy(&push.length, &history_at, 4);
+                }
+                vk.Stamp(0);
+                if (pass.parity >= 0) {
+                    VkClearColorValue zero{};
+                    vkCmdClearColorImage(vk.cmd, history[cur_history].image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+                    vk.Barrier();
+                }
+                if (pass.half) {
+                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, half.pipeline);
+                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, half.layout, 0, 11, writes.data());
+                    unsigned word = mode | 2u | 8u; // MODE_HALF_FIRST | MODE_HALF_COUNT
+                    std::memcpy(&push.thickness, &word, 4);
+                    vkCmdPushConstants(vk.cmd, half.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                    vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 15) / 16, (H + 15) / 16, 1);
+                    vk.Barrier();
+                    word = mode | 4u | 8u; // MODE_HALF_FILL | MODE_HALF_COUNT
+                    std::memcpy(&push.thickness, &word, 4);
+                    vkCmdPushConstants(vk.cmd, half.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                    vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
+                } else {
+                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.pipeline);
+                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.layout, 0, 9, writes.data());
+                    std::memcpy(&push.thickness, &mode, 4);
+                    vkCmdPushConstants(vk.cmd, lamp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                    vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
+                }
+                vk.Barrier();
+                vk.Stamp(1);
+                vk.Barrier();
+                return vk.End();
+            };
+            const auto values = [&] {
+                const auto bits = lab.Read(lamp_images[0], VK_FORMAT_R32_SFLOAT);
+                std::vector<float> out(bits.size());
+                for (std::size_t k = 0; k < bits.size(); ++k) {
+                    std::uint32_t word;
+                    std::memcpy(&word, &bits[k], 4);
+                    out[k] = decode(word);
+                }
+                return out;
+            };
+            const auto dump = [&](const std::string& name, const std::vector<float>& picture) {
+                if (out_dir) WritePgm((std::string(out_dir) + "/" + name + ".pgm").c_str(), picture);
+            };
+            // The frames in turn: the frame counter, and whether the frame before left a history.
+            unsigned clock = 0;
+            bool have_history = false;
+            const auto restart = [&] {
+                clock = 0;
+                have_history = false;
+                track.End(false);
+            };
+            // One frame as the engine runs it. before: the camera of the frame before.
+            const auto frame = [&](const Views& v, const Vulkan::LampShadowTune& tune, const Views* before = nullptr,
+                                   bool follow = true) {
+                const bool history = Vulkan::LampHistoryFrames(tune) > 0.0f;
+                const double ms = run(v, {.tune = &tune, .frame = clock, .parity = history ? int(clock & 1u) : -1,
+                                          .read = have_history && history, .before = before, .follow = follow});
+                have_history = history;
+                ++clock;
+                return ms;
+            };
+            // The frame `frame` just ran, once more as BB_LAMP_SHADOW_VIEW=5 shows it: for every pixel the
+            // share of the frames its history may hold that it does hold (the pass writes the same history
+            // again). Below 0: the pass does not shadow the pixel.
+            const auto held_view = [&](const Views& v, const Vulkan::LampShadowTune& tune) {
+                Vulkan::LampShadowTune shown = tune;
+                shown.view = 5;
+                shown.view_gain = 0.5f;
+                run(v, {.tune = &shown, .frame = clock - 1, .parity = int((clock - 1) & 1u), .again = true});
+                auto picture = values(); // red: (1 - held) / 2; a pixel the pass leaves alone keeps 1
+                for (float& p : picture) p = p > 0.75f ? -1.0f : 1.0f - 2.0f * p;
+                return picture;
+            };
+            // The area lamp's true picture: the mean of `count` frames, each one ray a lamp.
+            const auto truth = [&](const Views& v, const Vulkan::LampShadowTune& tune, unsigned count = 128) {
+                Vulkan::LampShadowTune single = tune;
+                single.history = 0.0f;
+                std::vector<float> mean(W * H, 0.0f);
+                for (unsigned k = 0; k < count; ++k) {
+                    run(v, {.tune = &single, .frame = 4096u + k});
+                    const auto one = values();
+                    for (std::size_t i = 0; i < one.size(); ++i) mean[i] += one[i] / float(count);
+                }
+                return mean;
+            };
+            // Mean difference from `reference`: over the picture, over the reference's penumbra
+            // (0.05 to 0.95), and the share of pixels more than 0.25 off, in percent.
+            struct Off { double all = 0, penumbra = 0, far = 0; };
+            const auto off = [&](const std::vector<float>& picture, const std::vector<float>& reference) {
+                Off o;
+                std::size_t soft = 0;
+                for (std::size_t i = 0; i < picture.size(); ++i) {
+                    const double d = std::abs(double(picture[i]) - reference[i]);
+                    o.all += d;
+                    o.far += d > 0.25 ? 1 : 0;
+                    if (reference[i] > 0.05f && reference[i] < 0.95f) {
+                        o.penumbra += d;
+                        ++soft;
+                    }
+                }
+                o.all /= double(picture.size());
+                o.far *= 100.0 / double(picture.size());
+                o.penumbra /= double(std::max<std::size_t>(soft, 1));
+                return o;
+            };
+            // The mean of `held` (held_view) over the reference's penumbra: how much history the pixels
+            // that need it have. The error numbers alone rank a smeared picture above a noisy one.
+            const auto held_mean = [&](const std::vector<float>& held, const std::vector<float>& reference) {
+                double sum = 0;
+                std::size_t soft = 0;
+                for (std::size_t i = 0; i < held.size(); ++i) {
+                    if (held[i] >= 0.0f && reference[i] > 0.05f && reference[i] < 0.95f) {
+                        sum += held[i];
+                        ++soft;
+                    }
+                }
+                return sum / double(std::max<std::size_t>(soft, 1));
+            };
+            // A stand-in for the temporal upscaler that runs after the pass (still camera only):
+            // each frame's picture goes into a running mean that keeps 0.8 of what it held.
+            const auto settle = [](std::vector<float>& held, const std::vector<float>& one, bool first) {
+                if (first) {
+                    held = one;
+                    return;
+                }
+                for (std::size_t i = 0; i < one.size(); ++i) held[i] = 0.8f * held[i] + 0.2f * one[i];
+            };
+
+            // The knobs as the environment has them (BB_LAMP_SHADOW_*), as the engine reads them:
+            // a radius or a history blend can be tried here before the game is started. The
+            // checks below are made for the defaults (checked) and left out otherwise.
+            Vulkan::LampShadowTune soft = Vulkan::ReadLampShadowTune([](const char* name) -> const char* { return std::getenv(name); });
+            soft.view = 0;
+            const Vulkan::LampShadowTune stock;
+            const bool checked = soft.radius_m == stock.radius_m && soft.history == stock.history &&
+                                 soft.reject == stock.reject && soft.trail_m == stock.trail_m &&
+                                 soft.follow == stock.follow && soft.carry_m == stock.carry_m &&
+                                 soft.around == stock.around && soft.weights == stock.weights &&
+                                 soft.clearance_m == stock.clearance_m && soft.bias_m == stock.bias_m &&
+                                 soft.self_m == stock.self_m;
+            if (!checked) std::puts("Torch lab: BB_LAMP_SHADOW_* knobs differ from the defaults: numbers and pictures only, no checks");
+            Vulkan::LampShadowTune point = soft;
+            point.radius_m = 0.0f;
+            const Views view = camera(0.0f, 0.0f);
+
+            // 1. The point lamp: the same picture whatever the frame counter, and no history.
+            place(view, 0.0f, 0.0f, false);
+            run(view, {.tune = &point});
+            const auto point_bare = values(); // without the stick
+            place(view, 0.0f, 0.0f);
+            run(view, {.tune = &point, .frame = 0});
+            const auto point_picture = values();
+            run(view, {.tune = &point, .frame = 7});
+            if (values() != point_picture || Vulkan::LampHistoryFrames(point) != 0.0f) {
+                std::fprintf(stderr, "the point lamp (BB_LAMP_SHADOW_SOFT=0) changes with the frame counter, or keeps a history\n");
+                return 1;
+            }
+            dump("point", point_picture);
+            // The stick's band: dark with the stick, lit without. The bodies' shadows: dark without it.
+            std::vector<std::size_t> band, body;
+            for (std::size_t i = 0; i < point_picture.size(); ++i) {
+                if (point_bare[i] < 0.25f) body.push_back(i);
+                else if (point_picture[i] < 0.25f && point_bare[i] > 0.75f) band.push_back(i);
+            }
+
+            // 2. The area lamp: one frame, the true picture, 16 and 48 frames of history.
+            run(view, {.tune = &soft, .frame = 0});
+            const auto one_frame = values();
+            dump("area_1_frame", one_frame);
+            const auto reference = truth(view, soft);
+            dump("area_true", reference);
+            restart();
+            // (late: the plain mean of frames 33 to 48, for what the history adds to or takes from the
+            // light where the true picture is nearly dark or nearly lit: a bound that pulled the history
+            // towards the answers around a pixel would show there.)
+            std::vector<float> after4, after16, after48, upscaled, late(W * H, 0.0f);
+            for (unsigned k = 0; k < 48; ++k) {
+                frame(view, soft);
+                if (k == 3 || k == 15 || k >= 32) {
+                    auto now = values();
+                    if (k >= 32) {
+                        settle(upscaled, now, k == 32);
+                        for (std::size_t i = 0; i < now.size(); ++i) late[i] += now[i] / 16.0f;
+                    }
+                    if (k == 3) after4 = std::move(now);
+                    else if (k == 15) after16 = std::move(now);
+                    else if (k == 47) after48 = std::move(now);
+                }
+            }
+            dump("area_16_frames", after16);
+            dump("area_48_frames", after48);
+            dump("area_48_frames_upscaled", upscaled);
+            const Off off1 = off(one_frame, reference), off4 = off(after4, reference), off16 = off(after16, reference),
+                      off48 = off(after48, reference), off_up = off(upscaled, reference);
+            double mean_true = 0, mean48 = 0, band_point = 0, band_light = 0, band_true = 0;
+            std::array<double, 2> lean{}; // late minus true where the true picture is 0.05 to 0.2, 0.8 to 0.95
+            std::array<std::size_t, 2> lean_n{};
+            for (std::size_t i = 0; i < reference.size(); ++i) {
+                mean_true += reference[i] / double(reference.size());
+                mean48 += after48[i] / double(reference.size());
+                const int bin = reference[i] > 0.05f && reference[i] < 0.2f ? 0 : reference[i] > 0.8f && reference[i] < 0.95f ? 1 : -1;
+                if (bin >= 0) {
+                    lean[std::size_t(bin)] += double(late[i]) - reference[i];
+                    ++lean_n[std::size_t(bin)];
+                }
+            }
+            for (std::size_t b = 0; b < 2; ++b) lean[b] /= double(std::max<std::size_t>(lean_n[b], 1));
+            for (const std::size_t i : band) {
+                band_point += point_picture[i] / double(std::max<std::size_t>(band.size(), 1));
+                band_light += after48[i] / double(std::max<std::size_t>(band.size(), 1));
+                band_true += reference[i] / double(std::max<std::size_t>(band.size(), 1));
+            }
+            std::size_t body_dark = 0;
+            for (const std::size_t i : body) body_dark += after48[i] < 0.25f ? 1 : 0;
+            std::printf("Torch lab, radius %.2f m, history %.2f (%.0f frames): difference from the true picture (mean of "
+                        "128 frames), all pixels / penumbra / share more than 0.25 off: one frame %.4f / %.4f / %.2f%%, "
+                        "4 frames %.4f / %.4f / %.2f%%, 16 frames %.4f / %.4f / %.2f%%, 48 frames %.4f / %.4f / %.2f%%, "
+                        "48 frames through the upscaler's stand-in %.4f / %.4f / %.2f%%; mean light true %.4f, after 48 "
+                        "frames %.4f; the mean of frames 33 to 48 less the true picture where that is 0.05 to 0.2: "
+                        "%+.4f, 0.8 to 0.95: %+.4f\n",
+                        soft.radius_m, soft.history, Vulkan::LampHistoryFrames(soft), off1.all, off1.penumbra, off1.far,
+                        off4.all, off4.penumbra, off4.far, off16.all, off16.penumbra, off16.far, off48.all, off48.penumbra,
+                        off48.far, off_up.all, off_up.penumbra, off_up.far, mean_true, mean48, lean[0], lean[1]);
+            std::printf("Torch lab: the stick's band (%zu pixels the point lamp leaves dark): light kept %.3f with the "
+                        "point lamp, %.3f with the area lamp (true %.3f); the bodies' shadows (%zu pixels dark without "
+                        "the stick): %zu still below 0.25 with the area lamp\n",
+                        band.size(), band_point, band_light, band_true, body.size(), body_dark);
+            if (checked && (std::abs(mean48 - mean_true) > 0.004 || std::abs(lean[0]) > 0.02 || std::abs(lean[1]) > 0.02)) {
+                std::fprintf(stderr, "the history is biased: mean light %.4f against the true %.4f, off by %+.4f where "
+                                     "that is nearly dark and %+.4f where it is nearly lit\n",
+                             mean48, mean_true, lean[0], lean[1]);
+                return 1;
+            }
+            if (checked && (band.empty() || band_light < 0.5 || body_dark * 2 < body.size())) {
+                std::fprintf(stderr, "the area lamp keeps %.3f of the light in the stick's band (%zu pixels) and %zu of "
+                                     "%zu dark pixels of the bodies' shadows\n",
+                             band_light, band.size(), body_dark, body.size());
+                return 1;
+            }
+
+            // 3. Raw frames (BB_LAMP_SHADOW_HISTORY=0) through the upscaler's stand-in alone.
+            {
+                Vulkan::LampShadowTune single = soft;
+                single.history = 0.0f;
+                std::vector<float> held;
+                restart();
+                for (unsigned k = 0; k < 16; ++k) {
+                    frame(view, single);
+                    settle(held, values(), k == 0);
+                }
+                const Off o = off(held, reference);
+                dump("area_no_history_upscaled", held);
+                std::printf("Torch lab: no history, 16 frames through the upscaler's stand-in: %.4f / %.4f / %.2f%%\n",
+                            o.all, o.penumbra, o.far);
+            }
+
+            // 3b. A lamp that sits lower over a surface than its radius (a candle on the ground): the
+            // surface must not shadow itself under the lamp's disc. The figures are 30 m off, the lamp
+            // 5 cm and 2 cm over bare ground: the area lamp's light where the point lamp's is whole.
+            {
+                std::array<double, 2> kept{};
+                unsigned slot = 0;
+                for (const float height : {0.05f, 0.02f}) {
+                    place(view, 30.0f, 30.0f);
+                    wobble = Vec3{0.2f - flame.x, height - flame.y, 0.0f - flame.z};
+                    run(view, {.tune = &point, .frame = 0});
+                    const auto low_point = values();
+                    const auto low_true = truth(view, soft, 32);
+                    double sum = 0;
+                    std::size_t lit = 0;
+                    for (std::size_t i = 0; i < low_true.size(); ++i) {
+                        if (low_point[i] > 0.999f) {
+                            sum += low_true[i];
+                            ++lit;
+                        }
+                    }
+                    kept[slot++] = sum / double(std::max<std::size_t>(lit, 1));
+                    if (height > 0.03f) dump("low_lamp_true", low_true);
+                }
+                wobble = {0, 0, 0};
+                place(view, 0.0f, 0.0f);
+                std::printf("Torch lab: a lamp 5 cm and 2 cm over bare ground, radius %.2f m: the area lamp keeps %.4f "
+                            "and %.4f of the light where the point lamp's is whole\n", soft.radius_m, kept[0], kept[1]);
+                if (checked && !(kept[0] > 0.98 && kept[1] > 0.98)) {
+                    std::fprintf(stderr, "the ground shadows itself under a lamp that sits lower than its radius\n");
+                    return 1;
+                }
+            }
+
+            // 4. Motion. 24 still frames, then `frames` frames in which the character walks with its
+            // torch (walk, metres a frame; the camera goes with it as the game's does), the second
+            // figure walks under the lamps (other), or the torch's lamp is off its place by up to
+            // `shake` metres, anew every frame (a flame that flickers); then the picture of the last
+            // frame against the true picture of that moment. plain: the history without its guards
+            // (BB_LAMP_SHADOW_CLAMP=0, BB_LAMP_SHADOW_REJECT=0, BB_LAMP_SHADOW_TRAIL=0); follow
+            // false: looked up where the ground was, never where the lamp's motion puts it.
+            Vulkan::LampShadowTune plain = soft;
+            plain.around = 0.0f;
+            plain.reject = 0.0f;
+            plain.trail_m = 0.0f;
+            struct Move {
+                float walk = 0.0f, other = 0.0f, shake = 0.0f;
+                unsigned frames = 16;
+                bool follow = true;
+            };
+            Views moved_view = view;
+            std::vector<float> moved_held; // held_view of the last frame
+            const auto moving = [&](const Vulkan::LampShadowTune& tune, const Move& move,
+                                    std::vector<float>* upscaled_out = nullptr) {
+                restart();
+                Views now = view;
+                wobble = {0, 0, 0};
+                place(now, 0.0f, 0.0f);
+                for (unsigned k = 0; k < 24; ++k) frame(now, tune);
+                std::vector<float> held;
+                std::mt19937 rng(11);
+                for (unsigned k = 1; k <= move.frames; ++k) {
+                    const float walked = move.walk * float(k);
+                    const Views before = now;
+                    now = camera(0.0f, -walked);
+                    if (move.shake > 0.0f) {
+                        std::uniform_real_distribution<float> off(-move.shake, move.shake);
+                        wobble = {off(rng), 0.0f, off(rng)};
+                    }
+                    place(now, walked, move.other * float(k));
+                    frame(now, tune, &before, move.follow);
+                    if (upscaled_out) settle(held, values(), k == 1);
+                }
+                if (upscaled_out) *upscaled_out = std::move(held);
+                moved_view = now;
+                auto picture = values();
+                moved_held = Vulkan::LampHistoryFrames(tune) > 0.0f ? held_view(now, tune) : std::vector<float>{};
+                return picture;
+            };
+            // (The true picture of the moment `moving` ended at: the scene and the lamp stand as its
+            // last frame left them.)
+            for (const float speed : {0.067f, 0.02f}) {
+                // 6.7 cm a frame is a run (4 m/s at 60 frames a second), 2 cm a walk.
+                const Move walk{.walk = speed};
+                Move anchored = walk;
+                anchored.follow = false;
+                const auto alone = moving(plain, walk), all = moving(soft, walk);
+                const auto all_held = moved_held;
+                const auto guarded = moving(soft, anchored);
+                Vulkan::LampShadowTune loose = soft;
+                loose.trail_m = 0.0f;
+                const auto untrailed = moving(loose, walk);
+                const auto untrailed_held = moved_held;
+                const auto moved_true = truth(moved_view, soft);
+                const Off a = off(alone, moved_true), c = off(guarded, moved_true), d = off(all, moved_true),
+                          e = off(untrailed, moved_true);
+                const std::string tag = speed > 0.05f ? "run" : "walk";
+                dump(tag + "_true", moved_true);
+                dump(tag + "_history_alone", alone);
+                dump(tag + "_not_followed", guarded);
+                dump(tag + "_no_trail", untrailed);
+                dump(tag + "_default", all);
+                std::printf("Torch lab, the character goes with its torch, %.1f cm a frame (the camera with it), the 16th "
+                            "moving frame against the true picture of that moment (all / penumbra / more than 0.25 off): "
+                            "the history without its guards %.4f / %.4f / %.2f%%; the default %.4f / %.4f / %.2f%% "
+                            "(history held in the penumbra: %.2f of what it may); looked up where the ground was only "
+                            "%.4f / %.4f / %.2f%%; with BB_LAMP_SHADOW_TRAIL=0 %.4f / %.4f / %.2f%% (held %.2f)\n",
+                            speed * 100.0f, a.all, a.penumbra, a.far, d.all, d.penumbra, d.far,
+                            held_mean(all_held, moved_true), c.all, c.penumbra, c.far, e.all, e.penumbra, e.far,
+                            held_mean(untrailed_held, moved_true));
+                if (checked && !(d.all < a.all && d.penumbra < c.penumbra)) {
+                    std::fprintf(stderr, "the guards, or following the lamp, do not help a carried torch\n");
+                    return 1;
+                }
+            }
+            for (const bool two : {false, true}) {
+                second = two;
+                std::vector<float> held;
+                const Move other{.other = 0.05f};
+                const auto alone = moving(plain, other), all = moving(soft, other, &held);
+                const auto moved_true = truth(moved_view, soft);
+                const Off a = off(alone, moved_true), d = off(all, moved_true), e = off(held, moved_true);
+                const std::string tag = two ? "other_two_lamps" : "other";
+                dump(tag + "_true", moved_true);
+                dump(tag + "_history_alone", alone);
+                dump(tag + "_default", all);
+                dump(tag + "_default_upscaled", held);
+                // And the frames one by one without a history, through the stand-in alone.
+                Vulkan::LampShadowTune single = soft;
+                single.history = 0.0f;
+                std::vector<float> bare;
+                const auto raw_frame = moving(single, other, &bare);
+                const Off f = off(bare, moved_true), g = off(raw_frame, moved_true);
+                dump(tag + "_no_history_upscaled", bare);
+                std::printf("Torch lab, a figure walks under %s (5 cm a frame), the 16th moving frame against the true "
+                            "picture of that moment: the history without its guards %.4f / %.4f / %.2f%%; the default "
+                            "%.4f / %.4f / %.2f%%; one frame's rays alone %.4f / %.4f / %.2f%%; through the upscaler's "
+                            "stand-in: the default %.4f / %.4f / %.2f%%, the rays alone %.4f / %.4f / %.2f%%\n",
+                            two ? "the still torch and a second lamp" : "the still torch", a.all, a.penumbra, a.far,
+                            d.all, d.penumbra, d.far, g.all, g.penumbra, g.far, e.all, e.penumbra, e.far, f.all,
+                            f.penumbra, f.far);
+                if (checked && !(d.all < a.all && d.all < g.all)) {
+                    std::fprintf(stderr, "the history's guards do not help a moving caster (%s)\n", tag.c_str());
+                    return 1;
+                }
+            }
+            // A caster is gone from one frame to the next (the second figure, set 30 m off): how
+            // much of the old picture is left where the true one changed by more than 0.15, after
+            // 1, 2, 4, 8 and 16 frames. With one lamp, and with two (where a shadow is only a part
+            // of the pixel's light).
+            for (const bool two : {false, true}) {
+                second = two;
+                std::array<std::array<double, 5>, 2> left{};
+                place(view, 0.0f, 0.0f);
+                const auto old_true = truth(view, soft, 64);
+                place(view, 0.0f, 30.0f);
+                const auto new_true = truth(view, soft, 64);
+                for (int which = 0; which < 2; ++which) {
+                    const Vulkan::LampShadowTune& tune = which == 0 ? soft : plain;
+                    restart();
+                    place(view, 0.0f, 0.0f);
+                    for (unsigned k = 0; k < 24; ++k) frame(view, tune);
+                    place(view, 0.0f, 30.0f);
+                    unsigned slot = 0;
+                    for (unsigned k = 1; k <= 16; ++k) {
+                        frame(view, tune);
+                        if (k != 1 && k != 2 && k != 4 && k != 8 && k != 16) continue;
+                        const auto now = values();
+                        double sum = 0;
+                        std::size_t changed = 0;
+                        for (std::size_t i = 0; i < now.size(); ++i) {
+                            const double change = double(old_true[i]) - new_true[i];
+                            if (std::abs(change) > 0.15) {
+                                sum += (double(now[i]) - new_true[i]) / change;
+                                ++changed;
+                            }
+                        }
+                        left[which][slot++] = sum / double(std::max<std::size_t>(changed, 1));
+                    }
+                }
+                std::printf("Torch lab, a figure is gone from one frame to the next, %s: share of the old picture left "
+                            "where the true one changed, after 1 / 2 / 4 / 8 / 16 frames: the default %.3f / %.3f / %.3f "
+                            "/ %.3f / %.3f; the history without its guards %.3f / %.3f / %.3f / %.3f / %.3f\n",
+                            two ? "two lamps" : "one lamp", left[0][0], left[0][1], left[0][2], left[0][3], left[0][4],
+                            left[1][0], left[1][1], left[1][2], left[1][3], left[1][4]);
+                if (checked && !(left[0][1] < 0.2 && left[0][2] < 0.15 && left[0][2] < 0.5 * left[1][2])) {
+                    std::fprintf(stderr, "a shadow that is gone lingers (%s)\n", two ? "two lamps" : "one lamp");
+                    return 1;
+                }
+            }
+            second = false;
+            // A flame that flickers: the torch's lamp is up to 2 cm off its place, anew every frame,
+            // over a still scene.
+            {
+                const Move shaken{.shake = 0.02f, .frames = 24};
+                Move anchored = shaken;
+                anchored.follow = false;
+                const auto all = moving(soft, shaken);
+                const auto all_held = moved_held;
+                const auto unfollowed = moving(soft, anchored);
+                const auto moved_true = truth(moved_view, soft);
+                wobble = {0, 0, 0};
+                const Off d = off(all, moved_true), c = off(unfollowed, moved_true);
+                dump("flicker_true", moved_true);
+                dump("flicker_default", all);
+                std::printf("Torch lab, the torch's lamp is up to 2 cm off its place, anew every frame, the 24th frame "
+                            "against its true picture: the default %.4f / %.4f / %.2f%% (history held in the penumbra: "
+                            "%.2f of what it may); looked up where the ground was only %.4f / %.4f / %.2f%%\n",
+                            d.all, d.penumbra, d.far, held_mean(all_held, moved_true), c.all, c.penumbra, c.far);
+            }
+
+            // 5. The camera moves 3 cm a frame over a still scene: the history follows it (the
+            // way back to the camera of the frame before), or, as a check that it matters, does
+            // not (as if the camera had stood still).
+            {
+                std::array<Off, 2> offs{};
+                std::vector<float> pan_true;
+                for (const bool with_camera : {true, false}) {
+                    restart();
+                    Views before = view;
+                    for (unsigned k = 0; k <= 24; ++k) {
+                        const Views now = camera(0.03f * float(k), 0.0f);
+                        place(now, 0.0f, 0.0f);
+                        frame(now, soft, with_camera ? &before : nullptr);
+                        before = now;
+                    }
+                    const auto picture = values();
+                    if (with_camera) {
+                        pan_true = truth(before, soft);
+                        dump("pan_true", pan_true);
+                        dump("pan_default", picture);
+                    }
+                    offs[with_camera ? 0 : 1] = off(picture, pan_true);
+                }
+                std::printf("Torch lab, the camera moves 3 cm a frame, the 25th frame against its true picture: %.4f / "
+                            "%.4f / %.2f%%; with the history left where it was on screen %.4f / %.4f / %.2f%%\n",
+                            offs[0].all, offs[0].penumbra, offs[0].far, offs[1].all, offs[1].penumbra, offs[1].far);
+                if (checked && !(offs[0].penumbra < offs[1].penumbra)) {
+                    std::fprintf(stderr, "the history does not follow the camera\n");
+                    return 1;
+                }
+            }
+
+            // 6. The half-resolution build keeps the point lamp whatever the radius.
+            place(view, 0.0f, 0.0f);
+            run(view, {.tune = &soft, .frame = 3, .half = true});
+            {
+                const auto half_picture = values();
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < half_picture.size(); ++i) {
+                    differ += std::abs(half_picture[i] - point_picture[i]) > 1.0f / 64.0f ? 1 : 0;
+                }
+                std::printf("Torch lab: the half-resolution build with the default tuning differs from the point lamp at "
+                            "full resolution on %zu pixels\n", differ);
+                if (differ * 500 > half_picture.size()) {
+                    std::fprintf(stderr, "the half-resolution build does not show the point lamp\n");
+                    return 1;
+                }
+            }
+
+            // 7. The cost here (a small scene; --speed has the heavy one): the fastest of 40 runs
+            // taken in turn, the history's clear included.
+            {
+                std::array<double, 3> best{1e9, 1e9, 1e9};
+                restart();
+                for (int i = 0; i < 40; ++i) {
+                    best[0] = std::min(best[0], run(view, {.frame = unsigned(i)}));
+                    best[1] = std::min(best[1], run(view, {.tune = &point, .frame = unsigned(i)}));
+                    best[2] = std::min(best[2], frame(view, soft));
+                }
+                std::printf("Torch lab: mode 0 of this shader (the experiment bit's path; not the shader before r41) %.3f ms, the point lamp %.3f ms, the area lamp with its "
+                            "history %.3f ms\n", best[0], best[1], best[2]);
+            }
+            vk.destroy_as(vk.device, tlas.handle, nullptr);
+            vk.Free(tlas.instances); vk.Free(tlas.storage); vk.Free(tlas.scratch);
+            std::puts(checked ? "torch lab: ok" : "torch lab: done, not checked");
+            return 0;
+        }
         std::vector<std::array<double, 3>> lamp_ms(variants.size()), sun_ms(variants.size());
         std::array<double, 3> per_tile_ms{}, pick_ms{}, reuse_ms{}, reuse_error{};
         std::array<std::array<double, 2>, 3> pick_error{};
@@ -974,7 +1710,10 @@ int main(int argc, char** argv) {
         // (every lamp traced). Pixels on which two runs of mode 0 differ and on which the old
         // tuning under MODE_REPAIR differs from mode 0 (picked); mean lamp light kept with the
         // inverse-square weights; pixels a torch leaves dark as a point lamp and repaired.
-        std::array<std::array<double, 2>, 3> repair_ms{}, torch_ms{};
+        // bbport (r42_lamp-soft): the default repair is the area lamp now: timed with its history
+        // (third: as a point lamp, BB_LAMP_SHADOW_SOFT=0), its light and its dark pixels taken
+        // from the mean of 16 frames.
+        std::array<std::array<double, 3>, 3> repair_ms{}, torch_ms{};
         std::array<std::array<double, 3>, 3> repair_kept{}, torch_kept{};
         std::array<std::array<std::size_t, 2>, 3> repair_differ{}, torch_dark{};
         std::array<double, 3> inverse_kept{};
@@ -1068,16 +1807,20 @@ int main(int argc, char** argv) {
                     bool inverse_square = false;
                     bool engine_bias = false;
                     bool torch = false;
+                    // bbport (r42_lamp-soft): with a history (parity) and a tuning: the history
+                    // averages the ratio over the frames (HISTORY_BLEND), as the engine's does
+                    // for the area lamp.
+                    bool blend = false;
                 };
                 constexpr unsigned MaxTorches = 8;
-                const unsigned tune_at = used + 32;
+                const unsigned tune_at = used + 30 + Vulkan::LampHistoryTailWords; // after the history block
                 const unsigned torch_at = tune_at + Vulkan::LampTuneWordCount;
                 unsigned torch_count = 0;
                 const auto run_lamps = [&](bool per_tile, unsigned pick = 0, unsigned frame = 0, int parity = -1,
                                            LampRun more = {}) {
                     if (more.tune) {
                         const auto tune_words =
-                            Vulkan::LampTuneWords(*more.tune, more.inverse_square, 0.05f, views.view.m.data());
+                            Vulkan::LampTuneWords(*more.tune, more.inverse_square, 0.05f, views.view.m.data(), frame);
                         std::memcpy(reinterpret_cast<std::uint32_t*>(words) + tune_at, tune_words.data(),
                                     sizeof(tune_words));
                     }
@@ -1088,6 +1831,11 @@ int main(int argc, char** argv) {
                         const std::array<float, 12> identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
                         std::memcpy(block + 2, identity.data(), sizeof(identity));
                         std::memcpy(block + 14, views.proj.m.data(), 64);
+                        if (more.blend && more.tune) { // bbport (r42_lamp-soft): words 30 to 33
+                            block[0] |= 4u;
+                            const auto tail = Vulkan::LampHistoryTail(*more.tune);
+                            std::memcpy(block + 30, tail.data(), sizeof(tail));
+                        }
                     }
                     vk.Begin();
                     VkClearColorValue one{};
@@ -1097,7 +1845,7 @@ int main(int argc, char** argv) {
                     vkCmdClearColorImage(vk.cmd, lamp_images[2].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
                     vk.Barrier();
                     VkDescriptorBufferInfo data{lights.buffer, 0,
-                                                (used + 32 + Vulkan::LampTuneWordCount + MaxTorches * 24) * 4};
+                                                (tune_at + Vulkan::LampTuneWordCount + MaxTorches * 24) * 4};
                     VkDescriptorImageInfo depth{vk.sampler, lab.depth.view, VK_IMAGE_LAYOUT_GENERAL};
                     std::array<VkDescriptorImageInfo, 4> images{};
                     for (int k = 0; k < 4; ++k) images[k] = {{}, lamp_images[k].view, VK_IMAGE_LAYOUT_GENERAL};
@@ -1226,17 +1974,20 @@ int main(int argc, char** argv) {
                     //    second lamp depends on the order in which a workgroup's invocations list
                     //    its tiles, which is not fixed (two runs of mode 0 differ on some pixels),
                     //    so there the difference is bounded, not zero.
-                    //  - A lamp with a radius never darkens a pixel that a point lamp lights (a
-                    //    free rim ray only ever lights).
+                    //  - bbport (r42_lamp-soft): the point lamp (BB_LAMP_SHADOW_SOFT=0) gives the
+                    //    same picture whatever the frame counter; the area lamp's picture is the
+                    //    mean of 16 frames here (one ray a lamp a frame, to a point of the lamp's
+                    //    disc that moves with the frame counter).
                     //  - The torch lamps: one beside each character (a capsule 1.8 m tall and 0.6 m
                     //    wide), 0.45 m from its side at 1.4 m, reaching 5 m, as a hand torch is
                     //    held: the caster is near the lamp, which is where a point lamp magnifies
-                    //    it and where the rim rays are spent (the street lamps stand metres from
-                    //    what they shadow). The same checks, and the body keeps most of its
-                    //    shadow.
+                    //    it (the street lamps stand metres from what they shadow). The same
+                    //    checks, and the body keeps most of its shadow.
                     //  - What the default repair costs against mode 0 of this same shader (the
                     //    experiment bit's path; the shader before r41 is not in this build), with
-                    //    the engine's ray start offset, runs taken in turn.
+                    //    the engine's ray start offset, runs taken in turn: the area lamp with
+                    //    its history (cleared and written every frame, read from the second on),
+                    //    and the point lamp.
                     {
                         build_tlas(tlas, views.view, variant.flags, variant.doubled, 4);
                         {
@@ -1304,18 +2055,22 @@ int main(int argc, char** argv) {
                             const double kept_before = kept(lamp_values());
                             run_lamps(false, 0, 0, -1, {.tune = &point, .torch = torch});
                             const auto with_point = lamp_values();
-                            run_lamps(false, 0, 0, -1, {.tune = &repaired, .torch = torch});
-                            const auto with_radius = lamp_values();
-                            std::size_t darker = 0, dark_point = 0, dark_radius = 0;
+                            run_lamps(false, 0, 5, -1, {.tune = &point, .torch = torch});
+                            if (lamp_values() != with_point) {
+                                std::fprintf(stderr, "the point lamp's picture changes with the frame counter (camera "
+                                                     "%zu, %s lamps)\n", cam, torch ? "torch" : "street");
+                                return 1;
+                            }
+                            std::vector<float> with_radius(with_point.size(), 0.0f);
+                            for (unsigned f = 0; f < 16; ++f) {
+                                run_lamps(false, 0, f, -1, {.tune = &repaired, .torch = torch});
+                                const auto one = lamp_values();
+                                for (std::size_t k = 0; k < one.size(); ++k) with_radius[k] += one[k] / 16.0f;
+                            }
+                            std::size_t dark_point = 0, dark_radius = 0;
                             for (std::size_t k = 0; k < with_point.size(); ++k) {
-                                darker += with_radius[k] < with_point[k] ? 1 : 0;
                                 dark_point += with_point[k] < 0.25f ? 1 : 0;
                                 dark_radius += with_radius[k] < 0.25f ? 1 : 0;
-                            }
-                            if (darker != 0) {
-                                std::fprintf(stderr, "a lamp with a radius left %zu pixels darker than a point lamp "
-                                                     "(camera %zu, %s lamps)\n", darker, cam, torch ? "torch" : "street");
-                                return 1;
                             }
                             (torch ? torch_kept : repair_kept)[cam] = {kept_before, kept(with_point), kept(with_radius)};
                             if (torch) {
@@ -1326,16 +2081,19 @@ int main(int argc, char** argv) {
                                     return 1;
                                 }
                             }
-                            std::vector<double> plain, fixed;
+                            std::vector<double> plain, fixed, as_point;
                             for (int i = 0; i < 40; ++i) {
                                 plain.push_back(run_lamps(false, 1, unsigned(i), -1, {.engine_bias = true, .torch = torch}));
-                                fixed.push_back(run_lamps(false, 1, unsigned(i), -1,
-                                                          {.tune = &repaired, .engine_bias = true, .torch = torch}));
+                                fixed.push_back(run_lamps(false, 1, unsigned(i), i & 1,
+                                                          {.tune = &repaired, .engine_bias = true, .torch = torch, .blend = true}));
+                                as_point.push_back(run_lamps(false, 1, unsigned(i), -1,
+                                                             {.tune = &point, .engine_bias = true, .torch = torch}));
                             }
                             // The fastest run of each: this lab's lamp pass times jump between runs
                             // by several times, and the median moves with them.
                             (torch ? torch_ms : repair_ms)[cam] = {*std::min_element(plain.begin(), plain.end()),
-                                                                   *std::min_element(fixed.begin(), fixed.end())};
+                                                                   *std::min_element(fixed.begin(), fixed.end()),
+                                                                   *std::min_element(as_point.begin(), as_point.end())};
                         }
                         // The inverse-square weights (startup_local_inverse_square): they run and
                         // give a ratio.
@@ -1380,25 +2138,29 @@ int main(int argc, char** argv) {
                     "against every lamp over 16 frames %.4f %.4f %.4f\n",
                     reuse_ms[0], reuse_ms[1], reuse_ms[2], reuse_error[0], reuse_error[1], reuse_error[2]);
         // bbport (r41_lamp-shadows)
-        std::printf("Lamps that hit (instances with the lamp bit), picked, repaired (r41, default tuning): %.3f %.3f "
-                    "%.3f ms against %.3f %.3f %.3f ms of mode 0 of this shader (the experiment bit's path; the "
+        std::printf("Lamps that hit (instances with the lamp bit), picked, repaired (r42, default tuning: the area "
+                    "lamp with its history): %.3f %.3f %.3f ms, as a point lamp %.3f %.3f %.3f ms, against %.3f %.3f "
+                    "%.3f ms of mode 0 of this shader (the experiment bit's path; the "
                     "fastest of 40 runs taken in turn, the engine's ray start offset); mean lamp light kept with "
                     "every lamp traced: mode 0 "
-                    "%.4f %.4f %.4f, repaired with a point lamp %.4f %.4f %.4f, repaired %.4f %.4f %.4f, repaired "
-                    "with inverse-square weights %.4f %.4f %.4f; the old "
+                    "%.4f %.4f %.4f, repaired with a point lamp %.4f %.4f %.4f, repaired (16 frames) %.4f %.4f %.4f, "
+                    "repaired with inverse-square weights %.4f %.4f %.4f; the old "
                     "tuning under MODE_REPAIR gave mode 0's numbers with every lamp traced, and with picked lamps "
                     "differed on %zu %zu %zu pixels where two runs of mode 0 differed on %zu %zu %zu\n",
-                    repair_ms[0][1], repair_ms[1][1], repair_ms[2][1], repair_ms[0][0], repair_ms[1][0],
+                    repair_ms[0][1], repair_ms[1][1], repair_ms[2][1], repair_ms[0][2], repair_ms[1][2],
+                    repair_ms[2][2], repair_ms[0][0], repair_ms[1][0],
                     repair_ms[2][0], repair_kept[0][0], repair_kept[1][0], repair_kept[2][0], repair_kept[0][1],
                     repair_kept[1][1], repair_kept[2][1], repair_kept[0][2], repair_kept[1][2], repair_kept[2][2],
                     inverse_kept[0], inverse_kept[1], inverse_kept[2],
                     repair_differ[0][1], repair_differ[1][1], repair_differ[2][1], repair_differ[0][0],
                     repair_differ[1][0], repair_differ[2][0]);
-        std::printf("Torch lamps (0.45 m from a character's side, reach 5 m), picked, repaired: %.3f %.3f %.3f ms "
+        std::printf("Torch lamps (0.45 m from a character's side, reach 5 m), picked, repaired: %.3f %.3f %.3f ms, "
+                    "as a point lamp %.3f %.3f %.3f ms, "
                     "against %.3f %.3f %.3f ms of mode 0 of this shader; mean lamp light kept with every lamp traced: "
-                    "mode 0 %.4f %.4f %.4f, repaired with a point lamp %.4f %.4f %.4f, repaired %.4f %.4f %.4f; dark "
-                    "pixels repaired %zu %zu %zu, with a point lamp %zu %zu %zu\n",
-                    torch_ms[0][1], torch_ms[1][1], torch_ms[2][1], torch_ms[0][0], torch_ms[1][0], torch_ms[2][0],
+                    "mode 0 %.4f %.4f %.4f, repaired with a point lamp %.4f %.4f %.4f, repaired (16 frames) %.4f %.4f "
+                    "%.4f; dark pixels repaired %zu %zu %zu, with a point lamp %zu %zu %zu\n",
+                    torch_ms[0][1], torch_ms[1][1], torch_ms[2][1], torch_ms[0][2], torch_ms[1][2], torch_ms[2][2],
+                    torch_ms[0][0], torch_ms[1][0], torch_ms[2][0],
                     torch_kept[0][0], torch_kept[1][0], torch_kept[2][0], torch_kept[0][1], torch_kept[1][1],
                     torch_kept[2][1], torch_kept[0][2], torch_kept[1][2], torch_kept[2][2], torch_dark[0][1],
                     torch_dark[1][1], torch_dark[2][1], torch_dark[0][0], torch_dark[1][0], torch_dark[2][0]);
