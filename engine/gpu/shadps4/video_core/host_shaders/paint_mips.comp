@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r45_drawn-look): one more level of the drawn look's two images, each texel the mean
+// of the 2x2 texels of the level above: the copy (rgb the scene, a the view depth) and the marks
+// (paint_stats.comp). Run once a level down to one texel (the copy's one texel is then written
+// again by paint_key.comp: the frame's key). The stroke pass takes a stroke's one
+// colour from the level whose texels are about as large as the stroke is wide, which costs a
+// few reads however large the stroke is, and reads the marks over a stroke's whole place.
+// A level is read at the place of the new texel's middle, so that an odd size keeps every level
+// over the same place of the picture.
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D prep_from;  // the copy's level n (linear, clamped)
+layout(binding = 1) uniform sampler2D marks_from; // the marks' level n - 1
+layout(binding = 2, rgba16f) uniform writeonly image2D prep_to;  // the copy's level n + 1
+layout(binding = 3, rgba16f) uniform writeonly image2D marks_to; // the marks' level n
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 to_size = imageSize(prep_to);
+    if (any(greaterThanEqual(texel, to_size))) {
+        return;
+    }
+    const vec2 uv = (vec2(texel) + 0.5) / vec2(to_size);
+    imageStore(prep_to, texel, textureLod(prep_from, uv, 0.0));
+    // The tone's variance under the new texel: the mean of the four variances and what their
+    // four mean tones vary by.
+    vec4 marks = textureLod(marks_from, uv, 0.0);
+    const vec4 tones = textureGather(marks_from, uv, 0);
+    const float mean = dot(tones, vec4(0.25));
+    marks.g += max(dot(tones, tones) * 0.25 - mean * mean, 0.0);
+    imageStore(marks_to, texel, marks);
+}

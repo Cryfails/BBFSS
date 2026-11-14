@@ -18,6 +18,15 @@
 #include "video_core/host_shaders/contact_shadow_comp.h"
 #include "video_core/host_shaders/gtao_frag.h"
 #include "video_core/host_shaders/native_motion_blur_frag.h"
+#include "video_core/host_shaders/paint_key_comp.h"
+#include "video_core/host_shaders/paint_key_last_comp.h"
+#include "video_core/host_shaders/paint_lock_comp.h"
+#include "video_core/host_shaders/paint_lock_down_comp.h"
+#include "video_core/host_shaders/paint_lock_first_comp.h"
+#include "video_core/host_shaders/paint_mips_comp.h"
+#include "video_core/host_shaders/paint_prep_comp.h"
+#include "video_core/host_shaders/paint_stats_comp.h"
+#include "video_core/host_shaders/paint_strokes_comp.h"
 #include "video_core/host_shaders/point_shadow_comp.h"
 #include "video_core/host_shaders/point_volumetric_comp.h"
 #include "video_core/host_shaders/ssgi_composite_comp.h"
@@ -114,6 +123,30 @@ int main() {
          {eCombinedImageSampler, eCombinedImageSampler, eStorageImage}, 32},
         {"froyok upsample", FROYOK_BLOOM_UPSAMPLE_COMP,
          {eCombinedImageSampler, eCombinedImageSampler, eStorageImage}, 32},
+        // bbport (r45_drawn-look): as vk_drawn_look.cpp makes them (DrawnLookParams::Params)
+        {"drawn look prep", PAINT_PREP_COMP, {eSampledImage, eSampledImage, eStorageImage}, 112},
+        {"drawn look stats", PAINT_STATS_COMP, {eSampledImage, eStorageImage, eStorageImage}, 112},
+        {"drawn look mips",
+         PAINT_MIPS_COMP,
+         {eCombinedImageSampler, eCombinedImageSampler, eStorageImage, eStorageImage},
+         112},
+        {"drawn look key sums", PAINT_KEY_COMP, {eSampledImage, eStorageImage}, 112},
+        {"drawn look key", PAINT_KEY_LAST_COMP, {eSampledImage, eStorageImage}, 112},
+        {"drawn look strokes",
+         PAINT_STROKES_COMP,
+         {eCombinedImageSampler, eSampledImage, eSampledImage, eSampledImage, eStorageImage,
+          eCombinedImageSampler},
+         112},
+        {"drawn look lock means", PAINT_LOCK_FIRST_COMP, {eSampledImage, eStorageImage}, 112},
+        {"drawn look lock levels",
+         PAINT_LOCK_DOWN_COMP,
+         {eCombinedImageSampler, eStorageImage},
+         112},
+        {"drawn look lock",
+         PAINT_LOCK_COMP,
+         {eCombinedImageSampler, eSampledImage, eSampledImage, eStorageImage,
+          eCombinedImageSampler},
+         112},
         {"ssgi prep", SSGI_PREP_COMP, {eSampledImage, eStorageImage, eSampledImage}, 128},
         {"ssgi gather",
          SSGI_GATHER_COMP,

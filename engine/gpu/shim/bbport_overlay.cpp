@@ -1242,10 +1242,47 @@ void PictureSection() {
             Store(s.graphics_volumetric_intensity, 1.0f, true);
             Store(s.graphics_point_fog_intensity, 1.0f, true);
             Store(s.graphics_point_fog_glow_size, 0.08f, true);
+            Store(s.graphics_drawn_look, false, true); // bbport (r45_drawn-look)
             SyncRayTracing();
         }
     }
     ImGui::EndDisabled();
+    // bbport (r45_drawn-look): the renderer's own pass, so not under the switch above, which
+    // is for what the game's code does.
+    Section("Drawn look", "Рисованный стиль");
+    const char* const drawn_problem = s.drawn_look_problem.load();
+    if (const char* label = Item("Drawn look (in development)", "Рисованный стиль (в разработке)")) {
+        // While it cannot run it cannot be switched on; switched on, it can always be switched
+        // off (the renderer then lets go of what it holds for it).
+        ImGui::BeginDisabled(drawn_problem != nullptr && !s.graphics_drawn_look);
+        Checkbox(label, s.graphics_drawn_look);
+        ImGui::EndDisabled();
+        Hint(BbSettings::MenuText(
+            "An optional hand-painted look: brush strokes laid on the world's surfaces, bold on plain "
+            "walls and floors, fine where there is detail. Fire, glows, fog, particles and the HUD stay "
+            "as the game draws them, and colours are not changed. Applies at once. This build paints "
+            "the strokes; ink lines and painted shadow edges are not built yet.",
+            "Необязательный рисованный вид: мазки кисти ложатся на поверхности мира, крупные на ровных "
+            "стенах и полах, мелкие там, где есть детали. Огонь, свечение, туман, частицы и интерфейс "
+            "остаются такими, какими их рисует игра, цвета не меняются. Применяется сразу. В этой "
+            "сборке рисуются мазки; контурные линии и рисованные края теней ещё не сделаны."));
+        if (drawn_problem) {
+            ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"),
+                                BbSettings::MenuText(drawn_problem));
+        }
+    }
+    if (const char* label = Item("Drawn look strength", "Сила рисованного стиля")) {
+        ImGui::BeginDisabled(drawn_problem != nullptr || !s.graphics_drawn_look);
+        Slider(label, s.graphics_drawn_look_strength, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::EndDisabled();
+        Hint(BbSettings::MenuText(
+            "How much of the strokes is laid over the game's picture: 1 is the full look, lower values "
+            "let more of the game's own picture through. At 0 the look does no work at all. Applies at "
+            "once.",
+            "Насколько мазки перекрывают изображение игры: 1 — стиль в полную силу, меньшие значения "
+            "оставляют больше исходного изображения. При 0 стиль вообще не работает. Применяется "
+            "сразу."));
+    }
 }
 
 // bbport (r39_master-debug): a measuring or tracing row of the Debug tab. The row writes a

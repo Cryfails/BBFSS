@@ -48,8 +48,15 @@ These `graphics_*` keys in `lantern.ini` have no control in the Windows launcher
 | `graphics_env_ggx_tails` | GGX tails for environment reflections | on |
 | `graphics_light_sharpness` | Light sharpness | `100.0` |
 | `graphics_dof_intensity` | Depth-of-field intensity | `1` |
+| `graphics_drawn_look` | Drawn look (in development): an optional hand-painted look, brush strokes laid on the world's surfaces, bold on plain walls and floors and fine where there is detail. Fire, glows, fog, particles and the HUD are not painted, colours are not changed. Ink lines and painted shadow edges are not built yet | off |
+| `graphics_drawn_look_strength` | Drawn look strength, 0 to 1: how much of the strokes is laid over the game's picture (at 0 the look does no work) | `0.6` |
+| `graphics_drawn_look_stroke_size` | Drawn look: size of the strokes, 0.6 to 1.4 | `1.0` |
+| `graphics_drawn_look_texture` | Drawn look: the brush's marks in a stroke (each stroke a little lighter or darker, streaks along it), 0 to 1.2 | `1.0` |
+| `graphics_drawn_look_characters` | Drawn look: share of the strength on characters and whatever else moves by itself, 0 to 1. They are smoothed, not stroked: strokes lie still in the world and a moving body would slide under them | `0.5` |
+| `graphics_drawn_look_debug` | Drawn look test view while the look is on: `1` paints every stroke in a flat colour of its own, bold and fine as the look mixes them, `2` the same with all strokes fine, `4` with all strokes bold (`3` is kept for the ink lines) | `0` |
+| `graphics_drawn_look_outlines`, `_shadow_edges`, `_ink_world`, `_shadow_soft`, `_quality` | Drawn look: kept for parts of the look that are not built yet (character ink, painted shadow edges and world ink 0 to 1, shadow softness 0.05 to 0.3, quality 0 or 1); read, clamped and saved, without effect so far | `0.35`, `1.0`, `0`, `0.12`, `1` |
 
-Experimental environment-only toggles (no ini key): `BB_SKY_ZENITH_FIX=1` enables the sky zenith fix (off by default); `BB_SKY_SEAM_FIX` controls the sky seam fix, which is on by default and disabled with `BB_SKY_SEAM_FIX=0`.
+Experimental environment-only toggles (no ini key): `BB_SKY_ZENITH_FIX=1` enables the sky zenith fix (off by default); `BB_SKY_SEAM_FIX` controls the sky seam fix, which is on by default and disabled with `BB_SKY_SEAM_FIX=0`. `BB_DRAWN_LOOK_VIEW=1`, `2` or `4` shows the drawn look's test view (as `graphics_drawn_look_debug`) while the look is on, without writing it to the ini.
 
 ## Sponsors
 

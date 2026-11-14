@@ -1,0 +1,409 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r45_drawn-look): the drawn look's stroke pass. It rewrites the scene colour's rgb in
+// place, after the solid surfaces are drawn and before fire, glows, fog and particles are (those
+// stay as the game draws them); the alpha is the game's data and is kept. The sky is not painted.
+//
+// Every pixel finds the brush strokes that lie on its place in the world (paint_common.glsl) and
+// takes the colour of the one on top. A stroke has one colour: the scene's own, averaged over the
+// stroke from the copy's small levels, so the fine grit of a surface goes and its hue and
+// brightness stay. Large plain surfaces get bold strokes, places with detail fine ones
+// (detailAt). What a stroke may not swallow keeps its own colour: a pixel much lighter or darker
+// than its stroke or of another hue (an eye, a glint, a letter, a thin railing), and what glows.
+// Nothing is tinted and no contrast is added: every step is a mean of the scene's colours or a
+// change of brightness that is as often up as down.
+//
+// All thresholds are ratios of brightness (stops) or shares of the frame's key (paint_key.comp):
+// the scene is linear and has not had the game's exposure yet, so no fixed brightness means
+// anything, and a scene twice as bright gets the same look.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "paint_common.glsl"
+
+// paint_prep.comp's copy and its smaller levels: rgb the scene before the strokes, a the view
+// depth in metres (0: sky). Its last level, one texel, holds the frame's key (paint_key.comp).
+// Linear between texels and levels, clamped.
+layout(binding = 0) uniform sampler2D prep_tex;
+layout(binding = 1) uniform texture2D depth_tex;  // depth 0..1 (D3D projection), 1: sky
+// FLAG_NORMALS: the G-buffer's world normal, xyz * 2 - 1 (a length under 0.5: none here).
+layout(binding = 2) uniform texture2D normal_tex;
+// FLAG_MOTION: this frame's object motion: rg pixels (previous - current), b 1 where a draw
+// with vectors of its own wrote the pixel, a the depth it wrote at.
+layout(binding = 3) uniform texture2D motion_tex;
+layout(binding = 4, rgba16f) uniform image2D scene_img;
+// paint_stats.comp's marks and their smaller levels; level 0 is half the scene's size.
+layout(binding = 5) uniform sampler2D marks_tex;
+
+// A stroke blends the scene's colours that are like the pixel's own: within about this many
+// stops at strength 0 and 1 (a wider net flattens more), and within this much of its hue (as
+// shares of red, green and blue).
+const vec2 BLEND_STOPS = vec2(0.3, 1.5);
+const float BLEND_HUE = 0.06;
+// A pixel this many stops from its stroke's brightness starts to keep its own colour, and
+// keeps all of it from the second number on; on a thin line (LINE_*) the second pair holds.
+const vec2 KEEP_STOPS = vec2(0.6, 1.2);
+const vec2 KEEP_STOPS_LINE = vec2(0.3, 0.7);
+const vec2 KEEP_HUE = vec2(0.05, 0.12);
+// Detail, which takes fine strokes: the tone under a bold stroke varies by this share of itself
+// (0.08 is about a third of a stop; grit stays below), or its slopes run one way this strongly
+// (edges, railings, joints).
+const vec2 DETAIL_ROUGH = vec2(0.09, 0.2);
+const vec2 DETAIL_LINES = vec2(0.02, 0.05);
+const vec2 LINE_SLOPE = vec2(0.03, 0.08);
+// Strokes are bold up to the first of these numbers of detail and fine from the second on: most
+// of the picture is one or the other, and there a little more or less detail from one frame to
+// the next (the marks are measured on each frame's own pixels) changes nothing.
+const vec2 FINE_FROM = vec2(0.25, 0.75);
+// The brush's marks at graphics_drawn_look_texture 1: a stroke as a whole is up to this much
+// lighter or darker (a bold one, a fine one: bold strokes of plain walls that differ by more
+// read as scales), and streaks along it up to that much.
+const vec2 BRUSH_VALUE = vec2(0.04, 0.07);
+const float BRUSH_STREAKS = 0.05;
+// A colour of the copy belongs to the pixel's surface while its depth is within this share of
+// the depth that surface has there (all of it, none of it).
+const vec2 SAME_DEPTH = vec2(0.01, 0.03);
+// What glows is left unpainted: brighter than the frame's key by the first number of stops and
+// than the place around it by the second (a lit wall is bright against the frame, not against
+// its place); over one stop more it is left alone altogether.
+const vec2 GLOW_STOPS = vec2(4.0, 1.0);
+
+float lum_floor;  // the frame's black (blackLevel)
+float tone_floor; // the same as a tone (toneOf)
+// In the test view (graphics_drawn_look_debug 1, 2 or 4) every dab has a flat colour of its
+// own, grey where the surface moves by itself.
+bool test_view = false;
+bool test_grey = false;
+// What shows between the look's dabs (calmColour), worked out for the first dab that needs it.
+vec3 under = vec3(0.0);
+bool have_under = false;
+
+float depthAt(ivec2 p) {
+    return texelFetch(depth_tex, clamp(p, ivec2(0), ivec2(size) - 1), 0).r;
+}
+
+// The surface's world normal from the depth around the pixel, for a frame without the G-buffer's
+// normals and for pixels the G-buffer has none for. Of the two neighbours on each axis the one
+// nearer in depth is taken, so the normal does not lean across an edge.
+vec3 depthNormal(ivec2 pixel, vec3 c) {
+    vec3 px[2], py[2];
+    for (int i = 0; i < 2; ++i) {
+        const int s = i == 0 ? -1 : 1;
+        const float dx = depthAt(pixel + ivec2(s, 0));
+        const float dy = depthAt(pixel + ivec2(0, s));
+        px[i] = viewPos(vec2(pixel + ivec2(s, 0)) + 0.5, dx >= 1.0 ? 1e6 : viewZ(dx));
+        py[i] = viewPos(vec2(pixel + ivec2(0, s)) + 0.5, dy >= 1.0 ? 1e6 : viewZ(dy));
+    }
+    const vec3 ex = abs(px[1].z - c.z) < abs(c.z - px[0].z) ? px[1] - c : c - px[0];
+    const vec3 ey = abs(py[1].z - c.z) < abs(c.z - py[0].z) ? py[1] - c : c - py[0];
+    const vec3 n = cross(ey, ex);
+    return dirToWorld(dot(n, n) > 1e-12 ? normalize(n) : -normalize(c));
+}
+
+// Only which way the surface faces matters here, not the normal's sign.
+vec3 worldNormal(ivec2 pixel, vec3 c) {
+    if ((flags & FLAG_NORMALS) != 0u) {
+        const ivec2 last = textureSize(normal_tex, 0) - 1;
+        const vec3 n = texelFetch(normal_tex, clamp(pixel, ivec2(0), last), 0).xyz * 2.0 - 1.0;
+        if (dot(n, n) > 0.25) {
+            return normalize(n);
+        }
+    }
+    return depthNormal(pixel, c);
+}
+
+bool movesItself(ivec2 pixel, float depth) {
+    return (flags & FLAG_MOTION) != 0u && ownMotion(texelFetch(motion_tex, pixel, 0), depth);
+}
+
+// How much fine detail lies around a place of the screen: 0 a plain surface, which takes bold
+// strokes, 1 detail (carvings, faces, branches, windows), which takes fine ones. Read from the
+// marks' level whose texels are two bold cells wide, about what a bold stroke covers and would
+// swallow. The marks are measured on this frame's pixels, so they are the one thing in a
+// stroke's place and size that is not fixed to the world: over a place of this width they
+// change little with the jitter and with a turn of the camera (texels one cell wide changed the
+// size of a third more of the picture from one jitter to the next), and FINE_FROM keeps what
+// change there is to the line between plain and detailed.
+float detailAt(vec2 uv) {
+    const vec4 marks = textureLod(marks_tex, uv, log2(cell_bold));
+    const float base = marks.r + tone_floor;
+    const float detail =
+        max(smoothstep(DETAIL_ROUGH.x, DETAIL_ROUGH.y, sqrt(marks.g) / base),
+            smoothstep(DETAIL_LINES.x, DETAIL_LINES.y, sqrt(length(marks.ba)) / base));
+    return smoothstep(FINE_FROM.x, FINE_FROM.y, detail);
+}
+
+// The pixel's own colour, as the strokes compare the scene around it with, and its surface.
+struct Own {
+    vec3 rgb;
+    float lum;
+    vec3 hue;    // its shares of red, green and blue (grey near black)
+    float z;     // view depth, metres
+    vec3 facing; // the surface's normal from the depth around the pixel, view axes
+    float level; // that normal times the pixel's view position: the surface's plane
+};
+
+// The view depth the pixel's surface has at another place of the screen, were it flat.
+float surfaceDepth(vec2 uv, Own own) {
+    const float along = dot(own.facing, viewPos(uv * size, 1.0));
+    return abs(along) > 1e-4 ? clamp(own.level / along, 0.5 * own.z, 2.0 * own.z) : own.z;
+}
+
+vec3 hueOf(vec3 rgb) {
+    return (rgb + lum_floor) / (rgb.r + rgb.g + rgb.b + 3.0 * lum_floor);
+}
+
+float stopsBetween(float a, float b) {
+    return log2((a + lum_floor) / (b + lum_floor));
+}
+
+// How much a colour read from the copy at view depth `z` counts for the pixel: all of it where
+// it has the pixel's brightness and hue and lies at the depth the pixel's surface has there. A
+// texel of a small level that is partly another surface's (a silhouette runs through it) has a
+// depth between the two and the other's colour mixed in: SAME_DEPTH leaves it out.
+float alike(vec4 there, float z, Own own) {
+    const float stops = stopsBetween(dot(there.rgb, LUMA), own.lum);
+    const float reach = mix(BLEND_STOPS.x, BLEND_STOPS.y, strength);
+    const vec3 hue = hueOf(there.rgb) - own.hue;
+    return exp(-0.5 * stops * stops / (reach * reach) -
+               0.5 * dot(hue, hue) / (BLEND_HUE * BLEND_HUE)) *
+           (1.0 - smoothstep(SAME_DEPTH.x, SAME_DEPTH.y, abs(there.a - z) / z));
+}
+
+// The scene around the pixel, smoothed over `radius` pixels without crossing an edge: what
+// shows between strokes, and what a surface that moves by itself gets instead of strokes.
+vec3 calmColour(vec2 uv, float radius, Own own) {
+    const float level = log2(max(radius, 1.0));
+    vec4 sum = vec4(own.rgb, 1.0) * 0.25;
+    for (int i = 0; i < 4; ++i) {
+        const vec2 at = uv + vec2((i & 1) * 2 - 1, (i >> 1) * 2 - 1) * (0.7 * radius) / size;
+        const vec4 there = textureLod(prep_tex, at, level);
+        const float w = alike(there, surfaceDepth(at, own), own);
+        sum += vec4(there.rgb, 1.0) * w;
+    }
+    return sum.rgb / sum.a;
+}
+
+// `count` streaks side by side across a dab, each a little lighter or darker: -0.5..0.5.
+float streaksAcross(Dab dab, float count, uint salt) {
+    const float x = (dab.t * 0.5 + 0.5) * count;
+    const float cell = floor(x);
+    float f = x - cell;
+    f = f * f * (3.0 - 2.0 * f);
+    const uint at = dab.id + salt + uint(int(cell) + 8);
+    return mix(unit(pcg(at)), unit(pcg(at + 1u)), f) - 0.5;
+}
+
+// The brush's marks in a dab: the dab as a whole a little lighter or darker than its colour, and
+// streaks along it. Around 1: over many dabs the brightness stays what it was. `width`: the
+// dab's width on the screen in pixels. Six streaks across a dab where each is a few pixels wide
+// (a bold dab on a scene of 2160 lines); a narrower dab (a bold one at 1080 lines, a fine one at
+// 2160) has three; where even those would be finer than two or three pixels they would flicker,
+// and there are none. One count fades into the other as a dab's width changes with the distance.
+// `detail`: 0 a bold dab, 1 a fine one.
+float brushMarks(Dab dab, float width, float detail) {
+    const float six = smoothstep(2.0, 4.0, width / 6.0);
+    const float three = (1.0 - six) * smoothstep(2.0, 4.0, width / 3.0);
+    float streak = 0.0;
+    if (six > 0.0) {
+        streak += six * streaksAcross(dab, 6.0, 0u);
+    }
+    if (three > 0.0) {
+        streak += three * streaksAcross(dab, 3.0, 97u);
+    }
+    return 1.0 + brush * (2.0 * mix(BRUSH_VALUE.x, BRUSH_VALUE.y, detail) * dab.idv +
+                          2.0 * BRUSH_STREAKS * streak);
+}
+
+// A dab's colour for the pixel: rgb, and in a how much of the dab is there (0: none of it, show
+// what lies under it). The colour is read at three places along the dab, from the copy's level
+// whose texels are about as large as the dab is wide, so the whole dab is nearly one colour;
+// where the dab crosses an edge each pixel takes the side it is like.
+// `px_per_m`: pixels a metre covers at the pixel; `lean`: how squarely the dab's plane is seen.
+vec4 dabPaint(Dab dab, vec3 rel, vec3 n, int plane, float px_per_m, float lean, float detail,
+              Own own) {
+    const float squash = max(lean, LEAN_MIN);
+    const float cell = dab.cell * px_per_m;
+    const float level = log2(max(0.7 * cell * sqrt(squash), 1.0));
+    vec4 sum = vec4(0.0);
+    for (int i = -1; i <= 1; ++i) {
+        const vec3 v = dirToView(rel + planeStep(dab.offset + dab.reach * (0.6 * float(i)), n, plane));
+        if (v.z <= 0.01) {
+            continue;
+        }
+        const vec2 uv = viewToPixel(v) / size;
+        if (any(lessThan(uv, vec2(-0.01))) || any(greaterThan(uv, vec2(1.01)))) {
+            continue;
+        }
+        const vec4 there = textureLod(prep_tex, uv, level);
+        sum += vec4(there.rgb, 1.0) * alike(there, v.z, own);
+    }
+    if (sum.a < 1e-3) {
+        return vec4(0.0);
+    }
+    // A dab thinner than a pixel or two on the screen (a fine one on a floor far away) is no
+    // shape any more: it fades, and the smoothed scene shows.
+    const float width = cell * squash;
+    return vec4(sum.rgb / sum.a * brushMarks(dab, width, detail),
+                dab.cover * smoothstep(0.02, 0.2, sum.a) * smoothstep(1.2, 2.5, width));
+}
+
+// The test view's colour for a dab: some hue of its own, luminance 1.
+vec3 idColour(uint id) {
+    const float hue = unit(id) * 6.0;
+    const vec3 pure = clamp(abs(mod(hue + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    const vec3 c = mix(vec3(1.0), pure, 0.65);
+    return c / dot(c, LUMA);
+}
+
+// The scene's luminance where a dab's centre lies, so that the whole dab gets one brightness and
+// the test view is neither black nor blown out whatever the game's exposure is. `own` (the
+// pixel's luminance) where the centre is off the screen, behind something else, or on another
+// surface.
+float dabLuminance(vec3 rel, vec3 n, int plane, vec2 offset, float own) {
+    const vec3 v = dirToView(rel + planeStep(offset, n, plane));
+    if (v.z <= 0.0) {
+        return own;
+    }
+    const ivec2 p = ivec2(floor(viewToPixel(v)));
+    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(size)))) {
+        return own;
+    }
+    const vec4 there = texelFetch(prep_tex, p, 0);
+    return abs(there.a - v.z) < 0.03 * v.z + 0.03 ? dot(there.rgb, LUMA) : own;
+}
+
+// What one dab gives the pixel. The look: its paint, and between dabs the smoothed scene. The
+// test view: its flat colour, and between dabs the scene.
+vec3 dabColour(Dab dab, vec2 uv, vec3 rel, vec3 flat_n, int plane, float px_per_m, float lean,
+               float detail, Own own) {
+    if (test_view) {
+        if (dab.cover <= 0.0) {
+            return own.rgb;
+        }
+        vec3 flat_colour = idColour(dab.id) * (1.0 + 0.5 * dab.idv);
+        if (test_grey) {
+            flat_colour = vec3(dot(flat_colour, LUMA));
+        }
+        return flat_colour * dabLuminance(rel, flat_n, plane, dab.offset, own.lum);
+    }
+    vec4 paint = vec4(0.0);
+    if (dab.cover > 0.0) {
+        paint = dabPaint(dab, rel, flat_n, plane, px_per_m, lean, detail, own);
+    }
+    if (paint.a < 1.0) {
+        if (!have_under) {
+            under = calmColour(uv, 0.5 * cell_fine, own);
+            have_under = true;
+        }
+        paint.rgb = mix(under, paint.rgb, paint.a);
+    }
+    return paint.rgb;
+}
+
+// The colour the strokes give the pixel: the dabs of the planes its surface takes them from
+// (planeShares) and of the two sizes around the one its `detail` asks for, mixed as their shares
+// say. `n` (with the surface's bumps) and `flat_n` (the surface itself) pick the planes; flat_n
+// says where a dab's other places lie.
+vec3 strokeColour(vec2 uv, vec3 rel, vec3 n, vec3 flat_n, float detail, Own own) {
+    const vec3 shares = planeShares(n, flat_n);
+    const float distance = length(rel);
+    const float px_per_m = 1.0 / metresPerPixel(distance);
+    vec3 sum = vec3(0.0);
+    for (int plane = 0; plane < 3; ++plane) {
+        if (shares[plane] <= 0.0) {
+            continue;
+        }
+        const float lean = planeLean(rel, plane);
+        int octave;
+        float upper_share;
+        strokeOctaves(distance, detail, lean, octave, upper_share);
+        for (int o = 0; o < 2; ++o) {
+            const float share = shares[plane] * (o == 0 ? 1.0 - upper_share : upper_share);
+            if (share <= 0.0) {
+                continue;
+            }
+            const Dab dab = findDab(rel, plane, octave + o);
+            sum += share * dabColour(dab, uv, rel, flat_n, plane, px_per_m, lean, detail, own);
+        }
+    }
+    return sum;
+}
+
+// How much of its own colour the pixel keeps under the paint: all of it where it glows, and
+// where it is far from the paint's brightness or hue (the stroke would swallow a detail). On a
+// thin line of the picture a smaller difference is enough.
+float keepOwn(vec2 uv, vec3 paint, Own own, float key) {
+    const vec4 marks = textureLod(marks_tex, uv, 1.0);
+    const float line = smoothstep(LINE_SLOPE.x, LINE_SLOPE.y,
+                                  sqrt(length(marks.ba)) / (marks.r + tone_floor));
+    const vec2 stops = mix(KEEP_STOPS, KEEP_STOPS_LINE, line);
+    float keep = smoothstep(stops.x, stops.y, abs(stopsBetween(own.lum, dot(paint, LUMA))));
+    keep = max(keep, smoothstep(KEEP_HUE.x, KEEP_HUE.y, length(own.hue - hueOf(paint))));
+    // The scene around the pixel over a few pixels and over a large place (about 1/270 and
+    // 1/17 of the picture's height).
+    const float lines = log2(size.y);
+    const float near = dot(textureLod(prep_tex, uv, lines - 8.1).rgb, LUMA);
+    const float place = dot(textureLod(prep_tex, uv, lines - 4.1).rgb, LUMA);
+    const float top = max(own.lum, near);
+    const float glow = min(stopsBetween(top, key) - GLOW_STOPS.x,
+                           stopsBetween(top, place) - GLOW_STOPS.y);
+    return max(keep, smoothstep(0.0, 1.0, glow));
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    if (depth >= 1.0) {
+        return;
+    }
+    const vec4 scene = imageLoad(scene_img, pixel);
+    const vec2 uv = (vec2(pixel) + 0.5) / size;
+    // The copy's last level is one texel: the frame's key.
+    const float key = textureLod(prep_tex, vec2(0.5), 99.0).r;
+    lum_floor = blackLevel(key);
+    tone_floor = pow(lum_floor, 1.0 / 3.0);
+    const float z = viewZ(depth);
+    const vec3 c = viewPos(vec2(pixel) + 0.5, z);
+    const vec3 rel = dirToWorld(c);
+    const vec3 n = worldNormal(pixel, c);
+    const uint view = (flags >> 8u) & 7u;
+    test_view = view == VIEW_STROKES || view == VIEW_FINE || view == VIEW_BOLD;
+    const float detail = view == VIEW_FINE ? 1.0 : view == VIEW_BOLD ? 0.0 : detailAt(uv);
+    // What moves by itself would slide under strokes that lie still in the world: it is
+    // smoothed instead, by its own share of the strength (the test view shows its dabs grey).
+    const bool moving = movesItself(pixel, depth);
+    test_grey = moving;
+    const float amount = strength * (moving ? characters : 1.0);
+    if (amount <= 0.0 && !test_view) {
+        return;
+    }
+    Own own;
+    own.rgb = max(scene.rgb, 0.0);
+    own.lum = dot(own.rgb, LUMA);
+    own.hue = hueOf(own.rgb);
+    own.z = z;
+    // The G-buffer's normal has the surface's bumps in it; where the surface itself lies comes
+    // from the depth.
+    const vec3 flat_n = (flags & FLAG_NORMALS) != 0u ? depthNormal(pixel, c) : n;
+    own.facing = dirToView(flat_n);
+    own.level = dot(own.facing, c);
+    if (test_view) {
+        imageStore(scene_img, pixel,
+                   vec4(strokeColour(uv, rel, n, flat_n, detail, own), scene.a));
+        return;
+    }
+    const vec3 paint = moving ? calmColour(uv, cell_fine, own)
+                              : strokeColour(uv, rel, n, flat_n, detail, own);
+    const float keep = keepOwn(uv, paint, own, key);
+    const vec3 rgb = mix(scene.rgb, paint, amount * (1.0 - keep));
+    // A scene colour that is no number stays what it is.
+    if (!any(isnan(rgb))) {
+        imageStore(scene_img, pixel, vec4(rgb, scene.a));
+    }
+}
