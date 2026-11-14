@@ -98,7 +98,7 @@ void main() {
         return;
     }
     if (characters <= 0.0 && (flags & FLAG_MOTION) != 0u &&
-        ownMotion(texelFetch(motion_tex, pixel, 0), depth)) {
+        movesItself(texelFetch(motion_tex, pixel, 0), depth, vec2(pixel) + 0.5) >= 1.0) {
         return;
     }
     const vec2 uv = (vec2(pixel) + 0.5) / size;

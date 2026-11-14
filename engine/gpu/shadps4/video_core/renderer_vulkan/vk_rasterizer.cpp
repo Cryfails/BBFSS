@@ -814,8 +814,26 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 EffectsBlendedScene();
                 upscaler->OnBlendedSceneDraw();
             } else if (regs.num_indices <= 6 && regs.num_instances.NumInstances() <= 1) {
-                // A full-screen pass over the scene (the fog composite): the transparents are in.
-                EffectsSceneComposite(pipeline);
+                // bbport (r45b_drawn-look-fixes): a particle system of six indices or fewer (a
+                // card of fog, a few sparks) is as small a draw as a full-screen pass, and is one
+                // of the transparents: blended, no depth written, tested against the scene's
+                // depth. The drawn look paints before it as before a larger one (it was painted
+                // over: one card of fog a frame at the place this was found, up to fifteen draws
+                // in a level's first seconds) and does not take it for the fog composite. Only with
+                // the look on; the upscaler's two calls are as they were.
+                if (drawn_look_wanted &&
+                    DrawnLookParams::SmallTransparent(
+                        regs.blend_control[0].enable, regs.color_buffers[0].info.blend_bypass,
+                        regs.depth_control.depth_write_enable, regs.depth_control.depth_enable,
+                        regs.depth_control.depth_func == AmdGpu::CompareFunc::Always)) {
+                    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+                    drawn_look->OnSmallTransparent(ps ? ps->pgm_hash : 0, regs.num_indices);
+                    EffectsBlendedScene();
+                } else {
+                    // A full-screen pass over the scene (the fog composite): the transparents
+                    // are in.
+                    EffectsSceneComposite(pipeline);
+                }
                 upscaler->OnSceneComposite();
             }
         }

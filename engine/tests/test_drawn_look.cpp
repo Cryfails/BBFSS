@@ -9,7 +9,11 @@
 //  - the look keeps the picture's colours: the mean colour of every surface stays, the sky and
 //    the alpha are not touched, a brighter or darker scene (another exposure) gets the same look;
 //  - it flattens fine grit, leaves what moves by itself without strokes, and a colour that is no
-//    number does not spread.
+//    number does not spread;
+//  - (r45b_drawn-look-fixes) what moves by itself is told against the camera's own move: a wall
+//    with a vector in the object motion image gets its strokes whatever the camera does, a ball
+//    that lies still does too, one that moves does not; and which small draws count as
+//    transparents (DrawnLookParams::SmallTransparent).
 //
 // drawn-look-test [picture.bmp]: with a path, four views of the scene are also written.
 // drawn-look-test --picture in.bmp out [2]: the look on a picture (24-bit BMP, sRGB), laid on a
@@ -134,6 +138,18 @@ struct Camera {
         }
         return rows;
     }
+    /// World to view, 3x4 rows.
+    std::array<float, 12> View() const {
+        const std::array<Vec3, 3> axes{Right(), Down(), Forward()};
+        std::array<float, 12> rows;
+        for (int i = 0; i < 3; ++i) {
+            for (int k = 0; k < 3; ++k) {
+                rows[i * 4 + k] = float(axes[i][k]);
+            }
+            rows[i * 4 + 3] = float(-Dot(axes[i], pos));
+        }
+        return rows;
+    }
 };
 
 /// The projection's scales for a screen of this shape: 50 degrees from top to bottom.
@@ -243,7 +259,28 @@ u32 Hash(u32 v) {
 /// just rough enough to count as detail, and the look goes from bold strokes to fine ones.
 enum class Paint { Plain, Lit, Grit, Patches };
 
-Scene MakeScene(const Lens& lens, const Camera& camera, Paint paint, float exposure = 1.0f) {
+/// What the object motion image holds for a scene. Without `before`: as the scenes of r45, the
+/// ball alone has a vector, and it is zero. With `before` (the camera of the frame before and
+/// its lens): the ball's vector is what the camera's own move makes of a still point there
+/// plus `ball` pixels of its own, and with `world` every surface has a vector too, the
+/// camera's: what the game's walls and floors drawn through a bone buffer have.
+struct Vectors {
+    const Camera* before = nullptr;
+    const Lens* lens_before = nullptr;
+    bool world = false;
+    std::array<float, 2> ball{};
+};
+
+/// Where a world point lies on a camera's screen in pixels, without the jitter.
+std::array<double, 2> Place(const Lens& lens, const Camera& camera, const Vec3& world) {
+    const Vec3 rel = Add(world, camera.pos, -1.0);
+    const double z = Dot(rel, camera.Forward());
+    return {(Dot(rel, camera.Right()) * lens.xs / z * 0.5 + 0.5) * lens.width,
+            (Dot(rel, camera.Down()) * lens.ys / z * 0.5 + 0.5) * lens.height};
+}
+
+Scene MakeScene(const Lens& lens, const Camera& camera, Paint paint, float exposure = 1.0f,
+                const Vectors& vectors = {}) {
     const u32 w = lens.width, h = lens.height;
     Scene scene{w, h};
     scene.surface.resize(size_t(w) * h);
@@ -295,8 +332,17 @@ Scene MakeScene(const Lens& lens, const Camera& camera, Paint paint, float expos
                 scene.normal[i][k] = u8(std::lround((hit.normal[k] * 0.5 + 0.5) * 255.0));
             }
             scene.normal[i][3] = 255;
-            if (hit.surface == Ball) {
+            if (hit.surface == Ball && !vectors.before) {
                 scene.motion[i] = {0.0f, 0.0f, 1.0f, scene.depth[i]};
+            } else if (vectors.before && hit.surface != Sky &&
+                       (vectors.world || hit.surface == Ball)) {
+                // Previous - current, pixels, as the game's vertex positions give it.
+                const auto now = Place(lens, camera, p);
+                const auto then = Place(*vectors.lens_before, *vectors.before, p);
+                const bool ball = hit.surface == Ball;
+                scene.motion[i] = {float(then[0] - now[0]) + (ball ? vectors.ball[0] : 0.0f),
+                                   float(then[1] - now[1]) + (ball ? vectors.ball[1] : 0.0f),
+                                   1.0f, scene.depth[i]};
             }
         }
     }
@@ -465,7 +511,7 @@ private:
 
     /// The colour lock runs with the look; a test view has no colours to lock.
     static bool ShowsLook(const Look::Params& params) {
-        const u32 view = params.flags >> Look::ViewShift;
+        const u32 view = Look::ViewOf(params.flags);
         return view == Look::ViewOff || view == Look::ViewInk;
     }
 
@@ -803,14 +849,21 @@ void Expect(bool ok, const char* what) {
     failed |= !ok;
 }
 
+/// `before`, `lens_before`: the camera of the frame before and its lens (none: this frame's), or
+/// no camera of the frame before.
 Look::Params Words(const Lens& lens, const Camera& camera, int view, bool normals = true,
-                   bool motion = false, float strength = 0.6f, float characters = 0.5f) {
+                   bool motion = false, float strength = 0.6f, float characters = 0.5f,
+                   const Camera* before = nullptr, const Lens* lens_before = nullptr) {
     Look::Knobs knobs;
     knobs.strength = strength;
     knobs.characters = characters;
     knobs.view = view;
+    Look::Previous previous{};
+    if (before) {
+        previous = {before->View(), (lens_before ? lens_before : &lens)->Proj()};
+    }
     return Look::Make(knobs, camera.InvView(), lens.Proj(), lens.width, lens.height,
-                      camera.jitter, normals, motion);
+                      camera.jitter, normals, motion, before ? &previous : nullptr);
 }
 
 /// Where a world point lies on the camera's screen (the pixel it falls in) and how deep.
@@ -1791,6 +1844,146 @@ int main(int argc, char** argv) {
         Expect(ball > 5000 && marked < ball / 20 && most < 0.1 && stroked > ball / 4 &&
                    untouched == ball,
                "what moves by itself is smoothed, not stroked");
+    }
+    {
+        // (r45b_drawn-look-fixes) Having a vector in the object motion image is not moving: in
+        // the game most of the world has one (walls and floors drawn through a bone buffer),
+        // and it says what the camera did. Every surface has such a vector here. The camera
+        // stood still since the frame before, or turned and walked, or turned and zoomed: the
+        // surfaces get the strokes they get without the image, pixel for pixel; a ball that
+        // lies still gets them too; a ball that moves three pixels a frame is smoothed. Without
+        // the camera of the frame before nothing tells still from moving, and all of it is
+        // smoothed (what r45 did on every frame).
+        const Lens longer{large.width, large.height, large.ys * 1.07};
+        struct Case {
+            const char* name;
+            const Camera* before;
+            const Lens* lens_before;
+        };
+        const Case cases[] = {{"the camera stood still", &first, &large},
+                              {"the camera turned and walked", &walked, &large},
+                              {"the camera turned and zoomed", &turned, &longer}};
+        const Scene plain = MakeScene(large, first, Paint::Plain);
+        const auto fixed = gpu.Run(plain, Words(large, first, Look::ViewOff, true, false, 1.0f));
+        u32 world = 0, ball = 0, world_stroked = 0;
+        for (u32 i = 0; i < pixels; ++i) {
+            world += plain.surface[i] != Sky && plain.surface[i] != Ball;
+            ball += plain.surface[i] == Ball;
+            world_stroked += plain.surface[i] != Sky && plain.surface[i] != Ball &&
+                             std::abs(Change(plain, fixed, i)) > 0.02;
+        }
+        bool ok = world > pixels / 2 && ball > 5000 && world_stroked > world / 4;
+        for (const Case& c : cases) {
+            const Vectors still{c.before, c.lens_before, true, {}};
+            const Vectors rolls{c.before, c.lens_before, true, {3.0f, 0.0f}};
+            const Scene at_rest = MakeScene(large, first, Paint::Plain, 1.0f, still);
+            const Scene rolling = MakeScene(large, first, Paint::Plain, 1.0f, rolls);
+            const auto words = Words(large, first, Look::ViewOff, true, true, 1.0f, 1.0f,
+                                     c.before, c.lens_before);
+            ok &= (words.flags & Look::FlagPrevious) != 0;
+            const auto rest = gpu.Run(at_rest, words);
+            const auto roll = gpu.Run(rolling, words);
+            u32 world_off = 0, world_beside = 0, ball_off = 0, ball_marked = 0;
+            for (u32 i = 0; i < pixels; ++i) {
+                if (plain.surface[i] == Sky) {
+                    continue;
+                }
+                if (plain.surface[i] == Ball) {
+                    ball_off += !Same(rest[i], fixed[i]);
+                    ball_marked += std::abs(Change(plain, roll, i)) > 0.02;
+                } else {
+                    // (Beside a smoothed ball the colour lock's means are other ones.)
+                    world_off += !Same(rest[i], fixed[i]);
+                    world_beside += !Same(roll[i], fixed[i]);
+                }
+            }
+            std::printf("every surface has a vector, %s: %u of %u pixels of the world are not "
+                        "the strokes they get without vectors; of the ball's %u pixels %u are "
+                        "not when it lies still, and %u change by more than 2%% when it moves "
+                        "3 pixels a frame (%u pixels of the world beside it are other ones "
+                        "then)\n",
+                        c.name, world_off, world, ball, ball_off, ball_marked, world_beside);
+            ok &= world_off == 0 && ball_off == 0 && ball_marked < ball / 20 &&
+                  world_beside < world / 100;
+        }
+        {
+            const Vectors still{&walked, &large, true, {}};
+            const Scene at_rest = MakeScene(large, first, Paint::Plain, 1.0f, still);
+            const auto blind = gpu.Run(at_rest, Words(large, first, Look::ViewOff, true, true, 1.0f,
+                                                      1.0f));
+            u32 marked = 0;
+            for (u32 i = 0; i < pixels; ++i) {
+                marked += plain.surface[i] != Sky && plain.surface[i] != Ball &&
+                          std::abs(Change(plain, blind, i)) > 0.02;
+            }
+            std::printf("the same without the camera of the frame before: %u pixels of the world "
+                        "change by more than 2%% (%u with strokes)\n", marked, world_stroked);
+            ok &= marked < world_stroked / 5;
+        }
+        Expect(ok, "a surface that lies still gets its strokes although it has a vector, "
+                   "whatever the camera did; what moves against the camera's move does not");
+    }
+    {
+        // The words of the camera of the frame before (DrawnLookParams::Make).
+        const auto same = Words(large, first, Look::ViewOff, true, true, 0.6f, 0.5f, &first);
+        bool ok = (same.flags & Look::FlagPrevious) != 0 &&
+                  (same.flags >> Look::ZoomShift) == 32768u;
+        for (int k = 0; k < 3; ++k) {
+            ok &= std::abs(same.back_turn[k]) < 1e-6f && std::abs(same.back_shift[k]) < 1e-5f;
+        }
+        const auto none = Words(large, first, Look::ViewOff, true, true);
+        ok &= !(none.flags & Look::FlagPrevious) && (none.flags >> Look::ZoomShift) == 32768u;
+        // A cut: the camera looks the other way; and a lens three times as long.
+        Camera behind = first;
+        behind.yaw += 3.0;
+        const Lens tele{large.width, large.height, large.ys * 3.0};
+        ok &= !(Words(large, first, Look::ViewOff, true, true, 0.6f, 0.5f, &behind).flags &
+                Look::FlagPrevious);
+        ok &= !(Words(large, first, Look::ViewOff, true, true, 0.6f, 0.5f, &first, &tele).flags &
+                Look::FlagPrevious);
+        // A mirrored camera (a reflection's) is no turn of this one.
+        Look::Previous mirrored{first.View(), large.Proj()};
+        for (int k = 0; k < 4; ++k) {
+            mirrored.view[4 + k] = -mirrored.view[4 + k];
+        }
+        ok &= !(Look::Make({}, first.InvView(), large.Proj(), large.width, large.height,
+                           first.jitter, true, true, &mirrored).flags & Look::FlagPrevious);
+        const Lens longer{large.width, large.height, large.ys * 1.07};
+        const auto zoomed = Words(large, first, Look::ViewOff, true, true, 0.6f, 0.5f, &first,
+                                  &longer);
+        ok &= (zoomed.flags & Look::FlagPrevious) != 0 &&
+              std::abs(int(zoomed.flags >> Look::ZoomShift) - 32768 - int(0.07 * 32768.0)) <= 1;
+        // The zoom's bits lie above the test view's: the view is read without them.
+        ok &= Look::ViewOf(zoomed.flags) == u32(Look::ViewOff) &&
+              Look::ViewOf(Words(large, first, Look::ViewBold, true, true, 0.6f, 0.5f, &first,
+                                 &longer).flags) == u32(Look::ViewBold);
+        Expect(ok, "the camera of the frame before becomes a turn, a shift and a zoom, and is "
+                   "left out after a cut");
+    }
+    {
+        // Which draws of six indices or fewer are transparents (the rasterizer's scene hook):
+        // blended, not bypassed, no depth written, depth tested with a function that can fail.
+        using Look::SmallTransparent;
+        bool ok = SmallTransparent(true, false, false, true, false);
+        u32 counted = 0;
+        for (u32 bits = 0; bits < 32; ++bits) {
+            const bool blend = bits & 1, bypass = bits & 2, write = bits & 4, test = bits & 8,
+                       always = bits & 16;
+            if (SmallTransparent(blend, bypass, write, test, always)) {
+                ++counted;
+                ok &= blend && !bypass && !write && test && !always;
+            }
+        }
+        // A full-screen pass: not blended (a lighting pass, a copy), or blended without a depth
+        // test or with one that always passes (the fog composite). A decal: it writes depth.
+        ok &= counted == 1 && !SmallTransparent(false, false, false, true, false) &&
+              !SmallTransparent(true, false, false, false, false) &&
+              !SmallTransparent(true, false, false, true, true) &&
+              !SmallTransparent(true, false, true, true, false) &&
+              !SmallTransparent(true, true, false, true, false);
+        static_assert(SmallTransparent(true, false, false, true, false));
+        Expect(ok, "of the draws of six indices or fewer only a blended, depth-tested one that "
+                   "writes no depth is a transparent");
     }
     {
         // A colour that is no number, an endless one and one below 0 stay where they are.

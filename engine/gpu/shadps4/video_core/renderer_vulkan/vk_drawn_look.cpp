@@ -268,10 +268,33 @@ void DrawnLook::OnGBufferDraw(VideoCore::ImageId depth, VideoCore::ImageId norma
     gbuffer_normal = normal;
 }
 
+void DrawnLook::OnSmallTransparent(u64 hash, u32 indices) {
+    small_hash = hash;
+    small_indices = indices;
+    small_pending = true;
+}
+
 void DrawnLook::OnBlendedScene(VideoCore::ImageId color, VideoCore::ImageId depth,
                                std::array<float, 2> jitter) {
+    const bool small = small_pending;
+    small_pending = false;
     if (!SceneDepth(depth)) {
         return;
+    }
+    // The frame's first transparent draw is a small one: its state told it from a full-screen
+    // pass (DrawnLookParams::SmallTransparent). Each shader that does this is named once, so a
+    // lighting pass taken for a particle (the strokes would go in before the light is
+    // complete) shows in the log.
+    if (small && !blended_this_frame && frame_result == NotReached &&
+        std::find(small_seen.begin(), small_seen.begin() + small_seen_count, small_hash) ==
+            small_seen.begin() + small_seen_count) {
+        if (small_seen_count < small_seen.size()) {
+            small_seen[small_seen_count++] = small_hash;
+            std::printf("Drawn look: a frame's first transparent draw is a small one (%u indices, "
+                        "ps %016llx): blended, no depth written, depth tested; the strokes are "
+                        "painted before it\n",
+                        small_indices, static_cast<unsigned long long>(small_hash));
+        }
     }
     blended_this_frame = true;
     Paint(AtBlended, color, depth, jitter);
@@ -342,13 +365,18 @@ void DrawnLook::OnFrameEnd(bool wanted) {
                              "on %u, before the fog composite (no transparents) on %u, before "
                              "the upscaler (neither: fog and particles painted too) on %u; not "
                              "painted: %u menu previews, %u without a camera, %u for want of "
-                             "video memory, %u without a scene\n",
+                             "video memory, %u without a scene; what moves by itself told "
+                             "against the camera of the frame before on %u\n",
                              frames, results[AtBlended], results[AtComposite],
                              results[AtBeforeUpscaler], results[Preview], results[NoCamera],
-                             results[NoRoom], results[NotReached]);
+                             results[NoRoom], results[NotReached], previous_frames);
             results = {};
             frames = 0;
+            previous_frames = 0;
         }
+        // The camera the frame was painted with is the next frame's "frame before"; a frame
+        // that was not painted leaves none.
+        last_camera_valid = frame_result <= AtBeforeUpscaler && last_camera_set;
         // The scene's depth is the last G-buffer pass's (as CameraMotion and the upscaler take
         // it): remembered, so that an earlier pass of a frame is known not to be the scene.
         if (gbuffer_depth && std::find(scene_depths.begin(), scene_depths.end(), gbuffer_depth) ==
@@ -369,6 +397,11 @@ void DrawnLook::OnFrameEnd(bool wanted) {
             }
         }
     }
+    if (!was_wanted) {
+        last_camera_valid = false;
+    }
+    last_camera_set = false;
+    small_pending = false;
     was_wanted = wanted;
     frame_result = NotReached;
     blended_this_frame = false;
@@ -511,15 +544,19 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
         .strength = s.graphics_drawn_look_strength.load(std::memory_order_relaxed),
         .stroke_size = s.graphics_drawn_look_stroke_size.load(std::memory_order_relaxed),
         .texture = s.graphics_drawn_look_texture.load(std::memory_order_relaxed),
-        .outlines = s.graphics_drawn_look_outlines.load(std::memory_order_relaxed),
-        .ink_world = s.graphics_drawn_look_ink_world.load(std::memory_order_relaxed),
         .characters = s.graphics_drawn_look_characters.load(std::memory_order_relaxed),
         .view = env_view >= 0 ? env_view
                               : s.graphics_drawn_look_debug.load(std::memory_order_relaxed),
     };
+    // (r45b_drawn-look-fixes) The camera of the frame before, when that frame was painted: the
+    // object motion's vectors are told from the camera's own move with it.
     const auto params = DrawnLookParams::Make(knobs, camera.inv_view, camera.proj, width, height,
-                                              jitter, has_normal, has_motion);
-    const u32 view = params.flags >> DrawnLookParams::ViewShift;
+                                              jitter, has_normal, has_motion,
+                                              last_camera_valid ? &last_camera : nullptr);
+    last_camera = {camera.view, camera.proj};
+    last_camera_set = true;
+    previous_frames += (params.flags & DrawnLookParams::FlagPrevious) != 0;
+    const u32 view = DrawnLookParams::ViewOf(params.flags);
     // A test view shows the strokes' places in colours of its own: no colours to lock.
     const bool locked = view == DrawnLookParams::ViewOff || view == DrawnLookParams::ViewInk;
     // The inputs may come and go from frame to frame (a frame painted right before the upscaler
