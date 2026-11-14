@@ -253,8 +253,9 @@ private:
     u32 blend_unread = 0;     ///< frames in a row on which the averaging pass could not read its history
     // Since the last line that says where the lamps are: frames the pass averaged on, those of
     // them on which it read its history, camera cuts it did not read across, and ray traced
-    // lamp passes that ran beside it with point lamps.
-    u32 line_blend = 0, line_read = 0, line_cuts = 0, line_beside = 0;
+    // lamp passes that ran beside it with point lamps. bbport (r44_half-area-lamp): line_half:
+    // the frames of line_blend on which the pass ran at half resolution.
+    u32 line_blend = 0, line_read = 0, line_cuts = 0, line_beside = 0, line_half = 0;
     u32 lamp_line_frames = 480;
     void TrackLamps(u32 end, bool blend, bool read, bool line);
     bool tried = false;
@@ -265,6 +266,9 @@ private:
     // the variable not set, while lantern.ini's graphics_lamp_shadow_half is (read every pass);
     // HalfReady makes the pipeline the first time a pass wants it. Experiment 72057594037927936
     // set: the full-resolution pass, as before.
+    // bbport (r44_half-area-lamp): the half-resolution pass has the area lamp too, averaged in
+    // the history like the full-resolution pass's (Flush). Experiment 2305843009213693952 set:
+    // point lamps without a history at half resolution, as before r44.
     int half_env = -1;        ///< BB_LAMP_SHADOW_HALF: -1 not set, 1 for "1", 0 for anything else
     bool half_tried = false;  ///< HalfReady made its attempt
     bool half_made = false;   ///< the half-resolution pipeline and its counters exist
@@ -275,6 +279,7 @@ private:
     u32 half_frames = 0;        ///< frames since the last counter line
     u32 half_line_passes = 0;   ///< since the last line: half-resolution passes
     u32 half_line_full = 0;     ///< since the last line: apart passes at full resolution
+    u32 half_line_soft = 0;     ///< since the last line: half-resolution passes that averaged area lamps (radius not zeroed)
     OwnImage half_answers;
     std::unique_ptr<VideoCore::Buffer> half_counts, half_readback;
     std::array<u32, 16> half_last{};

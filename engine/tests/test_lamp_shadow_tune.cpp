@@ -3,6 +3,7 @@
 // defaults, clamping, bad text, the words the shader reads and the weight it works out.
 // bbport (r42_lamp-soft): the area lamp's knobs, the frames of history, and the lamps of a pass
 // told apart and followed from one frame to the next (LampTrack).
+// bbport (r44_half-area-lamp): which pass of a frame has the area lamp (LampPassRadius).
 #include <array>
 #include <bit>
 #include <cassert>
@@ -209,6 +210,42 @@ int main() {
         t.around = 2.0f;
         const auto tail = LampHistoryTail(t);
         assert(std::abs(F(tail[0]) - 9.0f) < 1e-4f && F(tail[1]) == 0.25f && F(tail[2]) == 1.5f && F(tail[3]) == 2.0f);
+    }
+    // bbport (r44_half-area-lamp): the lamp's radius for one pass of a frame (takes the history,
+    // half resolution, experiment 2305843009213693952 set).
+    {
+        const LampShadowTune d;
+        // Full resolution: the pass that takes the history has the area lamp, a pass beside it
+        // the point lamp; the experiment bit is about the half resolution only.
+        assert(LampPassRadius(d, true, false, false) == 0.1f);
+        assert(LampPassRadius(d, false, false, false) == 0.0f);
+        assert(LampPassRadius(d, true, false, true) == 0.1f);
+        assert(LampPassRadius(d, false, false, true) == 0.0f);
+        // Half resolution: the same, and point lamps while the bit is set (the pass of before).
+        assert(LampPassRadius(d, true, true, false) == 0.1f);
+        assert(LampPassRadius(d, false, true, false) == 0.0f);
+        assert(LampPassRadius(d, true, true, true) == 0.0f);
+        assert(LampPassRadius(d, false, true, true) == 0.0f);
+        // What the pass averages follows from the radius it got: with the bit set no history.
+        LampShadowTune pass = d;
+        pass.radius_m = LampPassRadius(d, true, true, false);
+        assert(std::abs(LampHistoryFrames(pass) - 9.0f) < 1e-4f);
+        pass.radius_m = LampPassRadius(d, true, true, true);
+        assert(LampHistoryFrames(pass) == 0.0f);
+        // BB_LAMP_SHADOW_HISTORY=0: every full-resolution pass shows the bare rays; a pass at
+        // half resolution cannot share them among a block's pixels and has point lamps.
+        LampShadowTune bare;
+        bare.history = 0.0f;
+        bare.radius_m = 0.25f;
+        assert(LampPassRadius(bare, true, false, false) == 0.25f && LampPassRadius(bare, false, false, false) == 0.25f);
+        assert(LampPassRadius(bare, true, true, false) == 0.0f && LampPassRadius(bare, false, true, false) == 0.0f);
+        assert(LampPassRadius(bare, true, true, true) == 0.0f);
+        // BB_LAMP_SHADOW_SOFT=0: a point lamp in every pass.
+        LampShadowTune point;
+        point.radius_m = 0.0f;
+        for (int k = 0; k < 8; ++k) {
+            assert(LampPassRadius(point, (k & 1) != 0, (k & 2) != 0, (k & 4) != 0) == 0.0f);
+        }
     }
     // A cut: the way back to the camera of the frame before is more than 2 m or about 20 degrees.
     {

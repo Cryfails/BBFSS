@@ -17,7 +17,13 @@ layout(set = 0, binding = 4, r11f_g11f_b10f) uniform image2D cur1;
 layout(set = 0, binding = 5, r11f_g11f_b10f) uniform image2D snap1;
 layout(set = 0, binding = 6) uniform accelerationStructureEXT scene;
 layout(set = 0, binding = 7, rgba16f) uniform readonly image2D history_prev;
+#ifdef HALF
+// bbport (r44_half-area-lamp): read as well: a pixel that takes its block's answer takes the
+// age of that answer from what the first pass stored for the block's pixel.
+layout(set = 0, binding = 8, rgba16f) uniform image2D history_cur;
+#else
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D history_cur;
+#endif
 #ifdef HALF
 // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 only (the point_shadow_ray_half_comp build).
 // half_answers: one texel per 2x2 block, written by the first pass: (shadow ratio, view depth,
@@ -69,8 +75,17 @@ vec4 row(uint i) { return vec4(word(i), word(i + 1u), word(i + 2u), word(i + 3u)
 // caster near the lamp then covers a small part of the disc from every place: a faint wide
 // smear. A body covers all of it in its core and less towards its rim: a penumbra that widens
 // with the distance behind the caster. No more rays than a point lamp casts. t_radius 0: the
-// point lamp, the same ray every frame, no history (BB_LAMP_SHADOW_SOFT=0; and always in the
-// half-resolution build, whose block answers must agree to be shared).
+// point lamp, the same ray every frame, no history (BB_LAMP_SHADOW_SOFT=0).
+// bbport (r44_half-area-lamp): the half-resolution build has the area lamp too, where the pass
+// averages (HISTORY_BLEND). Its first pass averages the pixel it traces for each 2x2 block as
+// the full-resolution pass averages every pixel, and stores that averaged ratio as the block's
+// answer: averaged answers are 0 or 1 outside a penumbra, so the blocks there agree and are
+// shared as before; inside a penumbra they differ, and each pixel casts its own ray to the
+// lamp's disc and averages it in its own history (the history images are of full resolution).
+// So where a shadow has an edge or a penumbra every pixel is worked out as at full resolution,
+// and only flat light or flat shadow is shared. Without HISTORY_BLEND the half-resolution build
+// keeps the point lamp (main): one bare ray to a point of the disc, shared by four pixels,
+// would be noise in blocks.
 const uint MODE_REPAIR = 16u;
 bool new_w = false;             // weights follow the game's falloff and the surface's facing
 bool inv_sq = false;            // the game's lamps use the inverse-square curve
@@ -115,9 +130,6 @@ void loadTune() {
     t_reject = word(at + 9u);
     t_axis_a = vec3(word(at + 10u), word(at + 11u), word(at + 12u));
     t_axis_b = vec3(word(at + 13u), word(at + 14u), word(at + 15u));
-#ifdef HALF
-    t_radius = 0.0; // bbport (r42_lamp-soft): the half-resolution build keeps the point lamp
-#endif
 }
 
 // The views' colour for a count: 0 blue, 1 green, 2 yellow, 3 or more red.
@@ -355,15 +367,17 @@ bool blendHistory(vec3 P, uint history_at, vec3 moved, out float ratio, out floa
 }
 
 shared uint group_trace;
-#ifndef HALF
 // bbport (r42_lamp-soft): averaging (HISTORY_BLEND), what each pixel of the workgroup found on
 // this frame: its answer (the shadow ratio its rays gave; below 0: the pass does not shadow the
 // pixel), and what blocked the ray to its strongest lamp if that lamp moves: -1 nothing (or the
 // lamp stands), -2 something near the lamp (within word 32 of it), else how far the hit lies
 // from the pixel over how far it lies from the lamp.
+// bbport (r44_half-area-lamp): in the half-resolution build too. Its first pass's workgroup
+// holds the 8x8 block pixels of 16x16 pixels (the answers around a pixel are those of the
+// blocks around it). In its second pass a pixel that took its block's answer gives that
+// averaged ratio as its answer, and a pixel the first pass did has none.
 shared float group_answer[64];
 shared float group_cast[64];
-#endif
 
 #ifdef HALF
 // bbport (r32_lamp-half): more bits of `mode` (vk_point_shadow.cpp ModeHalf*).
@@ -517,6 +531,13 @@ void main() {
     const uint tile_count = overflow ? light_count : listed;
     const uint history_at = floatBitsToUint(length_m);
     const uint history_flags = history_at != 0u ? data.d[history_at] : 0u;
+#ifdef HALF
+    // bbport (r44_half-area-lamp): a block's answer is shared by its pixels, so at half
+    // resolution a lamp is an area lamp only where its answers are averaged over the frames
+    if ((history_flags & HISTORY_BLEND) == 0u) {
+        t_radius = 0.0;
+    }
+#endif
 
 #ifdef HALF
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy) * (first ? 2 : 1);
@@ -581,11 +602,7 @@ void main() {
     // largest weight (top_w is not kept when every lamp is traced).
     uint lamps = 0u;
     float view_top = 0.0;
-#ifdef HALF
-    const bool blend = false; // bbport (r42_lamp-soft): the point lamp, see loadTune
-#else
     const bool blend = (history_flags & HISTORY_BLEND) != 0u;
-#endif
     uint top_at = 0u; // blend: the record of the pixel's strongest lamp (0: none)
     const bool exact = steps == 0u;
     float top_w = 0.0;
@@ -828,7 +845,6 @@ void main() {
     const float answer = ratio; // what this frame's rays said (view 1)
     float frames = 0.0;         // the frames of history in the ratio (view 5)
     vec3 looked = vec3(0.0, 0.0, 1.0); // view 6
-#ifndef HALF
     if (blend) {
         // Words 12 to 15 of the strongest lamp's record: its motion, and how far that is.
         vec3 top_moved = vec3(0.0);
@@ -847,6 +863,18 @@ void main() {
         if (!live) {
             return;
         }
+#ifdef HALF
+        if (half_why == HALF_TAKEN) {
+            // bbport (r44_half-area-lamp): the block's averaged ratio goes on as this pixel's,
+            // with the frames and the mean of the last few frames that the first pass stored
+            // for the block's pixel: a pixel that has to cast its own ray on a later frame (a
+            // shadow's edge reaches it) then finds a history as old as its block's and does not
+            // start again from one ray.
+            const vec4 h = imageLoad(history_cur, px & ~1);
+            frames = max(h.b - 1.0, 0.0);
+            imageStore(history_cur, px, vec4(ratio, P.z, h.b, h.a));
+        } else {
+#endif
         // The 5x5 answers around the pixel, moved in from the workgroup's rim so that every
         // pixel has 25 places to ask (this pixel's own is always one of them).
         const ivec2 around_lo = clamp(ivec2(gl_LocalInvocationID.xy) - 2, ivec2(0), ivec2(3));
@@ -913,9 +941,10 @@ void main() {
             ratio = mix(answer, held_ratio, frames / (frames + 1.0));
         }
         imageStore(history_cur, px, vec4(ratio, P.z, frames + 1.0, fast));
-    } else
+#ifdef HALF
+        }
 #endif
-    if ((history_flags & HISTORY_WRITE) != 0u) {
+    } else if ((history_flags & HISTORY_WRITE) != 0u) {
         imageStore(history_cur, px, vec4(ratio, P.z, stable, 1.0));
     }
     const float scale = mix(1.0, ratio, strength * fade);

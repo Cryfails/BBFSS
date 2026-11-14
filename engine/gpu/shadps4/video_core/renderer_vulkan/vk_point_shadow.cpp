@@ -73,6 +73,9 @@ static_assert(DataWords <= 1u << (32 - TuneAtShift));
 constexpr u32 ModeHalfFirst = 2, ModeHalfFill = 4, ModeHalfCount = 8;
 constexpr u32 HalfSlots = 16;
 constexpr u64 HalfOffBit = 72057594037927936ull;
+// bbport (r44_half-area-lamp): set: a pass at half resolution has point lamps without a history,
+// as before r44 (hard-edged shadows; for pictures of before and after). Read at every pass.
+constexpr u64 HalfPointsBit = 2305843009213693952ull;
 constexpr u32 TileWords = 8;
 constexpr auto HistoryFormat = vk::Format::eR16G16B16A16Sfloat;
 constexpr u32 HistoryRead = 1, HistoryWrite = 2;
@@ -262,10 +265,13 @@ bool PointShadow::HalfReady() {
             half_made = true;
         }
     }
-    // bbport (r42_lamp-soft): and what it does to the area lamp (see Flush)
+    // bbport (r42_lamp-soft, r44_half-area-lamp): and what it does to the area lamp (see Flush)
     std::printf("Ray traced lamps (r32): half resolution (%s) %s; at half resolution the lamps "
-                "stay points without a history (r42: BB_LAMP_SHADOW_SOFT and "
-                "BB_LAMP_SHADOW_HISTORY act on the full-resolution pass only)\n",
+                "are area lamps averaged over the frames as at full resolution (r44: one pixel "
+                "of each 2x2 block is traced and averaged first, its answer is shared where the "
+                "blocks around a pixel agree, every other pixel casts its own ray and keeps its "
+                "own history; experiment 2305843009213693952 set = point lamps without a "
+                "history, as before r44)\n",
                 half_env == 1 ? "BB_LAMP_SHADOW_HALF=1" : "graphics_lamp_shadow_half=1",
                 half_made ? "ready" : "ignored - no pipeline");
     return half_made;
@@ -438,12 +444,23 @@ void PointShadow::OnFrameEnd() {
                     "%.0f from history; second pass (the other three) %.0f pixels took the "
                     "block's answer, %.0f traced at full resolution with %.0f rays (%.0f a block "
                     "near them had no answer, %.0f the answers differed, %.0f another surface), "
-                    "%.0f from history; second-pass workgroups with no ray %.0f of %.0f\n",
+                    "%.0f from history; second-pass workgroups with no ray %.0f of %.0f",
                     half_frames, half_line_passes, half_line_full, counted, d[1], d[2], d[3],
                     d[4], d[5], d[6], d[10], d[11], d[12], d[7], d[9], d[8]);
+        // bbport (r44_half-area-lamp): whether the passes had the area lamp, and what share of
+        // its pixels the second pass traced (the first pass always traces a quarter of the
+        // screen: this share is what the half resolution saves or does not).
+        const double second = d[4] + d[5] + d[7];
+        std::printf("; r44: %u of the half-resolution passes averaged area lamps over the frames "
+                    "(the others had point lamps: experiment 2305843009213693952 or "
+                    "35184372088832 set, BB_LAMP_SHADOW_SOFT=0, BB_LAMP_SHADOW_HISTORY=0, not the "
+                    "pass that takes the history, or a history that could not be read for 8 "
+                    "frames), the second pass traced %.1f%% of its pixels\n",
+                    half_line_soft, second > 0.0 ? 100.0 * d[5] / second : 0.0);
         half_frames = 0;
         half_line_passes = 0;
         half_line_full = 0;
+        half_line_soft = 0;
     }
     dispatch_flushes = 0;
     if ((unended || lost_passes || flushed_in_draw > 60) && frame_index % 300 == 0) {
@@ -991,12 +1008,13 @@ void PointShadow::TrackLamps(u32 end, bool blend, bool read, bool line) {
                 "near ones first, %u at most; %u records are of more lamps than that), %u "
                 "within %.0f m of the camera; since the last such line the pass averaged on %u "
                 "frames and read its history on %u of them (%u camera cuts), and %u ray traced "
-                "lamp passes beside it had point lamps; the brightest near lamps (%s, reach, "
+                "lamp passes beside it had point lamps; on %u of the averaged frames the pass "
+                "ran at half resolution (r44); the brightest near lamps (%s, reach, "
                 "luminance, distance to the camera, records, moved since the frame before; "
                 "then over the frames it was followed since the last line: how many, its mean "
                 "step and its largest):",
                 records, track.Count(), LampTrack::Most, untold, close, double(LampTrack::Near),
-                line_blend, line_read, line_cuts, line_beside,
+                line_blend, line_read, line_cuts, line_beside, line_half,
                 camera.valid ? "world x y z" : "view space x y z, the camera is not known");
     for (const int index : track.Strongest()) {
         if (index < 0) {
@@ -1016,7 +1034,7 @@ void PointShadow::TrackLamps(u32 end, bool blend, bool read, bool line) {
         }
     }
     std::printf("\n");
-    line_blend = line_read = line_cuts = line_beside = 0;
+    line_blend = line_read = line_cuts = line_beside = line_half = 0;
     track.ClearSteps();
 }
 
@@ -1119,18 +1137,28 @@ void PointShadow::Flush(bool animate_noise) {
     // bbport (r42_lamp-soft): the tuning of this pass. The area lamp shows one ray's answer a
     // frame, which is noise until the history has averaged it, so only the pass that takes the
     // history has it (with the lamps drawn apart, the default, that is the one pass that covers
-    // the screen); another ray traced pass of the frame (`beside`) keeps the point lamp. So does
-    // the pass at half resolution (r32): one area-lamp ray for a 2x2 block would show as noise
-    // in blocks, and its second half traces at full resolution wherever the block answers
-    // around a pixel differ, which in a penumbra of single rays is everywhere: the saving would
-    // be gone. BB_LAMP_SHADOW_HISTORY=0 asks for the bare rays: then every full-resolution
-    // pass has the area lamp.
+    // the screen); another ray traced pass of the frame (`beside`) keeps the point lamp.
+    // BB_LAMP_SHADOW_HISTORY=0 asks for the bare rays: then every full-resolution pass has the
+    // area lamp.
+    // bbport (r44_half-area-lamp): the pass at half resolution (r32) has the area lamp as well
+    // when it takes the history. r42 kept point lamps there (one area-lamp ray for a 2x2 block
+    // would show as noise in blocks), which left the hard bands the area lamp was made to
+    // remove in every game played with graphics_lamp_shadow_half. Now the pass's first half
+    // averages the pixel it traces for a block in the history, as the full-resolution pass
+    // does for every pixel, so a block's answer is an averaged ratio: 0 or 1 where light or
+    // shadow is flat, where the second half shares it as before; where the blocks around a
+    // pixel differ (a shadow's edge, a penumbra) every pixel casts its own ray and averages it
+    // in its own history, which is of full resolution (point_shadow_ray.comp). What the half
+    // resolution saves is then the flat part of the screen: the 600-frame line of the
+    // half-resolution pass says what share of its pixels the second half traced. Without the
+    // averaging a pass at half resolution has point lamps, and with experiment
+    // 2305843009213693952 set (half_points) it is the pass of before r44: point lamps without
+    // a history (LampPassRadius).
     const bool history_pass = use_rays && !history_written && history_ours;
-    const bool beside = use_rays && !use_half && !history_pass && LampHistoryFrames(tune) > 0.0f;
+    const bool half_points = use_half && BbToggle::Experiment(HalfPointsBit);
+    const bool beside = use_rays && !half_points && !history_pass && LampHistoryFrames(tune) > 0.0f;
     LampShadowTune pass_tune = tune;
-    if (use_half || beside) {
-        pass_tune.radius_m = 0.0f;
-    }
+    pass_tune.radius_m = LampPassRadius(tune, history_pass, use_half, half_points);
     if (use_rays) {
         table = u32(data.size());
         for (const Tile& tile : batch) {
@@ -1221,29 +1249,44 @@ void PointShadow::Flush(bool animate_noise) {
             blend_unread = (flags & HistoryRead) ? 0u : std::min(blend_unread + 1u, UnreadMost + 1u);
             ++line_blend;
             line_read += (flags & HistoryRead) ? 1 : 0;
+            line_half += use_half ? 1 : 0; // bbport (r44_half-area-lamp): for the lamp line
             unread = blend_unread > UnreadMost;
             if (unread) {
                 data[tune_at + 2] = std::bit_cast<u32>(0.0f);
             }
+            // bbport (r44_half-area-lamp): for the half-resolution pass's line, which says
+            // "area lamps": not a pass whose radius was just zeroed
+            half_line_soft += use_half && !unread ? 1 : 0;
         }
         // What the lamps are on this pass, logged at each change (SoftLines times at most).
+        // bbport (r44_half-area-lamp): 1, 6 and 7 are the pass at half resolution.
         const int soft = !repair                                ? 0
-                         : use_half                             ? 1
+                         : half_points                          ? 1
                          : !(tune.radius_m > 0.0f)              ? 2
-                         : !(LampHistoryFrames(tune) > 0.0f)    ? 3
+                         : !(LampHistoryFrames(tune) > 0.0f)    ? (use_half ? 6 : 3)
                          : unread                               ? 5
+                         : use_half                             ? 7
                                                                 : 4;
         if (soft != std::exchange(soft_state, soft) && soft_lines < SoftLines) {
-            static constexpr std::array<const char*, 6> What{
+            static constexpr std::array<const char*, 8> What{
                 "point lamps: experiment 35184372088832 is set, the pass of before r41",
                 "point lamps without a history: the pass runs at half resolution "
-                "(graphics_lamp_shadow_half or BB_LAMP_SHADOW_HALF), which keeps them",
+                "(graphics_lamp_shadow_half or BB_LAMP_SHADOW_HALF) and experiment "
+                "2305843009213693952 is set, the half-resolution pass of before r44",
                 "point lamps without a history (BB_LAMP_SHADOW_SOFT=0)",
                 "area lamps, one ray a lamp a frame, not averaged (BB_LAMP_SHADOW_HISTORY=0)",
                 "area lamps, one ray a lamp a frame, averaged over the frames in the pass's "
                 "history",
                 "point lamps for now: the pass could not read its history for 8 frames (no "
                 "camera for the pass, or the history is made anew every frame)",
+                "point lamps without a history: the pass runs at half resolution "
+                "(graphics_lamp_shadow_half or BB_LAMP_SHADOW_HALF), where a lamp is an area "
+                "lamp only when its answers are averaged (BB_LAMP_SHADOW_HISTORY=0)",
+                "area lamps at half resolution (graphics_lamp_shadow_half or "
+                "BB_LAMP_SHADOW_HALF): one ray a lamp a frame for one pixel of each 2x2 block "
+                "and for every pixel where the blocks' averaged answers differ, averaged over "
+                "the frames in the pass's history; experiment 2305843009213693952 set = point "
+                "lamps there, as before r44",
             };
             ++soft_lines;
             std::printf("Ray traced lamps (r42): %s%s\n", What[std::size_t(soft)],

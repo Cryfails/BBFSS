@@ -1651,7 +1651,7 @@
   "Faster ray traced sun shadows: 0.24 ms instead of 0.56 ms at one heavy spot. An object thinner than about 2 pixels can lose its shadow. Needs Ultra (Ray Traced Shadows) in Shadow rendering method. Off by default.": "更快的光線追蹤太陽陰影：在一處負擔較重的位置，耗時從 0.56 毫秒降到 0.24 毫秒。細於約 2 像素的物件可能失去陰影。需要在「陰影繪製方式」中選擇 Ultra（光線追蹤陰影）。預設為關閉。",
   "Needs Ultra (Ray Traced Shadows) in Shadow rendering method": "需要在「陰影繪製方式」中選擇 Ultra（光線追蹤陰影）",
   "Half-resolution lamp shadows": "半解析度光線追蹤燈光陰影",
-  "Faster ray traced lamp shadows: about +2.6% FPS at one heavy spot. An object thinner than about 2 pixels can lose its shadow. Needs Ray traced lamp shadows, which is in the in-game menu. Off by default.": "更快的光線追蹤燈光陰影：在一處負擔較重的位置，FPS 約 +2.6%。細於約 2 像素的物件可能失去陰影。需要開啟遊戲內選單中的「Ray traced lamp shadows」。預設為關閉。",
+  "Faster ray traced lamp shadows. An object thinner than about 2 pixels can lose its shadow. Needs Ray traced lamp shadows, which is in the in-game menu. Off by default.": "更快的光線追蹤燈光陰影。細於約 2 像素的物件可能失去陰影。需要開啟遊戲內選單中的「Ray traced lamp shadows」。預設為關閉。",
   "Needs Ray traced lamp shadows: turn it on in the in-game menu (Insert or L3 + R3)": "需要「Ray traced lamp shadows」：請在遊戲內選單（Insert 或 L3 + R3）中開啟",
   "Far animated objects in ray tracing: update every 8th frame": "光線追蹤中遠處的動畫物件：每 8 幀更新一次",
   "About +2.5% FPS at one heavy spot. An animated object that is only in the far sun shadow bands updates its ray tracing shape every 8th frame, so its ray traced shadow can be up to 7 frames old. Needs Ultra (Ray Traced Shadows), Ultra (RTGI) or Ray traced lamp shadows. Off by default.": "在一處負擔較重的位置，FPS 約 +2.5%。只位於遠處太陽陰影分段中的動畫物件，每 8 幀才更新一次其光線追蹤形狀，因此它的光線追蹤陰影最多可能落後 7 幀。需要 Ultra（光線追蹤陰影）、Ultra（RTGI）或「Ray traced lamp shadows」。預設為關閉。",

@@ -860,21 +860,29 @@ void PictureSection() {
     }
     // bbport (r37_menu-options): BB_LAMP_SHADOW_HALF as a setting. Live: vk_point_shadow.cpp reads
     // it at every lamps-apart pass and makes the half-resolution pipeline the first time.
+    // bbport (r44_half-area-lamp): the hint says what the option does now that the pass at half
+    // resolution has the area lamp (soft shadows, averaged over the frames). The numbers of
+    // before (0.38 ms instead of 0.73 ms, about +2.6% FPS) were measured with point lamps and are
+    // gone until the new pass has been measured in the game.
     if (const char* label = Item("Half-resolution lamp shadows",
                                  "Тени ламп в половинном разрешении")) {
         ImGui::BeginDisabled(!s.graphics_rt_point_shadows);
         Checkbox(label, s.graphics_lamp_shadow_half);
         ImGui::EndDisabled();
         Hint(BbSettings::MenuText(
-            "Live, off by default. Needs Ray traced lamp shadows. Traces one ray per 2x2 pixels "
-            "first, then every pixel where the answers around it differ. At one heavy spot the lamp "
-            "shadow pass took 0.38 ms instead of 0.73 ms (about +2.6% FPS) and still pictures "
-            "showed no difference; a shadow caster thinner than about 2 pixels can be missed.",
-            "Работает сразу, по умолчанию выкл. Нужны трассированные тени ламп. Сначала трассирует "
-            "один луч на 2x2 пикселя, затем каждый пиксель там, где ответы вокруг него расходятся. "
-            "В одном тяжёлом месте проход теней ламп занял 0.38 мс вместо 0.73 мс (около +2.6% "
-            "FPS), на неподвижных кадрах разницы не видно; предмет тоньше примерно 2 пикселей может "
-            "остаться без тени."));
+            "Live, off by default. Needs Ray traced lamp shadows. Lamp shadows stay soft, at a "
+            "lower cost: traces one pixel of every 2x2 block first, then every pixel where the "
+            "answers around it differ, so shadow edges and soft rims are traced in full and only "
+            "evenly lit or evenly dark areas share a block's answer. The saving depends on the "
+            "view: large where lamp light is even, small where much of the picture is soft shadow. "
+            "A shadow caster thinner than about 2 pixels can be missed.",
+            "Работает сразу, по умолчанию выкл. Нужны трассированные тени ламп. Тени ламп остаются "
+            "мягкими, но обходятся дешевле: сначала трассируется один пиксель каждого блока 2x2, "
+            "затем каждый пиксель там, где ответы вокруг него расходятся, так что края теней и "
+            "мягкие полутени трассируются полностью, а ответ блока берут только ровно освещённые "
+            "или ровно тёмные участки. Выигрыш зависит от кадра: большой там, где свет ламп ровный, "
+            "малый там, где большую часть кадра занимает мягкая тень. Предмет тоньше примерно 2 "
+            "пикселей может остаться без тени."));
         if (s.graphics_rt_point_shadows && s.graphics_lamp_shadow_half) {
             RayTracingNotice();
         }

@@ -175,7 +175,7 @@ namespace BloodborneLauncher.Views
                 "graphics_rt_sun_half");
             _sunHalfHint = ((SettingRow)Body.Children[^1]).Hint;
             IniToggle(SymbolRegular.TopSpeed24, L.T("Half-resolution lamp shadows"),
-                L.T("Faster ray traced lamp shadows: about +2.6% FPS at one heavy spot. An object thinner than about 2 pixels can lose its shadow. Needs Ray traced lamp shadows, which is in the in-game menu. Off by default."),
+                L.T("Faster ray traced lamp shadows. An object thinner than about 2 pixels can lose its shadow. Needs Ray traced lamp shadows, which is in the in-game menu. Off by default."),
                 "graphics_lamp_shadow_half");
             _lampHalfHint = ((SettingRow)Body.Children[^1]).Hint;
             IniToggle(SymbolRegular.TopSpeed24, L.T("Far animated objects in ray tracing: update every 8th frame"),

@@ -174,6 +174,23 @@ inline float LampHistoryFrames(const LampShadowTune& tune) {
     return tune.history / (1.0f - std::min(tune.history, 0.98f));
 }
 
+/// bbport (r44_half-area-lamp): the lamp's radius for one ray traced lamp pass of a frame
+/// (PointShadow::Flush); 0: a point lamp. The area lamp shows one ray's answer a frame, which
+/// is noise until the history has averaged it: where the knobs ask for the averaging, only the
+/// pass that takes the history has the area lamp (takes_history), and another pass of the frame
+/// keeps the point lamp. A pass at half resolution (half) shares one answer among the pixels of
+/// a 2x2 block, which only an averaged answer can be: it has the area lamp when it averages, and
+/// the point lamp without the averaging (BB_LAMP_SHADOW_HISTORY=0, where a full-resolution pass
+/// shows the bare rays) and while experiment 2305843009213693952 is set (half_points: the
+/// half-resolution pass of before r44, point lamps without a history).
+inline float LampPassRadius(const LampShadowTune& tune, bool takes_history, bool half, bool half_points) {
+    const bool averages = LampHistoryFrames(tune) > 0.0f;
+    if (half && (half_points || !averages)) {
+        return 0.0f;
+    }
+    return averages && !takes_history ? 0.0f : tune.radius_m;
+}
+
 /// What the shader reads at the place the mode word names. inverse_square, core: the lamp
 /// falloff the game's shaders were patched to (startup_local_inverse_square,
 /// startup_local_light_core). view: see LampTuneAxes. frame: the frame counter.

@@ -1079,6 +1079,11 @@ int main(int argc, char** argv) {
                                                // are in the buffer), with this tuning: for a view of that frame
             };
             Vulkan::LampTrack track;
+            // bbport (r44_half-area-lamp): whether the half-resolution build counts what it does
+            // (MODE_HALF_COUNT). Off while it is timed: the counters are in host memory here, where
+            // the shader's atomic adds cost fifty times the pass (the engine keeps them on the GPU
+            // and counts one pass in eight).
+            bool half_count = true;
             const auto run = [&](const Views& v, const Pass& pass) {
                 auto* words = static_cast<float*>(lights.data);
                 for (int r = 0; r < 4; ++r)
@@ -1177,12 +1182,13 @@ int main(int argc, char** argv) {
                 if (pass.half) {
                     vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, half.pipeline);
                     vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, half.layout, 0, 11, writes.data());
-                    unsigned word = mode | 2u | 8u; // MODE_HALF_FIRST | MODE_HALF_COUNT
+                    const unsigned count = half_count ? 8u : 0u; // MODE_HALF_COUNT
+                    unsigned word = mode | 2u | count; // MODE_HALF_FIRST
                     std::memcpy(&push.thickness, &word, 4);
                     vkCmdPushConstants(vk.cmd, half.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
                     vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 15) / 16, (H + 15) / 16, 1);
                     vk.Barrier();
-                    word = mode | 4u | 8u; // MODE_HALF_FILL | MODE_HALF_COUNT
+                    word = mode | 4u | count; // MODE_HALF_FILL
                     std::memcpy(&push.thickness, &word, 4);
                     vkCmdPushConstants(vk.cmd, half.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
                     vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
@@ -1219,12 +1225,30 @@ int main(int argc, char** argv) {
                 have_history = false;
                 track.End(false);
             };
+            // bbport (r44_half-area-lamp): at_half: `frame` and `held_view` run the half-resolution build
+            // (with the same history block: PointShadow::Flush hands both builds the same words).
+            // half_did: what its two passes did since the counters were last zeroed (the shader's
+            // half_counts words); traced_share: the share of the second pass's pixels that cast their
+            // own rays, in percent.
+            bool at_half = false;
+            using HalfDid = std::array<std::uint32_t, 16>;
+            const auto half_zero = [&] { std::memset(half_counts.data, 0, 64); };
+            const auto half_did = [&] {
+                HalfDid did{};
+                std::memcpy(did.data(), half_counts.data, 64);
+                return did;
+            };
+            const auto traced_share = [](const HalfDid& did) {
+                const double all = double(did[4]) + double(did[5]) + double(did[7]);
+                return all > 0.0 ? 100.0 * double(did[5]) / all : 0.0;
+            };
             // One frame as the engine runs it. before: the camera of the frame before.
             const auto frame = [&](const Views& v, const Vulkan::LampShadowTune& tune, const Views* before = nullptr,
                                    bool follow = true) {
                 const bool history = Vulkan::LampHistoryFrames(tune) > 0.0f;
                 const double ms = run(v, {.tune = &tune, .frame = clock, .parity = history ? int(clock & 1u) : -1,
-                                          .read = have_history && history, .before = before, .follow = follow});
+                                          .read = have_history && history, .before = before, .follow = follow,
+                                          .half = at_half});
                 have_history = history;
                 ++clock;
                 return ms;
@@ -1236,7 +1260,7 @@ int main(int argc, char** argv) {
                 Vulkan::LampShadowTune shown = tune;
                 shown.view = 5;
                 shown.view_gain = 0.5f;
-                run(v, {.tune = &shown, .frame = clock - 1, .parity = int((clock - 1) & 1u), .again = true});
+                run(v, {.tune = &shown, .frame = clock - 1, .parity = int((clock - 1) & 1u), .half = at_half, .again = true});
                 auto picture = values(); // red: (1 - held) / 2; a pixel the pass leaves alone keeps 1
                 for (float& p : picture) p = p > 0.75f ? -1.0f : 1.0f - 2.0f * p;
                 return picture;
@@ -1255,11 +1279,16 @@ int main(int argc, char** argv) {
             };
             // Mean difference from `reference`: over the picture, over the reference's penumbra
             // (0.05 to 0.95), and the share of pixels more than 0.25 off, in percent.
+            // bbport (r44_half-area-lamp): part 1: over pixel (2x, 2y) of every 2x2 block alone, which
+            // the half-resolution build's first pass works out; part 0: over the other three, its
+            // second pass's. A fault of one of the two passes shows as a difference between these.
             struct Off { double all = 0, penumbra = 0, far = 0; };
-            const auto off = [&](const std::vector<float>& picture, const std::vector<float>& reference) {
+            const auto off = [&](const std::vector<float>& picture, const std::vector<float>& reference, int part = -1) {
                 Off o;
-                std::size_t soft = 0;
+                std::size_t soft = 0, count = 0;
                 for (std::size_t i = 0; i < picture.size(); ++i) {
+                    if (part >= 0 && int((i % W) % 2 == 0 && (i / W) % 2 == 0) != part) continue;
+                    ++count;
                     const double d = std::abs(double(picture[i]) - reference[i]);
                     o.all += d;
                     o.far += d > 0.25 ? 1 : 0;
@@ -1268,8 +1297,8 @@ int main(int argc, char** argv) {
                         ++soft;
                     }
                 }
-                o.all /= double(picture.size());
-                o.far *= 100.0 / double(picture.size());
+                o.all /= double(std::max<std::size_t>(count, 1));
+                o.far *= 100.0 / double(std::max<std::size_t>(count, 1));
                 o.penumbra /= double(std::max<std::size_t>(soft, 1));
                 return o;
             };
@@ -1312,6 +1341,10 @@ int main(int argc, char** argv) {
             Vulkan::LampShadowTune point = soft;
             point.radius_m = 0.0f;
             const Views view = camera(0.0f, 0.0f);
+            // bbport (r44_half-area-lamp): how much further from the true picture the half-resolution
+            // build may be than the full-resolution pass in the same scene (over all pixels, over the
+            // penumbra) before a check fails.
+            constexpr double HalfAllMost = 1.25, HalfPenumbraMost = 1.25;
 
             // 1. The point lamp: the same picture whatever the frame counter, and no history.
             place(view, 0.0f, 0.0f, false);
@@ -1475,6 +1508,7 @@ int main(int argc, char** argv) {
             };
             Views moved_view = view;
             std::vector<float> moved_held; // held_view of the last frame
+            HalfDid moved_did{};           // at_half: what the two passes did on the last frame
             const auto moving = [&](const Vulkan::LampShadowTune& tune, const Move& move,
                                     std::vector<float>* upscaled_out = nullptr) {
                 restart();
@@ -1493,9 +1527,11 @@ int main(int argc, char** argv) {
                         wobble = {off(rng), 0.0f, off(rng)};
                     }
                     place(now, walked, move.other * float(k));
+                    if (k == move.frames) half_zero();
                     frame(now, tune, &before, move.follow);
                     if (upscaled_out) settle(held, values(), k == 1);
                 }
+                moved_did = half_did();
                 if (upscaled_out) *upscaled_out = std::move(held);
                 moved_view = now;
                 auto picture = values();
@@ -1516,9 +1552,15 @@ int main(int argc, char** argv) {
                 loose.trail_m = 0.0f;
                 const auto untrailed = moving(loose, walk);
                 const auto untrailed_held = moved_held;
+                // bbport (r44_half-area-lamp): the default once more in the half-resolution build
+                at_half = true;
+                const auto halved = moving(soft, walk);
+                const auto halved_held = moved_held;
+                const HalfDid halved_did = moved_did;
+                at_half = false;
                 const auto moved_true = truth(moved_view, soft);
                 const Off a = off(alone, moved_true), c = off(guarded, moved_true), d = off(all, moved_true),
-                          e = off(untrailed, moved_true);
+                          e = off(untrailed, moved_true), h = off(halved, moved_true);
                 const std::string tag = speed > 0.05f ? "run" : "walk";
                 dump(tag + "_true", moved_true);
                 dump(tag + "_history_alone", alone);
@@ -1529,12 +1571,19 @@ int main(int argc, char** argv) {
                             "moving frame against the true picture of that moment (all / penumbra / more than 0.25 off): "
                             "the history without its guards %.4f / %.4f / %.2f%%; the default %.4f / %.4f / %.2f%% "
                             "(history held in the penumbra: %.2f of what it may); looked up where the ground was only "
-                            "%.4f / %.4f / %.2f%%; with BB_LAMP_SHADOW_TRAIL=0 %.4f / %.4f / %.2f%% (held %.2f)\n",
+                            "%.4f / %.4f / %.2f%%; with BB_LAMP_SHADOW_TRAIL=0 %.4f / %.4f / %.2f%% (held %.2f); the "
+                            "default in the half-resolution build %.4f / %.4f / %.2f%% (held %.2f; its second pass "
+                            "traced %.1f%% of its pixels on that frame)\n",
                             speed * 100.0f, a.all, a.penumbra, a.far, d.all, d.penumbra, d.far,
                             held_mean(all_held, moved_true), c.all, c.penumbra, c.far, e.all, e.penumbra, e.far,
-                            held_mean(untrailed_held, moved_true));
+                            held_mean(untrailed_held, moved_true), h.all, h.penumbra, h.far,
+                            held_mean(halved_held, moved_true), traced_share(halved_did));
                 if (checked && !(d.all < a.all && d.penumbra < c.penumbra)) {
                     std::fprintf(stderr, "the guards, or following the lamp, do not help a carried torch\n");
+                    return 1;
+                }
+                if (checked && !(h.all < HalfAllMost * d.all && h.penumbra < HalfPenumbraMost * d.penumbra)) {
+                    std::fprintf(stderr, "a carried torch looks worse in the half-resolution build than at full resolution\n");
                     return 1;
                 }
             }
@@ -1543,13 +1592,27 @@ int main(int argc, char** argv) {
                 std::vector<float> held;
                 const Move other{.other = 0.05f};
                 const auto alone = moving(plain, other), all = moving(soft, other, &held);
+                // bbport (r44_half-area-lamp): the default once more in the half-resolution build. Its
+                // first pass bounds a pixel's history by the answers of the blocks around it, which
+                // lie twice as far apart as the pixels around a full-resolution pixel, so behind a
+                // shadow's moving edge that one pixel in four could trail as dots: its error is
+                // given for those pixels and for the other three apart (off's part), beside the
+                // full-resolution pass's on the same pixels.
+                at_half = true;
+                const auto halved = moving(soft, other);
+                const HalfDid halved_did = moved_did;
+                at_half = false;
                 const auto moved_true = truth(moved_view, soft);
-                const Off a = off(alone, moved_true), d = off(all, moved_true), e = off(held, moved_true);
+                const Off a = off(alone, moved_true), d = off(all, moved_true), e = off(held, moved_true),
+                          h = off(halved, moved_true);
+                const std::array<Off, 2> half_part{off(halved, moved_true, 1), off(halved, moved_true, 0)},
+                                         full_part{off(all, moved_true, 1), off(all, moved_true, 0)};
                 const std::string tag = two ? "other_two_lamps" : "other";
                 dump(tag + "_true", moved_true);
                 dump(tag + "_history_alone", alone);
                 dump(tag + "_default", all);
                 dump(tag + "_default_upscaled", held);
+                dump(tag + "_half", halved);
                 // And the frames one by one without a history, through the stand-in alone.
                 Vulkan::LampShadowTune single = soft;
                 single.history = 0.0f;
@@ -1568,6 +1631,26 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "the history's guards do not help a moving caster (%s)\n", tag.c_str());
                     return 1;
                 }
+                std::printf("Torch lab, that figure under %s in the half-resolution build: %.4f / %.4f / %.2f%% (its second "
+                            "pass traced %.1f%% of its pixels on that frame); pixel (2x,2y) of each block alone %.4f / "
+                            "%.4f / %.2f%%, the other three %.4f / %.4f / %.2f%% (at full resolution %.4f / %.4f / %.2f%% "
+                            "and %.4f / %.4f / %.2f%%)\n",
+                            two ? "the still torch and a second lamp" : "the still torch", h.all, h.penumbra, h.far,
+                            traced_share(halved_did), half_part[0].all, half_part[0].penumbra, half_part[0].far,
+                            half_part[1].all, half_part[1].penumbra, half_part[1].far, full_part[0].all,
+                            full_part[0].penumbra, full_part[0].far, full_part[1].all, full_part[1].penumbra,
+                            full_part[1].far);
+                if (checked && !(h.all < HalfAllMost * d.all && h.penumbra < HalfPenumbraMost * d.penumbra)) {
+                    std::fprintf(stderr, "a moving caster looks worse in the half-resolution build than at full resolution (%s)\n",
+                                 tag.c_str());
+                    return 1;
+                }
+                if (checked && !(half_part[0].all < HalfAllMost * half_part[1].all &&
+                                 half_part[0].penumbra < HalfPenumbraMost * half_part[1].penumbra)) {
+                    std::fprintf(stderr, "behind a moving caster the half-resolution build's first-pass pixels trail the other "
+                                         "three of their blocks (%s)\n", tag.c_str());
+                    return 1;
+                }
             }
             // A caster is gone from one frame to the next (the second figure, set 30 m off): how
             // much of the old picture is left where the true one changed by more than 0.15, after
@@ -1575,13 +1658,16 @@ int main(int argc, char** argv) {
             // of the pixel's light).
             for (const bool two : {false, true}) {
                 second = two;
-                std::array<std::array<double, 5>, 2> left{};
+                // (which: 0 the default, 1 the history without its guards; bbport r44_half-area-lamp:
+                // 2 the default in the half-resolution build)
+                std::array<std::array<double, 5>, 3> left{};
                 place(view, 0.0f, 0.0f);
                 const auto old_true = truth(view, soft, 64);
                 place(view, 0.0f, 30.0f);
                 const auto new_true = truth(view, soft, 64);
-                for (int which = 0; which < 2; ++which) {
-                    const Vulkan::LampShadowTune& tune = which == 0 ? soft : plain;
+                for (int which = 0; which < 3; ++which) {
+                    const Vulkan::LampShadowTune& tune = which == 1 ? plain : soft;
+                    at_half = which == 2;
                     restart();
                     place(view, 0.0f, 0.0f);
                     for (unsigned k = 0; k < 24; ++k) frame(view, tune);
@@ -1603,13 +1689,21 @@ int main(int argc, char** argv) {
                         left[which][slot++] = sum / double(std::max<std::size_t>(changed, 1));
                     }
                 }
+                at_half = false;
                 std::printf("Torch lab, a figure is gone from one frame to the next, %s: share of the old picture left "
                             "where the true one changed, after 1 / 2 / 4 / 8 / 16 frames: the default %.3f / %.3f / %.3f "
-                            "/ %.3f / %.3f; the history without its guards %.3f / %.3f / %.3f / %.3f / %.3f\n",
+                            "/ %.3f / %.3f; the history without its guards %.3f / %.3f / %.3f / %.3f / %.3f; the default "
+                            "in the half-resolution build %.3f / %.3f / %.3f / %.3f / %.3f\n",
                             two ? "two lamps" : "one lamp", left[0][0], left[0][1], left[0][2], left[0][3], left[0][4],
-                            left[1][0], left[1][1], left[1][2], left[1][3], left[1][4]);
+                            left[1][0], left[1][1], left[1][2], left[1][3], left[1][4], left[2][0], left[2][1],
+                            left[2][2], left[2][3], left[2][4]);
                 if (checked && !(left[0][1] < 0.2 && left[0][2] < 0.15 && left[0][2] < 0.5 * left[1][2])) {
                     std::fprintf(stderr, "a shadow that is gone lingers (%s)\n", two ? "two lamps" : "one lamp");
+                    return 1;
+                }
+                if (checked && !(left[2][1] < 0.2 && left[2][2] < 0.15 && left[2][2] < 0.5 * left[1][2])) {
+                    std::fprintf(stderr, "a shadow that is gone lingers in the half-resolution build (%s)\n",
+                                 two ? "two lamps" : "one lamp");
                     return 1;
                 }
             }
@@ -1623,62 +1717,182 @@ int main(int argc, char** argv) {
                 const auto all = moving(soft, shaken);
                 const auto all_held = moved_held;
                 const auto unfollowed = moving(soft, anchored);
+                // bbport (r44_half-area-lamp): the default once more in the half-resolution build
+                at_half = true;
+                const auto halved = moving(soft, shaken);
+                const auto halved_held = moved_held;
+                const HalfDid halved_did = moved_did;
+                at_half = false;
                 const auto moved_true = truth(moved_view, soft);
                 wobble = {0, 0, 0};
-                const Off d = off(all, moved_true), c = off(unfollowed, moved_true);
+                const Off d = off(all, moved_true), c = off(unfollowed, moved_true), h = off(halved, moved_true);
                 dump("flicker_true", moved_true);
                 dump("flicker_default", all);
+                dump("flicker_half", halved);
                 std::printf("Torch lab, the torch's lamp is up to 2 cm off its place, anew every frame, the 24th frame "
                             "against its true picture: the default %.4f / %.4f / %.2f%% (history held in the penumbra: "
-                            "%.2f of what it may); looked up where the ground was only %.4f / %.4f / %.2f%%\n",
-                            d.all, d.penumbra, d.far, held_mean(all_held, moved_true), c.all, c.penumbra, c.far);
+                            "%.2f of what it may); looked up where the ground was only %.4f / %.4f / %.2f%%; the default "
+                            "in the half-resolution build %.4f / %.4f / %.2f%% (held %.2f; its second pass traced %.1f%% "
+                            "of its pixels on that frame)\n",
+                            d.all, d.penumbra, d.far, held_mean(all_held, moved_true), c.all, c.penumbra, c.far, h.all,
+                            h.penumbra, h.far, held_mean(halved_held, moved_true), traced_share(halved_did));
+                if (checked && !(h.all < HalfAllMost * d.all && h.penumbra < HalfPenumbraMost * d.penumbra)) {
+                    std::fprintf(stderr, "a flickering lamp looks worse in the half-resolution build than at full resolution\n");
+                    return 1;
+                }
             }
 
             // 5. The camera moves 3 cm a frame over a still scene: the history follows it (the
             // way back to the camera of the frame before), or, as a check that it matters, does
             // not (as if the camera had stood still).
             {
-                std::array<Off, 2> offs{};
+                // (which: 0 the history follows the camera, 1 it does not; bbport r44_half-area-lamp:
+                // 2 as 0 in the half-resolution build)
+                std::array<Off, 3> offs{};
                 std::vector<float> pan_true;
-                for (const bool with_camera : {true, false}) {
+                HalfDid pan_did{};
+                for (const int which : {0, 1, 2}) {
+                    at_half = which == 2;
                     restart();
                     Views before = view;
                     for (unsigned k = 0; k <= 24; ++k) {
                         const Views now = camera(0.03f * float(k), 0.0f);
                         place(now, 0.0f, 0.0f);
-                        frame(now, soft, with_camera ? &before : nullptr);
+                        if (k == 24) half_zero();
+                        frame(now, soft, which != 1 ? &before : nullptr);
                         before = now;
                     }
                     const auto picture = values();
-                    if (with_camera) {
+                    if (which == 0) {
                         pan_true = truth(before, soft);
                         dump("pan_true", pan_true);
                         dump("pan_default", picture);
+                    } else if (which == 2) {
+                        pan_did = half_did();
+                        dump("pan_half", picture);
                     }
-                    offs[with_camera ? 0 : 1] = off(picture, pan_true);
+                    offs[std::size_t(which)] = off(picture, pan_true);
                 }
+                at_half = false;
                 std::printf("Torch lab, the camera moves 3 cm a frame, the 25th frame against its true picture: %.4f / "
-                            "%.4f / %.2f%%; with the history left where it was on screen %.4f / %.4f / %.2f%%\n",
-                            offs[0].all, offs[0].penumbra, offs[0].far, offs[1].all, offs[1].penumbra, offs[1].far);
+                            "%.4f / %.2f%%; with the history left where it was on screen %.4f / %.4f / %.2f%%; in the "
+                            "half-resolution build %.4f / %.4f / %.2f%% (its second pass traced %.1f%% of its pixels on "
+                            "that frame)\n",
+                            offs[0].all, offs[0].penumbra, offs[0].far, offs[1].all, offs[1].penumbra, offs[1].far,
+                            offs[2].all, offs[2].penumbra, offs[2].far, traced_share(pan_did));
                 if (checked && !(offs[0].penumbra < offs[1].penumbra)) {
                     std::fprintf(stderr, "the history does not follow the camera\n");
                     return 1;
                 }
+                if (checked && !(offs[2].all < HalfAllMost * offs[0].all && offs[2].penumbra < HalfPenumbraMost * offs[0].penumbra)) {
+                    std::fprintf(stderr, "a moving camera looks worse in the half-resolution build than at full resolution\n");
+                    return 1;
+                }
             }
 
-            // 6. The half-resolution build keeps the point lamp whatever the radius.
+            // 6. The half-resolution build on the still scene (bbport r44_half-area-lamp; its
+            // moving scenes are in 4 and 5).
             place(view, 0.0f, 0.0f);
-            run(view, {.tune = &soft, .frame = 3, .half = true});
+            // Without a history it keeps the point lamp whatever the radius (one bare ray to a
+            // point of the lamp's disc cannot be shared by the four pixels of a block), and it is the
+            // picture of the radius zeroed: what the pass hands it while experiment
+            // 2305843009213693952 is set, the half-resolution pass of before r44.
+            HalfDid point_did{};
             {
-                const auto half_picture = values();
+                run(view, {.tune = &soft, .frame = 3, .half = true});
+                const auto bare_picture = values();
+                half_zero();
+                run(view, {.tune = &point, .frame = 3, .half = true});
+                point_did = half_did();
+                const auto half_point = values();
                 std::size_t differ = 0;
-                for (std::size_t i = 0; i < half_picture.size(); ++i) {
-                    differ += std::abs(half_picture[i] - point_picture[i]) > 1.0f / 64.0f ? 1 : 0;
+                for (std::size_t i = 0; i < half_point.size(); ++i) {
+                    differ += std::abs(half_point[i] - point_picture[i]) > 1.0f / 64.0f ? 1 : 0;
                 }
-                std::printf("Torch lab: the half-resolution build with the default tuning differs from the point lamp at "
-                            "full resolution on %zu pixels\n", differ);
-                if (differ * 500 > half_picture.size()) {
-                    std::fprintf(stderr, "the half-resolution build does not show the point lamp\n");
+                std::printf("Torch lab: the half-resolution build with point lamps (the radius zeroed, as with experiment "
+                            "2305843009213693952 set) differs from the point lamp at full resolution on %zu pixels; with "
+                            "the default tuning and no history it shows %s\n",
+                            differ, bare_picture == half_point ? "that same picture" : "another picture");
+                if (differ * 500 > half_point.size() || bare_picture != half_point) {
+                    std::fprintf(stderr, "the half-resolution build without a history does not show the point lamp\n");
+                    return 1;
+                }
+            }
+            // With its history it shows the area lamp: 48 frames as in 2, against the same true
+            // picture and beside the full-resolution pass's numbers, and what its two passes did on
+            // the first frame (no history yet: bare rays) and on the last.
+            {
+                restart();
+                at_half = true;
+                std::vector<float> half1, half16;
+                HalfDid first_did{};
+                for (unsigned k = 0; k < 48; ++k) {
+                    if (k == 0 || k == 47) half_zero();
+                    frame(view, soft);
+                    if (k == 0) {
+                        first_did = half_did();
+                        half1 = values();
+                    }
+                    if (k == 15) half16 = values();
+                }
+                const HalfDid did = half_did();
+                const auto half48 = values();
+                const auto half_held = held_view(view, soft);
+                at_half = false;
+                dump("half_16_frames", half16);
+                dump("half_48_frames", half48);
+                const Off h16 = off(half16, reference), h48 = off(half48, reference);
+                double half_mean = 0, half_band = 0;
+                for (const float p : half48) half_mean += p / double(half48.size());
+                for (const std::size_t i : band) half_band += half48[i] / double(std::max<std::size_t>(band.size(), 1));
+                std::size_t half_dark = 0;
+                for (const std::size_t i : body) half_dark += half48[i] < 0.25f ? 1 : 0;
+                std::printf("Torch lab, the half-resolution build with its history, the still scene against the true "
+                            "picture (all / penumbra / more than 0.25 off): 16 frames %.4f / %.4f / %.2f%%, 48 frames "
+                            "%.4f / %.4f / %.2f%% (at full resolution %.4f / %.4f / %.2f%% and %.4f / %.4f / %.2f%%); "
+                            "history held in the penumbra %.2f of what it may; mean light %.4f (true %.4f); the stick's "
+                            "band keeps %.3f of the light (at full resolution %.3f, true %.3f), %zu of the %zu dark pixels "
+                            "of the bodies' shadows are still below 0.25\n",
+                            h16.all, h16.penumbra, h16.far, h48.all, h48.penumbra, h48.far, off16.all, off16.penumbra,
+                            off16.far, off48.all, off48.penumbra, off48.far, held_mean(half_held, reference), half_mean,
+                            mean_true, half_band, band_light, band_true, half_dark, body.size());
+                const auto tell = [&](const char* when, const HalfDid& n) {
+                    std::printf("Torch lab, the half-resolution build, %s: the first pass traced %u pixels with %u rays; "
+                                "of the second pass's pixels %u took their block's answer and %u cast their own rays (%u "
+                                "rays; %u a block near them had no answer, %u the blocks' answers differed, %u another "
+                                "surface): %.1f%% traced\n",
+                                when, n[1], n[2], n[4], n[5], n[6], n[10], n[11], n[12], traced_share(n));
+                };
+                tell("point lamps without a history (before r44)", point_did);
+                tell("the area lamp's first frame (no history to read)", first_did);
+                tell("the area lamp's 48th frame", did);
+                // The first frame has bare rays (so has the frame after a camera cut). The second pass
+                // shares them only where those of the nine blocks around a pixel agree, so no block
+                // stands out from the blocks around it; the frame is held to the bound of the other
+                // scenes against the full-resolution pass's first frame.
+                const Off h1 = off(half1, reference);
+                dump("half_1_frame", half1);
+                std::printf("Torch lab, the half-resolution build's first frame (no history to read) against the true "
+                            "picture: %.4f / %.4f / %.2f%% (at full resolution %.4f / %.4f / %.2f%%)\n",
+                            h1.all, h1.penumbra, h1.far, off1.all, off1.penumbra, off1.far);
+                if (checked && !(h1.all < HalfAllMost * off1.all && h1.penumbra < HalfPenumbraMost * off1.penumbra)) {
+                    std::fprintf(stderr, "the half-resolution build's first frame is worse than the full-resolution pass's\n");
+                    return 1;
+                }
+                if (checked && (std::abs(half_mean - mean_true) > 0.004 || half_band < 0.5 || half_dark * 2 < body.size())) {
+                    std::fprintf(stderr, "the half-resolution build does not show the area lamp: mean light %.4f against "
+                                         "the true %.4f, %.3f of the light in the stick's band, %zu of %zu dark pixels\n",
+                                 half_mean, mean_true, half_band, half_dark, body.size());
+                    return 1;
+                }
+                if (checked && !(h48.all < HalfAllMost * off48.all && h48.penumbra < HalfPenumbraMost * off48.penumbra)) {
+                    std::fprintf(stderr, "the still scene looks worse in the half-resolution build than at full resolution\n");
+                    return 1;
+                }
+                // (A second pass that shared nothing would be the full-resolution pass in two
+                // dispatches; one that traced nothing would have no penumbra.)
+                if (checked && (did[4] == 0 || did[5] == 0 || did[5] >= did[4])) {
+                    std::fprintf(stderr, "the half-resolution build's second pass shares too little, or traces nothing\n");
                     return 1;
                 }
             }
@@ -1686,15 +1900,29 @@ int main(int argc, char** argv) {
             // 7. The cost here (a small scene; --speed has the heavy one): the fastest of 40 runs
             // taken in turn, the history's clear included.
             {
-                std::array<double, 3> best{1e9, 1e9, 1e9};
+                std::array<double, 5> best{1e9, 1e9, 1e9, 1e9, 1e9};
                 restart();
                 for (int i = 0; i < 40; ++i) {
                     best[0] = std::min(best[0], run(view, {.frame = unsigned(i)}));
                     best[1] = std::min(best[1], run(view, {.tune = &point, .frame = unsigned(i)}));
                     best[2] = std::min(best[2], frame(view, soft));
                 }
+                // bbport (r44_half-area-lamp): the half-resolution build, with point lamps (before
+                // r44) and with the area lamp and its history (once that has settled: its first
+                // frames trace more), without its counters
+                restart();
+                at_half = true;
+                half_count = false;
+                for (int i = 0; i < 48; ++i) {
+                    best[3] = std::min(best[3], run(view, {.tune = &point, .frame = unsigned(i), .half = true}));
+                    const double ms = frame(view, soft);
+                    if (i >= 8) best[4] = std::min(best[4], ms);
+                }
+                half_count = true;
+                at_half = false;
                 std::printf("Torch lab: mode 0 of this shader (the experiment bit's path; not the shader before r41) %.3f ms, the point lamp %.3f ms, the area lamp with its "
-                            "history %.3f ms\n", best[0], best[1], best[2]);
+                            "history %.3f ms; the half-resolution build: with point lamps %.3f ms, with the area lamp "
+                            "and its history %.3f ms\n", best[0], best[1], best[2], best[3], best[4]);
             }
             vk.destroy_as(vk.device, tlas.handle, nullptr);
             vk.Free(tlas.instances); vk.Free(tlas.storage); vk.Free(tlas.scratch);
