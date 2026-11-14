@@ -1,0 +1,133 @@
+Start to title 6 s, title to save chosen 12 s, loading and settling 14 s; measuring 108 s now.
+
+masks 0 0   7 windows:   90.2 FPS,  5241 draws/frame, stage B busy  91.7%, GPU thread 1.66 us/draw
+           frame times: median 10.98 ms, 99th percentile 14.41 ms (worst window 15.07), worst frame 19.1 ms (worst window 25.5), 1.6 frames over 1.5x median per window
+           stage B us/packet: packet 1.61, draw 1.45, bind 0.39, ObtainBuffer 0.22, vertex 0.19, buffers 0.17, textures 0.15, begin render 0.12, descriptors 0.09, VRAM path 0.08, tex set 0.08, render state 0.08, dispatch 0.06, dynamic 0.06, index 0.05, EnsureResident 0.05, emit vertex 0.05, HLE shader 0.04, VRAM track 0.04, tasks 0.04, kick 0.04, samplers 0.03, tex set apply 0.03, effects bind 0.03, after draw 0.03, tex set check 0.02, HLE copy 0.02, motion 0.02, HLE obtain 0.02, stream copy 0.02, upscaler eval 0.01, upscaler 0.01, flush 0.01, VRAM upload 0.01, VRAM written 0.01, VRAM image sync 0.01, tex full 0.01, wait copies 0.00, rt prepare 0.00, rt builds 0.00, rt capture 0.00, wait fences 0.00, HLE batch 0.00, refresh upload 0.00, refresh detile 0.00, refresh obtain 0.00, refresh hash 0.00, tex full empty 0.00, protect 0.00, preupload 0.00
+masks set   6 windows:   63.6 FPS,  5241 draws/frame, stage B busy  68.4%, GPU thread 1.75 us/draw
+           frame times: median 15.30 ms, 99th percentile 29.57 ms (worst window 30.20), worst frame 30.8 ms (worst window 32.3), 11.0 frames over 1.5x median per window
+           stage B us/packet: packet 1.71, draw 1.44, bind 0.39, ObtainBuffer 0.29, vertex 0.20, buffers 0.17, textures 0.15, begin render 0.13, tasks 0.12, VRAM path 0.11, flush 0.10, descriptors 0.09, tex set 0.08, EnsureResident 0.08, dispatch 0.07, render state 0.07, dynamic 0.06, emit vertex 0.06, index 0.06, VRAM track 0.05, kick 0.05, HLE shader 0.04, effects bind 0.03, samplers 0.03, tex set apply 0.03, HLE obtain 0.02, tex set check 0.02, stream copy 0.02, motion 0.02, after draw 0.02, HLE copy 0.01, refresh upload 0.01, upscaler 0.01, upscaler eval 0.01, tex full 0.01, VRAM written 0.01, VRAM image sync 0.01, VRAM upload 0.01, rt builds 0.00, rt prepare 0.00, rt capture 0.00, wait fences 0.00, wait copies 0.00, tex full empty 0.00, HLE batch 0.00, refresh detile 0.00, refresh obtain 0.00, refresh hash 0.00, protect 0.00, preupload 0.00
+           (masks set = disable 0 experiment 1114031498345823968)
+           GPU load (nvidia-smi, 72 samples): median 98%, max 98%
+           The game window had the focus at all 72 samples.
+
+--- log lines
+Sun atlas: a frame 0.0 draws in 0.0 passes, 0.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 0.0 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 0.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 0 frame pairs, same 0, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0000 m, viewport 0x0, another matrix in 0 of 0 sampled draws] [c1: 0 frame pa
+Scene proxies: of the last 4096 render-target copies at the reduced size (r10), 2341 between proxies into proxies made for copies (0 such proxies made, 3 live), 0 into other proxies, 1755 without a dirty source proxy, 0 destinations not eligible; proxies made for copies since resolved 1170 times by native accesses and sampled by
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 clear),
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Scene proxies: of the last 4096 image clears of proxied targets, 4096 proxy levels cleared with the image, 3185 resolves before a clear left out (experiment 17179869184: resolve first, fill later)
+Volumetric lighting: tint over 225 records, one thread for all (old)
+HDR output: the frame is encoded from a copy in the composite (clear + blit) (3840x2160 into 3840x2160)
+Render-target copy HLE, last 4096 copies: 1780 between proxies, 2316 native; of the native ones 560 with a dirty source proxy (resolved), 1 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 set: kept); not between proxies: source without proxy 1336, experiment mask 131072 980
+Froyok bloom, last 600 frames: 227 pyramids built (0 of them late, at the composite; 227 never read), 373 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 set: built at every recombination)
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 94.7 191.3 530.5 486.9, left out 0.0 0.0 0.0 0.0; frames with draws 48% 48% 48% 48%
+Sun atlas: a frame 1303.4 draws in 13.9 passes, 0.48 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 987.8 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 1.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 286 frame pairs, same 286, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 985 sampled draws] [c1
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 set: re
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Scene proxy resolves and fills per frame, last 600 frames, by consumer (experiment 1073741824 set: as before):
+  resolve B10G11R11UfloatPack32 3840x2160: 2.00/frame, by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 5.00/frame, by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill B10G11R11UfloatPack32 3840x2160: 0.43/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.43/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.43/frame, by pass depth, cleared by the pass, ps/vs 00000000e21e283a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  resolve R8G8B8A8Unorm 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  resolve R8G8B8A8Unorm 3840x2160: 0.00/frame, by image copy (render-target copy HLE or texture cache) [transfer write]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by image download (readback) [transfer read]
+  fill R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [reduced pass attachment]; proxy dropped by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 1920x1080: 2.00/frame, by draw textures, stage 00000000e820ee9d [shader read]
+  fill R16G16B16A16Sfloat 1920x1080: 1.00/frame, by pass ps 000000006c2323c2 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080: 1.00/frame, by draw textures, stage 000000006320bb24 [shader read]
+  fill R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  fill B10G11R11UfloatPack32 3840x2160: 1.00/frame, by pass ps 000000003fe9e964 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000008650418f [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000002eacb983 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000009eb30215 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 00000000898dabb3 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 0000000086e96401 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by unlabelled (engine effect, presenter or other) [proxy read (engine effect or upscaler input)]; proxy dropped by pass ps 000000009e1cb278 [color attachment]
+  resolve R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [color attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.55/frame, by pass ps 0000000052738b8a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.55/frame, by pass ps 0000000052738b8a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.55/frame, by pass depth, cleared by the pass, ps/vs 0000000052738b8a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 0000000050287a64 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.00/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.00/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 000000009e3394c8 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.00/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.00/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 00000000a89e01e9 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+Render-target copy HLE, last 4096 copies: 0 between proxies, 4096 native; of the native ones 2340 with a dirty source proxy (resolved), 0 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 set: kept); not between proxies: experiment mask 131072 4096
+Froyok bloom, last 600 frames: 600 pyramids built (0 of them late, at the composite; 600 never read), 0 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 set: built at every recombination)
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 198.0 400.0 1109.0 1016.0, left out 0.0 0.0 0.0 0.0; frames with draws 100% 100% 100% 100%
+Sun atlas: a frame 2723.0 draws in 29.0 passes, 1.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 2063.4 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 2.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 600 frame pairs, same 600, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 1773 sampled draws] [c
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 set: re
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Scene proxy resolves and fills per frame, last 600 frames, by consumer (experiment 1073741824 set: as before):
+  resolve B10G11R11UfloatPack32 3840x2160: 2.00/frame, by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 5.00/frame, by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill B10G11R11UfloatPack32 3840x2160: 0.40/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.40/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.40/frame, by pass depth, cleared by the pass, ps/vs 00000000e21e283a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  resolve R8G8B8A8Unorm 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by image download (readback) [transfer read]
+  fill R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [reduced pass attachment]; proxy dropped by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 1920x1080: 2.00/frame, by draw textures, stage 00000000e820ee9d [shader read]
+  fill R16G16B16A16Sfloat 1920x1080: 1.00/frame, by pass ps 000000006c2323c2 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080: 1.00/frame, by draw textures, stage 000000006320bb24 [shader read]
+  fill R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  fill B10G11R11UfloatPack32 3840x2160: 1.00/frame, by pass ps 000000003fe9e964 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000008650418f [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000002eacb983 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000009eb30215 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 00000000898dabb3 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 0000000086e96401 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by unlabelled (engine effect, presenter or other) [proxy read (engine effect or upscaler input)]; proxy dropped by pass ps 000000009e1cb278 [color attachment]
+  resolve R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [color attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.56/frame, by pass ps 0000000052738b8a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.56/frame, by pass ps 0000000052738b8a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.56/frame, by pass depth, cleared by the pass, ps/vs 0000000052738b8a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 0000000050287a64 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 00000000a89e01e9 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.00/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.00/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 000000009e3394c8 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+Volumetric lighting: tint over 225 records, one thread per record
+HDR output: the frame is encoded from its own image (no composite clear and copy) (3840x2160 into 3840x2160)
+Exit: clean shutdown in 47 ms

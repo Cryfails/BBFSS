@@ -1,0 +1,170 @@
+Start to title 6 s, title to save chosen 12 s, loading and settling 13 s; measuring 108 s now.
+
+masks 0 0   7 windows:   88.5 FPS,  5242 draws/frame, stage B busy  89.6%, GPU thread 1.71 us/draw
+           frame times: median 11.13 ms, 99th percentile 15.88 ms (worst window 20.81), worst frame 24.9 ms (worst window 42.3), 3.0 frames over 1.5x median per window
+           stage B us/packet: packet 1.60, draw 1.43, bind 0.39, ObtainBuffer 0.24, vertex 0.18, buffers 0.17, textures 0.15, begin render 0.12, VRAM path 0.10, descriptors 0.09, tex set 0.08, render state 0.08, dispatch 0.06, dynamic 0.06, index 0.05, emit vertex 0.05, kick 0.05, EnsureResident 0.05, HLE shader 0.04, VRAM track 0.04, samplers 0.03, tex set apply 0.03, effects bind 0.03, tex set check 0.03, after draw 0.03, tasks 0.03, motion 0.02, HLE copy 0.02, HLE obtain 0.02, stream copy 0.02, VRAM upload 0.01, upscaler 0.01, upscaler eval 0.01, tex full 0.01, VRAM written 0.01, VRAM image sync 0.01, rt builds 0.00, rt prepare 0.00, rt capture 0.00, wait fences 0.00, wait copies 0.00, protect 0.00, refresh detile 0.00, flush 0.00, HLE batch 0.00, tex full empty 0.00, refresh hash 0.00, refresh upload 0.00, refresh obtain 0.00, preupload 0.00
+masks set   6 windows:   63.7 FPS,  5241 draws/frame, stage B busy  67.1%, GPU thread 1.73 us/draw
+           frame times: median 15.27 ms, 99th percentile 29.41 ms (worst window 29.88), worst frame 30.8 ms (worst window 39.7), 12.8 frames over 1.5x median per window
+           stage B us/packet: packet 1.68, draw 1.42, bind 0.38, ObtainBuffer 0.28, vertex 0.18, buffers 0.17, textures 0.15, begin render 0.13, tasks 0.12, VRAM path 0.11, flush 0.10, EnsureResident 0.08, descriptors 0.08, tex set 0.08, dispatch 0.07, render state 0.07, emit vertex 0.06, index 0.06, kick 0.05, VRAM track 0.05, dynamic 0.05, HLE shader 0.04, effects bind 0.03, samplers 0.03, tex set apply 0.03, tex set check 0.03, after draw 0.02, stream copy 0.02, HLE obtain 0.02, motion 0.02, HLE copy 0.01, upscaler eval 0.01, upscaler 0.01, refresh upload 0.01, VRAM upload 0.01, VRAM image sync 0.01, tex full 0.01, rt capture 0.00, rt prepare 0.00, rt builds 0.00, wait copies 0.00, wait fences 0.00, HLE batch 0.00, preupload 0.00, refresh detile 0.00, refresh obtain 0.00, refresh hash 0.00, tex full empty 0.00, VRAM written 0.00, protect 0.00, ms a frame waiting for a free presentation frame and 0.00
+           (masks set = disable 0 experiment 1114031498345823968)
+
+GPU profile masks 0 0  7 blocks: 11.26 ms/frame, idle 0.30, busy 10.96
+GPU profile masks set  7 blocks: 15.77 ms/frame, idle 0.61, busy 15.16
+    1.398   1.820  +0.422  upscaler: evaluate (DLSS, FSR, XeSS or TAA)
+    1.088   1.173  +0.084  pass 4096x4096 [- ] depth D32Sfloat vs 00000000014b7164 ps 00000000a2108f5e
+    0.000   1.028  +1.028  image download D32SfloatS8Uint 3840x2160
+    0.899   0.891  -0.008  Lighting: indirect light
+    0.814   0.796  -0.018  Lighting: SSR full trace
+    0.755   0.648  -0.107  pass 1920x1080 [R8G8B8A8Unorm R8G8B8A8Unorm R8G8B8A8Srgb R8G8B8A8Unorm B10G11R11UfloatPack32 R16G16B16A16Sfloat - - ] depth D32SfloatS8Uint vs 000000009da6aacb ps 00000000bb10e440
+    0.000   0.592  +0.592  pass 960x540 [R16G16B16A16Sfloat ] depth - vs 000000005a619b89 ps 000000006c2323c2
+    0.000   0.557  +0.557  image upload R32Sfloat 3840x2160
+    0.130   0.520  +0.389  scene proxy resolve R16G16B16A16Sfloat 3840x2160
+    0.518   0.511  -0.008  copy shader HLE: barrier + dispatch
+    0.091   0.386  +0.294  (between submissions: GPU idle) before a batched (guest submission end, BB_HONEST_FLUSH_US over) submission, GPU had finished the one before it when it reached the queue
+    0.000   0.371  +0.371  image upload R16G16B16A16Sfloat 1920x1080
+    0.127   0.250  +0.123  scene proxy resolve D32SfloatS8Uint 3840x2160
+    0.212   0.227  +0.015  (between submissions: GPU idle) before a batched (guest submission end, BB_HONEST_FLUSH_US over) submission, the one before still on the GPU when it reached the queue
+    0.000   0.221  +0.221  render-target copy HLE: image copy
+    0.195   0.188  -0.007  pass 1920x1080 [R16G16B16A16Sfloat ] depth D32SfloatS8Uint vs 000000004cd21a0f ps 0000000071c96598
+    0.178   0.176  -0.002  Lighting: volumetric sunlight
+    0.175   0.175  -0.001  Lighting: lamp fog
+    0.164   0.164   0.000  Lighting: contact shadows and PCSS
+    0.157   0.128  -0.029  pass 4096x4096 [- ] depth D32Sfloat vs 000000007e259f22 ps 00000000a2108f5e
+    0.147   0.146   0.000  HDR native: exposure
+    0.127   0.112  -0.015  upscaler: merge
+    0.088   0.123  +0.035  pass 4096x4096 [- ] depth D32Sfloat vs 0000000061547e10 ps 00000000a2108f5e
+    0.107   0.123  +0.015  pass 4096x4096 [- ] depth D32Sfloat vs 00000000b9bd3bb1 ps 00000000a2108f5e
+    0.118   0.000  -0.118  pass 4096x4096 [- ] depth D32Sfloat vs 00000000327e1a5e ps 00000000108e11bc
+    0.000   0.110  +0.110  scene proxy fill R16G16B16A16Sfloat 3840x2160
+    0.108   0.108   0.000  pass 1920x1080 [R8G8B8A8Unorm ] depth - vs 000000000b0acf50 ps 00000000f7229091
+    0.105   0.105   0.000  pass 3840x2160 [R8G8B8A8Unorm ] depth - vs 000000000b0acf50 ps 00000000ed4c7668
+    0.103   0.044  -0.060  pass 3840x2160 [R8G8B8A8Unorm ] depth - vs 000000000b0acf50 ps 000000008c08444c
+    0.098   0.000  -0.098  dispatch indirect cs 000000002da7fe60
+    0.094   0.000  -0.094  pass 3840x2160 [R8G8B8A8Unorm ] depth - vs 0000000081d336ce ps 000000004baeaa00
+    0.084   0.094  +0.010  pass 3840x2160 [R16G16B16A16Sfloat ] depth - vs 000000007d668276 ps 00000000fbe7c4b6
+    0.093   0.000  -0.093  pass 1920x1080 [R8G8B8A8Unorm R8G8B8A8Unorm R8G8B8A8Srgb R8G8B8A8Unorm B10G11R11UfloatPack32 R16G16B16A16Sfloat - - ] depth D32SfloatS8Uint vs 00000000b57af00c ps 000000000f54e5f9
+    0.086   0.000  -0.086  pass 1920x1080 [- ] depth D32SfloatS8Uint vs 000000004b8827a6 ps 000000009837d1c8
+           GPU load (nvidia-smi, 72 samples): median 97%, max 98%
+           The game window had the focus at all 72 samples.
+
+--- log lines
+  fill D32SfloatS8Uint 3840x2160: 0.60/frame, by pass depth, cleared by the pass, ps/vs 0000000052738b8a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  resolve R8G8B8A8Unorm 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  resolve R8G8B8A8Unorm 3840x2160: 0.00/frame, by image copy (render-target copy HLE or texture cache) [transfer write]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by image download (readback) [transfer read]
+  fill R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [reduced pass attachment]; proxy dropped by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 1920x1080: 2.00/frame, by draw textures, stage 00000000e820ee9d [shader read]
+  fill R16G16B16A16Sfloat 1920x1080: 1.00/frame, by pass ps 000000006c2323c2 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080: 1.00/frame, by draw textures, stage 000000006320bb24 [shader read]
+  fill R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  fill B10G11R11UfloatPack32 3840x2160: 1.00/frame, by pass ps 000000003fe9e964 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000008650418f [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000002eacb983 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000009eb30215 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 00000000898dabb3 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 0000000086e96401 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by unlabelled (engine effect, presenter or other) [proxy read (engine effect or upscaler input)]; proxy dropped by pass ps 000000009e1cb278 [color attachment]
+  resolve R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [color attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.38/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.38/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.38/frame, by pass depth, cleared by the pass, ps/vs 00000000e21e283a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000009e3394c8 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 00000000a89e01e9 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.00/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.00/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 0000000050287a64 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+Submit diag: over 600 frames (experiment mask 1114031498345823968), 8.53 submissions/frame of the game's scheduler, 0.07/frame reached the queue after the GPU had finished the one before (dry: the GPU may have waited for it)
+Submit diag:   4.48/frame, dry   1.1%,  3.053 ms after the previous, decision to queue    63 us (max    232),  0.01/frame with semaphore waits: batched (guest submission end, BB_HONEST_FLUSH_US over)
+Submit diag:   0.02/frame, dry 100.0%,  3.856 ms after the previous, decision to queue    72 us (max    131),  0.00/frame with semaphore waits: GPU idle (guest submission end, GPU done with all)
+Submit diag:   1.03/frame, dry   0.0%,  0.049 ms after the previous, decision to queue    68 us (max    248),  0.00/frame with semaphore waits: GPU command thread idle 0.2 ms (SignalFlush)
+Submit diag:   1.00/frame, dry   0.0%,  0.041 ms after the previous, decision to queue   132 us (max    567),  0.00/frame with semaphore waits: frame end (FramesRetired)
+Submit diag:   1.00/frame, dry   0.0%,  0.332 ms after the previous, decision to queue    73 us (max    641),  0.00/frame with semaphore waits: sceGnmSubmitDone (OnSubmit)
+Submit diag:   1.00/frame, dry   0.3%,  1.529 ms after the previous, decision to queue   115 us (max    442),  0.01/frame with semaphore waits: flip (presenter frame)
+Submit diag: guest submission ends 60.5/frame: 2.9 without fences pending, 53.1 held for the batch interval, 0.05 of those although the GPU had finished everything submitted (64 KiB backlog rule); held ends with the near-dry rule off for want of stage B slack: 0.0/frame
+Submit diag: game thread blocked on the GPU (sceGnm waits for the previous frame) 1.00/frame, 12.452 ms/frame, after guest submission 3.0 of 12.0 a frame (BB_SUBMIT_AHEAD)
+Submit diag: GPU waits (Scheduler::Wait that blocked, any thread): none
+Render-target copy HLE, last 4096 copies: 0 between proxies, 4096 native; of the native ones 2341 with a dirty source proxy (resolved), 0 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 set: kept); not between proxies: experiment mask 131072 4096
+Froyok bloom, last 600 frames: 600 pyramids built (0 of them late, at the composite; 600 never read), 0 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 set: built at every recombination)
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 198.0 400.0 1109.0 1016.0, left out 0.0 0.0 0.0 0.0; frames with draws 100% 100% 100% 100%
+Sun atlas: a frame 2723.0 draws in 29.0 passes, 1.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 2059.6 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 2.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 600 frame pairs, same 600, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 1773 sampled draws] [c
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 set: re
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Scene proxy resolves and fills per frame, last 600 frames, by consumer (experiment 1073741824 set: as before):
+  resolve B10G11R11UfloatPack32 3840x2160: 2.00/frame, by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 5.00/frame, by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill B10G11R11UfloatPack32 3840x2160: 0.58/frame, by pass ps 0000000052738b8a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.58/frame, by pass ps 0000000052738b8a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.58/frame, by pass depth, cleared by the pass, ps/vs 0000000052738b8a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  resolve R8G8B8A8Unorm 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by image download (readback) [transfer read]
+  fill R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [reduced pass attachment]; proxy dropped by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 1920x1080: 2.00/frame, by draw textures, stage 00000000e820ee9d [shader read]
+  fill R16G16B16A16Sfloat 1920x1080: 1.00/frame, by pass ps 000000006c2323c2 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080: 1.00/frame, by draw textures, stage 000000006320bb24 [shader read]
+  fill R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  fill R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by pass ps 000000006320bb24 [reduced pass attachment]; proxy dropped by image upload (CPU data) [transfer write]
+  resolve R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  fill B10G11R11UfloatPack32 3840x2160: 1.00/frame, by pass ps 000000003fe9e964 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000008650418f [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000002eacb983 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 000000009eb30215 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 2.00/frame, by image copy (render-target copy HLE or texture cache) [transfer read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 00000000898dabb3 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by pass ps 0000000086e96401 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by upscaler and HDR native at the trigger, cs 000000009a9cf8a9 [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by unlabelled (engine effect, presenter or other) [proxy read (engine effect or upscaler input)]; proxy dropped by pass ps 000000009e1cb278 [color attachment]
+  resolve R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [color attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 00000000a89e01e9 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 00000000a89e01e9 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.39/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.39/frame, by pass ps 00000000e21e283a [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.39/frame, by pass depth, cleared by the pass, ps/vs 00000000e21e283a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 0000000050287a64 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 0000000050287a64 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 000000009e3394c8 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000009e3394c8 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill B10G11R11UfloatPack32 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill R16G16B16A16Sfloat 3840x2160: 0.01/frame, by pass ps 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+Submit diag: over 600 frames (experiment mask 1114031498345823968), 8.48 submissions/frame of the game's scheduler, 0.06/frame reached the queue after the GPU had finished the one before (dry: the GPU may have waited for it)
+Submit diag:   4.44/frame, dry   1.1%,  3.045 ms after the previous, decision to queue    63 us (max    264),  0.01/frame with semaphore waits: batched (guest submission end, BB_HONEST_FLUSH_US over)
+Submit diag:   0.01/frame, dry 100.0%,  6.648 ms after the previous, decision to queue    65 us (max    106),  0.00/frame with semaphore waits: GPU idle (guest submission end, GPU done with all)
+Submit diag:   1.03/frame, dry   0.0%,  0.041 ms after the previous, decision to queue    68 us (max    162),  0.00/frame with semaphore waits: GPU command thread idle 0.2 ms (SignalFlush)
+Submit diag:   1.00/frame, dry   0.0%,  0.045 ms after the previous, decision to queue   125 us (max    539),  0.00/frame with semaphore waits: frame end (FramesRetired)
+Submit diag:   1.00/frame, dry   0.0%,  0.342 ms after the previous, decision to queue    68 us (max    443),  0.00/frame with semaphore waits: sceGnmSubmitDone (OnSubmit)
+Submit diag:   1.00/frame, dry   0.3%,  1.508 ms after the previous, decision to queue   113 us (max    416),  0.00/frame with semaphore waits: flip (presenter frame)
+Submit diag: guest submission ends 60.5/frame: 2.9 without fences pending, 53.1 held for the batch interval, 0.05 of those although the GPU had finished everything submitted (64 KiB backlog rule); held ends with the near-dry rule off for want of stage B slack: 0.0/frame
+Submit diag: game thread blocked on the GPU (sceGnm waits for the previous frame) 1.00/frame, 12.260 ms/frame, after guest submission 3.0 of 12.0 a frame (BB_SUBMIT_AHEAD)
+Submit diag: GPU waits (Scheduler::Wait that blocked, any thread): none
+Volumetric lighting: tint over 225 records, one thread per record
+HDR output: the frame is encoded from its own image (no composite clear and copy) (3840x2160 into 3840x2160)
+Exit: clean shutdown in 46 ms

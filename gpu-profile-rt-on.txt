@@ -1,0 +1,170 @@
+Start to title 6 s, title to save chosen 12 s, loading and settling 14 s; measuring 108 s now.
+
+masks 0 0   6 windows:   74.1 FPS,  5242 draws/frame, stage B busy  85.8%, GPU thread 1.68 us/draw
+           frame times: median 13.25 ms, 99th percentile 22.67 ms (worst window 23.43), worst frame 28.5 ms (worst window 38.6), 4.2 frames over 1.5x median per window
+           stage B us/packet: packet 1.81, draw 1.65, bind 0.38, ObtainBuffer 0.23, buffers 0.17, vertex 0.17, begin render 0.16, textures 0.15, rt capture 0.11, VRAM path 0.09, render state 0.09, descriptors 0.09, tex set 0.07, dispatch 0.06, emit vertex 0.06, dynamic 0.05, index 0.05, kick 0.05, EnsureResident 0.05, rt prepare 0.05, VRAM track 0.04, HLE shader 0.04, effects bind 0.04, samplers 0.03, tex set apply 0.03, tex set check 0.03, tasks 0.03, motion 0.03, after draw 0.02, HLE copy 0.02, HLE obtain 0.02, stream copy 0.02, VRAM upload 0.01, upscaler eval 0.01, upscaler 0.01, tex full 0.01, VRAM image sync 0.01, refresh detile 0.00, refresh obtain 0.00, refresh hash 0.00, tex full empty 0.00, VRAM written 0.00, protect 0.00, wait copies 0.00, wait fences 0.00, flush 0.00, preupload 0.00, rt builds 0.00, refresh upload 0.00, HLE batch 0.00
+masks set   6 windows:   26.4 FPS,  5243 draws/frame, stage B busy  33.2%, GPU thread 1.66 us/draw
+           frame times: median 37.77 ms, 99th percentile 48.33 ms (worst window 51.70), worst frame 51.0 ms (worst window 53.3), 0.0 frames over 1.5x median per window
+           stage B us/packet: packet 2.00, draw 1.74, bind 0.38, ObtainBuffer 0.29, vertex 0.18, buffers 0.17, textures 0.15, begin render 0.15, rt capture 0.14, tasks 0.12, render state 0.12, VRAM path 0.11, flush 0.09, rt prepare 0.09, descriptors 0.08, tex set 0.07, EnsureResident 0.07, dispatch 0.07, effects bind 0.07, VRAM track 0.06, emit vertex 0.06, index 0.06, kick 0.05, dynamic 0.05, HLE shader 0.04, samplers 0.03, tex set check 0.03, tex set apply 0.03, motion 0.03, stream copy 0.02, HLE obtain 0.02, after draw 0.02, VRAM image sync 0.01, VRAM upload 0.01, HLE copy 0.01, tex full 0.01, VRAM written 0.01, upscaler 0.01, refresh upload 0.01, upscaler eval 0.01, HLE batch 0.00, tex full empty 0.00, refresh detile 0.00, protect 0.00, wait copies 0.00, wait fences 0.00, preupload 0.00, refresh obtain 0.00, rt builds 0.00, refresh hash 0.00
+           (masks set = disable 0 experiment 1114031498345823968)
+
+GPU profile masks 0 0  7 blocks: 13.48 ms/frame, idle 0.28, busy 13.20
+GPU profile masks set  7 blocks: 37.97 ms/frame, idle 0.33, busy 37.64
+    0.761  10.402  +9.641  Lighting: point shadows
+    0.000   7.258  +7.258  Lighting: point shadow snapshots
+    1.397   1.818  +0.421  upscaler: evaluate (DLSS, FSR, XeSS or TAA)
+    0.000   1.635  +1.635  pass 1920x1080 [B10G11R11UfloatPack32 B10G11R11UfloatPack32 ] depth D32SfloatS8Uint vs 000000008747a367 ps 00000000bae5454e
+    1.185   1.293  +0.108  pass 4096x4096 [- ] depth D32Sfloat vs 00000000014b7164 ps 00000000a2108f5e
+    0.855   1.182  +0.327  Lighting: ray tracing geometry
+    0.000   1.020  +1.020  image download D32SfloatS8Uint 3840x2160
+    0.135   0.937  +0.802  pass 1920x1080 [B10G11R11UfloatPack32 B10G11R11UfloatPack32 ] depth D32SfloatS8Uint vs 000000008747a367 ps 00000000370174f7
+    0.891   0.892  +0.002  Lighting: indirect light
+    0.798   0.792  -0.006  Lighting: SSR full trace
+    0.111   0.719  +0.608  pass 1920x1080 [B10G11R11UfloatPack32 B10G11R11UfloatPack32 ] depth D32SfloatS8Uint vs 000000008747a367 ps 00000000600f86b0
+    0.708   0.632  -0.076  pass 1920x1080 [R8G8B8A8Unorm R8G8B8A8Unorm R8G8B8A8Srgb R8G8B8A8Unorm B10G11R11UfloatPack32 R16G16B16A16Sfloat - - ] depth D32SfloatS8Uint vs 000000009da6aacb ps 00000000bb10e440
+    0.000   0.589  +0.589  pass 960x540 [R16G16B16A16Sfloat ] depth - vs 000000005a619b89 ps 000000006c2323c2
+    0.000   0.552  +0.552  image upload R32Sfloat 3840x2160
+    0.129   0.515  +0.387  scene proxy resolve R16G16B16A16Sfloat 3840x2160
+    0.509   0.496  -0.012  Lighting: ray traced sun
+    0.502   0.500  -0.002  copy shader HLE: barrier + dispatch
+    0.000   0.368  +0.368  image upload R16G16B16A16Sfloat 1920x1080
+    0.252   0.313  +0.061  (between submissions: GPU idle) before a batched (guest submission end, BB_HONEST_FLUSH_US over) submission, the one before still on the GPU when it reached the queue
+    0.127   0.250  +0.123  scene proxy resolve D32SfloatS8Uint 3840x2160
+    0.000   0.216  +0.216  render-target copy HLE: image copy
+    0.205   0.202  -0.003  pass 1920x1080 [R16G16B16A16Sfloat ] depth D32SfloatS8Uint vs 000000004cd21a0f ps 0000000071c96598
+    0.177   0.175  -0.002  Lighting: volumetric sunlight
+    0.000   0.176  +0.176  pass 1920x1080 [R8G8B8A8Unorm R8G8B8A8Unorm R8G8B8A8Srgb R8G8B8A8Unorm B10G11R11UfloatPack32 R16G16B16A16Sfloat - - ] depth D32SfloatS8Uint vs 000000003eaa5555 ps 00000000dbeccd9c
+    0.175   0.174  -0.001  Lighting: lamp fog
+    0.164   0.170  +0.006  Lighting: ray tracing scene
+    0.155   0.157  +0.002  pass 4096x4096 [- ] depth D32Sfloat vs 000000007e259f22 ps 00000000a2108f5e
+    0.146   0.146   0.000  HDR native: exposure
+    0.125   0.049  -0.076  upscaler: merge
+    0.123   0.000  -0.123  pass 1920x1080 [R8G8B8A8Unorm R8G8B8A8Unorm R8G8B8A8Srgb R8G8B8A8Unorm B10G11R11UfloatPack32 R16G16B16A16Sfloat - - ] depth D32SfloatS8Uint vs 0000000087724f59 ps 000000006b45aeff
+    0.108   0.000  -0.108  pass 1920x1080 [R8G8B8A8Unorm ] depth - vs 000000000b0acf50 ps 00000000f7229091
+    0.027   0.107  +0.080  pass 4096x4096 [- ] depth D32Sfloat vs 0000000061547e10 ps 00000000a2108f5e
+    0.105   0.000  -0.105  pass 3840x2160 [R8G8B8A8Unorm ] depth - vs 000000000b0acf50 ps 00000000ed4c7668
+    0.104   0.000  -0.104  pass 3840x2160 [R8G8B8A8Unorm ] depth - vs 000000000b0acf50 ps 000000008c08444c
+           GPU load (nvidia-smi, 72 samples): median 97%, max 98%
+           The game window had the focus at all 72 samples.
+
+--- log lines
+Ray tracing: 2723 shadow + 702 camera draws, 1330 instances, 8380894 triangles a frame; 1330 BLAS; alpha 0.0, not ortho 0.0, no camera 0.0, unsupported 0.0, many instances 6.0, over budget 131.0, moving 176.0, copies rebuilt 25.0, strips 0.0, in both passes 617.0, cut-out characters 318.0, new triangles built 330624, evicted 0.0
+Ray tracing: 2177281 triangles refit a frame; shared copies drawn on the last frame: 156 of 27 meshes, 1319776 triangles, 156 moving, 52 with a palette, 29 in the camera pass, 25 (314089 triangles) rebuilt on it; rebuilt budget 300000
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Ray tracing world copies: 105600 builds, 19668 copied (5442.7 MB), 70332 sun shadow builds not copied (19383.5 MB) since the last line; copies on (sun VSM off, experiment 16777216 set)
+HDR output: the frame is encoded from its own image (no composite clear and copy) (3840x2160 into 3840x2160)
+Volumetric lighting: tint over 225 records, one thread per record
+Ray tracing upkeep (r17): a frame 149.9 meshes refit (2177245 triangles), 26.1 built (330660 triangles), 3.5 of them shared copies built fast (44496 triangles); unchanged inputs (BB_RT_UNCHANGED=off): 0.0 refits skipped (0 triangles), 0.0 refit although unchanged (0 triangles), 0.0 not provable; far only (every 0, 0 off; BB_RT_R
+Froyok bloom, last 600 frames: 515 pyramids built (0 of them late, at the composite; 515 never read), 85 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 clear)
+Render-target copy HLE, last 4096 copies: 282 between proxies, 3814 native; of the native ones 2058 with a dirty source proxy (resolved), 1 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 clear); not between proxies: source without proxy 211, experiment mask 131072 3603
+Scene proxies: of the last 4096 image clears of proxied targets, 4096 proxy levels cleared with the image, 3186 resolves before a clear left out (experiment 17179869184: resolve first, fill later)
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 198.0 400.0 1109.0 1016.0, left out 0.0 0.0 0.0 0.0; frames with draws 100% 100% 100% 100%
+Sun atlas: readers (r12): water draws 2.3 a frame (1372 measured, 0 without a query) on 686 of 600 frames, answers read: 0 frames with samples, 686 without, 0 late, 0 frames whose query group was still busy; other reader draws 14.8 a frame (latched: every cascade drawn); this frame left out cascades from 4 (water quiet now yes, 
+Sun atlas: a frame 2723.0 draws in 29.0 passes, 1.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 2062.7 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 2.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 600 frame pairs, same 600, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 1773 sampled draws] [c
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 clear),
+Ray tracing: 2723 shadow + 702 camera draws, 1330 instances, 8380894 triangles a frame; 1330 BLAS; alpha 0.0, not ortho 0.0, no camera 0.0, unsupported 0.0, many instances 6.0, over budget 131.0, moving 176.0, copies rebuilt 25.0, strips 0.0, in both passes 617.0, cut-out characters 318.0, new triangles built 330198, evicted 0.0
+Ray tracing: 2177707 triangles refit a frame; shared copies drawn on the last frame: 156 of 27 meshes, 1319776 triangles, 156 moving, 52 with a palette, 29 in the camera pass, 25 (314089 triangles) rebuilt on it; rebuilt budget 300000
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Ray tracing world copies: 105600 builds, 57067 copied (15792.0 MB), 32933 sun shadow builds not copied (9034.2 MB) since the last line; copies off (sun VSM off, experiment 16777216 clear)
+Scene proxies: of the last 4096 render-target copies at the reduced size (r10), 2341 between proxies into proxies made for copies (0 such proxies made, 3 live), 0 into other proxies, 1755 without a dirty source proxy, 0 destinations not eligible; proxies made for copies since resolved 1172 times by native accesses and sampled by
+Scene proxies: of the last 4096 image clears of proxied targets, 4096 proxy levels cleared with the image, 3185 resolves before a clear left out (experiment 17179869184: resolve first, fill later)
+Scene proxy resolves and fills per frame, last 600 frames, by consumer (experiment 1073741824 clear: no fill of a cleared target, read-only depth keeps its proxy):
+  resolve D32SfloatS8Uint 1920x1080: 2.00/frame, by draw textures, stage 00000000e820ee9d [shader read]
+  fill R16G16B16A16Sfloat 3840x2160: 0.00/frame, by pass ps 00000000898dabb3 [reduced pass attachment]; proxy dropped by image clear (fast-clear eliminate or clear HLE) [transfer write]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [storage or shader write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by unlabelled (engine effect, presenter or other) [proxy read (engine effect or upscaler input)]; proxy dropped by pass ps 000000009e1cb278 [color attachment]
+  resolve R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by pass depth, ps/vs 000000009837d1c8 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.42/frame, by pass depth, cleared by the pass, ps/vs 00000000e21e283a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [reduced pass attachment]; proxy dropped by pass ps 00000000f7229091 [color attachment]
+  resolve R16G16B16A16Sfloat 1920x1080: 1.00/frame, by draw textures, stage 000000006320bb24 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R8G8B8A8Unorm 3840x2160: 1.00/frame, by dispatch textures, cs 000000002da7fe60 [shader read]
+  fill D32SfloatS8Uint 3840x2160: 0.56/frame, by pass depth, cleared by the pass, ps/vs 0000000052738b8a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 0000000050287a64 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 00000000a89e01e9 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 000000009e3394c8 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+Submit diag: over 600 frames (experiment mask 0), 8.48 submissions/frame of the game's scheduler, 0.09/frame reached the queue after the GPU had finished the one before (dry: the GPU may have waited for it)
+Submit diag:   4.41/frame, dry   0.5%,  2.678 ms after the previous, decision to queue    76 us (max    950),  0.21/frame with semaphore waits: batched (guest submission end, BB_HONEST_FLUSH_US over)
+Submit diag:   0.02/frame, dry 100.0%,  3.829 ms after the previous, decision to queue   110 us (max    423),  0.00/frame with semaphore waits: GPU idle (guest submission end, GPU done with all)
+Submit diag:   0.04/frame, dry 100.0%,  1.079 ms after the previous, decision to queue    67 us (max     94),  0.00/frame with semaphore waits: near dry (r8: guest submission end, BB_NEAR_DRY_DEPTH)
+Submit diag:   1.01/frame, dry   0.0%,  0.035 ms after the previous, decision to queue    95 us (max   1343),  0.00/frame with semaphore waits: GPU command thread idle 0.2 ms (SignalFlush)
+Submit diag:   1.00/frame, dry   0.0%,  0.031 ms after the previous, decision to queue   130 us (max    716),  0.00/frame with semaphore waits: frame end (FramesRetired)
+Submit diag:   1.00/frame, dry   0.0%,  0.415 ms after the previous, decision to queue    89 us (max   1332),  0.00/frame with semaphore waits: sceGnmSubmitDone (OnSubmit)
+Submit diag:   1.00/frame, dry   0.3%,  1.000 ms after the previous, decision to queue   113 us (max    442),  0.01/frame with semaphore waits: flip (presenter frame)
+Submit diag: guest submission ends 60.5/frame: 2.9 without fences pending, 53.1 held for the batch interval, 0.00 of those although the GPU had finished everything submitted (64 KiB backlog rule); held ends with the near-dry rule off for want of stage B slack: 10.3/frame
+Submit diag: game thread blocked on the GPU (sceGnm waits for the previous frame) 1.00/frame, 10.202 ms/frame, after guest submission 3.0 of 12.2 a frame (BB_SUBMIT_AHEAD)
+Submit diag: GPU waits (Scheduler::Wait that blocked, any thread): none
+Ray tracing upkeep (r17): a frame 149.9 meshes refit (2177703 triangles), 26.1 built (330202 triangles), 25.0 of them shared copies built fast (314089 triangles); unchanged inputs (BB_RT_UNCHANGED=off): 0.0 refits skipped (0 triangles), 0.0 refit although unchanged (0 triangles), 0.0 not provable; far only (every 0, 0 off; BB_RT
+Froyok bloom, last 600 frames: 0 pyramids built (0 of them late, at the composite; 0 never read), 600 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 clear)
+Render-target copy HLE, last 4096 copies: 2341 between proxies, 1755 native; of the native ones 0 with a dirty source proxy (resolved), 0 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 clear); not between proxies: source without proxy 1755
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 198.0 400.0 1109.0 1016.0, left out 0.0 0.0 0.0 0.0; frames with draws 100% 100% 100% 100%
+Sun atlas: readers (r12): water draws 2.0 a frame (1200 measured, 0 without a query) on 600 of 600 frames, answers read: 0 frames with samples, 600 without, 0 late, 0 frames whose query group was still busy; other reader draws 13.0 a frame (latched: every cascade drawn); this frame left out cascades from 4 (water quiet now yes, 
+Sun atlas: a frame 2723.0 draws in 26.8 passes, 1.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 2062.7 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 2.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 600 frame pairs, same 600, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 1773 sampled draws] [c
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 clear),
+Ray tracing: 2723 shadow + 702 camera draws, 1330 instances, 8380894 triangles a frame; 1330 BLAS; alpha 0.0, not ortho 0.0, no camera 0.0, unsupported 0.0, many instances 6.0, over budget 131.0, moving 176.0, copies rebuilt 25.0, strips 0.0, in both passes 617.0, cut-out characters 318.0, new triangles built 330506, evicted 0.0
+Ray tracing: 2177399 triangles refit a frame; shared copies drawn on the last frame: 156 of 27 meshes, 1319776 triangles, 156 moving, 52 with a palette, 29 in the camera pass, 25 (314089 triangles) rebuilt on it; rebuilt budget 300000
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Ray tracing world copies: 105600 builds, 0 copied (0.0 MB), 90000 sun shadow builds not copied (24826.2 MB) since the last line; copies off (sun VSM off, experiment 16777216 clear)
+Scene proxies: of the last 4096 image clears of proxied targets, 4096 proxy levels cleared with the image, 3186 resolves before a clear left out (experiment 17179869184: resolve first, fill later)
+Scene proxies: of the last 4096 render-target copies at the reduced size (r10), 2341 between proxies into proxies made for copies (0 such proxies made, 3 live), 0 into other proxies, 1755 without a dirty source proxy, 0 destinations not eligible; proxies made for copies since resolved 1170 times by native accesses and sampled by
+Scene proxy resolves and fills per frame, last 600 frames, by consumer (experiment 1073741824 clear: no fill of a cleared target, read-only depth keeps its proxy):
+  fill D32SfloatS8Uint 3840x2160: 0.57/frame, by pass depth, cleared by the pass, ps/vs 0000000052738b8a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [reduced pass attachment]; proxy dropped by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 1920x1080: 2.00/frame, by draw textures, stage 00000000e820ee9d [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080: 1.00/frame, by draw textures, stage 000000006320bb24 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 1: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 2: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 3: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R16G16B16A16Sfloat 1920x1080 level 4: 1.00/frame, by draw textures, stage 000000003fe9e964 [shader read]
+  resolve R8G8B8A8Unorm 3840x2160: 1.00/frame, by dispatch textures, cs 000000002da7fe60 [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [shader read]
+  resolve R16G16B16A16Sfloat 3840x2160: 1.00/frame, by dispatch textures, cs 00000000a040875f [storage or shader write]
+  fill R16G16B16A16Sfloat 3840x2160: 1.00/frame, by unlabelled (engine effect, presenter or other) [proxy read (engine effect or upscaler input)]; proxy dropped by pass ps 000000009e1cb278 [color attachment]
+  resolve R8G8B8A8Unorm 1920x1080: 1.00/frame, by pass ps 00000000f7229091 [color attachment]
+  resolve D32SfloatS8Uint 3840x2160: 1.00/frame, by pass depth, ps/vs 000000009837d1c8 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.39/frame, by pass depth, cleared by the pass, ps/vs 00000000e21e283a [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 00000000a89e01e9 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 000000004b6a2ff4 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.01/frame, by pass depth, cleared by the pass, ps/vs 0000000050287a64 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+  fill D32SfloatS8Uint 3840x2160: 0.00/frame, by pass depth, cleared by the pass, ps/vs 000000009e3394c8 [reduced pass attachment]; proxy dropped by pass depth, cleared by the pass, ps/vs 0000000089cda9e4 [depth attachment]
+Submit diag: over 600 frames (experiment mask 0), 8.35 submissions/frame of the game's scheduler, 0.11/frame reached the queue after the GPU had finished the one before (dry: the GPU may have waited for it)
+Submit diag:   4.29/frame, dry   1.2%,  2.716 ms after the previous, decision to queue    76 us (max    446),  0.12/frame with semaphore waits: batched (guest submission end, BB_HONEST_FLUSH_US over)
+Submit diag:   0.01/frame, dry 100.0%,  5.649 ms after the previous, decision to queue    77 us (max    123),  0.00/frame with semaphore waits: GPU idle (guest submission end, GPU done with all)
+Submit diag:   0.04/frame, dry 100.0%,  0.860 ms after the previous, decision to queue    70 us (max    378),  0.00/frame with semaphore waits: near dry (r8: guest submission end, BB_NEAR_DRY_DEPTH)
+Submit diag:   1.00/frame, dry   0.0%,  0.040 ms after the previous, decision to queue    96 us (max   1237),  0.00/frame with semaphore waits: GPU command thread idle 0.2 ms (SignalFlush)
+Submit diag:   1.00/frame, dry   0.0%,  0.037 ms after the previous, decision to queue   132 us (max    577),  0.00/frame with semaphore waits: frame end (FramesRetired)
+Submit diag:   1.00/frame, dry   0.0%,  0.422 ms after the previous, decision to queue    92 us (max   1226),  0.00/frame with semaphore waits: sceGnmSubmitDone (OnSubmit)
+Submit diag:   1.00/frame, dry   0.5%,  0.976 ms after the previous, decision to queue   115 us (max    525),  0.01/frame with semaphore waits: flip (presenter frame)
+Submit diag: guest submission ends 60.5/frame: 2.9 without fences pending, 53.2 held for the batch interval, 0.01 of those although the GPU had finished everything submitted (64 KiB backlog rule); held ends with the near-dry rule off for want of stage B slack: 14.2/frame
+Submit diag: game thread blocked on the GPU (sceGnm waits for the previous frame) 1.00/frame, 9.998 ms/frame, after guest submission 3.0 of 12.2 a frame (BB_SUBMIT_AHEAD)
+Submit diag: GPU waits (Scheduler::Wait that blocked, any thread): none
+Render-target copy HLE, last 4096 copies: 2341 between proxies, 1755 native; of the native ones 0 with a dirty source proxy (resolved), 0 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 clear); not between proxies: source without proxy 1755
+Ray tracing upkeep (r17): a frame 149.9 meshes refit (2177548 triangles), 26.1 built (330357 triangles), 25.0 of them shared copies built fast (314089 triangles); unchanged inputs (BB_RT_UNCHANGED=off): 0.0 refits skipped (0 triangles), 0.0 refit although unchanged (0 triangles), 0.0 not provable; far only (every 0, 0 off; BB_RT
+Froyok bloom, last 600 frames: 0 pyramids built (0 of them late, at the composite; 0 never read), 600 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 clear)
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 198.0 400.0 1109.0 1016.0, left out 0.0 0.0 0.0 0.0; frames with draws 100% 100% 100% 100%
+Sun atlas: readers (r12): water draws 2.0 a frame (1200 measured, 0 without a query) on 600 of 600 frames, answers read: 0 frames with samples, 600 without, 0 late, 0 frames whose query group was still busy; other reader draws 13.0 a frame (latched: every cascade drawn); this frame left out cascades from 4 (water quiet now yes, 
+Sun atlas: a frame 2723.0 draws in 26.8 passes, 1.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 2062.7 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 2.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 600 frame pairs, same 600, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 1970 sampled draws] [c
+Scene proxies: of the last 600 dispatches of cs a040875f at the reduced size (r11, rectangle copy), 0 indirect (resolve kept), 0 with unreadable constants, 600 not storing from 0,0 in 8x8 groups; 0 proxied destinations of the others: 0 stored whole with a dirty proxy, 0 of those resolves left out (experiment 137438953472 clear),
+Ray tracing: 2723 shadow + 702 camera draws, 1330 instances, 8380894 triangles a frame; 1330 BLAS; alpha 0.0, not ortho 0.0, no camera 0.0, unsupported 0.0, many instances 6.0, over budget 131.0, moving 176.0, copies rebuilt 25.0, strips 0.0, in both passes 617.0, cut-out characters 318.0, new triangles built 330621, evicted 0.0
+Ray tracing: 2177284 triangles refit a frame; shared copies drawn on the last frame: 156 of 27 meshes, 1319776 triangles, 156 moving, 52 with a palette, 29 in the camera pass, 25 (314089 triangles) rebuilt on it; rebuilt budget 300000
+Scene proxies: of the last 600 native passes clearing a proxied depth image (r11), 0 proxies cleared with the pass: 0 fills left out at the next reduced use, 0 dropped again before it; not cleared: 0 depth not cleared, 0 depth written by the draws (no DB clear), 600 stencil not cleared, 0 not all of the image, 0 pass continued, 
+Ray tracing world copies: 105600 builds, 0 copied (0.0 MB), 90000 sun shadow builds not copied (24826.2 MB) since the last line; copies off (sun VSM off, experiment 16777216 clear)
+Scene proxies: of the last 4096 image clears of proxied targets, 4096 proxy levels cleared with the image, 3186 resolves before a clear left out (experiment 17179869184: resolve first, fill later)
+Volumetric lighting: tint over 225 records, one thread for all (old)
+HDR output: the frame is encoded from a copy in the composite (clear + blit) (3840x2160 into 3840x2160)
+Render-target copy HLE, last 4096 copies: 1058 between proxies, 3038 native; of the native ones 1283 with a dirty source proxy (resolved), 1 with a dirty destination proxy, 0 of those resolves dropped (experiment mask 67108864 set: kept); not between proxies: source without proxy 793, experiment mask 131072 2245
+Froyok bloom, last 600 frames: 340 pyramids built (0 of them late, at the composite; 340 never read), 260 not built (no Froyok composite in the last 60 frames), 600 of the sources read through a scene proxy; 0 Froyok composites, 0 of them without a pyramid (experiment mask 2147483648 set: built at every recombination)
+Ray tracing upkeep (r17): a frame 149.9 meshes refit (2177083 triangles), 26.1 built (330822 triangles), 10.9 of them shared copies built fast (136629 triangles); unchanged inputs (BB_RT_UNCHANGED=off): 0.0 refits skipped (0 triangles), 0.0 refit although unchanged (0 triangles), 0.0 not provable; far only (every 0, 0 off; BB_RT
+Sun atlas: at 0x10de280000, splits 20.0 / 40.0 / 150.0 m (valid), shadow distance 600.0 m, volumetric reach 40.0 m, 2 cascades sampled; left out on 0 of 600 frames (off: another reader); draws a frame by cascade 198.0 400.0 1109.0 1016.0, left out 0.0 0.0 0.0 0.0; frames with draws 100% 100% 100% 100%
+Sun atlas: a frame 2723.0 draws in 28.5 passes, 1.00 passes begin with a clear of the whole image, 0.00 DB clear draws, 0.0 draws with no single viewport, 0.0 across cascades, 2062.7 with the previous atlas draw's pipeline; the other reader (vs 000000009253a878 ps 00000000e3021062) 2.0 draws
+Sun atlas: light matrices by cascade (shadow pass constants: projection at dword 52, view to world at 180): [c0: 600 frame pairs, same 600, turned or rescaled 0, moved only 0 (whole texels 0 of 0, mean 0.000 max 0.000 texels), max element change 0, texel 0.0157 m, viewport 2048x2048, another matrix in 0 of 1773 sampled draws] [c
+Exit: clean shutdown in 60 ms
