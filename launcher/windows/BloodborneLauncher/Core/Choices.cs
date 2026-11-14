@@ -244,6 +244,26 @@ namespace BloodborneLauncher.Core
             new(L.T("Lowest (2)"), "2"),
         };
 
+        /// <summary>object_motion_store: how many animated vertices the engine keeps each frame for
+        /// motion vectors (8388608 or 4194304; made when the game starts). Auto is large, and small
+        /// on an AMD card with 8.5 GB or less.</summary>
+        public static readonly Choice[] MotionStore =
+        {
+            new(L.T("Auto (large; small on AMD cards with 8 GB or less)"), "auto"),
+            new(L.T("Large (8,388,608 vertices)"), "large", L.T("256 MiB of video memory. At one heavy spot it stored every moving draw, for about 0.05-0.1 ms a frame")),
+            new(L.T("Small (4,194,304 vertices)"), "small", L.T("128 MiB of video memory. At one heavy spot about 315 of 701 moving draws a frame did not fit")),
+        };
+
+        /// <summary>graphics_sun_far_shadows: how often the game draws the two far bands of the
+        /// sun's shadow (the engine hooks the game's loop when the game starts). The game's own is
+        /// every frame; a value the engine does not know is that too.</summary>
+        public static readonly Choice[] SunFarShadows =
+        {
+            new(L.T("Every frame (the game's own)"), "game"),
+            new(L.T("In turn (each every 2nd frame)"), "alternate", L.T("About +7% FPS at one heavy spot with ray tracing off, +5% with it on")),
+            new(L.T("Every 8th frame"), "rare", L.T("About +10% FPS at one heavy spot with ray tracing off, +11% with it on")),
+        };
+
         public static readonly Choice[] FpsModes =
         {
             new("60 FPS", "60"),
