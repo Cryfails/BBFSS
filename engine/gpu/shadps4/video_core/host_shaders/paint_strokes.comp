@@ -73,9 +73,9 @@ const vec2 GLOW_STOPS = vec2(4.0, 1.0);
 float lum_floor;  // the frame's black (blackLevel)
 float tone_floor; // the same as a tone (toneOf)
 // In the test view (graphics_drawn_look_debug 1, 2 or 4) every dab has a flat colour of its
-// own, grey where the surface moves by itself.
+// own, grey by as much as the surface moves by itself (movesItself).
 bool test_view = false;
-bool test_grey = false;
+float test_grey = 0.0;
 // What shows between the look's dabs (calmColour), worked out for the first dab that needs it.
 vec3 under = vec3(0.0);
 bool have_under = false;
@@ -112,10 +112,6 @@ vec3 worldNormal(ivec2 pixel, vec3 c) {
         }
     }
     return depthNormal(pixel, c);
-}
-
-bool movesItself(ivec2 pixel, float depth) {
-    return (flags & FLAG_MOTION) != 0u && ownMotion(texelFetch(motion_tex, pixel, 0), depth);
 }
 
 // How much fine detail lies around a place of the screen: 0 a plain surface, which takes bold
@@ -284,9 +280,7 @@ vec3 dabColour(Dab dab, vec2 uv, vec3 rel, vec3 flat_n, int plane, float px_per_
             return own.rgb;
         }
         vec3 flat_colour = idColour(dab.id) * (1.0 + 0.5 * dab.idv);
-        if (test_grey) {
-            flat_colour = vec3(dot(flat_colour, LUMA));
-        }
+        flat_colour = mix(flat_colour, vec3(dot(flat_colour, LUMA)), test_grey);
         return flat_colour * dabLuminance(rel, flat_n, plane, dab.offset, own.lum);
     }
     vec4 paint = vec4(0.0);
@@ -377,9 +371,15 @@ void main() {
     const float detail = view == VIEW_FINE ? 1.0 : view == VIEW_BOLD ? 0.0 : detailAt(uv);
     // What moves by itself would slide under strokes that lie still in the world: it is
     // smoothed instead, by its own share of the strength (the test view shows its dabs grey).
-    const bool moving = movesItself(pixel, depth);
+    // (r45b_drawn-look-fixes) Moving by itself is told against the camera's own move
+    // (paint_common.glsl, movesItself): having a vector in the object motion image is not it,
+    // most of the world has one, and all of that got smoothed and no strokes.
+    const float moving = (flags & FLAG_MOTION) != 0u
+                             ? movesItself(texelFetch(motion_tex, pixel, 0), depth,
+                                           vec2(pixel) + 0.5)
+                             : 0.0;
     test_grey = moving;
-    const float amount = strength * (moving ? characters : 1.0);
+    const float amount = strength * mix(1.0, characters, moving);
     if (amount <= 0.0 && !test_view) {
         return;
     }
@@ -398,8 +398,14 @@ void main() {
                    vec4(strokeColour(uv, rel, n, flat_n, detail, own), scene.a));
         return;
     }
-    const vec3 paint = moving ? calmColour(uv, cell_fine, own)
-                              : strokeColour(uv, rel, n, flat_n, detail, own);
+    // Between still and moving (MOVES_SPEED) the strokes fade into the smoothed scene.
+    vec3 paint = vec3(0.0);
+    if (moving < 1.0) {
+        paint = strokeColour(uv, rel, n, flat_n, detail, own);
+    }
+    if (moving > 0.0) {
+        paint = mix(paint, calmColour(uv, cell_fine, own), moving);
+    }
     const float keep = keepOwn(uv, paint, own, key);
     const vec3 rgb = mix(scene.rgb, paint, amount * (1.0 - keep));
     // A scene colour that is no number stays what it is.

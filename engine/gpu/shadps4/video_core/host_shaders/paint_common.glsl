@@ -15,16 +15,21 @@ layout(push_constant) uniform Constants {
     vec2 jitter;      // this frame's viewport shift in pixels (x right, y down)
     float strength;   // graphics_drawn_look_strength, 0..1
     float brush;      // graphics_drawn_look_texture, 0..1.2: the brush's marks in a stroke
-    float outlines;   // graphics_drawn_look_outlines, 0..1 (ink)
-    float ink_world;  // graphics_drawn_look_ink_world, 0..1 (ink)
     float characters; // graphics_drawn_look_characters, 0..1: the strength on what moves by itself
     float cell_bold;  // the cell of a bold stroke on the screen, pixels of the scene
+    // FLAG_PREVIOUS: from this frame's view axes to those of the frame before, a turn (the
+    // vector part of its unit quaternion, the scalar part positive), then a shift in metres.
+    vec3 back_turn;
     float cell_fine;  // the cell of a fine stroke
-    uint flags;       // FLAG_*; bits 8..10: the test view (VIEW_*)
+    vec3 back_shift;
+    // FLAG_*; bits 8..10: the test view (VIEW_*); bits 16..31: the lens of the frame before
+    // over this frame's, (ratio - 1) * 32768 + 32768.
+    uint flags;
 };
 
 const uint FLAG_NORMALS = 1u; // normal_tex holds the G-buffer's world normals
 const uint FLAG_MOTION = 2u;  // motion_tex holds this frame's object motion
+const uint FLAG_PREVIOUS = 4u; // back_turn, back_shift and the lens' ratio are the frame before's
 const uint VIEW_STROKES = 1u; // every stroke in a flat colour of its own, sizes as the look mixes them
 const uint VIEW_FINE = 2u;    // the same, every stroke at the fine size
 const uint VIEW_BOLD = 4u;    // the same, every stroke at the bold size
@@ -79,10 +84,12 @@ vec3 soundColour(vec3 rgb) {
     return clamp(mix(rgb, vec3(0.0), isnan(rgb)), 0.0, 60000.0);
 }
 
-// A texel of the object motion image (rg pixels, b 1 where a draw with vectors of its own wrote
-// it, a the depth it wrote at) says the pixel at `depth` moves by itself: a character, or
-// whatever else has a bone buffer, and nothing was drawn over it since (the test
-// camera_motion.comp makes).
+// A texel of the object motion image (rg pixels, previous - current; b 1 where a draw with
+// vectors of its own wrote it, a the depth it wrote at) holds the vector of the pixel at
+// `depth`: a draw whose vertices of the frame before are known wrote the pixel, and nothing was
+// drawn over it since (the test camera_motion.comp makes). That is every character, and most of
+// the world as well: walls and floors drawn through a bone buffer have such vectors too, and
+// theirs say what the camera did.
 bool ownMotion(vec4 motion, float depth) {
     return motion.b > 0.99 && abs(motion.a - depth) < max(2e-7, (proj.z - depth) * 0.01);
 }
@@ -92,6 +99,42 @@ bool ownMotion(vec4 motion, float depth) {
 vec3 viewPos(vec2 pixel, float z) {
     const vec2 ndc = (pixel - jitter) / size * 2.0 - 1.0;
     return vec3(ndc.x * z / proj.x, ndc.y * z / proj.y, z);
+}
+
+// (r45b_drawn-look-fixes) The pixels by which the camera's own move from the frame before
+// shifts a point that lies still at view position c: previous - current, without the jitter, as
+// camera_motion.comp works it out and as the object motion image holds it. FLAG_PREVIOUS.
+vec2 cameraShift(vec3 c) {
+    const float w = sqrt(max(1.0 - dot(back_turn, back_turn), 0.0));
+    const vec3 before =
+        c + 2.0 * (w * cross(back_turn, c) + cross(back_turn, cross(back_turn, c))) + back_shift;
+    const float zoom = 1.0 + (float(flags >> 16u) - 32768.0) / 32768.0;
+    return (before.xy * zoom / max(before.z, 1e-4) - c.xy / max(c.z, 1e-4)) * proj.xy * 0.5 * size;
+}
+
+// A point counts as moving by itself from the first of these speeds, and fully from the
+// second: pixels a frame on a scene of 1080 lines, against where the camera's own move puts it.
+// Below the first lies what the depth's and the vectors' rounding makes of a still wall.
+const vec2 MOVES_SPEED = vec2(0.25, 1.0);
+
+// How much the pixel at `depth` moves by itself, 0..1: `motion` is its texel of the object motion
+// image, `at` its centre (pixel + 0.5). A character that walks, a door that swings, a branch in
+// the wind: 1. A wall, and a character that stands still: 0, whatever the camera does. Without
+// the camera of the frame before nothing tells the two apart: what has a vector counts as
+// moving for that frame, as it did before r45b for every frame.
+float movesItself(vec4 motion, float depth, vec2 at) {
+    if (!ownMotion(motion, depth)) {
+        return 0.0;
+    }
+    if ((flags & FLAG_PREVIOUS) == 0u) {
+        return 1.0;
+    }
+    const vec2 own = motion.rg - cameraShift(viewPos(at, viewZ(depth)));
+    // A vector that is no number: the upscaler takes the camera's for it, so does the look.
+    if (any(isnan(own)) || any(isinf(own))) {
+        return 0.0;
+    }
+    return smoothstep(MOVES_SPEED.x, MOVES_SPEED.y, length(own) * 1080.0 / size.y);
 }
 
 // Where a view position lies on the screen, in pixels of this frame (jitter put back).

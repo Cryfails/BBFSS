@@ -31,6 +31,7 @@
 #include <span>
 #include <vector>
 #include "common/types.h"
+#include "video_core/renderer_vulkan/drawn_look_params.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
@@ -69,16 +70,24 @@ public:
     /// it (a reflection in water, from a mirrored camera, with a depth of its own), and strokes
     /// painted there would leave the scene without any.
     /// The first blended draw without depth writes into the scene colour: the solid surfaces
-    /// are in, the transparents start. The place the look is designed for.
+    /// are in, the transparents start. The place the look is designed for. A draw of six
+    /// indices or fewer counts when it tests the depth (a particle system of a few particles;
+    /// r45b_drawn-look-fixes: it used to be taken for a full-screen pass and painted over):
+    /// DrawnLookParams::SmallTransparent.
     void OnBlendedScene(VideoCore::ImageId color, VideoCore::ImageId depth,
                         std::array<float, 2> jitter);
-    /// A full-screen pass over the scene colour with fragment shader `hash`. On a frame with
+    /// A full-screen pass over the scene colour with fragment shader `hash` (a draw of six
+    /// indices or fewer that is not one of the transparents above). On a frame with
     /// transparents the first such pass after them is remembered (the fog composite; another
     /// one takes its place only after it came first on CompositeFrames such frames in a row);
     /// on a frame without any, the strokes are painted before that same pass, so the fog is
     /// left unpainted on both kinds of frame.
     void OnSceneComposite(u64 hash, VideoCore::ImageId color, VideoCore::ImageId depth,
                           std::array<float, 2> jitter);
+    /// (r45b_drawn-look-fixes) The draw that OnBlendedScene is called for next is a small one
+    /// (DrawnLookParams::SmallTransparent), with fragment shader `hash`: when it is the frame's
+    /// first transparent draw the log names it, once a shader.
+    void OnSmallTransparent(u64 hash, u32 indices);
     /// Right before the upscaler's trigger: the last chance of a frame that had neither. Fog
     /// and particles are in the scene by now and get painted; such frames are counted.
     void OnBeforeUpscaler(VideoCore::ImageId color, VideoCore::ImageId depth,
@@ -169,8 +178,8 @@ private:
     /// The full-screen passes of this frame so far, by shader, and the one that follows the
     /// transparents on the frames that have them (hash 0: none seen yet). `candidate` came
     /// first instead on the last `candidate_frames` such frames: a small sprite among the
-    /// transparents is drawn as such a pass too, and must not take the fog composite's place
-    /// for being first once.
+    /// transparents that does not test the depth is drawn as such a pass too, and must not
+    /// take the fog composite's place for being first once.
     static constexpr u32 CompositeFrames = 30;
     std::array<FullScreenPass, 16> frame_passes{};
     u32 frame_pass_count = 0;
@@ -181,6 +190,20 @@ private:
     /// For the line every 600 frames the look was wanted on.
     std::array<u32, ResultCount> results{};
     u32 frames = 0;
+    /// (r45b_drawn-look-fixes) The camera the last frame was painted with, for the frame after
+    /// it (DrawnLookParams::Make, `previous`). `last_camera_set`: this frame stored one;
+    /// `last_camera_valid`: the frame before did. `previous_frames`: for the line every 600
+    /// frames.
+    DrawnLookParams::Previous last_camera{};
+    bool last_camera_set = false;
+    bool last_camera_valid = false;
+    u32 previous_frames = 0;
+    /// The small transparent draw OnSmallTransparent announced, and the shaders already named.
+    u64 small_hash = 0;
+    u32 small_indices = 0;
+    bool small_pending = false;
+    std::array<u64, 8> small_seen{};
+    u32 small_seen_count = 0;
     /// What the last painted frame ran with: a line is printed when the size or the test view
     /// changes, and the first few times the inputs (normals, object motion) do: those may come
     /// and go with the place a frame is painted at.
