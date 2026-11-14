@@ -115,6 +115,8 @@ void Rasterizer::EffectsEndLampBatch() {
 
 void Rasterizer::EffectsOnFrameEnd() {
     effects_wanted = AnyWanted();
+    drawn_look_wanted = DrawnLook::Wanted(); // bbport (r45_drawn-look)
+    drawn_look->OnFrameEnd(drawn_look_wanted);
     // Lamps apart: a batch nothing ended. The frame is composed and the scene's depth forgotten
     // (CameraMotion::OnDisplayPass), so its lamp light is lost; it is counted and printed.
     point_shadow->DropUnended();
@@ -225,6 +227,9 @@ void Rasterizer::EffectsAfterTargets(const GraphicsPipeline* pipeline) {
     const bool gbuffer = std::popcount(key.mrt_mask) >= 5 && db_desc.first;
     if (gbuffer) {
         depth_of_field->Reset();
+        if (drawn_look_wanted) { // bbport (r45_drawn-look): cb 0 holds the world normals
+            drawn_look->OnGBufferDraw(db_desc.first, cb_descs[0].first);
+        }
     }
     if (!effects_wanted) {
         return;
@@ -244,9 +249,27 @@ void Rasterizer::EffectsBlendedScene() {
     if (effects_wanted) {
         ssgi->OnOpaqueScene(cb_descs[0].first, db_desc.first, upscaler->Jitter());
     }
+    // bbport (r45_drawn-look): after the indirect light is in: the strokes take the lit surface.
+    if (drawn_look_wanted) {
+        drawn_look->OnBlendedScene(cb_descs[0].first, db_desc.first, upscaler->Jitter());
+    }
+}
+
+// bbport (r45_drawn-look): a full-screen pass over the scene colour is about to be drawn.
+void Rasterizer::EffectsSceneComposite(const GraphicsPipeline* pipeline) {
+    if (drawn_look_wanted) {
+        drawn_look->OnSceneComposite(FragmentHash(pipeline), cb_descs[0].first, db_desc.first,
+                                     upscaler->Jitter());
+    }
 }
 
 void Rasterizer::EffectsBeforeUpscaler(u64 compute_hash) {
+    // bbport (r45_drawn-look): before the volumetric light below, which is fog and stays
+    // unpainted.
+    if (drawn_look_wanted && compute_hash == upscaler->TriggerHash()) {
+        drawn_look->OnBeforeUpscaler(upscaler->SceneColor(), camera_motion->Depth(),
+                                     upscaler->Jitter());
+    }
     if (effects_wanted && compute_hash == upscaler->TriggerHash()) {
         const auto camera = camera_motion->PassMatrices();
         volumetric_light->SetCamera({camera.view, camera.inv_view, camera.valid});

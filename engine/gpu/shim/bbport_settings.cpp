@@ -426,6 +426,30 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.graphics_rt_sun_half = ZeroOrOne(key, value, false);
     } else if (key == "graphics_rt_far_refit") {
         v.graphics_rt_far_refit = ZeroOrOne(key, value, false);
+    } else if (key == "graphics_drawn_look") { // bbport (r45_drawn-look)
+        v.graphics_drawn_look = ZeroOrOne(key, value, false);
+    } else if (key == "graphics_drawn_look_strength") {
+        v.graphics_drawn_look_strength = Clamp(std::isfinite(f) ? f : DrawnLookStrengthDefault, 0.0f, 1.0f);
+    } else if (key == "graphics_drawn_look_stroke_size") {
+        v.graphics_drawn_look_stroke_size =
+            Clamp(std::isfinite(f) ? f : 1.0f, DrawnLookStrokeSizeMin, DrawnLookStrokeSizeMax);
+    } else if (key == "graphics_drawn_look_texture") {
+        v.graphics_drawn_look_texture = Clamp(std::isfinite(f) ? f : 1.0f, 0.0f, DrawnLookTextureMax);
+    } else if (key == "graphics_drawn_look_outlines") {
+        v.graphics_drawn_look_outlines = Clamp(std::isfinite(f) ? f : DrawnLookOutlinesDefault, 0.0f, 1.0f);
+    } else if (key == "graphics_drawn_look_shadow_edges") {
+        v.graphics_drawn_look_shadow_edges = Clamp(std::isfinite(f) ? f : 1.0f, 0.0f, 1.0f);
+    } else if (key == "graphics_drawn_look_ink_world") {
+        v.graphics_drawn_look_ink_world = Clamp(std::isfinite(f) ? f : 0.0f, 0.0f, 1.0f);
+    } else if (key == "graphics_drawn_look_characters") {
+        v.graphics_drawn_look_characters = Clamp(std::isfinite(f) ? f : DrawnLookCharactersDefault, 0.0f, 1.0f);
+    } else if (key == "graphics_drawn_look_shadow_soft") {
+        v.graphics_drawn_look_shadow_soft = Clamp(std::isfinite(f) ? f : DrawnLookShadowSoftDefault,
+                                                  DrawnLookShadowSoftMin, DrawnLookShadowSoftMax);
+    } else if (key == "graphics_drawn_look_quality") {
+        v.graphics_drawn_look_quality = std::clamp(i, 0, 1);
+    } else if (key == "graphics_drawn_look_debug") {
+        v.graphics_drawn_look_debug = std::clamp(i, 0, DrawnLookDebugMax);
     } else if (key == "engine_previous_paths") { // bbport (r39_master-debug)
         v.engine_previous_paths = ZeroOrOne(key, value, false);
     } else if (const int debug = DebugSwitchOfKey(key); debug >= 0) { // bbport (r39_master-debug)
@@ -976,6 +1000,18 @@ void Save() {
     put("graphics_gi_reflections_fewer_rays",flag(v.graphics_gi_reflections_fewer_rays));
     put("graphics_rt_sun_half",flag(v.graphics_rt_sun_half));
     put("graphics_rt_far_refit",flag(v.graphics_rt_far_refit));
+    put("graphics_drawn_look", flag(v.graphics_drawn_look)); // bbport (r45_drawn-look)
+    put("graphics_drawn_look_strength", fixed(v.graphics_drawn_look_strength, 2));
+    put("graphics_drawn_look_stroke_size", fixed(v.graphics_drawn_look_stroke_size, 2));
+    put("graphics_drawn_look_texture", fixed(v.graphics_drawn_look_texture, 2));
+    put("graphics_drawn_look_outlines", fixed(v.graphics_drawn_look_outlines, 2));
+    put("graphics_drawn_look_shadow_edges", fixed(v.graphics_drawn_look_shadow_edges, 2));
+    put("graphics_drawn_look_ink_world", fixed(v.graphics_drawn_look_ink_world, 2));
+    put("graphics_drawn_look_characters", fixed(v.graphics_drawn_look_characters, 2));
+    put("graphics_drawn_look_shadow_soft", fixed(v.graphics_drawn_look_shadow_soft, 2));
+    put("graphics_drawn_look_quality", std::to_string(std::clamp(v.graphics_drawn_look_quality.load(), 0, 1)));
+    put("graphics_drawn_look_debug",
+        std::to_string(std::clamp(v.graphics_drawn_look_debug.load(), 0, DrawnLookDebugMax)));
     put("engine_previous_paths", flag(v.engine_previous_paths)); // bbport (r39_master-debug)
     for (int d = 0; d < DebugSwitchCount; ++d) {
         put(DebugSwitches[d].key, flag(v.debug_switches[d]));

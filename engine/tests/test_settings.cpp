@@ -696,6 +696,86 @@ int main(int argc, char** argv) {
            !s.graphics_rt_sun_half && !s.graphics_rt_far_refit);
     assert(s.object_motion_store == BbSettings::MotionStoreAuto &&
            s.startup_object_motion_store == BbSettings::MotionStoreAuto);
+    // bbport (r45_drawn-look): the drawn look's keys. Nothing above sets them: off, with the
+    // design's values; written back; read; saved after a change; a value outside its range is
+    // the nearest end; a switch that is not 0 or 1 is off; no number is the default.
+    assert(!s.graphics_drawn_look && s.graphics_drawn_look_strength == 0.6f &&
+           s.graphics_drawn_look_stroke_size == 1.0f && s.graphics_drawn_look_texture == 1.0f &&
+           s.graphics_drawn_look_outlines == 0.35f && s.graphics_drawn_look_shadow_edges == 1.0f &&
+           s.graphics_drawn_look_ink_world == 0.0f && s.graphics_drawn_look_characters == 0.5f &&
+           s.graphics_drawn_look_shadow_soft == 0.12f && s.graphics_drawn_look_quality == 1 &&
+           s.graphics_drawn_look_debug == 0 && !s.drawn_look_problem.load());
+    BbSettings::Save();
+    {
+        const std::string text = Read(path);
+        for (const char* line :
+             {"graphics_drawn_look=0\n", "graphics_drawn_look_strength=0.60\n",
+              "graphics_drawn_look_stroke_size=1.00\n", "graphics_drawn_look_texture=1.00\n",
+              "graphics_drawn_look_outlines=0.35\n", "graphics_drawn_look_shadow_edges=1.00\n",
+              "graphics_drawn_look_ink_world=0.00\n", "graphics_drawn_look_characters=0.50\n",
+              "graphics_drawn_look_shadow_soft=0.12\n", "graphics_drawn_look_quality=1\n",
+              "graphics_drawn_look_debug=0\n"}) {
+            assert(text.find(line) != std::string::npos);
+        }
+    }
+    { std::ofstream file(path); file << "graphics_drawn_look=1\ngraphics_drawn_look_strength=0.25\n"
+                                        "graphics_drawn_look_stroke_size=1.3\ngraphics_drawn_look_texture=1.1\n"
+                                        "graphics_drawn_look_outlines=0.8\ngraphics_drawn_look_shadow_edges=0.5\n"
+                                        "graphics_drawn_look_ink_world=0.4\ngraphics_drawn_look_characters=0.9\n"
+                                        "graphics_drawn_look_shadow_soft=0.2\ngraphics_drawn_look_quality=0\n"
+                                        "graphics_drawn_look_debug=4\n"; }
+    BbSettings::Load();
+    assert(s.graphics_drawn_look && s.graphics_drawn_look_strength == 0.25f &&
+           s.graphics_drawn_look_stroke_size == 1.3f && s.graphics_drawn_look_texture == 1.1f &&
+           s.graphics_drawn_look_outlines == 0.8f && s.graphics_drawn_look_shadow_edges == 0.5f &&
+           s.graphics_drawn_look_ink_world == 0.4f && s.graphics_drawn_look_characters == 0.9f &&
+           s.graphics_drawn_look_shadow_soft == 0.2f && s.graphics_drawn_look_quality == 0 &&
+           s.graphics_drawn_look_debug == 4);
+    s.graphics_drawn_look_strength = 0.0f; // the menu's slider at its lower end: the look does no work
+    s.graphics_drawn_look_debug = 1;
+    BbSettings::Save();
+    {
+        const std::string text = Read(path);
+        assert(text.find("graphics_drawn_look=1\n") != std::string::npos);
+        assert(text.find("graphics_drawn_look_strength=0.00\n") != std::string::npos);
+        assert(text.find("graphics_drawn_look_stroke_size=1.30\n") != std::string::npos);
+        assert(text.find("graphics_drawn_look_shadow_soft=0.20\n") != std::string::npos);
+        assert(text.find("graphics_drawn_look_quality=0\n") != std::string::npos);
+        assert(text.find("graphics_drawn_look_debug=1\n") != std::string::npos);
+    }
+    { std::ofstream file(path); file << "graphics_drawn_look=2\ngraphics_drawn_look_strength=7\n"
+                                        "graphics_drawn_look_stroke_size=0.1\ngraphics_drawn_look_texture=9\n"
+                                        "graphics_drawn_look_outlines=-1\ngraphics_drawn_look_shadow_edges=3\n"
+                                        "graphics_drawn_look_ink_world=2\ngraphics_drawn_look_characters=-0.5\n"
+                                        "graphics_drawn_look_shadow_soft=1\ngraphics_drawn_look_quality=5\n"
+                                        "graphics_drawn_look_debug=9\n"; }
+    BbSettings::Load();
+    assert(!s.graphics_drawn_look && s.graphics_drawn_look_strength == 1.0f &&
+           s.graphics_drawn_look_stroke_size == BbSettings::DrawnLookStrokeSizeMin &&
+           s.graphics_drawn_look_texture == BbSettings::DrawnLookTextureMax &&
+           s.graphics_drawn_look_outlines == 0.0f && s.graphics_drawn_look_shadow_edges == 1.0f &&
+           s.graphics_drawn_look_ink_world == 1.0f && s.graphics_drawn_look_characters == 0.0f &&
+           s.graphics_drawn_look_shadow_soft == BbSettings::DrawnLookShadowSoftMax &&
+           s.graphics_drawn_look_quality == 1 && s.graphics_drawn_look_debug == BbSettings::DrawnLookDebugMax);
+    { std::ofstream file(path); file << "graphics_drawn_look_stroke_size=9\ngraphics_drawn_look_shadow_soft=0\n"
+                                        "graphics_drawn_look_quality=-3\ngraphics_drawn_look_debug=-1\n"; }
+    BbSettings::Load();
+    assert(s.graphics_drawn_look_stroke_size == BbSettings::DrawnLookStrokeSizeMax &&
+           s.graphics_drawn_look_shadow_soft == BbSettings::DrawnLookShadowSoftMin &&
+           s.graphics_drawn_look_quality == 0 && s.graphics_drawn_look_debug == 0);
+    { std::ofstream file(path); file << "graphics_drawn_look=on\ngraphics_drawn_look_strength=nan\n"
+                                        "graphics_drawn_look_stroke_size=inf\ngraphics_drawn_look_texture=nan\n"
+                                        "graphics_drawn_look_outlines=nan\ngraphics_drawn_look_shadow_edges=nan\n"
+                                        "graphics_drawn_look_ink_world=nan\ngraphics_drawn_look_characters=-inf\n"
+                                        "graphics_drawn_look_shadow_soft=nan\n"; }
+    s.graphics_drawn_look = true; // on before this Load: the fallback is off
+    BbSettings::Load();
+    assert(!s.graphics_drawn_look && s.graphics_drawn_look_strength == BbSettings::DrawnLookStrengthDefault &&
+           s.graphics_drawn_look_stroke_size == 1.0f && s.graphics_drawn_look_texture == 1.0f &&
+           s.graphics_drawn_look_outlines == BbSettings::DrawnLookOutlinesDefault &&
+           s.graphics_drawn_look_shadow_edges == 1.0f && s.graphics_drawn_look_ink_world == 0.0f &&
+           s.graphics_drawn_look_characters == BbSettings::DrawnLookCharactersDefault &&
+           s.graphics_drawn_look_shadow_soft == BbSettings::DrawnLookShadowSoftDefault);
     // bbport (r39_master-debug): engine_previous_paths and the debug_* keys. Nothing above sets
     // them: off by default, written back, read, saved after a change (the start values stay),
     // an unknown value is 0.

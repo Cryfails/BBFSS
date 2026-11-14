@@ -112,6 +112,14 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                                                  *scene_targets);
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets, *hdr_native);
+    // bbport (r45_drawn-look): nothing of Vulkan is made here; its pipelines and its image are
+    // made on the first frame the look is wanted on. Its places in the frame are found with the
+    // upscaler's scene colour: without the upscaler there are none.
+    drawn_look = std::make_unique<DrawnLook>(instance, scheduler, texture_cache, runtime,
+                                             *scene_targets, *camera_motion, *object_motion);
+    if (!upscaler->Enabled()) {
+        DrawnLook::NoSceneHooks();
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -807,6 +815,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
                 upscaler->OnBlendedSceneDraw();
             } else if (regs.num_indices <= 6 && regs.num_instances.NumInstances() <= 1) {
                 // A full-screen pass over the scene (the fog composite): the transparents are in.
+                EffectsSceneComposite(pipeline);
                 upscaler->OnSceneComposite();
             }
         }

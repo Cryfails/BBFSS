@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_contact_shadow.h"
 #include "video_core/renderer_vulkan/vk_depth_of_field.h"
+#include "video_core/renderer_vulkan/vk_drawn_look.h"
 #include "video_core/renderer_vulkan/vk_froyok_bloom.h"
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
 #include "video_core/renderer_vulkan/vk_point_shadow.h"
@@ -436,6 +437,7 @@ private:
     void EffectsBeforeTargets(const GraphicsPipeline* pipeline);
     void EffectsAfterTargets(const GraphicsPipeline* pipeline);
     void EffectsBlendedScene();
+    void EffectsSceneComposite(const GraphicsPipeline* pipeline); // bbport (r45_drawn-look)
     void EffectsBeforeUpscaler(u64 compute_hash);
     void EffectsBeforeResources(const GraphicsPipeline* pipeline);
     void EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
@@ -649,7 +651,11 @@ private:
     std::unique_ptr<SkyZenith> sky_zenith;
     std::unique_ptr<DepthOfField> depth_of_field;
     std::unique_ptr<FroyokBloom> froyok_bloom;
+    std::unique_ptr<DrawnLook> drawn_look; // bbport (r45_drawn-look)
     bool effects_wanted = false;
+    /// bbport (r45_drawn-look): DrawnLook::Wanted() as EffectsOnFrameEnd read it. Apart from
+    /// effects_wanted: wanting the look starts none of the other effects' work on every draw.
+    bool drawn_look_wanted = false;
     u32 ssr_frame = 0;
     u32 shadow_frame = 0;
     vk::Rect2D effect_tile{};

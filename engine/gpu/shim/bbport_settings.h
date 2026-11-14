@@ -124,6 +124,14 @@ inline constexpr float FroyokBlendMin = 0.1f, FroyokBlendMax = 0.3f;
 inline constexpr float FroyokSpreadMin = 0.5f, FroyokSpreadDefault = 0.85f, FroyokSpreadMax = FroyokSpreadDefault;
 inline constexpr float WetGroundMin = 0.0f, WetGroundMax = 1.0f, WetGroundDefault = 0.5f;
 inline constexpr float DofIntensityMin = 0.0f, DofIntensityMax = 3.0f;
+// bbport (r45_drawn-look): the drawn look's keys (graphics_drawn_look_*) that do not run 0..1.
+inline constexpr float DrawnLookStrengthDefault = 0.6f;
+inline constexpr float DrawnLookStrokeSizeMin = 0.6f, DrawnLookStrokeSizeMax = 1.4f;
+inline constexpr float DrawnLookTextureMax = 1.2f;
+inline constexpr float DrawnLookOutlinesDefault = 0.35f, DrawnLookCharactersDefault = 0.5f;
+inline constexpr float DrawnLookShadowSoftMin = 0.05f, DrawnLookShadowSoftMax = 0.3f,
+                       DrawnLookShadowSoftDefault = 0.12f;
+inline constexpr int DrawnLookDebugMax = 4; // DrawnLookParams::ViewMax (drawn_look_params.h)
 inline constexpr float LocalLightIntensityMin = 0.0f, LocalLightIntensityMax = 4.0f;
 // Source size of local lights under inverse-square falloff, as a fraction of the light radius.
 inline constexpr float LocalLightCoreMin = 0.0f, LocalLightCoreMax = 0.35f, LocalLightCoreDefault = 0.05f;
@@ -412,6 +420,26 @@ struct Values {
     std::atomic<bool> graphics_gi_reflections_fewer_rays{false}; // BB_SSGI_HALF
     std::atomic<bool> graphics_rt_sun_half{false};               // BB_RT_SUN_HALF
     std::atomic<bool> graphics_rt_far_refit{false};              // BB_RT_REFIT_EVERY=8
+    // bbport (r45_drawn-look): the drawn look, an optional hand-painted look (renderer_vulkan/
+    // vk_drawn_look.h). All live. While the switch is off or the strength is 0 nothing of it
+    // runs. The renderer reads the switch, strength, stroke_size, texture, characters and debug
+    // so far; the others are parsed, clamped and saved for the parts of the look that are not
+    // built yet (ink lines, painted shadow edges).
+    std::atomic<bool> graphics_drawn_look{false};
+    std::atomic<float> graphics_drawn_look_strength{DrawnLookStrengthDefault}; // 0..1; 0: no pass
+    std::atomic<float> graphics_drawn_look_stroke_size{1.0f};  // 0.6..1.4, a factor on the strokes' size
+    std::atomic<float> graphics_drawn_look_texture{1.0f};      // 0..1.2, the brush's marks in a stroke
+    std::atomic<float> graphics_drawn_look_outlines{DrawnLookOutlinesDefault}; // 0..1, ink on characters
+    std::atomic<float> graphics_drawn_look_shadow_edges{1.0f}; // 0..1; 0: the game's shadows as they are
+    std::atomic<float> graphics_drawn_look_ink_world{0.0f};    // 0..1, ink on the world
+    std::atomic<float> graphics_drawn_look_characters{DrawnLookCharactersDefault}; // 0..1, the strength on characters
+    std::atomic<float> graphics_drawn_look_shadow_soft{DrawnLookShadowSoftDefault}; // 0.05..0.3
+    std::atomic<int> graphics_drawn_look_quality{1};           // 0 low, 1 high
+    // 0 the look; 1, 2, 4 the test view: every stroke in a flat colour of its own (sizes as the
+    // look mixes them, all fine, all bold); 3 is kept for the ink lines' view.
+    std::atomic<int> graphics_drawn_look_debug{0};
+    // Why the drawn look cannot run, for the menu; null while it can. Set by the renderer.
+    std::atomic<const char*> drawn_look_problem{nullptr};
     std::atomic<bool> engine_previous_paths{false}; // bbport (r39_master-debug): PreviousPathsMask, live
     std::atomic<bool> debug_switches[DebugSwitchCount]{}; // bbport (r39_master-debug): debug_* keys, restart
     std::atomic<int> look_choice{0};

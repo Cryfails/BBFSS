@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r45_drawn-look): the frame's key for the drawn look: how bright the scene's surfaces
+// are, as one number. The look's thresholds are shares of it (what counts as black, what glows):
+// the scene is linear and has not had the game's exposure yet. A plain mean of the picture (the
+// copy's last level as paint_mips.comp leaves it) would not do: the sky and the lamps are many
+// times as bright as stone at night, so what counted as black would rise when the camera looks
+// up, and one pixel that is off the scale would move it too. The key is the mean tone (toneOf:
+// the cube root of the luminance) of blocks of the picture, without the blocks that are all sky,
+// cubed (and times KEY_GAIN, paint_common.glsl). A block much brighter than the blocks around
+// it (a lamp, a window, a block that is partly sky) counts as no more than TONE_MOST times their
+// mean tone.
+// Two passes of this file, each one group of 8x8:
+//   (neither) every invocation adds up its part of a small level of the copy (64 texels or
+//             fewer on its longer side) and stores its sum: 8x8 sums or fewer
+//   LAST      one invocation adds up the sums and writes the key over the copy's last level
+// The sums are kept in the first texels of the means' level 0 (paint_lock.comp's image, which
+// is written only after the strokes).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "paint_common.glsl"
+
+#if !defined(LAST)
+
+layout(binding = 0) uniform texture2D prep_tex; // a small level of the copy: rgb, a view depth
+layout(binding = 1, rgba16f) uniform writeonly image2D sums_img;
+
+// Twice the tone: eight times the luminance.
+const float TONE_MOST = 2.0;
+
+// The tones of this invocation's blocks, each no more than `most`, and how many: r, g.
+vec2 tones(ivec2 start, ivec2 end, float most) {
+    vec2 sum = vec2(0.0);
+    for (int y = start.y; y < end.y; ++y) {
+        for (int x = start.x; x < end.x; ++x) {
+            const vec4 block = texelFetch(prep_tex, ivec2(x, y), 0);
+            // A depth of 0: nothing but sky under this texel.
+            if (block.a > 0.0) {
+                sum += vec2(min(toneOf(block.rgb), most), 1.0);
+            }
+        }
+    }
+    return sum;
+}
+
+void main() {
+    const ivec2 parts = min(imageSize(sums_img), ivec2(8));
+    const ivec2 part = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(part, parts))) {
+        return;
+    }
+    const ivec2 from = textureSize(prep_tex, 0);
+    const ivec2 start = part * from / parts, end = (part + 1) * from / parts;
+    vec2 sum = tones(start, end, 1e30);
+    if (sum.y > 0.0) {
+        sum = tones(start, end, TONE_MOST * sum.x / sum.y);
+    }
+    imageStore(sums_img, part, vec4(sum, 0.0, 0.0));
+}
+
+#else
+
+layout(binding = 0) uniform texture2D sums_tex;
+layout(binding = 1, rgba16f) uniform writeonly image2D key_img; // the copy's last level
+
+void main() {
+    if (gl_GlobalInvocationID.xy != uvec2(0)) {
+        return;
+    }
+    const ivec2 parts = min(textureSize(sums_tex, 0), ivec2(8));
+    vec2 sum = vec2(0.0);
+    for (int y = 0; y < parts.y; ++y) {
+        for (int x = 0; x < parts.x; ++x) {
+            sum += texelFetch(sums_tex, ivec2(x, y), 0).rg;
+        }
+    }
+    // A frame of sky alone has no surface to paint: any key will do.
+    const float tone = sum.y > 0.0 ? sum.x / sum.y : 0.0;
+    imageStore(key_img, ivec2(0), vec4(vec3(KEY_GAIN * tone * tone * tone), 0.0));
+}
+
+#endif

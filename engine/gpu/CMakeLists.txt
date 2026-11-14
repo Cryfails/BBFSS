@@ -162,6 +162,9 @@ function(add_host_shader FILENAME SHADER_NAME)
     if (FILENAME MATCHES "^ssgi")
         list(APPEND INCLUDES ${SHADER_SRC}/ssgi_common.glsl)
     endif()
+    if (FILENAME MATCHES "^paint_")
+        list(APPEND INCLUDES ${SHADER_SRC}/paint_common.glsl)
+    endif()
     add_custom_command(OUTPUT ${OUT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
         COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${STAGE} ${DEFINES} ${SHADER_SRC}/${FILENAME}
@@ -191,6 +194,16 @@ add_host_shader(ssr_temporal.comp ssr_temporal_resolve_comp RESOLVE=1)
 add_host_shader(ssr_temporal.comp ssr_temporal_copy_comp COPY=1)
 add_host_shader(ssr_trace.comp ssr_trace_comp)
 add_host_shader(contact_shadow.comp contact_shadow_comp)
+# bbport (r45_drawn-look): the drawn look's passes (renderer_vulkan/vk_drawn_look.cpp)
+add_host_shader(paint_prep.comp paint_prep_comp)
+add_host_shader(paint_stats.comp paint_stats_comp)
+add_host_shader(paint_mips.comp paint_mips_comp)
+add_host_shader(paint_key.comp paint_key_comp)
+add_host_shader(paint_key.comp paint_key_last_comp LAST=1)
+add_host_shader(paint_strokes.comp paint_strokes_comp)
+add_host_shader(paint_lock.comp paint_lock_first_comp FIRST=1)
+add_host_shader(paint_lock.comp paint_lock_down_comp DOWN=1)
+add_host_shader(paint_lock.comp paint_lock_comp)
 add_host_shader(rt_shadow.comp rt_shadow_comp)
 add_host_shader(rt_shadow.comp rt_shadow_coverage_comp COVERAGE_SKIP=1)
 add_host_shader(rt_unproject.comp rt_unproject_comp)
@@ -434,6 +447,14 @@ target_include_directories(motion-history-test PRIVATE ..)
 add_executable(lamp-fog-lights-test EXCLUDE_FROM_ALL ../tests/test_lamp_fog_lights.cpp)
 target_compile_options(lamp-fog-lights-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(lamp-fog-lights-test PRIVATE ..)
+# bbport (r45_drawn-look): the drawn look's passes on a synthetic scene (the strokes stay on
+# their surfaces under the jitter and a camera move, the colours stay) or on a picture; plain
+# Vulkan, no bbgpu.
+add_executable(drawn-look-test EXCLUDE_FROM_ALL ../tests/test_drawn_look.cpp)
+target_include_directories(drawn-look-test PRIVATE ${SHADER_INCLUDE} shadps4)
+target_compile_options(drawn-look-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-missing-field-initializers)
+target_link_libraries(drawn-look-test PRIVATE Vulkan::Vulkan)
+add_dependencies(drawn-look-test host_shaders)
 foreach(effect_test
         "motion-blur-shader-test;test_motion_blur.cpp"
         "directional-shadow-test;test_directional_shadows.cpp"
