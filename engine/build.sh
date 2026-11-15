@@ -212,6 +212,12 @@ if [[ ${1:-} == --test ]]; then
     out/content-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_rtc.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-rtc-test
     out/sys-rtc-test
+    "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_engine_hooks.cpp gpu/shim/engine/engine_hooks.cpp -o out/engine-hooks-test
+    out/engine-hooks-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. -Igpu/shim tests/test_settings.cpp gpu/shim/bbport_settings.cpp gpu/shim/bbport_menu_i18n.cpp -o out/settings-test
+    out/settings-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_motion_history.cpp -o out/motion-history-test
+    out/motion-history-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Wno-deprecated-declarations -I. tests/test_toml_patch.cpp start/toml_patch.cpp start/xml.cpp start/common.cpp -lexpat -lz $([[ -n $windows ]] && echo -lbcrypt) -o out/toml-patch-test
     out/toml-patch-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_gx_records.cpp gpu/shim/engine/gx_bindings.cpp -o out/gx-records-test
