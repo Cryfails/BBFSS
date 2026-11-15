@@ -77,7 +77,7 @@ static void EmitVertexMotion(EmitContext& ctx) {
                                            ctx.push_data_block,
                                            ctx.ConstU32(PushData::MotionParamIndex));
     Id param_index = ctx.OpLoad(u32_type, param_ptr);
-    if (ctx.runtime_info.hw.vs.motion_vectors == MotionVectors::VertexBoth) {
+    if (MotionVectors::Kind(ctx.runtime_info.hw.vs.motion_vectors) == MotionVectors::VertexBoth) {
         param_index = ctx.OpBitwiseAnd(u32_type, param_index, ctx.ConstU32(0xffffU));
     }
     param_index = ctx.OpSelect(u32_type,
@@ -167,13 +167,103 @@ static void EmitVertexMotion(EmitContext& ctx) {
     ctx.OpStore(ctx.motion_out_prev, previous);
 }
 
+// bbport (r54_leaf-stage2): with the card UVs (MotionVectors::CaptureUv, BB_RT_CARD_ALPHA=1) a
+// capture whose param names a place in the ring (word 1, the ring index + 1; 0: none) also
+// stores per vertex what a cut-out pixel shader samples its alpha at and multiplies it by: two
+// components of one output (u, v) and one of another (the alpha factor, 1.0 without one), which
+// word 7 names (Vulkan::PackCardSelector: bits 0-4 the uv output, 5-6 and 7-8 its components,
+// 9-13 the alpha factor's output, 14-15 its component, 16 an alpha factor at all, 31 set). The
+// outputs are the ones this shader wrote, read back before the epilogue's other work; an output
+// that is an integer, an array or the emulated clip distances is left out of the choice. Where
+// the selector names an output this shader does not have or that is left out, or a component
+// past the output's own
+// ones, the value stored is MotionVectors::CaptureUvUnset (a NaN, CARD_UV_RING_UNSET), never a
+// 0: the expand pass then marks the triangle not finite. (With clip distance emulation the
+// clip distances may take a real output's slot, spirv_emit_context.cpp; that output then reads
+// as not finite too.) No local variable may be declared here (past the function's first block):
+// the choice is a chain of selects. Indexed draws may run a vertex more than once; every run
+// stores the same values, as the position store above does. This is the recompiler's capture:
+// a capture vertex shader with CaptureUv is never replaced by the lifter's (CompileModule).
+static void EmitCardUvStore(EmitContext& ctx, Id ring_address, Id params, Id offsets, Id slot) {
+    const Id u32_type = ctx.U32[1];
+    const Id f32_type = ctx.F32[1];
+    const Id bool_type = ctx.U1[1];
+    const Id uv_word = ctx.OpCompositeExtract(u32_type, params, 1u);
+    const Id selector = ctx.OpCompositeExtract(u32_type, offsets, 3u);
+    const Id wanted = ctx.OpLogicalAnd(
+        bool_type, ctx.OpINotEqual(bool_type, uv_word, ctx.u32_zero_value),
+        ctx.OpINotEqual(bool_type, ctx.OpBitwiseAnd(u32_type, selector, ctx.ConstU32(0x80000000u)),
+                        ctx.u32_zero_value));
+    const Id uv_label = ctx.OpLabel();
+    const Id uv_merge = ctx.OpLabel();
+    ctx.OpSelectionMerge(uv_merge, spv::SelectionControlMask::MaskNone);
+    ctx.OpBranchConditional(wanted, uv_label, uv_merge);
+    ctx.AddLabel(uv_label);
+    const auto field = [&](u32 offset, u32 count) {
+        return ctx.OpBitFieldUExtract(u32_type, selector, ctx.ConstU32(offset), ctx.ConstU32(count));
+    };
+    const Id uv_out = field(0u, 5u);
+    const Id comp_u = field(5u, 2u);
+    const Id comp_v = field(7u, 2u);
+    const Id alpha_out = field(9u, 5u);
+    const Id alpha_comp = field(14u, 2u);
+    const Id has_alpha = ctx.OpINotEqual(bool_type, field(16u, 1u), ctx.u32_zero_value);
+    const Id one = ctx.Constant(f32_type, 1.0f);
+    const Id unset = ctx.OpBitcast(f32_type, ctx.ConstU32(MotionVectors::CaptureUvUnset));
+    const Id unset4 =
+        ctx.OpCompositeConstruct(ctx.F32[4], std::array<Id, 4>{unset, unset, unset, unset});
+    Id uv_vector = unset4;
+    Id alpha_vector = unset4;
+    for (u32 i = 0; i < IR::NumParams; ++i) {
+        const auto& output = ctx.output_params[i];
+        if (!Sirit::ValidId(output.id) || output.is_integer || output.is_array ||
+            output.id.value == ctx.clip_distances.value || output.num_components < 1 ||
+            output.num_components > 4) {
+            continue;
+        }
+        const u32 n = output.num_components;
+        const Id loaded = ctx.OpLoad(ctx.F32[n], output.id);
+        Id vector = loaded;
+        if (n != 4) {
+            std::array<Id, 4> parts{unset, unset, unset, unset};
+            for (u32 c = 0; c < n; ++c) {
+                parts[c] = n == 1 ? loaded : ctx.OpCompositeExtract(f32_type, loaded, c);
+            }
+            vector = ctx.OpCompositeConstruct(ctx.F32[4], parts);
+        }
+        uv_vector = ctx.OpSelect(ctx.F32[4], ctx.OpIEqual(bool_type, uv_out, ctx.ConstU32(i)), vector,
+                                 uv_vector);
+        alpha_vector = ctx.OpSelect(ctx.F32[4], ctx.OpIEqual(bool_type, alpha_out, ctx.ConstU32(i)),
+                                    vector, alpha_vector);
+    }
+    const Id u = ctx.OpVectorExtractDynamic(f32_type, uv_vector, comp_u);
+    const Id v = ctx.OpVectorExtractDynamic(f32_type, uv_vector, comp_v);
+    const Id a = ctx.OpSelect(f32_type, has_alpha,
+                              ctx.OpVectorExtractDynamic(f32_type, alpha_vector, alpha_comp), one);
+    const Id index = ctx.OpIAdd(u32_type, ctx.OpISub(u32_type, uv_word, ctx.ConstU32(1u)), slot);
+    const Id base = ctx.OpIAdd(
+        ctx.U64, ring_address,
+        ctx.OpIMul(ctx.U64, ctx.OpUConvert(ctx.U64, index),
+                   ctx.Constant(ctx.U64, u64(MotionVectors::CaptureUvStride))));
+    const Id f32_ptr = ctx.TypePointer(spv::StorageClass::PhysicalStorageBuffer, f32_type);
+    const std::array<Id, 3> values{u, v, a};
+    for (u32 k = 0; k < 3; ++k) {
+        const Id ptr = ctx.OpConvertUToPtr(
+            f32_ptr, ctx.OpIAdd(ctx.U64, base, ctx.Constant(ctx.U64, u64(k * 4))));
+        ctx.OpStore(ptr, values[k], spv::MemoryAccessMask::Aligned, 4u);
+    }
+    ctx.OpBranch(uv_merge);
+    ctx.AddLabel(uv_merge);
+}
+
 static void EmitVertexCapture(EmitContext& ctx) {
     const Id u32_type = ctx.U32[1];
     const Id position = ctx.OpLoad(ctx.F32[4], ctx.output_position);
     const Id param_ptr = ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, u32_type),
                                            ctx.push_data_block,
                                            ctx.ConstU32(PushData::MotionParamIndex));
-    const bool both = ctx.runtime_info.hw.vs.motion_vectors == MotionVectors::VertexBoth;
+    const bool both =
+        MotionVectors::Kind(ctx.runtime_info.hw.vs.motion_vectors) == MotionVectors::VertexBoth;
     Id param_index = ctx.OpLoad(u32_type, param_ptr);
     if (both) {
         param_index = ctx.OpShiftRightLogical(u32_type, param_index, ctx.ConstU32(16U));
@@ -223,6 +313,10 @@ static void EmitVertexCapture(EmitContext& ctx) {
     ctx.OpStore(ctx.OpConvertUToPtr(f32x4_ptr, address(positions_address,
                                                        ctx.OpIAdd(u32_type, store_base, slot), 16)),
                 position, spv::MemoryAccessMask::Aligned, 16u);
+    // bbport (r54_leaf-stage2): and the card UVs (EmitCardUvStore), with CaptureUv only
+    if ((ctx.runtime_info.hw.vs.motion_vectors & MotionVectors::CaptureUv) != 0) {
+        EmitCardUvStore(ctx, load_address(both ? 4 : 2), params, offsets, slot);
+    }
     ctx.OpBranch(store_merge);
     ctx.AddLabel(store_merge);
 }

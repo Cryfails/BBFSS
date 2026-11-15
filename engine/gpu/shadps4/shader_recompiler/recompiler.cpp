@@ -7,6 +7,7 @@
 #include "shader_recompiler/frontend/decode.h"
 #include "shader_recompiler/frontend/structured_control_flow.h"
 #include "shader_recompiler/frontend/translate/translate.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50_leaf-stage1)
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/post_order.h"
 #include "shader_recompiler/ir/program.h"
@@ -182,6 +183,11 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
         Native::ApplyGt7ToneMap(program, runtime_info, pools);
     }
     Shader::Optimization::CollectShaderInfoPass(program, profile);
+    // bbport (r50_leaf-stage1): what a pixel shader's discard tests, with
+    // BB_RT_CARD_ALPHA_LOG=1 only (ir/passes/cutout_analysis.h).
+    if (info.sw_stage == SwStage::Fragment && Shader::Optimization::CutoutAnalysisOn()) {
+        Shader::Optimization::CutoutAnalysisPass(program, runtime_info);
+    }
     Shader::IR::DumpProgram(program, info);
     timer.Next(CompileStats::LatePasses);
 

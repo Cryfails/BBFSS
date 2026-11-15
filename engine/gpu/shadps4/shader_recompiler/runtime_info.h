@@ -101,6 +101,22 @@ struct MotionVectors {
     static constexpr u8 VertexOutputs = 1;
     static constexpr u8 VertexCapture = 2;
     static constexpr u8 VertexBoth = 3;
+    /// bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1 the capture (VertexCapture) also
+    /// stores per vertex the card UVs of a cut-out pixel shader (RtShadow::CardCapture):
+    /// capture param word 1 is the ring index + 1 (0: none), word 7 the selector
+    /// (Vulkan::PackCardSelector), the ring's address the address block's last member;
+    /// CaptureUvStride bytes a vertex (u, v, the alpha factor). Never set with the knob off:
+    /// keys, SPIR-V and address blocks are then as before.
+    static constexpr u8 CaptureUv = 4;
+    static constexpr u32 CaptureUvStride = 12;
+    /// What the capture stores for a value its selector cannot name (a quiet NaN's bits,
+    /// the ring's CARD_UV_RING_UNSET): the expand pass marks such a triangle not finite.
+    static constexpr u32 CaptureUvUnset = 0x7fc00000u;
+    /// The kind of motion (VertexOutputs, VertexCapture or VertexBoth), CaptureUv apart:
+    /// every equality test of a motion_vectors value goes through this.
+    static constexpr u32 Kind(u32 motion_vectors) {
+        return motion_vectors & 3u;
+    }
 };
 
 struct HwLocalRuntimeInfo {

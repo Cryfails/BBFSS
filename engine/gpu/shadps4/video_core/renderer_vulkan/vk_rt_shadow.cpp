@@ -3,6 +3,7 @@
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
 
 #include <algorithm>
+#include <bit> // bbport (r54_leaf-stage2)
 #include <cmath>
 #include <cstddef> // bbport (r47_still-check): offsetof
 #include <cstdio>
@@ -17,11 +18,13 @@
 #include "bbport_settings.h"
 #include "bbport_sun_cascades.h"
 #include "bbport_toggles.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50_leaf-stage1)
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/host_shaders/rt_shadow_coverage_comp.h"
 #include "video_core/host_shaders/rt_shadow_filter_r25_comp.h" // bbport (r25_rt-sun-trace)
 #include "video_core/host_shaders/rt_shadow_half_comp.h"       // bbport (r25_rt-sun-trace)
 #include "video_core/host_shaders/rt_still_sig_comp.h"         // bbport (r47_still-check)
+#include "video_core/host_shaders/rt_card_uv_comp.h"           // bbport (r54_leaf-stage2)
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r42_lamp-soft)
 #include "video_core/renderer_vulkan/rt_lamp_cards.h"    // bbport (r46_lamp-cards)
@@ -374,6 +377,20 @@ struct StillPush {
 static_assert(sizeof(StillPush) == 80 && offsetof(StillPush, first) == 60 &&
               offsetof(StillPush, indices) == 64 && offsetof(StillPush, slot) == 76);
 
+// bbport (r54_leaf-stage2): what the capture's vertex shader stores (emit_spirv_special.cpp,
+// EmitCardUvStore: the stride, the selector's fields) is what the expand pass reads.
+static_assert(Shader::MotionVectors::CaptureUvStride == CARD_UV_RING_BYTES &&
+              Shader::MotionVectors::CaptureUvUnset == CARD_UV_RING_UNSET);
+static_assert(PackCardSelector({31, 3, 3, 31, 3, true}) == 0x8001ffffu &&
+              PackCardSelector({1, 0, 0, 0, 0, false}) == 0x80000001u &&
+              PackCardSelector({0, 1, 0, 0, 0, false}) == 0x80000020u &&
+              PackCardSelector({0, 0, 1, 0, 0, false}) == 0x80000080u &&
+              PackCardSelector({0, 0, 0, 1, 0, false}) == 0x80000200u &&
+              PackCardSelector({0, 0, 0, 0, 1, false}) == 0x80004000u);
+// bbport (r54_leaf-stage2): a sun shadow pass card is preferred for r14's longest hold window
+// (a cascade the game skips leaves its casters undrawn that long; rt_card_uv.h, CardSunFrames).
+static_assert(CardSunFrames == u64(MaxHoldPeriod) - 1 + HoldMarginFrames);
+
 // The key of an instance's own entry (see PrepareDraw): its mesh key and its bone palette.
 u64 InstanceKey(u64 key, u64 palette) {
     return XXH3_64bits_withSeed(&palette, sizeof(palette), key ^ 0xa24baed4963ee407ull);
@@ -524,6 +541,14 @@ RtShadow::~RtShadow() {
     Free(r25_readback);
     Free(still_sigs); // bbport (r47_still-check)
     Free(still_readback);
+    // bbport (r54_leaf-stage2): the card UVs' buffers and blocks (the GPU is done: Finish above)
+    if (card_block) {
+        vmaClearVirtualBlock(card_block);
+        vmaDestroyVirtualBlock(card_block);
+    }
+    for (Buffer* b : {&card_ring, &card_pool, &card_stat_buffer, &card_readback}) {
+        Free(*b);
+    }
     if (raw_view) {
         device.destroyImageView(raw_view);
     }
@@ -574,6 +599,7 @@ void RtShadow::Destroy(Entry& entry) {
     blas_bytes -= std::min(blas_bytes, entry.scene_bytes);
     entry.bytes = 0;
     entry.scene_bytes = 0;
+    CardRelease(entry); // bbport (r54_leaf-stage2): its block, once the GPU is past it
     // bbport (r47_still-check): its signatures still on their way back are not read (the lists
     // point at the entry), and it no longer counts against the cap of the casters found moving.
     if (entry.still_wait != 0) {
@@ -649,6 +675,7 @@ bool RtShadow::R25HalfWanted() {
 
 bool RtShadow::Setup(const ObjectMotion& object_motion) {
     tried = true;
+    card_uv_on = Shader::Optimization::CardAlphaOn(); // bbport (r54_leaf-stage2)
     const auto device = instance.GetDevice();
     using enum vk::DescriptorType;
     const VkBufferUsageFlags as_storage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
@@ -677,8 +704,9 @@ bool RtShadow::Setup(const ObjectMotion& object_motion) {
         !Make(instance_data,
               vk::DeviceSize(4 * MaxInstances) * sizeof(vk::AccelerationStructureInstanceKHR), true,
               InputUsage) ||
-        !Make(capture_addresses, 16, true, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
-        !Make(both_addresses, 32, true, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
+        // bbport (r54_leaf-stage2): one address more with the card UVs (the ring's)
+        !Make(capture_addresses, card_uv_on ? 24 : 16, true, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
+        !Make(both_addresses, card_uv_on ? 40 : 32, true, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT)) {
         return false;
     }
     std::memset(params.mapped, 0, 32);
@@ -739,12 +767,18 @@ bool RtShadow::Setup(const ObjectMotion& object_motion) {
         }
     }
     // bbport (r37_menu-options): the half-resolution trace is made by R25HalfWanted, when first wanted.
-    const std::array<u64, 2> capture_table{params.address, positions.address};
-    std::memcpy(capture_addresses.mapped, capture_table.data(), sizeof(capture_table));
+    // bbport (r54_leaf-stage2): with the card UVs the ring's address is the blocks' last
+    // member (0 where CardSetup failed: no capture then names a place in the ring). Written
+    // once, here, before any draw binds the blocks.
+    if (card_uv_on) {
+        CardSetup();
+    }
+    const std::array<u64, 3> capture_table{params.address, positions.address, card_ring.address};
+    std::memcpy(capture_addresses.mapped, capture_table.data(), card_uv_on ? 24 : 16);
     const auto motion_table = object_motion.AddressTable();
-    const std::array<u64, 4> both_table{motion_table.params, motion_table.positions, params.address,
-                                        positions.address};
-    std::memcpy(both_addresses.mapped, both_table.data(), sizeof(both_table));
+    const std::array<u64, 5> both_table{motion_table.params, motion_table.positions, params.address,
+                                        positions.address, card_ring.address};
+    std::memcpy(both_addresses.mapped, both_table.data(), card_uv_on ? 40 : 32);
     address_layout = ObjectMotion::CreateAddressLayout(device);
     const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eUniformBuffer, 2};
     auto [pool_result, pool] = device.createDescriptorPoolUnique(
@@ -761,8 +795,9 @@ bool RtShadow::Setup(const ObjectMotion& object_motion) {
     }
     capture_set = sets[0];
     both_set = sets[1];
-    const vk::DescriptorBufferInfo capture_info{capture_addresses.buffer, 0, 16};
-    const vk::DescriptorBufferInfo both_info{both_addresses.buffer, 0, 32};
+    const vk::DescriptorBufferInfo capture_info{capture_addresses.buffer, 0,
+                                                card_uv_on ? 24u : 16u}; // (r54)
+    const vk::DescriptorBufferInfo both_info{both_addresses.buffer, 0, card_uv_on ? 40u : 32u};
     const std::array<vk::WriteDescriptorSet, 2> writes{{
         {.dstSet = capture_set, .dstBinding = Shader::MotionVectors::AddressBinding,
          .descriptorCount = 1, .descriptorType = vk::DescriptorType::eUniformBuffer,
@@ -856,7 +891,9 @@ bool RtShadow::Complete() const {
 }
 
 void RtShadow::BindAddresses(vk::PipelineLayout layout, u32 mode) {
-    const vk::DescriptorSet set = mode == 3u ? both_set : capture_set;
+    const vk::DescriptorSet set =
+        Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth ? both_set
+                                                                              : capture_set;
     scheduler.Record([layout, set](vk::CommandBuffer command) {
         command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout,
                                    Shader::MotionVectors::DescriptorSet, set, {});
@@ -1579,6 +1616,23 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     entry.skinned = entry.skinned || draw.skinned;
     entry.card_shadow = entry.card_shadow || (draw.shadow_pass && draw.textured);
     entry.card_camera = entry.card_camera || (draw.camera_pass && draw.alpha);
+    // bbport (r50_leaf-stage1): with BB_RT_CARD_ALPHA_LOG=1, the pixel shaders that showed
+    // it a cut-out (the 600-frame line of the cut-out cards' pixel shaders)
+    if (draw.pixel_shader != 0 && Shader::Optimization::CutoutLogOn()) { // (r54)
+        if (draw.camera_pass && draw.alpha && entry.cut_camera_ps != draw.pixel_shader) {
+            entry.cut_camera_ps = draw.pixel_shader;
+            entry.cut_noted = 0;
+        }
+        if (draw.shadow_pass && draw.textured && entry.cut_sun_ps != draw.pixel_shader) {
+            entry.cut_sun_ps = draw.pixel_shader;
+            entry.cut_noted = 0;
+        }
+    }
+    // bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1, a cut-out draw's card data, at every
+    // draw of the entry (Draw::card)
+    if (draw.card) {
+        CardNoteDraw(entry, draw);
+    }
     entry.stream = draw.positions; // bbport (r46b_plant-rule): the same at every draw of the key
     // bbport (r47_still-check): the last camera pass draw of it, also when a sun cascade drew
     // it first on the frame (a caster the camera pass draws is looked at more often)
@@ -1591,7 +1645,9 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             tlas_count = 0;
             ++stats.merged;
         }
-        return 0;
+        // bbport (r54_leaf-stage2): a second draw of the frame may capture the UVs alone (the
+        // sun shadow pass's card of an entry the camera pass draws first on every frame)
+        return CardUvProbe(entry, draw);
     }
     entry.mask = mask;
     // Drawn by the game again: the object is back.
@@ -1718,6 +1774,7 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             still_stats.longest_wait =
                 std::max(still_stats.longest_wait, frame - entry.still_next);
             probe.param = Param(positions_used, entry);
+            (void)CardCapture(entry, draw, probe); // bbport (r54_leaf-stage2): its UVs too
             probe.sig = TakeStillSig(entry);
             probe.still_camera = draw.camera_pass;
             builds.push_back(probe);
@@ -1871,6 +1928,7 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
         builds.push_back({&entry, positions_used, update, to_world});
         builds.back().param = param; // bbport (r47_still-check): see CaptureLeftOut
+        (void)CardCapture(entry, draw, builds.back()); // bbport (r54_leaf-stage2): its UVs too
         stats.refit_triangles += update ? entry.triangles : 0;
         // bbport (r17_rt-upkeep): a shared copy's refresh (never refit) is built for speed
         builds.back().fast = UpkeepOn() && refresh;
@@ -1922,6 +1980,10 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
         stats.dynamic_draws += entry.dynamic ? 1 : 0;
     }
+    // bbport (r54_leaf-stage2): a draw nothing else captured may capture the UVs alone
+    if (param == 0) {
+        param = CardUvProbe(entry, draw);
+    }
     entry.seen_frame = frame;
     frame_entries.push_back(&entry);
     return param;
@@ -1951,6 +2013,11 @@ void RtShadow::RecordBuilds() {
         // signatures' bytes in still_sigs (source) and in the frame's part of still_readback
         std::vector<StillPush> still;
         vk::BufferCopy still_copy;
+        // bbport (r54_leaf-stage2): the expand pass's dispatches, the stat slots they fill,
+        // and the ring's bytes filled with CARD_UV_RING_UNSET after them (0: none)
+        std::vector<CardUvPush> card;
+        u32 card_stat_mask = 0;
+        vk::DeviceSize card_ring_fill = 0;
     };
     auto job = std::make_shared<Job>();
     job->geometries.reserve(builds.size());
@@ -1977,6 +2044,38 @@ void RtShadow::RecordBuilds() {
         // its triangles use, as it was stored (clip space, before the pass below brings it to
         // world space); the host reads them at a frame's end (ReadStillSigs). A probe is done
         // with that: its positions are read by nothing else.
+        // bbport (r54_leaf-stage2): this capture also stored the entry's card UVs
+        // (CardCapture): they are expanded into its block of the pool (the lambda below),
+        // unless the entry's coordinates changed since the capture (it is captured again).
+        if (build.uv_base != 0 && e.card_uv && e.card_uv->block) {
+            CardUvEntry& c = *e.card_uv;
+            CardSelector selector;
+            if (c.uv.card.uv_hash != build.uv_hash ||
+                !UnpackCardSelector(c.uv.card.selector, selector)) {
+                ++card_uv_stats.dropped;
+            } else {
+                u32 stat = 0;
+                if (card_stat_used < CARD_UV_STAT_SLOTS) {
+                    stat = ++card_stat_used;
+                    card_stat_info[stat - 1] = {e.base, c.uv.card.ps_hash, e.triangles,
+                                                CardClassOf(e.skinned, e.lone == LampLoneState::Lone),
+                                                c.uv.card.camera};
+                    job->card_stat_mask |= 1u << (stat - 1);
+                    card_stat_tick = scheduler.CurrentTick();
+                }
+                job->card.push_back({e.indices.address, build.uv_base - 1, e.triangles, c.offset,
+                                     CardPushFlags(c.uv.card.mode_u, c.uv.card.mode_v,
+                                                   selector.has_alpha, stat),
+                                     {}, CardPoolAffine(c.uv.card.affine)});
+                CardRecorded(c.uv, scheduler.CurrentTick());
+                if (!c.pending) {
+                    c.pending = true;
+                    card_pending.push_back(&e);
+                }
+                ++card_uv_stats.expanded;
+                card_uv_stats.expanded_triangles += e.triangles;
+            }
+        }
         if (build.sig != 0) {
             job->still.push_back({build.still_rows, build.still_origin, build.store,
                                   e.indices.address, e.triangles * 3, build.sig - 1});
@@ -2067,6 +2166,20 @@ void RtShadow::RecordBuilds() {
     builds.clear();
     positions_used = 0;
     scratch_used = 0;
+    // bbport (r54_leaf-stage2): the ring is reused as the positions are. What this call's
+    // captures and those no call took (card_ring_dirty) used of it, or all of it once before
+    // any capture stores UVs, is filled with CARD_UV_RING_UNSET after the expand pass (the
+    // lambda below): a vertex a later capture does not store reads as not finite, never as
+    // an earlier capture's values.
+    if (card_uv_ready && (card_ring_used != 0 || card_ring_dirty != 0 || !card_ring_clean)) {
+        job->card_ring_fill =
+            card_ring_clean
+                ? vk::DeviceSize(std::max(card_ring_used, card_ring_dirty)) * CARD_UV_RING_BYTES
+                : vk::DeviceSize(CardRingBytes);
+        card_ring_clean = true;
+        card_ring_dirty = 0;
+    }
+    card_ring_used = 0;
     if (frame >= world_copy_stats.printed_frame + 600) {
         std::printf("Ray tracing world copies: %llu builds, %llu copied (%.1f MB), %llu sun shadow "
                     "builds not copied (%.1f MB) since the last line; copies %s (sun VSM %s, "
@@ -2100,7 +2213,10 @@ void RtShadow::RecordBuilds() {
         [job, positions = positions.buffer, unproject_pipeline = *unproject_pipeline,
          unproject_layout = *unproject_layout, still_sigs = still_sigs.buffer,
          still_readback = still_readback.buffer, still_pipeline = *still_pipeline,
-         still_layout = *still_layout](vk::CommandBuffer cmdbuf) {
+         still_layout = *still_layout, card_ring_buffer = card_ring.buffer,
+         card_pool_buffer = card_pool.buffer, card_stat_buffer = card_stat_buffer.buffer,
+         card_readback_buffer = card_readback.buffer, card_pipeline = *card_pipeline,
+         card_layout = *card_layout](vk::CommandBuffer cmdbuf) {
             EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, Compute,
                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
             const vk::DescriptorBufferInfo position_info{positions, 0, VK_WHOLE_SIZE};
@@ -2150,6 +2266,81 @@ void RtShadow::RecordBuilds() {
                                           vk::PipelineStageFlagBits2::eHost | Transfer,
                                           vk::AccessFlagBits2::eHostRead |
                                               vk::AccessFlagBits2::eTransferWrite);
+            }
+            // bbport (r54_leaf-stage2): the card UVs of this call's UV captures into the pool
+            // (rt_card_uv.comp). The captures' vertex shaders wrote the ring before the
+            // barrier at the top; this reads the ring and the triangle lists and writes the
+            // pool and the stat slots only: no light target, no camera depth, nothing of the
+            // positions, so no lamp batch needs to end for it. Nothing reads the pool yet.
+            if (!job->card.empty()) {
+                constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+                constexpr vk::DeviceSize slot_bytes = CARD_UV_STAT_WORDS * 4;
+                if (job->card_stat_mask != 0) {
+                    for (u32 s = 0; s < CARD_UV_STAT_SLOTS; ++s) {
+                        if (job->card_stat_mask & (1u << s)) {
+                            cmdbuf.fillBuffer(card_stat_buffer, s * slot_bytes, slot_bytes, 0);
+                        }
+                    }
+                    EffectPass::MemoryBarrier(cmdbuf, Transfer, vk::AccessFlagBits2::eTransferWrite,
+                                              Compute,
+                                              vk::AccessFlagBits2::eShaderRead |
+                                                  vk::AccessFlagBits2::eShaderWrite);
+                }
+                const vk::DescriptorBufferInfo ring_info{card_ring_buffer, 0, VK_WHOLE_SIZE};
+                const vk::DescriptorBufferInfo pool_info{card_pool_buffer, 0, VK_WHOLE_SIZE};
+                const vk::DescriptorBufferInfo stat_info{card_stat_buffer, 0, VK_WHOLE_SIZE};
+                const std::array<vk::WriteDescriptorSet, 3> card_writes{{
+                    {.dstBinding = 0, .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &ring_info},
+                    {.dstBinding = 1, .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &pool_info},
+                    {.dstBinding = 2, .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &stat_info},
+                }};
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, card_pipeline);
+                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, card_layout, 0,
+                                            card_writes);
+                for (const CardUvPush& push : job->card) {
+                    cmdbuf.pushConstants(card_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(push), &push);
+                    cmdbuf.dispatch((push.triangles + CARD_UV_GROUP - 1) / CARD_UV_GROUP, 1, 1);
+                }
+                // The ring was read (the next call's captures write it again), the pool and
+                // the stat slots written (for the copy below, and for later readers).
+                EffectPass::MemoryBarrier(cmdbuf, Compute,
+                                          vk::AccessFlagBits2::eShaderRead |
+                                              vk::AccessFlagBits2::eShaderWrite,
+                                          Compute | vk::PipelineStageFlagBits2::eVertexShader |
+                                              Transfer,
+                                          vk::AccessFlagBits2::eShaderRead |
+                                              vk::AccessFlagBits2::eShaderWrite |
+                                              vk::AccessFlagBits2::eTransferRead);
+                if (job->card_stat_mask != 0) {
+                    for (u32 s = 0; s < CARD_UV_STAT_SLOTS; ++s) {
+                        if (job->card_stat_mask & (1u << s)) {
+                            cmdbuf.copyBuffer(card_stat_buffer, card_readback_buffer,
+                                              vk::BufferCopy{s * slot_bytes, s * slot_bytes,
+                                                             slot_bytes});
+                        }
+                    }
+                    EffectPass::MemoryBarrier(cmdbuf, Transfer, vk::AccessFlagBits2::eTransferWrite,
+                                              vk::PipelineStageFlagBits2::eHost,
+                                              vk::AccessFlagBits2::eHostRead);
+                }
+            }
+            // bbport (r54_leaf-stage2): the ring's used part (all of it the first time) back to
+            // CARD_UV_RING_UNSET: after the captures' writes and the expand pass's reads, before
+            // the next captures. A vertex a later capture does not store then reads as not finite.
+            if (job->card_ring_fill != 0) {
+                constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+                constexpr auto Vertex = vk::PipelineStageFlagBits2::eVertexShader;
+                constexpr auto ShaderAccess =
+                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+                EffectPass::MemoryBarrier(cmdbuf, Compute | Vertex, ShaderAccess, Transfer,
+                                          vk::AccessFlagBits2::eTransferWrite);
+                cmdbuf.fillBuffer(card_ring_buffer, 0, job->card_ring_fill, CARD_UV_RING_UNSET);
+                EffectPass::MemoryBarrier(cmdbuf, Transfer, vk::AccessFlagBits2::eTransferWrite,
+                                          Compute | Vertex, ShaderAccess);
             }
             const vk::WriteDescriptorSet write{.dstBinding = 0,
                                                .descriptorCount = 1,
@@ -2337,6 +2528,23 @@ bool RtShadow::PrepareScene() {
         const bool lone = entry->lone == LampLoneState::Lone;
         const bool card = LampCard(cards_old, card_level, entry->shadow_card, entry->dynamic,
                                    entry->card_shadow, cutout, entry->skinned, lone);
+        // bbport (r50_leaf-stage1): with BB_RT_CARD_ALPHA_LOG=1, the pixel shaders of the
+        // cut-outs by the class this rule gives them (each entry once a class)
+        if ((entry->cut_camera_ps | entry->cut_sun_ps) != 0 &&
+            Shader::Optimization::CutoutLogOn()) { // (r54)
+            using CardClass = Shader::Optimization::CutoutCardClass;
+            const CardClass card_class = card ? (!entry->skinned ? CardClass::Static
+                                                 : lone            ? CardClass::Plant
+                                                                   : CardClass::SkinnedOut)
+                                              : entry->skinned ? CardClass::SkinnedKept
+                                                               : CardClass::OtherKept;
+            const u8 bit = u8(1u << u32(card_class));
+            if ((entry->cut_noted & bit) == 0) {
+                entry->cut_noted |= bit;
+                Shader::Optimization::NoteCutoutCard(entry->cut_camera_ps, entry->cut_sun_ps,
+                                                     card_class);
+            }
+        }
         const u8 mask =
             kept ? ShadowMask
                  : u8(entry->mask | (entry->held && Holds(*entry) ? ShadowMask : 0));
@@ -3035,8 +3243,23 @@ bool RtShadow::StillWorld(const float* constants, Build& build) const {
 // set. `motion_param`, `mode`: the draw's push constant and its pipeline's motion mode, as
 // EffectsCaptureDraw left them.
 void RtShadow::CaptureLeftOut(u32 motion_param, u32 mode) {
-    const u32 param =
-        mode == Shader::MotionVectors::VertexBoth ? motion_param >> 16 : motion_param;
+    const u32 param = Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth
+                          ? motion_param >> 16
+                          : motion_param;
+    // bbport (r54_leaf-stage2): nor its card UVs: none are expanded, the entry stays Wanted.
+    // A capture for the UVs alone (CardUvProbe) is nothing more: r47's looks never counted
+    // it, so none of their state below changes for it.
+    if (param != 0 && !builds.empty() && builds.back().param == param) {
+        Build& last = builds.back();
+        if (last.uv_base != 0) {
+            last.uv_base = 0;
+            ++card_uv_stats.left_out;
+        }
+        if (last.uv_only) {
+            last.left_out = true;
+            return;
+        }
+    }
     const u32 still = StillNow();
     if (param == 0 || still == StillOff || builds.empty() || builds.back().param != param) {
         return;
@@ -3222,6 +3445,427 @@ void RtShadow::ReadStillSigs(u32 slot) {
     }
     still_pending[slot].clear();
     still_ticks[slot] = 0;
+}
+
+// bbport (r54_leaf-stage2): the card UVs, stage 2 of the ray traced foliage shadows (BB_RT_CARD_ALPHA=1;
+// rt_card_uv.h says what, engine/docs/rt_card_alpha.md why). A cut-out entry's capture also stores
+// its vertices' coordinates and alpha factors (the vertex shader's capture variant, CaptureUv,
+// into card_ring), and RecordBuilds expands them into the entry's block of card_pool: a record of
+// 16 bytes a BLAS primitive. Nothing reads the pool yet; no ray, mask, TLAS or BLAS changes.
+
+// The ring, the expand pass and its stat slots (at setup, the knob on). Without them no capture
+// stores UVs (CardCapture), and the address blocks hold a ring address of 0 that nothing reads.
+// The ring's memory is not known until the first RecordBuilds fills it with CARD_UV_RING_UNSET
+// (card_ring_clean); no capture stores UVs before that.
+bool RtShadow::CardSetup() {
+    using enum vk::DescriptorType;
+    const vk::DeviceSize stat_bytes = vk::DeviceSize(CARD_UV_STAT_SLOTS) * CARD_UV_STAT_WORDS * 4;
+    card_ring_clean = false;
+    card_ring_dirty = 0;
+    card_uv_ready =
+        EffectPass::Create(instance, card_set, card_layout, card_pipeline,
+                           {eStorageBuffer, eStorageBuffer, eStorageBuffer}, sizeof(CardUvPush),
+                           RT_CARD_UV_COMP, "Ray tracing card UVs") &&
+        Make(card_ring, CardRingBytes, false,
+             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+        Make(card_stat_buffer, stat_bytes, false,
+             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+        Make(card_readback, stat_bytes, true, VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+        card_readback.mapped;
+    if (!card_uv_ready) {
+        Free(card_ring);
+        Free(card_stat_buffer);
+        Free(card_readback);
+        std::printf("Ray tracing card UVs (r54): BB_RT_CARD_ALPHA=1 but off - no pipeline or "
+                    "buffer for them\n");
+        return false;
+    }
+    std::memset(card_readback.mapped, 0, std::size_t(stat_bytes));
+    std::printf("Ray tracing card UVs (r54): BB_RT_CARD_ALPHA=1, the cut-out cards' UVs are captured "
+                "(ring %llu MiB now, pool %llu MiB at the first card); no ray reads them yet, the "
+                "picture is unchanged\n",
+                static_cast<unsigned long long>(CardRingBytes >> 20),
+                static_cast<unsigned long long>(CardPoolBytes >> 20));
+    return true;
+}
+
+bool RtShadow::CardMakePool() {
+    if (card_pool_failed) {
+        return false;
+    }
+    const VmaVirtualBlockCreateInfo block_ci{.size = CardPoolBytes};
+    if (!Make(card_pool, CardPoolBytes, false, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) ||
+        vmaCreateVirtualBlock(&block_ci, &card_block) != VK_SUCCESS) {
+        Free(card_pool);
+        card_block = VK_NULL_HANDLE;
+        card_pool_failed = true;
+        std::printf("Ray tracing card UVs (r54): no pool (%llu MiB): no card gets UVs\n",
+                    static_cast<unsigned long long>(CardPoolBytes >> 20));
+        return false;
+    }
+    return true;
+}
+
+// A block of the pool for the entry's records (and its card slot). Over the pool: NoRoom, tried
+// again once a block is freed (card_pool_gen).
+bool RtShadow::CardTakeBlock(Entry& entry) {
+    CardUvEntry& c = *entry.card_uv;
+    if (!CardPoolFits(entry.triangles) || (!card_block && !CardMakePool())) {
+        CardNoRoom(c.uv, card_pool_gen);
+        ++card_uv_stats.no_room;
+        return false;
+    }
+    const VmaVirtualAllocationCreateInfo alloc_ci{.size = CardPoolSize(entry.triangles),
+                                                  .alignment = CARD_UV_RECORD_BYTES};
+    VmaVirtualAllocation block{};
+    VkDeviceSize offset = 0;
+    if (vmaVirtualAllocate(card_block, &alloc_ci, &block, &offset) != VK_SUCCESS) {
+        CardNoRoom(c.uv, card_pool_gen);
+        ++card_uv_stats.no_room;
+        return false;
+    }
+    c.block = block;
+    c.offset = u32(offset / CARD_UV_RECORD_BYTES);
+    c.slot = card_slots.Take();
+    card_pool_used += alloc_ci.size;
+    ++card_pool_blocks;
+    CardGotRoom(c.uv);
+    return true;
+}
+
+// A cut-out draw of the entry (Draw::card): its card data, at every draw (a second draw of the
+// frame too, so the sun shadow pass's card is had whichever pass comes first). The entry's part
+// is made at its first such draw, once (not on every frame). A sun shadow pass card gives way to
+// a camera pass card when it is stale or no sun shadow pass draw gave it for more than
+// CardSunFrames frames (CardTakes; counted). The first time an entry has a valid
+// card from both passes, both references and both second reference dwords (cb[21]) are printed
+// (the first CardBothLines such entries; the 600-frame line counts all), with the pass whose card
+// the entry holds then (the sun shadow pass's unless that card was stale), and a tester sees
+// whether the camera pass's material constants give another reference.
+void RtShadow::CardNoteDraw(Entry& entry, const Draw& draw) {
+    const CardDraw& d = *draw.card;
+    ++card_uv_stats.draws;
+    if (d.valid) {
+        ++card_uv_stats.valid;
+    } else {
+        ++card_uv_stats.miss[std::size_t(d.miss)];
+    }
+    if (!entry.card_uv) {
+        entry.card_uv = std::make_unique<CardUvEntry>();
+    }
+    CardUvEntry& c = *entry.card_uv;
+    if (entry.seen_frame != frame) {
+        CardWaitFrame(c.uv);
+    }
+    const CardNoted noted = CardNote(c.uv, d, frame);
+    card_uv_stats.coordinates += noted.taken && noted.coordinates && c.block ? 1 : 0;
+    card_uv_stats.constants += noted.other ? 1 : 0;
+    card_uv_stats.sun_gave_way += noted.sun_gave_way ? 1 : 0;
+    if (noted.both && card_both_said < CardBothLines) {
+        ++card_both_said;
+        const float sun = c.uv.pass_reference[0];
+        const float cam = c.uv.pass_reference[1];
+        std::printf("Ray tracing card UVs (r54): drawn by both passes, key %016llx (%s): sun shadow "
+                    "pass ps %016llx reference %.6g (second dword %.6g), camera pass ps %016llx "
+                    "reference %.6g (second dword %.6g, dither taken as 0), %s; the card is the "
+                    "%s pass's\n",
+                    static_cast<unsigned long long>(entry.base),
+                    entry.skinned ? (entry.lone == LampLoneState::Lone ? "plant" : "skinned kept")
+                                  : "static",
+                    static_cast<unsigned long long>(c.uv.pass_ps_hash[0]), double(sun),
+                    double(c.uv.pass_ref2[0]), static_cast<unsigned long long>(c.uv.pass_ps_hash[1]),
+                    double(cam), double(c.uv.pass_ref2[1]), sun == cam ? "the same" : "they differ",
+                    c.uv.card.camera ? "camera" : "sun shadow");
+    }
+}
+
+// Whether a capture of the entry by this draw may store its UVs now: they are wanted, the ring
+// was filled once (card_ring_clean), the draw is one of the card's own (its pixel shader and the same
+// coordinates, so the same vertex shader outputs) and stores the entry's instances (Param), the
+// ring and the frame's budget have room, and the entry has a block of the pool (taken here when
+// it has none). Nothing is set yet.
+bool RtShadow::CardCaptureCan(Entry& entry, const Draw& draw) {
+    if (!card_uv_ready || !card_ring_clean || !entry.card_uv || !need_scene) {
+        return false;
+    }
+    CardUvEntry& c = *entry.card_uv;
+    if (!CardCaptureWanted(c.uv, card_pool_gen) || c.taken_frame == frame) {
+        return false;
+    }
+    const CardDraw* d = draw.card;
+    if (!d || !d->valid || d->ps_hash != c.uv.card.ps_hash || d->uv_hash != c.uv.card.uv_hash ||
+        draw.first_instance != entry.first_instance) {
+        ++card_uv_stats.other_draw;
+        return false;
+    }
+    if (!CardRingFits(card_ring_used, u64(entry.vertices) * entry.instances, card_captures)) {
+        ++card_uv_stats.budget;
+        return false;
+    }
+    return c.block || CardTakeBlock(entry);
+}
+
+// The capture of `build` (a param of its own) stores the entry's UVs (CardCaptureCan said yes):
+// the param's word 1 (the ring index + 1) and word 7 (the selector) are set, and build.uv_base,
+// uv_hash.
+void RtShadow::CardCaptureTake(Entry& entry, const Draw& draw, Build& build) {
+    CardUvEntry& c = *entry.card_uv;
+    const u64 stored = u64(entry.vertices) * entry.instances;
+    build.uv_base = card_ring_used + 1;
+    build.uv_hash = draw.card->uv_hash;
+    auto* words = static_cast<u32*>(params.mapped) + std::size_t(build.param) * 8;
+    words[1] = build.uv_base;
+    words[7] = draw.card->selector;
+    card_ring_used += u32(stored);
+    card_ring_peak = std::max(card_ring_peak, card_ring_used);
+    ++card_captures;
+    ++card_uv_stats.captures;
+    c.taken_frame = frame;
+}
+
+// The capture of `build` (its param, made for the build or r47's look) also stores the entry's
+// UVs where CardCaptureCan says so. False for none (words 1 and 7 stay 0).
+bool RtShadow::CardCapture(Entry& entry, const Draw& draw, Build& build) {
+    if (build.param == 0 || !CardCaptureCan(entry, draw)) {
+        return false;
+    }
+    CardCaptureTake(entry, draw, build);
+    return true;
+}
+
+// A capture for the UVs alone, of an entry that waited CardWaitFrames frames drawn without one
+// (a caster built before its card data was there, held for still, drawn by a sun shadow pass
+// first on every frame): a probe (Build::probe and uv_only, no signature) that builds and copies
+// nothing. Every check comes before its param is taken, so a refused one costs no param; it
+// takes params and positions only within the first half of the frame's (CardUvProbeFits), so
+// the builds after it keep the rest. Returns its param, 0 for none (the draw then stores
+// nothing).
+u32 RtShadow::CardUvProbe(Entry& entry, const Draw& draw) {
+    if (!card_uv_ready || !entry.card_uv || !need_scene || r26_freeze != 0) {
+        return 0;
+    }
+    const CardUvEntry& c = *entry.card_uv;
+    if (!CardUvOnlyDue(c.uv, card_pool_gen) || c.taken_frame == frame || !draw.card ||
+        !draw.card->valid || draw.card->ps_hash != c.uv.card.ps_hash ||
+        draw.card->uv_hash != c.uv.card.uv_hash) {
+        return 0;
+    }
+    const u64 stored = u64(entry.vertices) * entry.instances;
+    if (!CardUvProbeFits(params_used, MaxParams, positions_used, stored, MaxPositions)) {
+        ++card_uv_stats.budget;
+        return 0;
+    }
+    if (!CardCaptureCan(entry, draw)) {
+        return 0;
+    }
+    Build probe{&entry, positions_used, false, {}};
+    probe.probe = true;
+    probe.uv_only = true;
+    probe.param = Param(positions_used, entry);
+    if (probe.param == 0) {
+        return 0; // not reached: CardUvProbeFits left params
+    }
+    CardCaptureTake(entry, draw, probe);
+    builds.push_back(probe);
+    positions_used += u32(stored);
+    ++card_uv_stats.uv_probes;
+    return probe.param;
+}
+
+// Destroy: the block and slot are freed once the GPU is past what was recorded so far (an
+// expand pass may still write the block).
+void RtShadow::CardRelease(Entry& entry) {
+    if (!entry.card_uv) {
+        return;
+    }
+    CardUvEntry& c = *entry.card_uv;
+    if (c.pending) {
+        std::erase(card_pending, &entry);
+    }
+    if (c.block) {
+        card_frees.push_back({std::bit_cast<u64>(c.block), c.slot, scheduler.CurrentTick()});
+    }
+    entry.card_uv.reset();
+}
+
+// At a frame's end: the frame's ring and budget start again, the expanded entries whose tick
+// the GPU passed are Ready, and the blocks of destroyed entries it is done with are freed. The
+// driver is asked once how far the GPU is (as ReadStillSigs' caller does); no wait. UV captures
+// no RecordBuilds took (drawn after the frame's last one; OnFrameEnd drops their builds) wrote
+// their part of the ring: card_ring_dirty keeps how far, and the next RecordBuilds fills that
+// part too. (A capture of the next frame before that RecordBuilds may meet such a value at a
+// vertex it does not store itself: a window this does not close.)
+void RtShadow::CardFrameEnd() {
+    card_ring_dirty = std::max(card_ring_dirty, card_ring_used);
+    card_ring_used = 0;
+    card_captures = 0;
+    if (card_pending.empty() && card_frees.empty()) {
+        return;
+    }
+    bool asked = false;
+    const auto passed = [&](u64 tick) {
+        const bool free = asked ? scheduler.GetWorkSemaphore()->IsFree(tick) : scheduler.IsFree(tick);
+        asked = true;
+        return free;
+    };
+    std::erase_if(card_pending, [&](Entry* e) {
+        CardUvEntry& c = *e->card_uv;
+        if (c.uv.state == CardUvState::Pending && !CardSettle(c.uv, passed(c.uv.tick))) {
+            return false;
+        }
+        c.pending = false;
+        return true;
+    });
+    CardReleaseFrees(card_frees, passed, [&](const CardFree& f) {
+        const auto block = std::bit_cast<VmaVirtualAllocation>(f.block);
+        VmaVirtualAllocationInfo info{};
+        vmaGetVirtualAllocationInfo(card_block, block, &info);
+        card_pool_used -= std::min<u64>(card_pool_used, info.size);
+        card_pool_blocks -= card_pool_blocks != 0 ? 1 : 0;
+        vmaVirtualFree(card_block, block);
+        card_slots.Give(f.slot);
+        ++card_pool_gen;
+    });
+}
+
+// The 600-frame line (BB_RT_CARD_ALPHA=1): the cut-out entries by class (as BB_RT_LAMP_CARDS=3
+// sees them) and state, which pass's card the entries both passes draw hold, the sun shadow pass
+// cards no sun shadow pass draw gave again, the cards' constants, why
+// entries have no card data or a stale one, the pool, the draws since the last line; then the
+// stat slots of the first entries expanded since, once the GPU is past them.
+void RtShadow::CardLog() {
+    if (!card_uv_on) {
+        return;
+    }
+    constexpr std::size_t Classes = std::size_t(CardClass::Count);
+    constexpr std::size_t States = std::size_t(CardUvState::Count);
+    std::array<std::array<u32, States>, Classes> states{};
+    std::array<u32, std::size_t(CardMiss::Count)> waiting{};
+    std::array<u32, std::size_t(CardMiss::Count)> stale{};
+    u64 ready_triangles = 0;
+    u32 card_entries = 0;
+    u32 both = 0, both_sun = 0, both_camera = 0, both_differ = 0, sun_gone = 0;
+    u32 with_card = 0, fade = 0, second = 0, dithered = 0;
+    // the least and greatest of the cards' reference dwords and dither coefficients (NaN: none)
+    std::array<float, 6> range{NAN, NAN, NAN, NAN, NAN, NAN};
+    const auto widen = [&range](std::size_t at, float v) {
+        range[at] = std::isnan(range[at]) ? v : std::min(range[at], v);
+        range[at + 1] = std::isnan(range[at + 1]) ? v : std::max(range[at + 1], v);
+    };
+    for (const auto& [key, e] : entries) {
+        if (!e->card_uv) {
+            continue;
+        }
+        const CardUvEntry& c = *e->card_uv;
+        const bool has_card = c.uv.state != CardUvState::NotCard;
+        if (c.uv.passes == 3) {
+            ++both;
+            both_sun += has_card && !c.uv.card.camera ? 1 : 0;
+            both_camera += has_card && c.uv.card.camera ? 1 : 0;
+        }
+        both_differ += CardBothDiffer(c.uv) ? 1 : 0;
+        sun_gone += CardSunGone(c.uv, frame) ? 1 : 0;
+        if (has_card) {
+            const CardDraw& d = c.uv.card;
+            ++with_card;
+            fade += d.fade_left_out ? 1 : 0;
+            second += d.ref_dwords[1] != 0.0f ? 1 : 0;
+            widen(0, d.ref_dwords[0]);
+            widen(2, d.ref_dwords[1]);
+            if (d.dither) {
+                ++dithered;
+                widen(4, d.dither_scale);
+            }
+        }
+        const CardClass card_class = CardClassOf(e->skinned, e->lone == LampLoneState::Lone);
+        ++states[std::size_t(card_class)][std::size_t(c.uv.state)];
+        if (!has_card) {
+            ++waiting[std::size_t(c.uv.miss)];
+        } else if (CardStale(c.uv)) {
+            ++stale[std::size_t(c.uv.miss)];
+        }
+        ready_triangles += c.uv.state == CardUvState::Ready ? e->triangles : 0;
+        ++card_entries;
+    }
+    const u32 ring_peak = card_ring_peak;
+    card_ring_peak = 0;
+    if (card_entries == 0 && card_uv_stats.draws == 0) {
+        return; // no cut-out entry and no cut-out draw: nothing to say
+    }
+    using ull = unsigned long long;
+    const auto& s = card_uv_stats;
+    const auto& m = s.miss;
+    const auto cls = [&](CardClass k, CardUvState st) {
+        return states[std::size_t(k)][std::size_t(st)];
+    };
+    using M = CardMiss;
+    const auto why = [](const auto& count, M miss) { return ull(count[std::size_t(miss)]); };
+    using enum CardUvState;
+    std::printf(
+        "Ray tracing card UVs (r54, BB_RT_CARD_ALPHA=1): %u cut-out entries [ready, pending, "
+        "wanted, no room, no card data]: plants [%u, %u, %u, %u, %u], static [%u, %u, %u, %u, %u], "
+        "skinned kept [%u, %u, %u, %u, %u]; drawn by both passes: %u (the card the sun shadow "
+        "pass's %u, the camera pass's %u), %u with another reference in the camera pass; sun "
+        "shadow pass cards not given again for more than %llu frames: %u; cards' constants: %u "
+        "with a card, %u with the fade left out, %u with a second reference dword not 0, first "
+        "reference dword %.6g to %.6g, second %.6g to %.6g, %u dithered with a coefficient %.6g "
+        "to %.6g (taken as 0); no card data at the last draw: %llu no record, %llu a record of "
+        "other resources, %llu not repeatable, %llu another permutation, %llu inputs, %llu "
+        "constants, %llu image; a card but none at the last draw of its pass (stale): %llu no "
+        "record, %llu a record of other resources, %llu not repeatable, %llu another "
+        "permutation, %llu inputs, %llu constants, %llu image; pool %.1f of %llu "
+        "MiB (%llu triangles in %u blocks, %llu ready); ring peak %u vertices (%.1f MiB); since "
+        "the last line: %llu cut-out draws, %llu with card data (without: %llu no record, %llu a "
+        "record of other resources, %llu not repeatable, %llu another permutation, %llu inputs, "
+        "%llu constants, %llu image), %llu sun shadow pass cards given way to the camera pass's, "
+        "%llu UV captures (%llu for the UVs alone), %llu expanded (%llu triangles; %llu dropped, "
+        "the card changed), %llu from another draw, %llu over the frame's budget, %llu no room, "
+        "%llu left out, %llu new coordinates, %llu other constants changed\n",
+        card_entries, cls(CardClass::Plant, Ready), cls(CardClass::Plant, Pending),
+        cls(CardClass::Plant, Wanted), cls(CardClass::Plant, NoRoom), cls(CardClass::Plant, NotCard),
+        cls(CardClass::Static, Ready), cls(CardClass::Static, Pending),
+        cls(CardClass::Static, Wanted), cls(CardClass::Static, NoRoom),
+        cls(CardClass::Static, NotCard), cls(CardClass::SkinnedKept, Ready),
+        cls(CardClass::SkinnedKept, Pending), cls(CardClass::SkinnedKept, Wanted),
+        cls(CardClass::SkinnedKept, NoRoom), cls(CardClass::SkinnedKept, NotCard), both, both_sun,
+        both_camera, both_differ, ull(CardSunFrames), sun_gone, with_card, fade, second,
+        double(range[0]), double(range[1]), double(range[2]), double(range[3]), dithered,
+        double(range[4]), double(range[5]), why(waiting, M::NoRecord),
+        why(waiting, M::OtherResources), why(waiting, M::NotRepeatable),
+        why(waiting, M::OtherPermutation), why(waiting, M::Inputs), why(waiting, M::Constants),
+        why(waiting, M::Image), why(stale, M::NoRecord), why(stale, M::OtherResources),
+        why(stale, M::NotRepeatable), why(stale, M::OtherPermutation), why(stale, M::Inputs),
+        why(stale, M::Constants), why(stale, M::Image), double(card_pool_used) / 1048576.0,
+        ull(CardPoolBytes >> 20), ull(card_pool_used / CARD_UV_RECORD_BYTES), card_pool_blocks,
+        ull(ready_triangles), ring_peak, double(u64(ring_peak) * CARD_UV_RING_BYTES) / 1048576.0,
+        ull(s.draws), ull(s.valid), why(m, M::NoRecord), why(m, M::OtherResources),
+        why(m, M::NotRepeatable), why(m, M::OtherPermutation), why(m, M::Inputs),
+        why(m, M::Constants), why(m, M::Image),
+        ull(s.sun_gave_way), ull(s.captures), ull(s.uv_probes), ull(s.expanded),
+        ull(s.expanded_triangles), ull(s.dropped), ull(s.other_draw), ull(s.budget),
+        ull(s.no_room), ull(s.left_out), ull(s.coordinates), ull(s.constants));
+    card_uv_stats = {};
+    if (card_stat_used == 0 || !scheduler.IsFree(card_stat_tick)) {
+        return; // none, or the GPU is not past them: the next line reads them
+    }
+    const auto* words = static_cast<const u32*>(card_readback.mapped);
+    static constexpr std::array<const char*, Classes> ClassNames{"plant", "static", "skinned kept"};
+    for (u32 i = 0; i < card_stat_used; ++i) {
+        const CardStat st = CardReadStat(words + i * CARD_UV_STAT_WORDS);
+        const CardStatInfo& info = card_stat_info[i];
+        std::printf("Ray tracing card UVs (r54): first entries, %u: key %016llx, ps %016llx (%s "
+                    "pass), %s, %u triangles: %s u %.4g to %.4g, v %.4g to %.4g, alpha factor "
+                    "%.3g to %.3g (scaled, no offset or shift applied), %u with an alpha factor "
+                    "outside [0, 1], %u with one off the 8-bit steps, %u wide, %u not "
+                    "finite\n",
+                    i + 1, ull(info.base), ull(info.ps_hash), info.camera ? "camera" : "sun shadow",
+                    ClassNames[std::size_t(info.card_class)], info.triangles,
+                    st.any ? "" : "no finite corner;", double(st.umin), double(st.umax),
+                    double(st.vmin), double(st.vmax), double(st.amin), double(st.amax),
+                    st.alpha_range, st.alpha_rounded, st.wide, st.not_finite);
+    }
+    card_stat_used = 0;
 }
 
 void RtShadow::OnFrameEnd() {
@@ -3617,6 +4261,10 @@ void RtShadow::OnFrameEnd() {
     }
     if (frame % 600 == 0) {
         r17_stats = {};
+        // bbport (r50_leaf-stage1): the pixel shaders' cut-out analysis so far, and the
+        // cut-out cards' pixel shaders, with BB_RT_CARD_ALPHA_LOG=1.
+        Shader::Optimization::PrintCutoutSummary();
+        CardLog(); // bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1
     }
     // The draw order entries of instances promoted this frame (their other cascades' copies, an
     // old pose's) would otherwise stay behind as duplicate kept casters.
@@ -3740,6 +4388,7 @@ void RtShadow::OnFrameEnd() {
     still_due = 0;
     still_pool_last = still_pool_peak.End(still_pool, frame); // bbport (r47c_review-fixes)
     still_pool = 0;
+    CardFrameEnd(); // bbport (r54_leaf-stage2)
     params_used = 0;
     positions_used = 0;
     scratch_used = 0;

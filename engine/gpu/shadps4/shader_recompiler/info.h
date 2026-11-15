@@ -169,6 +169,167 @@ struct Info : InfoPersistent {
     bool translation_failed{};
 
     std::array<Interpolation, IR::NumParams> fs_interpolation{};
+    /// bbport (r50_leaf-stage1, r50b_leaf-matcher): the alpha test of a pixel shader's discard,
+    /// as the cut-out analysis read it (ir/passes/cutout_analysis.h). Filled only when the shader
+    /// compiles with BB_RT_CARD_ALPHA_LOG=1; not in the cache record.
+    struct Cutout {
+        enum class Verdict : u8 {
+            NotAnalysed,
+            Matched,
+            NoDiscard,
+            NotTexture,     ///< no term of the discard reads a texture
+            UvNotInput,     ///< the alpha test matched, its coordinates are not an input
+            SeveralTextures,
+            Other,
+        };
+        /// Why a test did not match (the first reason found).
+        enum class Detail : u8 {
+            None,
+            BranchDiscard,   ///< a discard in a branch the alpha test does not decide
+            ControlFlow,     ///< the test reaches a phi, or sits under a branch the test does not
+                             ///< decide (a uniform switch, an early return, a loop)
+            Disjunction,     ///< the discard is an OR of tests
+            NotCompare,      ///< a term is not a float compare
+            VaryingFactor,   ///< the alpha times a varying beside the one accepted (r50b), or a
+                             ///< varying times an alpha with an offset
+            VaryingRef,      ///< the alpha compared with (or offset by) a varying, or by a value
+                             ///< made of varyings
+            ConstantScale,   ///< the alpha scaled by a value from memory
+            TwoConstants,    ///< more than two values from memory in one sum, or a product of two
+            RefComputed,     ///< a value read from a dynamic address
+            SampleKind,      ///< a depth compare, gather or texel load
+            Computed,        ///< another operation on the way
+            TwoTests,        ///< two terms of the discard test the same sample
+            SeveralTextures,
+            UvComputed,
+            UvTwoInputs,     ///< u and v from two inputs
+            TwoChannels,     ///< an alpha made of two channels of one sample
+            DitherNotScreen, ///< (r50b) a second texture enters the test as a dither would, but
+                             ///< it is not sampled at a screen position (x of one input over
+                             ///< its w as u, y over that w as v, or the pixel's FragCoord x, y),
+                             ///< or its T# at the compile is larger than 64x64
+            Clamped,         ///< (r50b) a saturate or clamp(0, 1) over anything but a texel
+                             ///< side alone, or one whose reference is not an immediate inside
+                             ///< the clamp's range (where the clamp changes the test)
+            Count,
+        };
+        enum class Op : u8 { Less, LessEqual, Greater, GreaterEqual, Equal, NotEqual };
+        enum class Ref : u8 { Immediate, UserData, FlatUserData, ConstBuffer };
+        /// The third coordinate (array layer, or w of a 3D image).
+        enum class Layer : u8 { None, Immediate, Other };
+        /// A dword index of this record that names no dword (the value is an immediate).
+        static constexpr u16 NoDword = 0xffff;
+        /// alpha_input: no input factor on the alpha.
+        static constexpr u8 NoInput = 0xff;
+        /// ignored_kinds: what the ignored factors of the nonzero term are (bits).
+        static constexpr u8 IgnoredBuffer = 1;   ///< a buffer load (LoadBuffer*: a fade)
+        static constexpr u8 IgnoredDword = 2;    ///< an immediate or memory dwords
+        static constexpr u8 IgnoredInput = 4;    ///< an input component
+        static constexpr u8 IgnoredComputed = 8; ///< anything else
+        Verdict verdict{};
+        Detail detail{};
+        Op op{};         ///< the pixel is kept where alpha <op> reference
+        Ref ref_kind{};  ///< where the first dword of the reference is
+        u8 image{};      ///< index in images of the alpha's texture
+        u8 sampler{};    ///< index in samplers
+        /// Component of the sample's result: a lane of the image VIEW, which applies the T#'s
+        /// dst_sel (image_view.cpp), not the stored channel. `stored` is the stored channel that
+        /// lane reads (AmdGpu::CompSwizzle: 0, 1, 4 r .. 7 a; 0xff not known) and `data_format`
+        /// the T#'s format, both as the compiling draw's T# has them.
+        u8 channel{};
+        u8 stored = 0xff;
+        u8 data_format{};
+        u8 ref_buffer{}; ///< ConstBuffer: index in buffers
+        u16 ref_dword{}; ///< UserData: the SGPR; FlatUserData, ConstBuffer: the dword
+        /// reference = ref + ref_scale * (first dword) + ref2_scale * (second dword), each dword
+        /// read as a float; in the camera pass also + dither_scale * (dither dword, or 1 for
+        /// NoDword) * the dither texel (r50b), which this reference takes as 0 (the game's sun
+        /// shadow pass form, so cb[20] + 0.5 * cb[21] for its material test)
+        f32 ref{};
+        f32 ref_scale{};
+        Ref ref2_kind{};   ///< (r50b) the second dword of the reference (Immediate: none)
+        u8 ref2_buffer{};
+        u16 ref2_dword{};
+        f32 ref2_scale{};
+        u8 input{};      ///< the coordinates' pixel shader input (ParamN)
+        u8 comp_u{};
+        u8 comp_v{};
+        /// (r50b) alpha = channel * this input's component (any smooth input: in the game's
+        /// shaders a vertex colour's alpha, which nothing here checks), NoInput: the channel alone
+        u8 alpha_input = NoInput;
+        u8 alpha_comp{};
+        u8 other_terms{};      ///< terms of the discard beside the alpha test (fades, ...)
+        u8 kill_blocks{};      ///< unconditional discards in branches only failing pixels reach
+        bool uv_by_constant{}; ///< a scale or offset of the coordinates is read from memory
+        /// (r50b) one of them the record cannot name: not exactly one dword (a coefficient other
+        /// than 1, a sum with an immediate, two dwords), or dwords of two buffers
+        bool uv_unrecorded{};
+        bool texel_offset{};   ///< the sample has a texel offset
+        /// (r50b) the camera pass's dither: a second texture's channel the test adds linearly,
+        /// sampled at one input's perspective divide (a screen space noise)
+        bool dither{};
+        /// (r50b) a term that keeps the pixel only where the alpha (times factors that read no
+        /// texture, ignored here) is not 0
+        bool nonzero{};
+        u8 ignored_factor_terms{}; ///< (r50b) those factors (a per-instance fade, ...)
+        u8 ignored_kinds{};        ///< (r50b) Ignored* bits: what they are
+        Layer layer{};
+        f32 layer_value{};     ///< Layer::Immediate: the layer
+        std::array<f32, 2> uv_scale{1.0f, 1.0f}; ///< coordinate = input * scale + offset
+        std::array<f32, 2> uv_offset{};          ///< (the immediate parts)
+        /// (r50b) the memory dwords of the scale and offset (NoDword: the immediate above; a
+        /// named one is exactly that dword, its immediate part 0), all of uv_kind in uv_buffer
+        Ref uv_kind{};
+        u8 uv_buffer{};
+        std::array<u16, 2> uv_scale_dword{NoDword, NoDword};
+        std::array<u16, 2> uv_offset_dword{NoDword, NoDword};
+        /// (r50b) the dither: its image and view channel, and its coefficient in the reference
+        /// (dither_scale * the dword of dither_kind, or dither_scale alone for NoDword)
+        u8 dither_image{};
+        u8 dither_channel{};
+        Ref dither_kind{};
+        u8 dither_buffer{};
+        u16 dither_dword = NoDword;
+        f32 dither_scale{};
+        /// (r50b) the dither's T# size at the compile (0: not known)
+        u16 dither_width{};
+        u16 dither_height{};
+        /// (r50b) the compiling program's images.size() and buffers.size(): a record found by
+        /// pgm_hash (FindCutout) is used only for an Info with the same counts
+        u8 image_count{};
+        u8 buffer_count{};
+        /// (r50b) the pixel shader inputs the analysis saw (RuntimeInfo, part of the permutation
+        /// key): how many, and a bit per input that is a default value or flat shaded. A draw
+        /// whose regs.ps_inputs differ is drawn by another permutation (CutoutSamePermutation).
+        u8 num_inputs{};
+        u32 input_default_mask{};
+        u32 input_flat_mask{};
+        /// (r50b) SeveralTextures: the samples the discard's terms read, and how many are sampled
+        /// at an input (the r50 UV rule) and at one input's perspective divide (screen space);
+        /// the rest are computed
+        u8 sample_count{};
+        u8 samples_input{};
+        u8 samples_screen{};
+
+        /// Matched, and the record alone says how to repeat it: no coordinate scale or offset
+        /// from memory, no computed layer, no texel offset (r50's Repeatable()).
+        bool RepeatableFromRecord() const {
+            return verdict == Verdict::Matched && !uv_by_constant && !texel_offset &&
+                   layer != Layer::Other;
+        }
+        /// (r50b) Matched, and repeatable once the draw's memory dwords the record names are
+        /// read: no texel offset, no computed layer, every value from memory one named user
+        /// data, flat user data or constant buffer dword (the reference's and the dither's
+        /// always are; the coordinates' are when not uv_unrecorded), no discard term beside the
+        /// alpha test (other_terms), and no ignored factor of the nonzero term that is an input
+        /// or computed (a buffer load or a dword is ignored, as the game's sun shadow pass does).
+        bool RepeatableWithConstants() const {
+            return verdict == Verdict::Matched && !uv_unrecorded && !texel_offset &&
+                   layer != Layer::Other && other_terms == 0 &&
+                   (ignored_kinds & (IgnoredInput | IgnoredComputed)) == 0;
+        }
+    };
+    Cutout cutout{};
 
     Info() = default;
     Info(HwStage stage_, SwStage l_stage_, ShaderParams params)

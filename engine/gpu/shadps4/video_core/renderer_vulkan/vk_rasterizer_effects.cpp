@@ -17,6 +17,8 @@
 #include <xxhash.h>
 
 #include "core/memory.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50b_leaf-matcher)
+#include "video_core/renderer_vulkan/rt_card_uv.h"           // bbport (r54_leaf-stage2)
 #include "video_core/renderer_vulkan/vk_effect_shaders.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -285,11 +287,312 @@ void Rasterizer::EffectsBeforeResources(const GraphicsPipeline* pipeline) {
     }
 }
 
+namespace {
+/// bbport (r50b_leaf-matcher): with BB_RT_CARD_ALPHA_LOG=1, every draw of a matched cut-out pixel
+/// shader whose record holds RepeatableWithConstants() is counted by its memory dwords
+/// (Shader::Optimization::CutoutConstants), and the first one of each pgm_hash prints the dwords'
+/// values (the record's camera pass reference and coordinates, for a ray to repeat). A draw whose
+/// pixel shader inputs are not the ones the record was analysed with is drawn by another
+/// permutation: counted, nothing read. A dword is read only from the shader's own user data, or
+/// from a guest constant buffer the shader does not write, at a valid V#, inside it and inside a
+/// GPU mapping, in no region the GPU wrote (as the r17 hash below: such a page may be the GPU's
+/// with BB_READBACKS=2, and a read fault here would wait for this thread; its CPU copy is stale
+/// otherwise); one in such a region is not read (NaN), and marked GPU-written, or in place when
+/// that range is bound in place (BB_GUEST_IN_PLACE: a write still pending).
+void LogCutoutConstants(const AmdGpu::Regs& regs, const Shader::Info& ps,
+                        Core::MemoryManager& memory, VideoCore::BufferCache& buffer_cache) {
+    namespace Opt = Shader::Optimization;
+    using Ref = Shader::Info::Cutout::Ref;
+    using State = Opt::CutoutConstants;
+    const Shader::Info::Cutout* cut = &ps.cutout;
+    if (cut->verdict == Shader::Info::Cutout::Verdict::NotAnalysed) {
+        // a program from the cache: the first compile's record
+        cut = Opt::FindCutout(ps.pgm_hash);
+        if (!cut || cut->image_count != ps.images.size() ||
+            cut->buffer_count != ps.buffers.size()) {
+            return;
+        }
+    }
+    if (!cut->RepeatableWithConstants()) {
+        return;
+    }
+    // (E6) the permutation: a draw gets permutation 0's Info (PipelineCache::GetProgram)
+    u32 default_mask = 0, flat_mask = 0;
+    for (u32 i = 0; i < regs.num_interp && i < 32 && i < regs.ps_inputs.size(); ++i) {
+        default_mask |= regs.ps_inputs[i].use_default ? 1u << i : 0u;
+        flat_mask |= regs.ps_inputs[i].flat_shade ? 1u << i : 0u;
+    }
+    if (!Opt::CutoutSamePermutation(*cut, regs.num_interp, default_mask, flat_mask)) {
+        (void)Opt::NoteCutoutConstants(ps.pgm_hash, State::OtherPermutation);
+        return;
+    }
+    const auto dwords = Opt::CutoutDwords(*cut);
+    std::array<f32, 7> values{};
+    values.fill(std::numeric_limits<f32>::quiet_NaN());
+    State state = State::CpuWritten;
+    const auto worse = [&state](State s) {
+        state = u8(s) > u8(state) ? s : state;
+    };
+    const auto user_data = ps.UserData();
+    const auto flat = ps.FlatUserData();
+    for (size_t i = 0; i < dwords.size(); ++i) {
+        const Opt::CutoutDword& d = dwords[i];
+        if (d.kind == Ref::UserData || d.kind == Ref::FlatUserData) {
+            const auto ud = d.kind == Ref::UserData ? user_data : flat;
+            if (d.dword < ud.size()) {
+                values[i] = std::bit_cast<f32>(ud[d.dword]);
+            } else {
+                worse(State::Unreadable);
+            }
+            continue;
+        }
+        if (d.kind != Ref::ConstBuffer) {
+            continue;
+        }
+        if (d.buffer >= ps.buffers.size() || ps.buffers[d.buffer].IsSpecial()) {
+            worse(State::Unreadable);
+            continue;
+        }
+        if (ps.buffers[d.buffer].is_written) {
+            worse(State::GpuWritten); // the shader's own writes
+            continue;
+        }
+        const AmdGpu::Buffer sharp = ps.buffers[d.buffer].GetSharp(ps);
+        const u64 offset = u64(d.dword) * 4;
+        const VAddr address = sharp.base_address + offset;
+        if (!sharp.Valid() || offset + 4 > sharp.GetSize() ||
+            !memory.IsValidGpuMapping(address, 4) || memory.ClampRangeSize(address, 4) != 4) {
+            worse(State::Unreadable);
+            continue;
+        }
+        if (buffer_cache.IsRegionGpuModified(address, 4)) {
+            worse(buffer_cache.IsInPlace(address, 4) ? State::InPlace : State::GpuWritten);
+            continue; // not read
+        }
+        u32 raw = 0;
+        std::memcpy(&raw, reinterpret_cast<const void*>(address), sizeof(raw));
+        values[i] = std::bit_cast<f32>(raw);
+    }
+    if (!Opt::NoteCutoutConstants(ps.pgm_hash, state)) {
+        return; // the line was printed for an earlier draw
+    }
+    const auto vs_out = [&regs](u32 input) {
+        if (input >= regs.ps_inputs.size()) {
+            return -1;
+        }
+        const AmdGpu::PsInputControl& control = regs.ps_inputs[input];
+        if (control.use_default) {
+            return -1;
+        }
+        return int(control.input_offset) | (control.flat_shade ? Opt::CutoutFlatInput : 0);
+    };
+    u8 stored = 0xff;
+    if (cut->image < ps.images.size()) {
+        const AmdGpu::Image image = ps.images[cut->image].GetSharp(ps);
+        if (image.Valid()) {
+            stored = u8(image.DstSelect().array[cut->channel & 3]);
+        }
+    }
+    std::array<u32, 2> dither_size{};
+    if (cut->dither && cut->dither_image < ps.images.size()) {
+        const AmdGpu::Image image = ps.images[cut->dither_image].GetSharp(ps);
+        if (image.Valid()) {
+            dither_size = {u32(image.width) + 1, u32(image.height) + 1};
+        }
+    }
+    const int alpha_vs_out =
+        cut->alpha_input != Shader::Info::Cutout::NoInput ? vs_out(cut->alpha_input) : -1;
+    const std::string line = Opt::CutoutConstantsLine(ps.pgm_hash, *cut, values,
+                                                      vs_out(cut->input), alpha_vs_out, stored,
+                                                      state, dither_size);
+    std::printf("%s\n", line.c_str());
+}
+} // namespace
+
+namespace {
+// bbport (r54_leaf-stage2): the record's ops in the order the card data keeps them.
+static_assert(u8(CardOp::Less) == u8(Shader::Info::Cutout::Op::Less) &&
+              u8(CardOp::LessEqual) == u8(Shader::Info::Cutout::Op::LessEqual) &&
+              u8(CardOp::Greater) == u8(Shader::Info::Cutout::Op::Greater) &&
+              u8(CardOp::GreaterEqual) == u8(Shader::Info::Cutout::Op::GreaterEqual) &&
+              u8(CardOp::Equal) == u8(Shader::Info::Cutout::Op::Equal) &&
+              u8(CardOp::NotEqual) == u8(Shader::Info::Cutout::Op::NotEqual));
+
+/// The guest memory as ReadCardBufferDword asks about it: the checks r50b's draw-time line makes
+/// (LogCutoutConstants above), in the same order.
+struct CardGuest {
+    Core::MemoryManager& memory;
+    VideoCore::BufferCache& buffer_cache;
+    bool Mapped(u64 address, u64 size) {
+        return memory.IsValidGpuMapping(address, size) && memory.ClampRangeSize(address, size) == size;
+    }
+    bool GpuModified(u64 address, u64 size) {
+        return buffer_cache.IsRegionGpuModified(address, size);
+    }
+    bool InPlace(u64 address, u64 size) {
+        return buffer_cache.IsInPlace(address, size);
+    }
+    u32 Read(u64 address) {
+        u32 raw = 0;
+        std::memcpy(&raw, reinterpret_cast<const void*>(address), sizeof(raw));
+        return raw;
+    }
+};
+
+/// bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1, a cut-out pixel shader's test as this draw
+/// holds it (rt_card_uv.h, CardDraw): the record of its pixel shader (r50b: matched, repeatable
+/// with the draw's constants, this permutation), the vertex shader outputs its inputs read (the
+/// selector the capture stores by), the dwords the coordinates and the reference read (from
+/// memory the GPU did not write only: a dword it wrote, or one bound in place, is not read and
+/// the draw has no card data), the alpha texture's T# and its sampler's repeat. A plain value:
+/// nothing in it points into the shader's Info or guest memory. miss says why not valid.
+/// RepeatableWithConstants() alone decides which records count. Since r50c it accepts a record
+/// whose nonzero term has an ignored factor that is a buffer load with one address a triangle
+/// (the game's per-instance fade): that factor is left out, never read here, and ignored_kinds
+/// is not looked at (CardKeeps says what leaving it out means); ignored_factor_terms only sets
+/// CardDraw::fade_left_out, which the 600-frame line counts.
+CardDraw ResolveCardDraw(const AmdGpu::Regs& regs, const Shader::Info& ps, bool camera,
+                         Core::MemoryManager& memory, VideoCore::BufferCache& buffer_cache) {
+    namespace Opt = Shader::Optimization;
+    using Cutout = Shader::Info::Cutout;
+    using Ref = Cutout::Ref;
+    CardDraw out;
+    out.camera = camera;
+    out.ps_hash = ps.pgm_hash;
+    const Cutout* cut = &ps.cutout;
+    if (cut->verdict == Cutout::Verdict::NotAnalysed) {
+        cut = Opt::FindCutout(ps.pgm_hash); // a program from the cache: the first compile's
+        if (!cut) {
+            out.miss = CardMiss::NoRecord;
+            return out;
+        }
+        // a record, but of another resource list: its dword and image indices are not this
+        // draw's, so none is read (counted apart from "no record")
+        if (cut->image_count != ps.images.size() || cut->buffer_count != ps.buffers.size()) {
+            out.miss = CardMiss::OtherResources;
+            return out;
+        }
+    }
+    // A sample of one fixed layer (Layer::Immediate) is repeatable, but the card data has no
+    // layer (stage 3 copies one 2D slice of the T#): no card for it until a stage carries one.
+    if (!cut->RepeatableWithConstants() || cut->layer != Cutout::Layer::None) {
+        out.miss = CardMiss::NotRepeatable;
+        return out;
+    }
+    u32 default_mask = 0, flat_mask = 0;
+    for (u32 i = 0; i < regs.num_interp && i < 32 && i < regs.ps_inputs.size(); ++i) {
+        default_mask |= regs.ps_inputs[i].use_default ? 1u << i : 0u;
+        flat_mask |= regs.ps_inputs[i].flat_shade ? 1u << i : 0u;
+    }
+    if (!Opt::CutoutSamePermutation(*cut, regs.num_interp, default_mask, flat_mask)) {
+        out.miss = CardMiss::OtherPermutation;
+        return out;
+    }
+    const auto input = [&regs](u32 i) {
+        if (i >= regs.ps_inputs.size()) {
+            return CardInput{0, true, false};
+        }
+        const AmdGpu::PsInputControl& control = regs.ps_inputs[i];
+        return CardInput{u32(control.input_offset), control.use_default != 0,
+                         control.flat_shade != 0};
+    };
+    const bool has_alpha = cut->alpha_input != Cutout::NoInput;
+    CardSelector selector;
+    if (!CardSelectorFor(input(cut->input), cut->comp_u, cut->comp_v, has_alpha,
+                         has_alpha ? input(cut->alpha_input) : CardInput{}, cut->alpha_comp,
+                         selector)) {
+        out.miss = CardMiss::Inputs;
+        return out;
+    }
+    // The dwords (CutoutDwords' order): every one the record names, the dither's coefficient
+    // too (a camera pass draw that dithers: kept apart from the reference, CardDraw::dither_scale).
+    // Slots come from the record, never fixed numbers.
+    const auto dwords = Opt::CutoutDwords(*cut);
+    CardRecordValues record;
+    record.uv_scale = cut->uv_scale;
+    record.uv_offset = cut->uv_offset;
+    record.ref = cut->ref;
+    record.ref_scale = cut->ref_scale;
+    record.ref2_scale = cut->ref2_scale;
+    record.dither = camera && cut->dither;
+    record.dither_scale = cut->dither_scale;
+    std::array<float, 7> values{};
+    CardDwordState state = CardDwordState::Read;
+    CardGuest guest{memory, buffer_cache};
+    for (size_t i = 0; i < dwords.size(); ++i) {
+        const Opt::CutoutDword& d = dwords[i];
+        if (d.kind == Ref::Immediate || (i == CardDwordDither && !record.dither)) {
+            continue;
+        }
+        record.named[i] = true;
+        u32 raw = 0;
+        CardDwordState s = CardDwordState::Unreadable;
+        if (d.kind == Ref::UserData || d.kind == Ref::FlatUserData) {
+            s = ReadCardUserDword(d.kind == Ref::UserData ? ps.UserData() : ps.FlatUserData(),
+                                  d.dword, raw);
+        } else if (d.kind == Ref::ConstBuffer) {
+            CardBufferFacts facts;
+            facts.bound = d.buffer < ps.buffers.size();
+            facts.special = facts.bound && ps.buffers[d.buffer].IsSpecial();
+            facts.written = facts.bound && ps.buffers[d.buffer].is_written;
+            if (facts.bound && !facts.special && !facts.written) {
+                const AmdGpu::Buffer sharp = ps.buffers[d.buffer].GetSharp(ps);
+                facts.valid = sharp.Valid();
+                facts.base = sharp.base_address;
+                facts.size = sharp.GetSize();
+            }
+            s = ReadCardBufferDword(facts, d.dword, guest, raw);
+        }
+        state = CardWorse(state, s);
+        if (s == CardDwordState::Read) {
+            values[i] = std::bit_cast<f32>(raw);
+        }
+    }
+    if (state != CardDwordState::Read) {
+        out.miss = CardMiss::Constants;
+        return out;
+    }
+    const CardResolved resolved = CardResolve(record, values);
+    if (!resolved.finite) {
+        out.miss = CardMiss::Constants;
+        return out;
+    }
+    if (cut->image >= ps.images.size() || cut->sampler >= ps.samplers.size()) {
+        out.miss = CardMiss::Image;
+        return out;
+    }
+    const AmdGpu::Image image = ps.images[cut->image].GetSharp(ps);
+    if (!image.Valid()) {
+        out.miss = CardMiss::Image;
+        return out;
+    }
+    static_assert(sizeof(image) == sizeof(out.tsharp));
+    std::memcpy(out.tsharp.data(), &image, sizeof(out.tsharp));
+    out.stored_channel = u8(image.DstSelect().array[cut->channel & 3]);
+    out.data_format = u8(image.GetDataFmt());
+    const AmdGpu::Sampler sampler = ps.samplers[cut->sampler].GetSharp(ps);
+    out.mode_u = u8(CardAxisMode(u32(sampler.clamp_x.Value())));
+    out.mode_v = u8(CardAxisMode(u32(sampler.clamp_y.Value())));
+    out.selector = PackCardSelector(selector);
+    out.affine = resolved.affine;
+    out.reference = resolved.reference;
+    out.dither_scale = resolved.dither_scale;
+    out.ref_dwords = resolved.ref_dwords;
+    out.op = CardOp(u8(cut->op));
+    out.nonzero = cut->nonzero;
+    out.dither = record.dither;
+    out.fade_left_out = cut->nonzero && cut->ignored_factor_terms != 0;
+    CardFinishHashes(out);
+    out.valid = true;
+    return out;
+}
+} // namespace
+
 void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
                                     bool is_indexed, u32 index_offset) {
     auto& dc = Dc();
     const u32 mode = pipeline->GetGraphicsKey().motion_vectors;
-    if (mode == Shader::MotionVectors::VertexBoth) {
+    if (Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth) {
         dc.push_data.motion_param &= 0xffffu;
     } else {
         dc.push_data.motion_param = 0;
@@ -333,7 +636,23 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
         .viewport = {regs.viewports[0].xoffset, regs.viewports[0].yoffset,
                      regs.viewports[0].xscale, regs.viewports[0].yscale},
         .target = regs.depth_buffer.Height(),
+        .pixel_shader = ps ? ps->pgm_hash : 0, // bbport (r50_leaf-stage1)
     };
+    // bbport (r50b_leaf-matcher): with BB_RT_CARD_ALPHA_LOG=1, the memory constants of a
+    // matched cut-out pixel shader as this draw holds them (once per pgm_hash).
+    static const bool cutout_log = Shader::Optimization::CutoutLogOn(); // (r54)
+    if (cutout_log && ps && ps->has_discard) {
+        LogCutoutConstants(regs, *ps, *memory, buffer_cache);
+    }
+    // bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1 (a capture pipeline with CaptureUv), a
+    // cut-out pixel shader's card data as this draw holds it, for RtShadow::PrepareDraw (the
+    // entry's UV capture). Kept on this stack until PrepareDraw returns: nothing is allocated.
+    std::optional<CardDraw> card;
+    if ((mode & Shader::MotionVectors::CaptureUv) != 0 && ps && ps->has_discard &&
+        (draw.camera_pass || draw.shadow_pass)) {
+        card = ResolveCardDraw(regs, *ps, draw.camera_pass, *memory, buffer_cache);
+        draw.card = &*card;
+    }
     if (fetch) {
         for (const auto& attribute : fetch->attributes) {
             if (attribute.semantic == 0) {
@@ -462,7 +781,7 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
     BbSections::Scope prepare_scope{BbSections::RtPrepare};
     const u32 param = rt_shadow->PrepareDraw(draw);
     prepare_scope.End();
-    if (mode == Shader::MotionVectors::VertexBoth) {
+    if (Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth) {
         dc.push_data.motion_param |= param << 16;
     } else {
         dc.push_data.motion_param = param;

@@ -22,6 +22,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r54_leaf-stage2): CardAlphaOn
 #include "shader_recompiler/native/capture.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -284,8 +285,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        // bbport (r54_leaf-stage2): CaptureUv: the capture stores the card UVs too
+        // (BB_RT_CARD_ALPHA=1, read once; the key below says the same)
         info.hw.vs.motion_vectors =
-            u8((sel.capture ? Shader::MotionVectors::VertexCapture : 0) | (sel.motion ? 1 : 0));
+            u8((sel.capture ? Shader::MotionVectors::VertexCapture : 0) | (sel.motion ? 1 : 0) |
+               (sel.capture && Shader::Optimization::CardAlphaOn() ? Shader::MotionVectors::CaptureUv
+                                                                    : 0));
         break;
     }
     case HwStage::Fragment: {
@@ -921,6 +926,9 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
     if (sel.capture) {
         key.motion_vectors = Shader::MotionVectors::VertexCapture;
+        if (Shader::Optimization::CardAlphaOn()) { // bbport (r54_leaf-stage2)
+            key.motion_vectors |= Shader::MotionVectors::CaptureUv;
+        }
     }
     if (sel.motion) {
         constexpr u32 mv = Shader::MotionVectors::Output;
@@ -1096,7 +1104,16 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     Shader::Native::StoreState(info, runtime_before, code, perm_idx);
     const auto binding_before = binding;
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
-    if (Lifter::GetMode() != Lifter::Mode::Off && !EffectShaders::KeepRecompiled(info)) {
+    // bbport (r54_leaf-stage2): a capture vertex shader with the card UVs (CaptureUv,
+    // BB_RT_CARD_ALPHA=1) keeps the recompiler's SPIR-V. Only its EmitVertexCapture stores the
+    // UVs (EmitCardUvStore); the lifter's capture stores the positions alone, so its module
+    // would leave the ring unwritten while the CPU names a place in it. With the knob off no
+    // key has CaptureUv and the lifter is asked as before.
+    const bool card_uv_capture =
+        info.hw_stage == HwStage::Vertex &&
+        (runtime_before.hw.vs.motion_vectors & Shader::MotionVectors::CaptureUv) != 0;
+    if (Lifter::GetMode() != Lifter::Mode::Off && !EffectShaders::KeepRecompiled(info) &&
+        !card_uv_capture) {
         auto lifted = Lifter::Lift(Lifter::MakeInput(info, runtime_before, profile, binding_before, code));
         if (lifted.ok() && lifted.uses_tone_curve == info.uses_tone_curve) {
             spv = std::move(lifted.spirv);

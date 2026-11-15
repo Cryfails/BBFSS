@@ -781,14 +781,22 @@ void EmitContext::DefineOutputs() {
 }
 
 void EmitContext::DefineMotionAddressBlock() {
-    const bool both = runtime_info.hw.vs.motion_vectors == MotionVectors::VertexBoth;
-    const Id type = both ? TypeStruct(U64, U64, U64, U64) : TypeStruct(U64, U64);
+    const u32 motion_vectors = runtime_info.hw.vs.motion_vectors;
+    const bool both = MotionVectors::Kind(motion_vectors) == MotionVectors::VertexBoth;
+    // bbport (r54_leaf-stage2): with the card UVs (CaptureUv) one more address after the
+    // others, the ring's (RtShadow::Setup writes it). Without, the block is as before.
+    const bool uv = (motion_vectors & MotionVectors::CaptureUv) != 0;
+    const Id type = both ? (uv ? TypeStruct(U64, U64, U64, U64, U64) : TypeStruct(U64, U64, U64, U64))
+                         : (uv ? TypeStruct(U64, U64, U64) : TypeStruct(U64, U64));
     Decorate(type, spv::Decoration::Block);
     MemberDecorate(type, 0, spv::Decoration::Offset, 0U);
     MemberDecorate(type, 1, spv::Decoration::Offset, 8U);
     if (both) {
         MemberDecorate(type, 2, spv::Decoration::Offset, 16U);
         MemberDecorate(type, 3, spv::Decoration::Offset, 24U);
+    }
+    if (uv) {
+        MemberDecorate(type, both ? 4 : 2, spv::Decoration::Offset, both ? 32U : 16U);
     }
     motion_addresses = DefineVar(type, spv::StorageClass::Uniform);
     Decorate(motion_addresses, spv::Decoration::DescriptorSet, MotionVectors::DescriptorSet);

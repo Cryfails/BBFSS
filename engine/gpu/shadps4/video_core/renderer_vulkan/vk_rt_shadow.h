@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/rt_copy_turns.h" // bbport (r43_copy-turns)
 #include "video_core/renderer_vulkan/rt_lamp_cards.h" // bbport (r46b_plant-rule)
 #include "video_core/renderer_vulkan/rt_still_check.h" // bbport (r47_still-check)
+#include "video_core/renderer_vulkan/rt_card_uv.h"     // bbport (r54_leaf-stage2)
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_sun_vsm.h"
 
@@ -122,6 +123,13 @@ public:
         // bbport (r47c_review-fixes): the bytes of the position stream as this draw binds it
         // (0: not known): another size at a known address is another mesh (LampLoneSized).
         u32 positions_size = 0;
+        // bbport (r50_leaf-stage1): the pixel shader's pgm_hash (0: none); read only with
+        // BB_RT_CARD_ALPHA_LOG=1 (the cut-out cards' pixel shaders, PrepareDraw)
+        u64 pixel_shader = 0;
+        // bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1 (a capture pipeline with
+        // CaptureUv), a cut-out pixel shader's card data as this draw holds it
+        // (EffectsCaptureDraw's, valid during the PrepareDraw call); null otherwise
+        const CardDraw* card = nullptr;
     };
     u32 PrepareDraw(const Draw& draw);
     // bbport (r47_still-check): the draw PrepareDraw was last called for is left out by the
@@ -177,6 +185,18 @@ private:
         VmaAllocation allocation{};
         void* mapped = nullptr;
         u64 address = 0;
+    };
+    // bbport (r54_leaf-stage2): an entry's card UVs (BB_RT_CARD_ALPHA=1; made at its first
+    // cut-out draw): the card data and state (rt_card_uv.h), its block of the pool (VMA's
+    // virtual allocator; `offset` in records) and card slot (stage 4's custom index), the frame
+    // of its last UV capture, whether it is in card_pending.
+    struct CardUvEntry {
+        CardUv uv;
+        VmaVirtualAllocation block{};
+        u32 offset = 0;
+        u32 slot = 0;
+        u64 taken_frame = 0;
+        bool pending = false;
     };
     struct Entry {
         Buffer storage;
@@ -239,6 +259,13 @@ private:
         bool card_mesh = false;
         bool skinned = false;
         u32 card_gen = 0;
+        // bbport (r50_leaf-stage1): with BB_RT_CARD_ALPHA_LOG=1, the pixel shaders of its last
+        // camera pass draw that discards and its last sun shadow pass draw with a texture,
+        // and the classes of the r46 rule PrepareScene noted them in (bit per
+        // Shader::Optimization::CutoutCardClass; cleared when either shader changes)
+        u64 cut_camera_ps = 0;
+        u64 cut_sun_ps = 0;
+        u8 cut_noted = 0;
         // bbport (r46b_plant-rule): the position stream of its draws (0: none), and what that
         // stream is taken for (LampLoneOf of lone_streams; Lone: a cut-out with a skeleton that
         // no sun shadow pass draws, a plant), as of lone_gen (looked up again by PrepareScene
@@ -302,6 +329,9 @@ private:
         bool still_blind = false;
         bool still_doubt = false;
         bool palette_placed = false; // bbport (r47b_casters): see Draw::palette_placed
+        // bbport (r54_leaf-stage2): its card UVs (empty with BB_RT_CARD_ALPHA off, and until
+        // its first cut-out draw)
+        std::unique_ptr<CardUvEntry> card_uv;
     };
     struct Build {
         Entry* entry;
@@ -325,6 +355,12 @@ private:
         u32 param = 0;
         std::array<float, 12> still_rows{};
         std::array<float, 3> still_origin{};
+        // bbport (r54_leaf-stage2): the capture also stores the entry's card UVs at ring index
+        // uv_base - 1 (0: none), for coordinates of this hash (CardCapture); uv_only: a probe
+        // for the UVs alone (CardUvProbe), which r47's looks know nothing of
+        u32 uv_base = 0;
+        u64 uv_hash = 0;
+        bool uv_only = false;
     };
 
     bool Setup(const ObjectMotion& object_motion);
@@ -602,6 +638,70 @@ private:
     bool StillWorld(const float* constants, Build& build) const;
     void StillAdmit(Entry& entry, u64 id);
     void ReadStillSigs(u32 slot);
+    // bbport (r54_leaf-stage2): the card UVs (BB_RT_CARD_ALPHA=1; rt_card_uv.h, CardSetup and
+    // the functions after it). card_uv_on: the knob, read at Setup; card_uv_ready: the ring, the
+    // stat slots and the expand pass are there (else no capture stores UVs). card_ring: the
+    // captures' UVs (CardRingBytes, made at setup: its address is in the capture address blocks,
+    // written once); card_ring_used: its vertices taken since the last RecordBuilds;
+    // card_captures: entries given UVs this frame. card_pool: the records (CardPoolBytes, made at
+    // the first card) and card_block its blocks (VMA's virtual allocator); card_pool_gen counts
+    // the frees (a NoRoom entry tries again after one). card_pending: the entries expanded and
+    // not yet Ready (Destroy takes an entry's out); card_frees: the blocks of destroyed entries
+    // the GPU may still write. card_stat_*: the stat slots of the first entries expanded after
+    // a 600-frame line (CardLog prints them); card_uv_stats: the counts since that line.
+    // card_ring_clean: the first RecordBuilds filled all of the ring with CARD_UV_RING_UNSET (no
+    // capture stores UVs before); card_ring_dirty: the ring's vertices UV captures no
+    // RecordBuilds took wrote (filled again by the next one).
+    bool card_uv_on = false;
+    bool card_uv_ready = false;
+    bool card_pool_failed = false;
+    bool card_ring_clean = false;
+    u32 card_ring_dirty = 0;
+    Buffer card_ring, card_pool, card_stat_buffer, card_readback;
+    VmaVirtualBlock card_block{};
+    vk::UniqueDescriptorSetLayout card_set;
+    vk::UniquePipelineLayout card_layout;
+    vk::UniquePipeline card_pipeline;
+    u32 card_ring_used = 0;
+    u32 card_ring_peak = 0; // the most card_ring_used reached since the last 600-frame line
+    u32 card_captures = 0;
+    u32 card_pool_gen = 0;
+    u32 card_pool_blocks = 0;
+    u64 card_pool_used = 0;
+    CardSlots card_slots;
+    std::vector<Entry*> card_pending;
+    std::vector<CardFree> card_frees;
+    struct CardStatInfo {
+        u64 base = 0; // Entry::base
+        u64 ps_hash = 0;
+        u32 triangles = 0;
+        CardClass card_class = CardClass::Static;
+        bool camera = false;
+    };
+    std::array<CardStatInfo, CARD_UV_STAT_SLOTS> card_stat_info{};
+    u32 card_stat_used = 0;
+    u64 card_stat_tick = 0;
+    // The "drawn by both passes" lines printed (CardNoteDraw prints the first CardBothLines).
+    static constexpr u32 CardBothLines = 32;
+    u32 card_both_said = 0;
+    struct CardUvStats {
+        u64 draws = 0, valid = 0, captures = 0, uv_probes = 0, expanded = 0,
+            expanded_triangles = 0, dropped = 0, other_draw = 0, budget = 0, no_room = 0,
+            left_out = 0, coordinates = 0, constants = 0;
+        u64 sun_gave_way = 0; // camera pass cards that replaced a stale or gone sun one
+        std::array<u64, std::size_t(CardMiss::Count)> miss{};
+    } card_uv_stats;
+    bool CardSetup();
+    bool CardMakePool();
+    bool CardTakeBlock(Entry& entry);
+    void CardNoteDraw(Entry& entry, const Draw& draw);
+    bool CardCaptureCan(Entry& entry, const Draw& draw);
+    void CardCaptureTake(Entry& entry, const Draw& draw, Build& build);
+    bool CardCapture(Entry& entry, const Draw& draw, Build& build);
+    u32 CardUvProbe(Entry& entry, const Draw& draw);
+    void CardRelease(Entry& entry);
+    void CardFrameEnd();
+    void CardLog();
     // For the 600-frame line: a caster a look found moving (the four that moved farthest are
     // kept, each caster once), and the counts since the last line.
     struct StillFound {

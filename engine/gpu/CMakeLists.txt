@@ -165,6 +165,10 @@ function(add_host_shader FILENAME SHADER_NAME)
     if (FILENAME MATCHES "^paint_")
         list(APPEND INCLUDES ${SHADER_SRC}/paint_common.glsl)
     endif()
+    # bbport (r54_leaf-stage2): the card UV pass's layout, shared with C++ (rt_card_uv.h)
+    if (FILENAME MATCHES "^rt_card_uv")
+        list(APPEND INCLUDES ${SHADER_SRC}/rt_card_uv_layout.h)
+    endif()
     add_custom_command(OUTPUT ${OUT}
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_DIR}
         COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${OUT} --vn ${SYMBOL} ${STAGE} ${DEFINES} ${SHADER_SRC}/${FILENAME}
@@ -209,11 +213,17 @@ add_host_shader(rt_shadow.comp rt_shadow_coverage_comp COVERAGE_SKIP=1)
 add_host_shader(rt_unproject.comp rt_unproject_comp)
 # bbport (r47_still-check): the bounds of a captured mesh, for the looks at casters held for still
 add_host_shader(rt_still_sig.comp rt_still_sig_comp)
+# bbport (r54_leaf-stage2): the cut-out cards' UVs into their records (BB_RT_CARD_ALPHA=1)
+add_host_shader(rt_card_uv.comp rt_card_uv_comp)
 add_host_shader(sun_vsm.comp sun_vsm_comp)
 add_host_shader(sun_vsm_draw.vert sun_vsm_draw_vert)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_comp)
 # bbport (r32_lamp-half): the BB_LAMP_SHADOW_HALF=1 build; the one above is unchanged.
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_comp HALF=1)
+# bbport (r60_lamp-centred-window): the BB_LAMP_SHADOW_WINDOW=2 builds (trace and resolve); the
+# two above are unchanged.
+add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_comp CENTRED=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_comp HALF=1 CENTRED=1)
 add_host_shader(ssgi_gather_ray.comp ssgi_gather_ray_comp)
 add_host_shader(rt_shadow_filter.comp rt_shadow_filter_comp)
 # bbport (r25_rt-sun-trace): the engine's build (fade-0 shortcut, counters); tests keep the plain
@@ -473,6 +483,10 @@ target_include_directories(rt-lamp-cards-test PRIVATE ..)
 add_executable(rt-still-check-test EXCLUDE_FROM_ALL ../tests/test_rt_still_check.cpp)
 target_compile_options(rt-still-check-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(rt-still-check-test PRIVATE ..)
+# bbport (r54_leaf-stage2): the card UVs' pure parts (renderer_vulkan/rt_card_uv.h)
+add_executable(rt-card-uv-test EXCLUDE_FROM_ALL ../tests/test_rt_card_uv.cpp)
+target_compile_options(rt-card-uv-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(rt-card-uv-test PRIVATE ..)
 foreach(effect_test
         "motion-blur-shader-test;test_motion_blur.cpp"
         "directional-shadow-test;test_directional_shadows.cpp"
@@ -519,6 +533,14 @@ target_include_directories(motion-shader-test PRIVATE shim shadps4 third_party/g
 target_link_libraries(motion-shader-test PRIVATE bbgpu)
 if (WIN32)
     target_link_libraries(motion-shader-test PRIVATE winmm ws2_32 psapi onecore)
+endif()
+# bbport (r50_leaf-stage1): the cut-out analysis of pixel shaders (cutout_analysis.h).
+add_executable(rt-card-alpha-test EXCLUDE_FROM_ALL ../tests/test_rt_card_alpha.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_compile_options(rt-card-alpha-test PRIVATE -UNDEBUG)
+target_include_directories(rt-card-alpha-test PRIVATE shim shadps4 third_party/gcn/include)
+target_link_libraries(rt-card-alpha-test PRIVATE bbgpu)
+if (WIN32)
+    target_link_libraries(rt-card-alpha-test PRIVATE winmm ws2_32 psapi onecore)
 endif()
 add_executable(ui-composition-test EXCLUDE_FROM_ALL ../tests/test_ui_composition.cpp)
 target_compile_options(ui-composition-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)

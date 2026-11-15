@@ -18,6 +18,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50_leaf-stage1)
 #include "shader_recompiler/native/froyok_composite.h"
 #include "shader_recompiler/native/gt7_tonemap.h"
 #include "video_core/cache_storage.h"
@@ -319,6 +320,14 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy
         !instance.GetPhysicalDevice().getFeatures().vertexPipelineStoresAndAtomics) {
         return false;
     }
+    // bbport (r54_leaf-stage2): a capture key of the other BB_RT_CARD_ALPHA setting is not
+    // built: no draw of this run asks for it, and one with the card UVs (CaptureUv) would read
+    // an address past the 16 or 32 bytes of the address block the knob off binds.
+    if (((sel.graphics_key.motion_vectors & Shader::MotionVectors::CaptureUv) != 0) !=
+        ((sel.graphics_key.motion_vectors & Shader::MotionVectors::VertexCapture) != 0 &&
+         Shader::Optimization::CardAlphaOn())) {
+        return false;
+    }
 
     GraphicsPipeline::SerializationSupport sdata{};
     if (!sdata.Deserialize(ar, legacy)) {
@@ -457,6 +466,14 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
         const u32 opcode = spv[word] & 0xffff;
         discards |= opcode == 252u || opcode == 5380u;
         word += count;
+    }
+
+    // bbport (r50_leaf-stage1): with BB_RT_CARD_ALPHA_LOG=1 a pixel shader that discards
+    // compiles again in play, so the cut-out analysis sees its IR.
+    if (discards && program->info.sw_stage == Shader::SwStage::Fragment &&
+        Shader::Optimization::CutoutAnalysisOn()) {
+        Shader::Optimization::NoteCutoutCacheRefusal();
+        return false;
     }
 
     auto it = program_cache.find(program->info.pgm_hash);
