@@ -58,6 +58,34 @@ These `graphics_*` keys in `lantern.ini` have no control in the Windows launcher
 
 Experimental environment-only toggles (no ini key): `BB_SKY_ZENITH_FIX=1` enables the sky zenith fix (off by default); `BB_SKY_SEAM_FIX` controls the sky seam fix, which is on by default and disabled with `BB_SKY_SEAM_FIX=0`. `BB_DRAWN_LOOK_VIEW=1`, `2` or `4` shows the drawn look's test view (as `graphics_drawn_look_debug`) while the look is on, without writing it to the ini.
 
+### Ray-traced lamp shadows
+
+`graphics_lamp_shadow_softness` (`sharp`, `soft` or `softer`, default `soft`) sets how soft ray-traced lamp and torch shadows are, as the lamp's radius: a point, 0.1 m or 0.2 m. Sharp traces every lamp that reaches a pixel and averages nothing; soft and softer average over about ten frames. `graphics_lamp_shadow_half` (default off) traces one pixel of each 2x2 block first and the rest only where the answers around it differ; an object thinner than about 2 pixels can lose its shadow. Both need `graphics_rt_point_shadows`. Both have a row in the launcher and in the in-game menu, which switches them at once, so they are not in the table above.
+
+These environment variables tune the lamp shadow pass. Each is read once when the game starts; a number out of range is clamped and text that is not a number leaves the default. They are for testing and are part of no look.
+
+| Variable | What it does | Default |
+|---|---|---|
+| `BB_LAMP_SHADOW_SOFT` | The lamp's radius in metres, 0 to 0.5 (0 is a point lamp). A number here wins over `graphics_lamp_shadow_softness`; text that is not a number does not | not set |
+| `BB_LAMP_SHADOW_HALF` | `1` turns half-resolution lamp shadows on, any other non-empty value turns them off, and it wins over `graphics_lamp_shadow_half` | not set |
+| `BB_LAMP_SHADOW_WEIGHTS` | `1`: a lamp's weight at a pixel is the game's falloff times N.L; `0`: the earlier weight | `1` |
+| `BB_LAMP_SHADOW_WRAP` | N.L tolerance, 0 to 1; 1 leaves N.L out | `0.15` |
+| `BB_LAMP_SHADOW_FLOOR` | Least facing factor, 0 to 1; 0 has none | `0.05` |
+| `BB_LAMP_SHADOW_HISTORY` | Share of the frames before in a pixel's shadow ratio, 0 to 0.98 (0.9 is about ten frames); 0 uses this frame's ray alone | `0.9` |
+| `BB_LAMP_SHADOW_REJECT` | The history is dropped where the last frames' ratio is this far from it; 0 or 0.45 to 1; 0 never drops it | `0.5` |
+| `BB_LAMP_SHADOW_TRAIL` | How far a moving lamp's shadows may trail, in metres, 0 to 2; 0 means its motion does not shorten the history | `0.08` |
+| `BB_LAMP_SHADOW_FOLLOW` | `1`: the history is looked up where a moving lamp's motion puts it; `0`: where the surface was | `1` |
+| `BB_LAMP_SHADOW_FOLLOW_SOFT` | `1`: under a moving lamp the history is looked up at both places and mixed per pixel by a follow state; `0`: one of the two, picked by a vote of the 5x5 answers around the pixel | `1` |
+| `BB_LAMP_SHADOW_WINDOW` | Which neighbours bound a pixel's history. `1`: the 5x5 answers of its 8x8 workgroup, and under a moving lamp their far blockers' swing caps it (the pass as before; it leaves square steps fixed to the screen behind moving shadows). `2`: the same window centred on every pixel, from a second dispatch and an image of 8 bytes a pixel; in tests it removed the squares, but it cost more than planned (about +0.16 to +0.20 ms in game runs), so it is not the default. `0`: the pixel's own last frames only; not for use: it left streaks after the camera stops, and a shadow of one of two lamps lingers. With `BB_LAMP_SHADOW_FOLLOW_SOFT=0` the vote and its cap keep the 5x5 window with `0` | `1` |
+| `BB_LAMP_SHADOW_CARRY` | What blocks a moving lamp within this distance of it, in metres (0 to 5), is taken to move with it | `2.5` |
+| `BB_LAMP_SHADOW_CLAMP` | The history may lie this many deviations from this frame's answers around the pixel (with `BB_LAMP_SHADOW_WINDOW=0`: from the pixel's own last frames); 0 or 0.5 to 4; 0 lets it lie anywhere | `1.6` |
+| `BB_LAMP_SHADOW_STALE` | `1`: starved moving shared copies are left out of lamp rays; `0`: they stay in | `0` |
+| `BB_LAMP_SHADOW_CLEARANCE` | A ray is blind within this distance of its target, in metres, 0.05 to 2 | `0.35` |
+| `BB_LAMP_SHADOW_BIAS` | Ray start offset in metres, 0.005 to 0.2 | `0.03` |
+| `BB_LAMP_SHADOW_SELF` | Grazing self-shadow skip in metres, 0 to 0.3 | `0.06` |
+| `BB_LAMP_SHADOW_VIEW` | Debug only: shows an intermediate of the lamp pass in place of the shadow, 0 (off) to 6; the views are in `point_shadow_ray.comp` | `0` |
+| `BB_LAMP_SHADOW_VIEW_GAIN` | Debug only: brightness gain of that view, 0.01 to 16 | `0.5` |
+
 ## Sponsors
 
 Seamless co-op runs on a server in Frankfurt, sponsored by [1337 Hosting](https://1337hosting.com). Thank you!

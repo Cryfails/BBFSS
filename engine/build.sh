@@ -218,6 +218,16 @@ if [[ ${1:-} == --test ]]; then
     out/settings-test
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_motion_history.cpp -o out/motion-history-test
     out/motion-history-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_card_uv.cpp -o out/rt-card-uv-test
+    out/rt-card-uv-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_lamp_shadow_tune.cpp -o out/lamp-shadow-tune-test
+    out/lamp-shadow-tune-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_copy_turns.cpp -o out/rt-copy-turns-test
+    out/rt-copy-turns-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_lamp_cards.cpp -o out/rt-lamp-cards-test
+    out/rt-lamp-cards-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_still_check.cpp -o out/rt-still-check-test
+    out/rt-still-check-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Wno-deprecated-declarations -I. tests/test_toml_patch.cpp start/toml_patch.cpp start/xml.cpp start/common.cpp -lexpat -lz $([[ -n $windows ]] && echo -lbcrypt) -o out/toml-patch-test
     out/toml-patch-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_gx_records.cpp gpu/shim/engine/gx_bindings.cpp -o out/gx-records-test
