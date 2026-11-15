@@ -214,6 +214,27 @@ namespace BloodborneLauncher.Core
                 s.Remove(item.Key);
         }
 
+        /// <summary>The engine's debug switches, lantern.ini keys with no row of their own (the
+        /// in-game menu's debug tab and a hand edit set them). They persist from run to run, so
+        /// Reset all turns them off with the page's other switches. Same list as DebugSwitches
+        /// in engine/gpu/shim/bbport_settings.h.</summary>
+        public static readonly string[] DebugKeys =
+        {
+            "debug_frame_stats", "debug_gpu_profile", "debug_gpu_profile_split", "debug_spike_trace",
+            "debug_submit_diag", "debug_scene_trips", "debug_rt_lamp_trace", "debug_draw_order",
+            "debug_sun_atlas_ignore_reader",
+        };
+
+        /// <summary>A debug switch is on in lantern.ini.</summary>
+        public static bool DebugOn(IniFile ini) => DebugKeys.Any(ini.Flag);
+
+        /// <summary>Turns every debug switch off.</summary>
+        public static void ResetDebug(IniFile ini)
+        {
+            foreach (var key in DebugKeys)
+                ini.Set(key, "0");
+        }
+
         /// <summary>The variables to pass: every switch with a valid value other than its default.</summary>
         public static IEnumerable<(string Name, string Value)> Changed(LauncherSettings s)
         {

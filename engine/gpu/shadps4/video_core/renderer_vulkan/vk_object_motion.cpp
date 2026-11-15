@@ -95,9 +95,9 @@ ObjectMotion::ObjectMotion(const Instance& instance_, Scheduler& scheduler_)
     // half (16 bytes each, two halves). BB_OBJECT_MOTION_VERTICES=<n>, when set, decides:
     // 1048576..16777216 (512 MiB in all); an unreadable value or 0 gives the large store. Not
     // set, lantern.ini's object_motion_store (its start value): large 8388608 (256 MiB in all),
-    // small 4194304 (128 MiB), auto large except where Instance::IsLowVramAmd (an AMD card with
-    // 8.5 GB or less, or BB_AMD_LOW_VRAM=1). A large store the setting chose that cannot be
-    // made falls back to the small one.
+    // small 4194304 (128 MiB), auto large except where Instance::IsLowVramAmd (an AMD discrete
+    // card whose largest device-local heap is at most 8 GiB + 512 MiB, or BB_AMD_LOW_VRAM=1).
+    // A large store the setting chose that cannot be made falls back to the small one.
     u32 store_vertices = PositionsPerFrameLarge;
     bool store_from_setting = false;
     if (const char* value = std::getenv("BB_OBJECT_MOTION_VERTICES"); value && value[0]) {
