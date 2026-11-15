@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono> // bbport (r65_lamp-half-at-start): how long the pipelines took
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -207,6 +208,32 @@ PointShadow::PointShadow(const Instance& instance_, Scheduler& scheduler_,
                     "differ (changes the picture; experiment 72057594037927936 set = full "
                     "resolution)\n");
     }
+    // bbport (r65_lamp-half-at-start): the pass's pipelines were made at the first lamp draw
+    // (Ready, from OnLightDraw) and the half-resolution build at the first pass that wanted it
+    // (HalfReady, from Flush): both during play, each a one-time stall of the draw thread while
+    // the driver compiles them (EffectPass::Create, as every effect pass here: no pipeline cache
+    // of ours, no compile thread). Now, when the pass is wanted at start (the test OnLightDraw
+    // makes), they are made here, at start, as RtShadow's constructor makes the sun's. Ready
+    // makes the same objects as it would later and reads only what is fixed by now (RtShadow's
+    // setup, this constructor's knobs, lantern.ini), so the picture does not change. Not wanted
+    // at start, or BB_LAMP_SHADOW_AT_START=0: on first use, as before.
+    const char* const at_start_env = std::getenv("BB_LAMP_SHADOW_AT_START");
+    const bool early = !at_start_env || at_start_env[0] != '0';
+    if (early && (BbSettings::Get().effects[BbSettings::EffectPointShadows].load(std::memory_order_relaxed) ||
+                  RaysWanted())) {
+        at_start = true;
+        Ready();
+        at_start = false;
+    } else {
+        std::printf("Ray traced lamps (r65): the pass's pipelines are made on first use (%s)\n",
+                    early ? "lamp shadows are off at start" : "BB_LAMP_SHADOW_AT_START=0");
+    }
+}
+
+// bbport (r65_lamp-half-at-start): one test for Flush and Ready (see the header)
+bool PointShadow::HalfWanted() const {
+    return half_env >= 0 ? half_env == 1
+                         : BbSettings::Get().graphics_lamp_shadow_half.load(std::memory_order_relaxed);
 }
 
 bool PointShadow::Ready() {
@@ -214,6 +241,7 @@ bool PointShadow::Ready() {
         return !failed;
     }
     tried = true;
+    const auto r65_began = std::chrono::steady_clock::now(); // bbport (r65_lamp-half-at-start)
     using enum vk::DescriptorType;
     const bool made =
         instance.GetPhysicalDevice().getFeatures().shaderStorageImageExtendedFormats &&
@@ -342,23 +370,41 @@ bool PointShadow::Ready() {
         }
     }
     // bbport (r37_menu-options): the half-resolution build is made by HalfReady, when first wanted.
+    // bbport (r65_lamp-half-at-start): or at the end of this function, at start, when wanted then.
     constexpr auto Drawn = vk::FormatFeatureFlagBits::eColorAttachment |
                            vk::FormatFeatureFlagBits::eColorAttachmentBlend;
     lamp_format = (instance.GetPhysicalDevice().getFormatProperties(TargetFormat)
                        .optimalTilingFeatures & Drawn) == Drawn;
     light_data = std::make_unique<VideoCore::Buffer>(
         instance, 0, DataWords * sizeof(u32), VideoCore::MemoryType::DeviceLocal, "Point shadow lights");
+    // bbport (r65_lamp-half-at-start): at start, the half-resolution build with the others when a
+    // pass would take it now (Flush also needs the ray pass and ray traced lamps wanted), so that
+    // the first half-resolution pass does not make it during play. Not at start
+    // (BB_LAMP_SHADOW_AT_START=0, or the lamp pass switched on later) or not wanted now: made by
+    // the first pass that wants it, as before.
+    if (at_start && ray_pipeline && RaysWanted() && HalfWanted()) {
+        HalfReady();
+    }
+    const double r65_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r65_began).count();
+    std::printf("Ray traced lamps (r65): the pass's pipelines made %s in %.1f ms (ray traced %s, half "
+                "resolution %s); BB_LAMP_SHADOW_AT_START=0 = at the first lamp draw\n",
+                at_start ? "at start" : "at the first lamp draw (during play)", r65_ms,
+                ray_pipeline ? "yes" : "no",
+                half_made ? "yes" : half_tried ? "could not be made" : "not now");
     return true;
 }
 
 // bbport (r32_lamp-half, r37_menu-options): the half-resolution build, made the first time a
 // pass wants it: the ray pass's bindings, then the block answers (9) and the counters (10).
 // bbport (r52_follow-soft): then the follow state (11, 12).
+// bbport (r65_lamp-half-at-start): or by Ready when it runs at start and it is wanted then.
 bool PointShadow::HalfReady() {
     if (half_tried) {
         return half_made;
     }
     half_tried = true;
+    const auto r65_began = std::chrono::steady_clock::now(); // bbport (r65_lamp-half-at-start)
     using enum vk::DescriptorType;
     // bbport (r61_lamp-window-cost, r73_lamp-resolve-list-check): the half-resolution centred
     // build and the resolves' own build of it must take the same bindings, as Ready's pair does;
@@ -420,6 +466,10 @@ bool PointShadow::HalfReady() {
                 "history, as before r44)\n",
                 half_env == 1 ? "BB_LAMP_SHADOW_HALF=1" : "graphics_lamp_shadow_half=1",
                 half_made ? "ready" : "ignored - no pipeline");
+    // bbport (r65_lamp-half-at-start): what this build cost, and when (during play it is a stall)
+    std::printf("Ray traced lamps (r65): the half-resolution build made %s in %.1f ms\n",
+                at_start ? "at start" : "during play",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r65_began).count());
     return half_made;
 }
 
@@ -574,8 +624,10 @@ void PointShadow::OnFrameEnd() {
     // bbport (r32_lamp-half): every 600 frames, what the two passes did: means per counted
     // pass (one in 8; u32 differences survive the wrap; read while the GPU may still copy a later
     // pass's counters, which then fall in the next line). half_readback: made by HalfReady
-    // (bbport r37_menu-options), the first time a pass wants the half resolution.
-    if (half_made && half_readback && ++half_frames >= 600) {
+    // (bbport r37_menu-options), the first time a pass wants the half resolution (bbport
+    // r65_lamp-half-at-start: or at start, by Ready; the line still waits for the first pass that
+    // asks for it, half_asked, as before).
+    if (half_made && half_asked && half_readback && ++half_frames >= 600) {
         std::array<u32, HalfSlots> now{};
         half_readback->Invalidate(0, sizeof(now));
         std::memcpy(now.data(), half_readback->mapped_data.data(), sizeof(now));
@@ -1255,9 +1307,8 @@ void PointShadow::Flush(bool animate_noise) {
     // does not take it.
     const bool history_ours = batch_apart || (apart_draws == 0 && !apart_last_frame);
     // bbport (r37_menu-options): BB_LAMP_SHADOW_HALF when set, else graphics_lamp_shadow_half.
-    const bool half_on = half_env >= 0 ? half_env == 1
-                                       : BbSettings::Get().graphics_lamp_shadow_half.load(
-                                             std::memory_order_relaxed);
+    // bbport (r65_lamp-half-at-start): HalfWanted, the test Ready makes at start too.
+    const bool half_on = HalfWanted();
     // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 and experiment 72057594037927936 clear: the
     // lamps-apart pass in two halves (point_shadow_ray_half_comp), with the block answers in an
     // image of half the size.
@@ -1266,6 +1317,9 @@ void PointShadow::Flush(bool animate_noise) {
     // bbport (r42_lamp-soft): decided here, before the pass's tuning, which depends on it (it
     // was decided after: a pass that asked for the half resolution and did not get it, no
     // pipeline or no room, ran at full resolution with point lamps and said "half resolution").
+    // bbport (r65_lamp-half-at-start): where HalfReady was first called before r65; from here
+    // the counters line runs (OnFrameEnd), as it did then.
+    half_asked = half_asked || (use_rays && batch_apart && half_on);
     bool use_half = use_rays && batch_apart && half_on && HalfReady();
     if (use_half && BbToggle::Experiment(HalfOffBit)) {
         use_half = false;

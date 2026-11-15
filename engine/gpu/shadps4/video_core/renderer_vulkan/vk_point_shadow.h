@@ -290,12 +290,19 @@ private:
     void TrackLamps(u32 end, bool blend, bool read, bool line);
     bool tried = false;
     bool failed = false;
+    // bbport (r65_lamp-half-at-start): Ready is running from the constructor (only its log
+    // lines differ: they say "at start")
+    bool at_start = false;
     // bbport (r32_lamp-half, r37_menu-options): the lamps-apart pass traces pixel (2x, 2y) of
     // each 2x2 block first, then the other three where the answers around them differ
     // (point_shadow_ray_half_comp; changes the picture). On while BB_LAMP_SHADOW_HALF=1 or, with
     // the variable not set, while lantern.ini's graphics_lamp_shadow_half is (read every pass);
     // HalfReady makes the pipeline the first time a pass wants it. Experiment 72057594037927936
     // set: the full-resolution pass, as before.
+    // bbport (r65_lamp-half-at-start): Ready runs at start (the constructor) when the lamp pass
+    // is wanted then and BB_LAMP_SHADOW_AT_START is not 0, else at the first lamp draw; at start
+    // it also calls HalfReady when HalfWanted and ray traced lamps are wanted then. Otherwise,
+    // and for a switch to the half resolution later, the build is made on first use, as before.
     // bbport (r44_half-area-lamp): the half-resolution pass has the area lamp too, averaged in
     // the history like the full-resolution pass's (Flush). Experiment 2305843009213693952 set:
     // point lamps without a history at half resolution, as before r44.
@@ -303,6 +310,13 @@ private:
     bool half_tried = false;  ///< HalfReady made its attempt
     bool half_made = false;   ///< the half-resolution pipeline and its counters exist
     bool HalfReady();
+    /// bbport (r65_lamp-half-at-start): BB_LAMP_SHADOW_HALF when set, else
+    /// graphics_lamp_shadow_half as it is now (Flush's test and Ready's, so they cannot differ)
+    bool HalfWanted() const;
+    /// bbport (r65_lamp-half-at-start): a pass has asked for the half resolution (Flush). The
+    /// counters line (OnFrameEnd) waits for it, as it waited for HalfReady before r65, so a build
+    /// made at start does not print lines of zeros from the title screen on.
+    bool half_asked = false;
     bool half_laid_out = false;
     bool half_cleared = false;  ///< half_counts zeroed (by the first half pass's commands)
     u32 half_passes = 0;        ///< half-resolution passes recorded

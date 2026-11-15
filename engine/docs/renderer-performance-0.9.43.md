@@ -153,6 +153,20 @@ switch on is not a run of the pre-PR engine.
   one in `PointShadow::HalfReady`, as the pass pushes the same descriptor writes to either. The
   default stays
   `LampWindowDefault` = 1. No experiment bit gates it, so the switch does not change it.
+- **Lamp shadow pipelines made at start (r65).** `BB_LAMP_SHADOW_AT_START`, read once in the
+  `PointShadow` constructor, default on; a value starting with `0` gives the old timing. On: when the lamp
+  pass is wanted at start (the point shadow effect on, or ray traced lamps wanted: the test
+  `PointShadow::OnLightDraw` makes), the constructor calls `PointShadow::Ready`, which makes the
+  pass's pipelines and light buffer, and there `Ready` calls `PointShadow::HalfReady` when the ray
+  traced pass exists, ray traced lamps are wanted and `PointShadow::HalfWanted` is true
+  (`BB_LAMP_SHADOW_HALF` when set, else `graphics_lamp_shadow_half`). Before, `Ready` ran at the
+  first lamp draw and `HalfReady` at the first half-resolution pass, both during play: a one-time
+  stall of the draw thread while the driver compiles them (the stall itself was not measured). The new log line
+  "Ray traced lamps (r65): ... made ... in N ms" gives the start cost: in game runs on an RTX 4090 with a
+  warm driver cache the pipelines took 4.0 ms in all at start, 1.1 to 1.7 ms of it for the
+  half-resolution build; with a cold driver cache it was not measured. Off, or not wanted at start: on first
+  use, as before. The same objects are made either way, so the picture does not change; the cost
+  moves to start. No experiment bit gates it, so the switch does not change it.
 - **Startup-only items.** The motion store size and thread pinning are read once at start.
 
 ## Effect on the claimed numbers
