@@ -23,7 +23,8 @@ static_assert(kReturnSlot + 8 == kFrame, "saved[-1] sits just below saved[0]");
 static_assert((8 + 6 * 8 + kFrame) % 16 == 0, "the host call needs a 16-byte aligned stack");
 
 enum Reg : std::uint8_t {
-    RAX = 0, RCX = 1, RDX = 2, RBX = 3, RBP = 5, RSI = 6, RDI = 7, R8 = 8, R9 = 9, R12 = 12, R13 = 13, R14 = 14, R15 = 15
+    RAX = 0, RCX = 1, RDX = 2, RBX = 3, RBP = 5, RSI = 6, RDI = 7, R8 = 8, R9 = 9, R10 = 10, R11 = 11,
+    R12 = 12, R13 = 13, R14 = 14, R15 = 15
 };
 constexpr Reg kArgs[] = {RDI, RSI, RDX, RCX, R8, R9};
 // bbport (r14_cascade-rotate): WriteBranchStub pushes these too, rbx last (saved[kSavedRbx]), above
@@ -31,6 +32,15 @@ constexpr Reg kArgs[] = {RDI, RSI, RDX, RCX, R8, R9};
 constexpr Reg kBodyRegs[] = {R15, R14, R13, R12, RBP, RBX};
 constexpr std::uint32_t kBodyPad = 8;
 static_assert((kBodyPad + 6 * 8 + 6 * 8 + kFrame) % 16 == 0, "the host call needs a 16-byte aligned stack");
+// bbport (r14_cascade-rotate): what a mid-function site must also get back, because the callback is
+// sysv_abi and may clobber all of it: rflags, r10, r11 and the full 256-bit ymm0-15 (xmm8-15 and the
+// upper halves are caller-saved in the host ABI; the game's own AVX code is live across the site).
+// Below the red zone the game's code may be using, they sit under the pad and the body registers.
+constexpr std::uint32_t kRedZone = 128;
+constexpr std::uint32_t kYmmBytes = 16 * 32;
+constexpr std::uint32_t kYmmArea = kYmmBytes + 8;   // the 8 bytes keep the host call aligned
+static_assert((kRedZone + 3 * 8 + kYmmArea + kBodyPad + 6 * 8 + 6 * 8 + kFrame) % 16 == 0,
+              "the host call needs a 16-byte aligned stack");
 static_assert(kSavedRbx == 6 && kSavedR15 == 11, "the body registers sit right above the six argument registers");
 
 class Emitter {
@@ -51,12 +61,25 @@ public:
     void StoreXmm(std::uint8_t disp, unsigned n) { Put({0x0f, 0x11, std::uint8_t(0x44 | (n << 3)), 0x24, disp}); }
     void LoadXmm(unsigned n, std::uint8_t disp) { Put({0x0f, 0x10, std::uint8_t(0x44 | (n << 3)), 0x24, disp}); }
     void LeaRsi(std::uint32_t disp) { Put({0x48, 0x8d, 0xb4, 0x24}); Value(disp); }
+    void Lea(std::int32_t disp) { Put({0x48, 0x8d, 0xa4, 0x24}); Value(disp); }  // lea rsp, [rsp+disp]: keeps rflags
+    void PushFlags() { Put({0x9c}); }
+    void PopFlags() { Put({0x9d}); }
+    // vmovdqu [rsp+disp], ymmN / ymmN, [rsp+disp]: unaligned, so only the stack's 16-byte alignment is needed.
+    void StoreYmm(std::uint32_t disp, unsigned n) {
+        Put({0xc5, std::uint8_t(n < 8 ? 0xfe : 0x7e), 0x7f, std::uint8_t(0x84 | ((n & 7) << 3)), 0x24}); Value(disp);
+    }
+    void LoadYmm(unsigned n, std::uint32_t disp) {
+        Put({0xc5, std::uint8_t(n < 8 ? 0xfe : 0x7e), 0x6f, std::uint8_t(0x84 | ((n & 7) << 3)), 0x24}); Value(disp);
+    }
+    void VZeroUpper() { Put({0xc5, 0xf8, 0x77}); }
     void ZeroEdi() { Put({0x31, 0xff}); }
     void MovRax(std::uint64_t v) { Put({0x48, 0xb8}); Value(v); }
     void CallRax() { Put({0xff, 0xd0}); }
     void TestRax() { Put({0x48, 0x85, 0xc0}); }
     std::uint8_t* Jz8() { Put({0x74, 0x00}); return at_ - 1; }
     void Land(std::uint8_t* rel8) { *rel8 = std::uint8_t(at_ - (rel8 + 1)); }
+    std::uint8_t* Jz32() { Put({0x0f, 0x84}); Value(std::int32_t(0)); return at_ - 4; }
+    void Land32(std::uint8_t* rel32) { const std::int32_t d = std::int32_t(at_ - (rel32 + 4)); std::memcpy(rel32, &d, sizeof d); }
     void Ret() { Put({0xc3}); }
     void JumpTo(std::uint64_t target) { Put({0xff, 0x25, 0, 0, 0, 0}); Value(target); }
 
@@ -94,13 +117,23 @@ std::size_t WriteStub(std::uint8_t* at, Callback callback, std::uint64_t resume,
 }
 
 /// bbport (r14_cascade-rotate): WriteStub for a site inside a function body (rsp 16-byte aligned on
-/// arrival). Both ways out restore every register; a non-zero return runs `taken` and jumps to
-/// `target` instead of the moved instructions. The taken way is short enough for the rel8 jz
-/// (PrepareBranch allows at most 16 taken bytes: 112 bytes in all).
+/// arrival). The site is mid-function, so the guest's whole state is live across it: both ways out
+/// restore rflags, rax, the argument and callee-saved registers, r10, r11 and ymm0-15 in full (the
+/// callback is sysv_abi and may clobber every caller-saved one of them). The red zone below rsp is
+/// skipped, not written. A non-zero return runs `taken` and jumps to `target` instead of the moved
+/// instructions. The branch over the callback is a jz rel32, so the taken way has no size limit
+/// beyond PrepareBranch's 16 bytes.
 std::size_t WriteBranchStub(std::uint8_t* at, Callback callback, std::uint64_t resume, const std::uint8_t* moved,
                             std::size_t n, const std::uint8_t* taken, std::size_t taken_bytes,
                             std::uint64_t target) {
     Emitter e(at);
+    e.Lea(-std::int32_t(kRedZone));           // lea: rflags must reach pushfq untouched
+    e.PushFlags();
+    e.Push(R10);
+    e.Push(R11);
+    e.SubRsp(kYmmArea);
+    for (unsigned y = 0; y < 16; ++y) e.StoreYmm(32 * y, y);
+    e.VZeroUpper();                           // the host code is SSE: no AVX-SSE transition penalty
     e.SubRsp(kBodyPad);
     for (Reg r : kBodyRegs) e.Push(r);
     for (Reg r : kArgs) e.Push(r);
@@ -113,19 +146,24 @@ std::size_t WriteBranchStub(std::uint8_t* at, Callback callback, std::uint64_t r
     e.MovRax(reinterpret_cast<std::uint64_t>(callback));
     e.CallRax();
     e.TestRax();
-    std::uint8_t* run = e.Jz8();
+    std::uint8_t* run = e.Jz32();
     const auto restore = [&e] {
-        for (unsigned x = 0; x < 8; ++x) e.LoadXmm(x, std::uint8_t(16 * x));
         e.Load(RAX, kSavedRax);
         e.AddRsp(kFrame);
         for (int i = 5; i >= 0; --i) e.Pop(kArgs[i]);
         for (int i = 5; i >= 0; --i) e.Pop(kBodyRegs[i]);
         e.AddRsp(kBodyPad);
+        for (unsigned y = 0; y < 16; ++y) e.LoadYmm(y, 32 * y);   // xmm0-15 and every upper half
+        e.AddRsp(kYmmArea);
+        e.Pop(R11);
+        e.Pop(R10);
+        e.PopFlags();                         // last of the instructions that touch rflags
+        e.Lea(std::int32_t(kRedZone));
     };
     restore();
     if (taken_bytes) e.Copy(taken, taken_bytes);
     e.JumpTo(target);
-    e.Land(run);
+    e.Land32(run);
     restore();
     if (n) e.Copy(moved, n);
     e.JumpTo(resume);

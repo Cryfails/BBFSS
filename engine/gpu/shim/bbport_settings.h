@@ -153,7 +153,7 @@ static_assert(sizeof(SunFarShadowsNames) / sizeof(SunFarShadowsNames[0]) == SunF
 // bbport (r37_menu-options): the motion-vector vertex store (renderer_vulkan/vk_object_motion.cpp
 // makes it at start; BB_OBJECT_MOTION_VERTICES, when set, wins). Large: 8388608 vertices a frame
 // half (256 MiB in all); small: 4194304 (128 MiB); auto: large, small where Instance::IsLowVramAmd
-// (an AMD card with 8.5 GB or less, or BB_AMD_LOW_VRAM=1).
+// (an AMD discrete card whose largest device-local heap is at most 8 GiB + 512 MiB, or BB_AMD_LOW_VRAM=1).
 enum MotionStore : int { MotionStoreAuto = 0, MotionStoreLarge = 1, MotionStoreSmall = 2, MotionStoreCount };
 inline constexpr const char* MotionStoreNames[] = {"auto", "large", "small"};
 static_assert(sizeof(MotionStoreNames) / sizeof(MotionStoreNames[0]) == MotionStoreCount);

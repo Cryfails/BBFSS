@@ -1,4 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// The engine library is built with NDEBUG, and Vulkan-Hpp's DispatchLoaderBase is 16 bytes larger
+// without it. Windows links one copy of each inline Vulkan-Hpp method for the test and the library,
+// so the headers must see the library's NDEBUG; assert() is turned back on after them.
+#ifndef NDEBUG
+#define NDEBUG
+#endif
 #include <cassert>
 #include <algorithm>
 #include <array>
@@ -14,6 +20,8 @@
 #include "video_core/host_shaders/taa_comp.h"
 #include "video_core/host_shaders/taa_sharpen_comp.h"
 #include <vk_mem_alloc.h>
+#undef NDEBUG
+#include <cassert>
 
 int main(int argc, char** argv) {
     using namespace Vulkan;
