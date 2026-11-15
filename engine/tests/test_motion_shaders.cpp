@@ -13,13 +13,6 @@
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 
-extern "C" {
-void runtime_blocked_report(void) {}
-[[noreturn]] void runtime_thread_exit(void*) { std::abort(); }
-int sys_pad_type(void) { return 0; }
-int sys_pad_button(uint32_t, int) { return 0; }
-}
-
 static void CheckMetadata() {
     using namespace Shader;
     const auto load = [](bool motion, u32 version) {

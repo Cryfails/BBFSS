@@ -238,12 +238,13 @@ namespace BloodborneLauncher.Views
         {
             // Previous engine paths, as lantern.ini has it now, is one of the page's switches.
             ReadPreviousPaths();
-            if (!EngineSwitches.Changed(S).Any() && !Ini.Flag("engine_previous_paths")) return;
+            if (!EngineSwitches.Changed(S).Any() && !Ini.Flag("engine_previous_paths") && !EngineSwitches.DebugOn(Ini)) return;
             if (!Prompt.Confirm(L.T("Reset engine switches"), L.T("Every switch on this page goes back to the engine's default."), L.T("Reset all"))) return;
             EngineSwitches.ResetAll(S);
             foreach (var reset in _resets)
                 reset();
             Ini.Set("engine_previous_paths", "0");
+            EngineSwitches.ResetDebug(Ini);
             _previousPaths.IsChecked = false;
             Ws.SaveSoon();
             ShowChanged();

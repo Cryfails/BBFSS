@@ -77,6 +77,27 @@ Require(namesPrevious.Ini.Count == 1 && namesPrevious.Ini["graphics_sun_far_shad
     "A settings code can turn the troubleshooting switch on");
 Console.WriteLine("PASS previous engine paths: off by default, in no look, a tested setting at off, not carried or set by shared settings");
 
+// Reset all (More > Engine) also turns the engine's debug switches off: they are lantern.ini keys that
+// persist, with no row on the page.
+var debugIni = new IniFile();
+Require(EngineSwitches.DebugKeys.Length == 9 && EngineSwitches.DebugKeys.Distinct().Count() == 9 && EngineSwitches.DebugKeys.All(k => k.StartsWith("debug_")),
+    "The debug switch list is not nine distinct debug_ keys");
+Require(EngineSwitches.DebugKeys.All(k => !knobs.Contains(k) && IniFile.Defaults.All(d => d.Key != k)), "A debug switch is a look knob or a settings default");
+Require(!EngineSwitches.DebugOn(debugIni), "A debug switch starts on");
+foreach (var key in EngineSwitches.DebugKeys)
+{
+    debugIni.Set(key, "1");
+    Require(EngineSwitches.DebugOn(debugIni), key + ": on is not seen");
+    debugIni.Set(key, "0");
+}
+foreach (var key in EngineSwitches.DebugKeys)
+    debugIni.Set(key, "1");
+debugIni.Set("debug_menu", "1");
+EngineSwitches.ResetDebug(debugIni);
+Require(EngineSwitches.DebugKeys.All(k => debugIni.Raw(k) == "0") && !EngineSwitches.DebugOn(debugIni), "Reset all leaves a debug switch on");
+Require(debugIni.Raw("debug_menu") == "1", "Reset all turned off a debug key that is not an engine debug switch");
+Console.WriteLine("PASS debug switches: Reset all sets " + EngineSwitches.DebugKeys.Length + " debug_ keys to 0");
+
 foreach (var look in Looks.Presets)
 {
     Require(look.BuiltIn && look.Description.Length > 0, look.Name + ": a preset says what it costs");
