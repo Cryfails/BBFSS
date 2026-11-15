@@ -15,6 +15,7 @@
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "lantern_pacing.h"
+#include "bbport_threads.h"
 // bbport: common/ntapi.h (ntdll entry points) is not used by the vendored code.
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -195,6 +196,7 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 void SetCurrentThreadName(const char* name) {
     // bbport: guest thread names are kept by the C runtime.
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    BbThreads::PlaceGpuThread(name); // bbport: X3D core group placement, bbport_platform.cpp
 }
 
 void SetThreadName(void* thread, const char* name) {

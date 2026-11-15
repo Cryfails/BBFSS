@@ -645,6 +645,72 @@ static void bench(void) {
     stress(1000, 4, 1);
 }
 
+// bbport (r39_master-debug): the experiment word is the bits of BB_TOGGLE_FILE ORed with the
+// forced bits (engine_previous_paths), whichever of the two was written last.
+extern uint64_t runtime_experiment_bits;
+void runtime_experiment_force(uint64_t bits);
+void host_sleep_ns(uint64_t ns);
+
+static uint64_t experiment_now(void) {
+    return __atomic_load_n(&runtime_experiment_bits, __ATOMIC_RELAXED);
+}
+
+static int experiment_reaches(uint64_t want) {
+    for (int tries = 0; tries < 500; ++tries) { // the watcher reads its file every 250 ms
+        if (experiment_now() == want) return 1;
+        host_sleep_ns(10000000);
+    }
+    return 0;
+}
+
+static int experiment_file(const char *path, const char *text) {
+    FILE *file = NULL;
+    for (int tries = 0; tries < 50 && !file; ++tries) { // the watcher may hold it open
+        file = fopen(path, "w");
+        if (!file) host_sleep_ns(10000000);
+    }
+    if (!file) return 0;
+    fputs(text, file);
+    return fclose(file) == 0;
+}
+
+static void experiment_word(void) {
+    char path[600];
+    const char *folder = getenv("TEMP");
+    if (!folder || !folder[0]) folder = getenv("TMPDIR");
+    if (!folder || !folder[0]) folder = ".";
+    snprintf(path, sizeof(path), "%.500s/sys-memory-test-toggles-%u.tmp", folder, (unsigned)rng_state);
+    // No toggle file yet: the forced bits alone.
+    runtime_experiment_force(0x30);
+    EXPECT(experiment_now() == 0x30);
+    runtime_experiment_force(0);
+    EXPECT(experiment_now() == 0);
+    // With a toggle file: its bits and the forced bits, in either order of writing.
+    EXPECT(experiment_file(path, "0 5\n"));
+#ifdef _WIN32
+    _putenv_s("BB_TOGGLE_FILE", path);
+#else
+    setenv("BB_TOGGLE_FILE", path, 1);
+#endif
+    runtime_memory_set_gpu_hooks(hook_map, hook_unmap, hook_invalidate); // starts the watcher
+    EXPECT(experiment_reaches(5));
+    runtime_experiment_force(0x30);
+    EXPECT(experiment_now() == 0x35); // at once, the file's bits kept
+    host_sleep_ns(600000000); // two rounds of the watcher: they keep the forced bits
+    EXPECT(experiment_now() == 0x35);
+    EXPECT(experiment_file(path, "0 9\n"));
+    EXPECT(experiment_reaches(0x39));
+    runtime_experiment_force(0x21); // a bit both have
+    EXPECT(experiment_now() == 0x29);
+    runtime_experiment_force(0);
+    EXPECT(experiment_now() == 9);
+    runtime_experiment_force(0x30);
+    for (int tries = 0; tries < 50 && remove(path); ++tries) host_sleep_ns(10000000); // the watcher may hold it open
+    EXPECT(experiment_reaches(0x30)); // no file: no bits from it, as before
+    runtime_experiment_force(0);
+    EXPECT(experiment_now() == 0);
+}
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     _putenv("BB_POOL_LAZY=1");
@@ -674,6 +740,7 @@ int main(int argc, char **argv) {
     rng_state = 12345;
     transcript(800);
     stress(200, 3, 0);
+    experiment_word(); // bbport (r39_master-debug)
     if (failures) return 1;
     puts("sys memory: PASS");
     return 0;

@@ -15,7 +15,9 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_timeline.h"
+#include "bbport_toggles.h"
 #include "face_shot.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "lantern_anti_lag.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -459,6 +461,22 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
     using Access = vk::AccessFlagBits2;
     using Layout = vk::ImageLayout;
 
+    // bbport: a frame of the back buffer's size is encoded from its own image: the clear and the
+    // 1:1 blit into hdr_game made an exact copy of it (same format, hdr_output.frag reads it texel
+    // for texel). Experiment bit 33554432: the copy as before.
+    const bool direct = frame->width == extent.width && frame->height == extent.height &&
+                        !BbToggle::Experiment(33554432);
+    {
+        static int logged = -1;
+        if (int(direct) != logged) {
+            logged = int(direct);
+            std::printf("HDR output: the frame is encoded %s (%ux%u into %ux%u)\n",
+                        direct ? "from its own image (no composite clear and copy)"
+                               : "from a copy in the composite (clear + blit)",
+                        frame->width, frame->height, extent.width, extent.height);
+            std::fflush(stdout);
+        }
+    }
     // The composite and the menu layer are rewritten whole: their old contents (read by the
     // previous present's encode, same queue: the all-commands source scope orders it) go.
     // The frame as in the SDR path: General -> transfer source -> General.
@@ -470,9 +488,18 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
         barrier(hdr_overlay.image, Layout::eUndefined, Layout::eTransferDstOptimal,
                 Stage::eAllCommands, Access::eNone, Stage::eTransfer, Access::eTransferWrite),
     };
-    barriers(std::span{pre.data(), overlay ? 3u : 2u});
+    if (direct) {
+        // The frame: General -> sampled by the encode -> General; no composite.
+        pre[0] = barrier(frame->image, Layout::eGeneral, Layout::eShaderReadOnlyOptimal,
+                         Stage::eAllCommands, Access::eMemoryWrite, Stage::eFragmentShader,
+                         Access::eShaderSampledRead);
+        pre[1] = pre[2];
+    }
+    barriers(std::span{pre.data(), (overlay ? 3u : 2u) - (direct ? 1u : 0u)});
     const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
-    cmdbuf.clearColorImage(hdr_game.image, Layout::eTransferDstOptimal, black, color_range);
+    if (!direct) {
+        cmdbuf.clearColorImage(hdr_game.image, Layout::eTransferDstOptimal, black, color_range);
+    }
     if (overlay) {
         const vk::ClearColorValue transparent{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
         cmdbuf.clearColorImage(hdr_overlay.image, Layout::eTransferDstOptimal, transparent,
@@ -484,14 +511,16 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
         .dstStageMask = Stage::eTransfer,
         .dstAccessMask = Access::eTransferWrite,
     };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &clear_done,
-    });
-    cmdbuf.blitImage(frame->image, Layout::eTransferSrcOptimal, hdr_game.image,
-                     Layout::eTransferDstOptimal,
-                     MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
-                     vk::Filter::eLinear);
+    if (!direct) {
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &clear_done,
+        });
+        cmdbuf.blitImage(frame->image, Layout::eTransferSrcOptimal, hdr_game.image,
+                         Layout::eTransferDstOptimal,
+                         MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
+                         vk::Filter::eLinear);
+    }
 
     std::array<vk::ImageMemoryBarrier2, 4> post{
         barrier(hdr_game.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
@@ -507,7 +536,11 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
                 Stage::eTransfer, Access::eTransferWrite, Stage::eColorAttachmentOutput,
                 Access::eColorAttachmentRead | Access::eColorAttachmentWrite),
     };
-    barriers(std::span{post.data(), overlay ? 4u : 3u});
+    if (direct) {
+        post[0] = post[2]; // the back buffer
+        post[1] = post[3]; // the menu layer
+    }
+    barriers(std::span{post.data(), (overlay ? 4u : 3u) - (direct ? 2u : 0u)});
 
     // bbport: the settings menu / FPS counter, at display resolution, into its own layer: the
     // encode shows it at paper white over the (possibly expanded) frame.
@@ -583,8 +616,9 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
         };
         barriers(gain_ready);
     }
-    hdr_pass.Render(cmdbuf, hdr_game.view, overlay ? hdr_overlay.view : hdr_game.view,
-                    native ? *gain->hdr_gain->view : hdr_game.view,
+    const vk::ImageView game_view = direct ? frame->image_view : hdr_game.view;
+    hdr_pass.Render(cmdbuf, game_view, overlay ? hdr_overlay.view : game_view,
+                    native ? *gain->hdr_gain->view : game_view,
                     native ? Layout::eGeneral : Layout::eShaderReadOnlyOptimal,
                     swapchain.ImageView(), extent, hdr);
 
@@ -592,8 +626,13 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
         barrier(swapchain_image, Layout::eColorAttachmentOptimal, Layout::ePresentSrcKHR,
                 Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite,
                 Stage::eBottomOfPipe, Access::eNone),
+        // Direct: the frame back to General (the UI alpha below may sample it; the next game
+        // frame writes it).
+        barrier(frame->image, Layout::eShaderReadOnlyOptimal, Layout::eGeneral,
+                Stage::eFragmentShader, Access::eShaderSampledRead, Stage::eAllCommands,
+                Access::eMemoryRead | Access::eMemoryWrite),
     };
-    barriers(to_present);
+    barriers(std::span{to_present.data(), direct ? 2u : 1u});
 
     // bbport: DLSS Frame Generation in HDR: the frame without its UI, placed and encoded as the
     // back buffer's frame was (same pass and settings, without the menu layer), so the two differ
@@ -606,48 +645,92 @@ void Presenter::PresentHdr(vk::CommandBuffer cmdbuf, Frame* frame, vk::Extent2D 
         return;
     }
     EnsureDlssHdrTargets(extent);
-    const std::array to_copy{
-        barrier(dlss_hdr_composite.image, Layout::eUndefined, Layout::eTransferDstOptimal,
-                Stage::eAllCommands, Access::eNone, Stage::eTransfer, Access::eTransferWrite),
-        barrier(hudless.image, Layout::eGeneral, Layout::eTransferSrcOptimal, Stage::eAllCommands,
-                Access::eMemoryWrite, Stage::eTransfer, Access::eTransferRead),
-    };
-    barriers(to_copy);
-    cmdbuf.clearColorImage(dlss_hdr_composite.image, Layout::eTransferDstOptimal, black, color_range);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .memoryBarrierCount = 1,
-        .pMemoryBarriers = &clear_done,
-    });
-    cmdbuf.blitImage(hudless.image, Layout::eTransferSrcOptimal, dlss_hdr_composite.image,
-                     Layout::eTransferDstOptimal,
-                     MakeImageBlitFit(hudless.width, hudless.height, extent.width, extent.height),
-                     vk::Filter::eLinear);
-    const std::array to_encode{
-        barrier(dlss_hdr_composite.image, Layout::eTransferDstOptimal,
-                Layout::eShaderReadOnlyOptimal, Stage::eTransfer, Access::eTransferWrite,
-                Stage::eFragmentShader, Access::eShaderSampledRead),
-        barrier(hudless.image, Layout::eTransferSrcOptimal, Layout::eGeneral, Stage::eTransfer,
-                Access::eTransferRead, Stage::eAllCommands, Access::eMemoryRead),
-        barrier(dlss_hdr_hudless.image, Layout::eUndefined, Layout::eColorAttachmentOptimal,
-                Stage::eAllCommands, Access::eNone, Stage::eColorAttachmentOutput,
-                Access::eColorAttachmentWrite),
-    };
-    barriers(to_encode);
+    if (auto* profiler = GpuProfiler::Get()) {
+        profiler->PresentMark(cmdbuf, GpuProfiler::PresentPart::HudlessEncode);
+    }
     auto hudless_hdr = hdr;
     hudless_hdr.flags &= ~HostPasses::HdrOutputPass::FlagOverlay;
-    hdr_pass.Render(cmdbuf, dlss_hdr_composite.view, dlss_hdr_composite.view,
-                    native ? *frame->hdr_gain->view : dlss_hdr_composite.view,
-                    native ? Layout::eGeneral : Layout::eShaderReadOnlyOptimal,
-                    dlss_hdr_hudless.view, extent, hudless_hdr);
-    const std::array encoded{
-        barrier(dlss_hdr_hudless.image, Layout::eColorAttachmentOptimal, Layout::eGeneral,
-                Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite, Stage::eAllCommands,
-                Access::eMemoryRead),
-    };
-    barriers(encoded);
+    // bbport: a HUD-less frame of the back buffer's size is encoded from its own image: the
+    // clear and the 1:1 blit into dlss_hdr_composite made an exact copy of it (same format, read
+    // texel for texel). Experiment bit 1048576: the copy as before.
+    const bool fill = hudless.width == extent.width && hudless.height == extent.height;
+    if (fill && !BbToggle::Experiment(1048576)) {
+        const std::array to_encode{
+            barrier(hudless.image, Layout::eGeneral, Layout::eShaderReadOnlyOptimal,
+                    Stage::eAllCommands, Access::eMemoryWrite, Stage::eFragmentShader,
+                    Access::eShaderSampledRead),
+            barrier(dlss_hdr_hudless.image, Layout::eUndefined, Layout::eColorAttachmentOptimal,
+                    Stage::eAllCommands, Access::eNone, Stage::eColorAttachmentOutput,
+                    Access::eColorAttachmentWrite),
+        };
+        barriers(to_encode);
+        hdr_pass.Render(cmdbuf, hudless.image_view, hudless.image_view,
+                        native ? *frame->hdr_gain->view : hudless.image_view,
+                        native ? Layout::eGeneral : Layout::eShaderReadOnlyOptimal,
+                        dlss_hdr_hudless.view, extent, hudless_hdr);
+        const std::array encoded{
+            barrier(dlss_hdr_hudless.image, Layout::eColorAttachmentOptimal, Layout::eGeneral,
+                    Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite,
+                    Stage::eAllCommands, Access::eMemoryRead),
+            barrier(hudless.image, Layout::eShaderReadOnlyOptimal, Layout::eGeneral,
+                    Stage::eFragmentShader, Access::eShaderSampledRead, Stage::eAllCommands,
+                    Access::eMemoryRead),
+        };
+        barriers(encoded);
+    } else {
+        const std::array to_copy{
+            barrier(dlss_hdr_composite.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+                    Stage::eAllCommands, Access::eNone, Stage::eTransfer, Access::eTransferWrite),
+            barrier(hudless.image, Layout::eGeneral, Layout::eTransferSrcOptimal,
+                    Stage::eAllCommands, Access::eMemoryWrite, Stage::eTransfer,
+                    Access::eTransferRead),
+        };
+        barriers(to_copy);
+        cmdbuf.clearColorImage(dlss_hdr_composite.image, Layout::eTransferDstOptimal, black,
+                               color_range);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &clear_done,
+        });
+        cmdbuf.blitImage(hudless.image, Layout::eTransferSrcOptimal, dlss_hdr_composite.image,
+                         Layout::eTransferDstOptimal,
+                         MakeImageBlitFit(hudless.width, hudless.height, extent.width,
+                                          extent.height),
+                         vk::Filter::eLinear);
+        const std::array to_encode{
+            barrier(dlss_hdr_composite.image, Layout::eTransferDstOptimal,
+                    Layout::eShaderReadOnlyOptimal, Stage::eTransfer, Access::eTransferWrite,
+                    Stage::eFragmentShader, Access::eShaderSampledRead),
+            barrier(hudless.image, Layout::eTransferSrcOptimal, Layout::eGeneral,
+                    Stage::eTransfer, Access::eTransferRead, Stage::eAllCommands,
+                    Access::eMemoryRead),
+            barrier(dlss_hdr_hudless.image, Layout::eUndefined, Layout::eColorAttachmentOptimal,
+                    Stage::eAllCommands, Access::eNone, Stage::eColorAttachmentOutput,
+                    Access::eColorAttachmentWrite),
+        };
+        barriers(to_encode);
+        hdr_pass.Render(cmdbuf, dlss_hdr_composite.view, dlss_hdr_composite.view,
+                        native ? *frame->hdr_gain->view : dlss_hdr_composite.view,
+                        native ? Layout::eGeneral : Layout::eShaderReadOnlyOptimal,
+                        dlss_hdr_hudless.view, extent, hudless_hdr);
+        const std::array encoded{
+            barrier(dlss_hdr_hudless.image, Layout::eColorAttachmentOptimal, Layout::eGeneral,
+                    Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite,
+                    Stage::eAllCommands, Access::eMemoryRead),
+        };
+        barriers(encoded);
+    }
+    // bbport: the UI alpha from the frame and its HUD-less copy before the encode (both General,
+    // the back buffer's size) instead of a copy of the back buffer: the encode is per pixel with
+    // the same settings and gain for both, so where they are equal the encoded ones are too.
+    // Not with the menu layer (it is in the back buffer only). Experiment bit 1048576: the copy.
+    const bool ui_direct = fill && !overlay && frame->width == extent.width &&
+                           frame->height == extent.height && !BbToggle::Experiment(1048576);
     dlss_fg->RecordPresent(cmdbuf, frame->dlss, dlss_hdr_hudless.image, dlss_hdr_hudless.view,
                            extent, swapchain_image, swapchain.GetHdrFormat().format, extent,
-                           vk::Rect2D{{0, 0}, extent});
+                           vk::Rect2D{{0, 0}, extent},
+                           ui_direct ? frame->image_view : vk::ImageView{},
+                           ui_direct ? hudless.image_view : vk::ImageView{});
 }
 
 void Presenter::LogHdrState(bool scrgb, int mode, bool native_frame) {
@@ -979,10 +1062,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const bool crumbs = Breadcrumbs::Enabled();
     const u32 fsr_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter FSR"}) : 0;
     const u32 pp_crumb = crumbs ? Breadcrumbs::Note(stream, {.name = "presenter post process"}) : 0;
+    // bbport: BB_GPU_PROFILE: the presenter's passes under labels of their own (they were
+    // charged to the game's last pass).
+    GpuProfiler* const profiler =
+        GpuProfiler::Get() && GpuProfiler::Get()->Records(&draw_scheduler) ? GpuProfiler::Get()
+                                                                            : nullptr;
+    if (profiler) {
+        profiler->Mark(0xF6E0'0003ull, [] { return std::string{"presenter: post process"}; });
+    }
     draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources, stream,
-                           fsr_crumb, pp_crumb, fsr = fsr_settings, pp = pp_settings, generated,
-                           gen_job, dlss_hudless, dlss_srgb, dlss = dlss_fg.get(),
-                           fg = frame_gen.get()](vk::CommandBuffer cmdbuf) {
+                           fsr_crumb, pp_crumb, fsr = fsr_settings,
+                           pp = pp_settings](vk::CommandBuffer cmdbuf) {
         // Frames of different submissions may be recorded on two threads at once.
         std::scoped_lock lock{passes_mutex};
         const auto pre_barrier = vk::ImageMemoryBarrier2{
@@ -1013,6 +1103,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         if (pp_crumb) {
             Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, true);
         }
+    });
+    if (profiler && (dlss_hudless || gen_job)) {
+        profiler->Mark(0xF6E0'0004ull, [] {
+            return std::string{"presenter: frame generation (DLSS-G slot copies and HUD-less "
+                               "post process, or FSR 3.1)"};
+        });
+    }
+    draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources,
+                           pp = pp_settings, generated, gen_job, dlss_hudless, dlss_srgb,
+                           dlss = dlss_fg.get(), fg = frame_gen.get()](vk::CommandBuffer cmdbuf) {
+        std::scoped_lock lock{passes_mutex};
         // bbport: DLSS Frame Generation's inputs for this frame: copies of the captures, and the
         // frame without its UI through the same post process (its capture stays in General).
         if (dlss_hudless) {
@@ -1302,6 +1403,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     const vk::Image swapchain_image = swapchain.Image();
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+    // bbport: BB_GPU_PROFILE: this present's parts, timed in its own command buffer.
+    GpuProfiler* const present_profiler = GpuProfiler::Get();
+    if (present_profiler) {
+        present_profiler->PresentBegin(cmdbuf);
+        present_profiler->PresentMark(cmdbuf, GpuProfiler::PresentPart::Frame);
+    }
     DumpFinalFrameIfDue(instance, scheduler, cmdbuf, frame->image, frame->width, frame->height,
                         swapchain.GetSurfaceFormat().format);
 
@@ -1436,13 +1543,23 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         // the UI alpha image, from the finished back buffer (vk_streamline.h).
         if (real_game_frame && frame->dlss.inputs) {
             const Frame& hudless = dlss_hudless_frames[frame->id];
+            // bbport: without the menu layer a frame filling the back buffer is the back
+            // buffer (a 1:1 blit): the UI alpha compares it with its HUD-less copy directly,
+            // the same mask without the copy (Experiment bit 1048576: the copy).
+            const bool ui_direct = !overlay && !BbToggle::Experiment(1048576);
             dlss_fg->RecordPresent(cmdbuf, frame->dlss, hudless.image, hudless.image_view,
                                    {frame->width, frame->height}, swapchain_image,
-                                   swapchain.GetSurfaceFormat().format, extent, fit);
+                                   swapchain.GetSurfaceFormat().format, extent, fit,
+                                   ui_direct ? frame->image_view : vk::ImageView{},
+                                   ui_direct ? hudless.image_view : vk::ImageView{});
         }
     }
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
+    }
+
+    if (present_profiler) {
+        present_profiler->PresentEnd(cmdbuf);
     }
 
     // Flush vulkan commands.
@@ -1505,9 +1622,43 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     note_real();
 }
 
+namespace {
+// bbport: BB_FRAME_STATS: how long GetRenderFrame waits for a free presentation frame and then
+// for its present fence, printed every 300 frames. Called from the flip step, these waits block
+// the GPU command thread (with frame generation, while the swap thread is in Streamline).
+void NoteFrameWaits(std::chrono::steady_clock::duration free_wait,
+                    std::chrono::steady_clock::duration fence_wait) {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_FRAME_STATS");
+        return env && env[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::mutex mutex;
+    static double free_ms = 0.0, fence_ms = 0.0, worst_ms = 0.0;
+    static u32 calls = 0;
+    const double a = std::chrono::duration<double, std::milli>(free_wait).count();
+    const double b = std::chrono::duration<double, std::milli>(fence_wait).count();
+    std::scoped_lock lock{mutex};
+    free_ms += a;
+    fence_ms += b;
+    worst_ms = std::max(worst_ms, a + b);
+    if (++calls == 300) {
+        std::printf("Presenter: over %u frames, %.2f ms a frame waiting for a free presentation "
+                    "frame and %.2f ms for its present fence (worst %.2f ms)\n",
+                    calls, free_ms / calls, fence_ms / calls, worst_ms);
+        std::fflush(stdout);
+        free_ms = fence_ms = worst_ms = 0.0;
+        calls = 0;
+    }
+}
+} // namespace
+
 Frame* Presenter::GetRenderFrame() {
     // Wait for free presentation frames
     Frame* frame;
+    const auto wait_start = std::chrono::steady_clock::now(); // bbport: NoteFrameWaits
     {
         std::unique_lock lock{free_mutex};
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
@@ -1517,6 +1668,7 @@ Frame* Presenter::GetRenderFrame() {
         frame = free_queue.front();
         free_queue.pop();
     }
+    const auto got_frame = std::chrono::steady_clock::now(); // bbport
 
     const vk::Device device = instance.GetDevice();
     vk::Result result{};
@@ -1538,6 +1690,7 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    NoteFrameWaits(got_frame - wait_start, std::chrono::steady_clock::now() - got_frame); // bbport
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {

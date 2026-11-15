@@ -3,7 +3,9 @@
 #extension GL_EXT_scalar_block_layout : require
 
 #ifdef TINT
-layout(local_size_x = 1, local_size_y = 1) in;
+// bbport: one thread per record (VolumetricLight::Tint passes at most 256); push constant `serial`
+// runs the old one-thread loop instead (experiment bit 134217728).
+layout(local_size_x = 256, local_size_y = 1) in;
 #else
 layout(local_size_x = 8, local_size_y = 8) in;
 #endif
@@ -38,7 +40,7 @@ layout(push_constant) uniform Params {
     float strength;
     float anisotropy;
     float bias;
-    float unused;
+    uint cascades; // sun atlas cascades drawn in full; the others count as outside the atlas
 };
 
 #ifdef REPAIR
@@ -84,7 +86,7 @@ vec3 local_splits;
 
 float visibility(vec3 p, vec2 texel) {
     int first = int(p.z > local_splits.x) + int(p.z > local_splits.y) + int(p.z > local_splits.z);
-    for (int cascade = first; cascade < 4; ++cascade) {
+    for (int cascade = first; cascade < int(min(cascades, 4u)); ++cascade) {
         mat4 m = local_light[cascade];
         vec4 q = m * vec4(p, 1.0);
         if (abs(q.w) < 1e-8) return 0.0;
@@ -181,6 +183,7 @@ layout(push_constant) uniform TintParams {
     uint record_count;
     float blend;
     uint skip_fallback;
+    uint serial;
 };
 
 vec3 record_vec3(uint id, uint field) {
@@ -212,17 +215,63 @@ bool brighter(vec4 a, vec4 b) {
     return a.b > b.b;
 }
 
+shared vec4 tint_best[256];
+shared uint tint_index[256];
+shared uint tint_fallback[256];
+
+// Record ib (value b) goes before record ia (value a): brighter, or as bright and earlier. The
+// serial loop keeps the first of equally bright records, since it replaces only on brighter().
+bool wins(vec4 b, uint ib, vec4 a, uint ia) {
+    return brighter(b, a) || (!brighter(a, b) && ib < ia);
+}
+
 void main() {
     vec4 best = vec4(0.0);
     bool has_fallback = false;
-    for (uint id = 0u; id < record_count; ++id) {
-        if (skip_fallback != 0u && is_fallback(id)) {
-            has_fallback = true;
-            continue;
+    if (serial != 0u) {
+        if (gl_LocalInvocationIndex != 0u) return;
+        for (uint id = 0u; id < record_count; ++id) {
+            if (skip_fallback != 0u && is_fallback(id)) {
+                has_fallback = true;
+                continue;
+            }
+            vec3 rgb = primary(id);
+            vec4 candidate = vec4(rgb, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+            if (brighter(candidate, best)) best = candidate;
         }
-        vec3 rgb = primary(id);
-        vec4 candidate = vec4(rgb, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
-        if (brighter(candidate, best)) best = candidate;
+    } else {
+        // Each thread loads its own record, so the load round trips overlap. A skipped or missing
+        // record holds vec4(0), which never beats the starting vec4(0) below.
+        const uint id = gl_LocalInvocationIndex;
+        vec4 mine = vec4(0.0);
+        uint fallback = 0u;
+        if (id < record_count) {
+            if (skip_fallback != 0u && is_fallback(id)) {
+                fallback = 1u;
+            } else {
+                vec3 rgb = primary(id);
+                mine = vec4(rgb, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+            }
+        }
+        tint_best[id] = mine;
+        tint_index[id] = id;
+        tint_fallback[id] = fallback;
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            memoryBarrierShared();
+            barrier();
+            if (id < stride) {
+                const vec4 b = tint_best[id + stride];
+                const uint ib = tint_index[id + stride];
+                if (wins(b, ib, tint_best[id], tint_index[id])) {
+                    tint_best[id] = b;
+                    tint_index[id] = ib;
+                }
+                tint_fallback[id] |= tint_fallback[id + stride];
+            }
+        }
+        if (id != 0u) return;
+        if (brighter(tint_best[0], best)) best = tint_best[0];
+        has_fallback = tint_fallback[0] != 0u;
     }
     if (best.w == 0.0 && has_fallback) best = vec4(1.0);
     vec3 target = mix(vec3(best.w), best.rgb, 0.75);

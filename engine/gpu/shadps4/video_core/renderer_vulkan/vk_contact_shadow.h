@@ -43,6 +43,14 @@ public:
 
     void Flush(bool native_blur = false);
 
+    /// bbport: whether the ray traced sun or the VSM replaced the game's sun shadow (its filter
+    /// wrote the shadow target's alpha) since the last call.
+    bool TakeSunReplaced() noexcept {
+        const bool replaced = sun_replaced;
+        sun_replaced = false;
+        return replaced;
+    }
+
 private:
     bool Ready();
 
@@ -64,6 +72,7 @@ private:
     bool use_pcss = false;
     bool use_filter = false;
     bool use_rt = false;
+    bool sun_replaced = false;
     float length_m = 0.6f;
     float thickness_m = 0.35f;
     float strength = 0.75f;

@@ -176,7 +176,9 @@ void FaultManager::ProcessFaultBuffer() {
             (void)buffer_cache.ObtainBuffer(start, end - start, false);
         });
         fault_areas[area] = 0;
-    });
+        // bbport (r35_pending-ops): not carried: ProcessFaultBuffer waits for this tick and
+        // expects it run before the area is cleared and used again.
+    }, "fault buffer read (ObtainBuffer)");
 
     fault_areas[current_area++] = scheduler.CurrentTick();
     current_area %= MaxPendingFaults;

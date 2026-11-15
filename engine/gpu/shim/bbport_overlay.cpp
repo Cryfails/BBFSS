@@ -276,6 +276,32 @@ void RayTracingNotice() {
                                                    "Трассированное освещение включится после перезапуска игры"));
 }
 
+// bbport (r37_menu-options): under a setting whose environment variable, when set (not empty),
+// decides instead of it.
+void EnvNote(const char* name) {
+    if (const char* env = std::getenv(name); env && *env) {
+        ImGui::TextDisabled(BbSettings::MenuText("%s is set: it decides instead of this setting.",
+                                                 "Задана %s: она решает вместо этой настройки."),
+                            name);
+    }
+}
+
+// bbport (r39_master-debug): under a row that "Previous engine paths" (Debug tab) overrides
+// while it is on: the row then does nothing. True when the note was shown; the row's EnvNote
+// is left out then, because the master switch decides over the row's variable as well.
+bool PreviousPathsNote() {
+    if (!BbSettings::Get().engine_previous_paths) {
+        return false;
+    }
+    ImGui::PushTextWrapPos();
+    ImGui::TextDisabled("%s", BbSettings::MenuText("Previous engine paths (debug tab) is on: this setting is not "
+                                                   "used.",
+                                                   "Включено «Прежние пути движка» (вкладка «отладка»): эта "
+                                                   "настройка не используется."));
+    ImGui::PopTextWrapPos();
+    return true;
+}
+
 // Ray tracing follows what uses it; the ini keeps the derived value.
 void SyncRayTracing() {
     auto& s = BbSettings::Get();
@@ -747,6 +773,77 @@ void PictureSection() {
             RayTracingNotice();
         }
     }
+    // bbport (r15_far-shadow-setting): how often the game draws its two far sun shadow cascades.
+    // The hook on the game's cascade loop is installed at start, so a change applies at restart.
+    if (const char* label = Item("Far sun shadows", "Дальние тени солнца")) {
+        const char* names[] = {BbSettings::MenuText("Every frame (the game's own)", "Каждый кадр (как в игре)"),
+                               BbSettings::MenuText("In turn (each every 2nd frame)",
+                                                    "По очереди (каждая раз в 2 кадра)"),
+                               BbSettings::MenuText("Every 8th frame", "Раз в 8 кадров")};
+        int mode = std::clamp(s.graphics_sun_far_shadows.load(), 0, BbSettings::SunFarShadowsCount - 1);
+        const bool changed = ImGui::Combo(label, &mode, names, BbSettings::SunFarShadowsCount);
+        Store(s.graphics_sun_far_shadows, mode, changed);
+        Hint(BbSettings::MenuText(
+            "Fewer shadow draws, more FPS. The game draws the sun's shadow in four distance bands; the "
+            "near two are always drawn every frame. Every frame is the game's own. In turn: the far two "
+            "take turns, each drawn every 2nd frame. Every 8th frame: each far band is drawn every 8th "
+            "frame. At one heavy spot in turn gave about +7% FPS with ray tracing off and +5% with it "
+            "on; every 8th frame about +10% with ray tracing off and +11% with it on. A far band "
+            "is drawn at once when the camera leaves what it covers or the sun turns, so the shadows of "
+            "things that stand still stay right. The cost: the shadow of a far moving thing (a distant "
+            "enemy) can lag behind it, by up to 1 frame in turn and up to 7 frames at every 8th frame. "
+            "With the Normal shadow method that shadow comes from the kept far shadow map; with ray "
+            "traced sun shadows (Ultra) the ray traced shadow of that thing lags the same way. Applied "
+            "when the game restarts.",
+            "Меньше отрисовок теней, больше FPS. Игра рисует тень солнца в четырёх полосах по "
+            "дальности; две ближние всегда рисуются каждый кадр. Каждый кадр — как в игре. По "
+            "очереди: две дальние сменяют друг друга, каждая рисуется раз в 2 кадра. Раз в 8 кадров: "
+            "каждая дальняя полоса рисуется раз в 8 кадров. В одном тяжёлом месте «по очереди» дало "
+            "около +7% FPS без трассировки лучей и +5% с ней; «раз в 8 кадров» — около +11% с "
+            "трассировкой и +10% без неё. Дальняя полоса рисуется сразу, когда камера выходит "
+            "за то, что она покрывает, или солнце поворачивается, поэтому тени неподвижных предметов "
+            "остаются верными. Цена: тень далёкого движущегося объекта (далёкого врага) может отставать "
+            "от него на 1 кадр «по очереди» и до 7 кадров «раз в 8 кадров». При обычном методе теней "
+            "эта тень берётся из сохранённой дальней карты теней; с трассированными тенями солнца "
+            "(Ультра) так же отстаёт трассированная тень этого объекта. Применяется после "
+            "перезапуска игры."));
+        if (s.graphics_sun_far_shadows != s.startup_sun_far_shadows) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Applied when the game restarts.",
+                                                           "Применяется после перезапуска игры."));
+        }
+        if (PreviousPathsNote()) { // bbport (r39_master-debug): every band every frame then
+        } else if (const char* env = std::getenv("BB_SUN_CASCADES"); env && *env) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("BB_SUN_CASCADES is set: it decides instead of this setting.",
+                                                           "Задана BB_SUN_CASCADES: она решает вместо этой настройки."));
+        }
+    }
+    // bbport (r37_menu-options): BB_RT_SUN_HALF as a setting. Live: vk_rt_shadow.cpp reads it at
+    // every sun trace and makes the half-resolution pipeline the first time it is wanted.
+    if (const char* label = Item("Half-resolution ray traced sun shadows",
+                                 "Трассированные тени солнца в половинном разрешении")) {
+        ImGui::BeginDisabled(!s.graphics_rt_sun);
+        Checkbox(label, s.graphics_rt_sun_half);
+        ImGui::EndDisabled();
+        Hint(BbSettings::MenuText(
+            "Live, off by default. Needs Ultra (Ray Traced Shadows) in Shadow rendering method. "
+            "Traces one ray per 2x2 pixels first, then every pixel where those rays differ. At one "
+            "heavy spot the sun shadow pass took 0.24 ms instead of 0.56 ms and still pictures "
+            "looked the same; a shadow caster thinner than about 2 pixels can be missed. With "
+            "Half-resolution lamp shadows and Fewer glossy reflection rays as well: 78.2 instead of "
+            "74.2 FPS there.",
+            "Работает сразу, по умолчанию выкл. Нужно «Ультра (трассированные тени)» в методе "
+            "отрисовки теней. Сначала трассирует один луч на 2x2 пикселя, затем каждый пиксель там, "
+            "где эти лучи расходятся. В одном тяжёлом месте проход теней солнца занял 0.24 мс "
+            "вместо 0.56 мс, неподвижные кадры выглядели так же; предмет тоньше примерно 2 пикселей "
+            "может остаться без тени. Вместе с «Тени ламп в половинном разрешении» и «Меньше лучей "
+            "глянцевых отражений»: там 78.2 вместо 74.2 FPS."));
+        if (s.graphics_rt_sun && s.graphics_rt_sun_half) {
+            RayTracingNotice();
+        }
+        if (!PreviousPathsNote()) { // bbport (r39_master-debug)
+            EnvNote("BB_RT_SUN_HALF");
+        }
+    }
     if (const char* label = Item("Ray traced lamp shadows", "Трассированные тени ламп")) {
         Checkbox(label, s.graphics_rt_point_shadows);
         SyncRayTracing();
@@ -759,6 +856,61 @@ void PictureSection() {
             "Выкл.: используются экранные тени точечных источников (если включены)."));
         if (s.graphics_rt_point_shadows) {
             RayTracingNotice();
+        }
+    }
+    // bbport (r37_menu-options): BB_LAMP_SHADOW_HALF as a setting. Live: vk_point_shadow.cpp reads
+    // it at every lamps-apart pass and makes the half-resolution pipeline the first time.
+    if (const char* label = Item("Half-resolution lamp shadows",
+                                 "Тени ламп в половинном разрешении")) {
+        ImGui::BeginDisabled(!s.graphics_rt_point_shadows);
+        Checkbox(label, s.graphics_lamp_shadow_half);
+        ImGui::EndDisabled();
+        Hint(BbSettings::MenuText(
+            "Live, off by default. Needs Ray traced lamp shadows. Traces one ray per 2x2 pixels "
+            "first, then every pixel where the answers around it differ. At one heavy spot the lamp "
+            "shadow pass took 0.38 ms instead of 0.73 ms (about +2.6% FPS) and still pictures "
+            "showed no difference; a shadow caster thinner than about 2 pixels can be missed.",
+            "Работает сразу, по умолчанию выкл. Нужны трассированные тени ламп. Сначала трассирует "
+            "один луч на 2x2 пикселя, затем каждый пиксель там, где ответы вокруг него расходятся. "
+            "В одном тяжёлом месте проход теней ламп занял 0.38 мс вместо 0.73 мс (около +2.6% "
+            "FPS), на неподвижных кадрах разницы не видно; предмет тоньше примерно 2 пикселей может "
+            "остаться без тени."));
+        if (s.graphics_rt_point_shadows && s.graphics_lamp_shadow_half) {
+            RayTracingNotice();
+        }
+        if (!PreviousPathsNote()) { // bbport (r39_master-debug)
+            EnvNote("BB_LAMP_SHADOW_HALF");
+        }
+    }
+    // bbport (r37_menu-options): BB_RT_REFIT_EVERY=8 as a setting. Live: vk_rt_shadow.cpp
+    // RefitEvery reads it at each use. Only a built ray tracing scene has refits to skip (the
+    // same test as RtShadow::SceneWanted: RTGI builds one only while High GI (probes) is not on).
+    if (const char* label = Item("Far animated objects in ray tracing: update every 8th frame",
+                                 "Далёкие анимированные объекты в трассировке лучей: обновлять раз "
+                                 "в 8 кадров")) {
+        const bool scene = s.graphics_rt_sun || s.graphics_rt_point_shadows ||
+                           (s.graphics_rt_bounce &&
+                            !(s.graphics_gi_probes && s.effects[BbSettings::EffectGi]));
+        ImGui::BeginDisabled(!scene);
+        Checkbox(label, s.graphics_rt_far_refit);
+        ImGui::EndDisabled();
+        Hint(BbSettings::MenuText(
+            "Live, off by default. Needs Ultra (Ray Traced Shadows), Ray traced lamp shadows or "
+            "Ultra (RTGI). An animated object that was only in the far sun shadow bands updates its "
+            "ray tracing shape every 8th frame instead of every frame; on screen it still moves "
+            "every frame. At one heavy spot about +2.5% FPS. The cost: the ray traced shadow of "
+            "such an object can be up to 7 frames old.",
+            "Работает сразу, по умолчанию выкл. Нужны «Ультра (трассированные тени)», "
+            "трассированные тени ламп или «Ультра (RTGI)». Анимированный объект, который был только "
+            "в дальних полосах теней солнца, обновляет свою форму для трассировки лучей раз в "
+            "8 кадров вместо каждого кадра; на экране он по-прежнему движется каждый кадр. В одном "
+            "тяжёлом месте около +2.5% FPS. Цена: трассированная тень такого объекта может "
+            "отставать до 7 кадров."));
+        if (scene && s.graphics_rt_far_refit) {
+            RayTracingNotice();
+        }
+        if (!PreviousPathsNote()) { // bbport (r39_master-debug)
+            EnvNote("BB_RT_REFIT_EVERY");
         }
     }
     if (const char* label = Item("Global Illumination Quality (Indirect Lighting)",
@@ -827,6 +979,27 @@ void PictureSection() {
             "Работает сразу, по умолчанию выкл. Трассирует один луч глянцевого отражения на "
             "каждый пиксель вместо 2x2: более чёткие отражения в лужах примерно за 4x стоимость "
             "отражений."));
+    }
+    // bbport (r37_menu-options): BB_SSGI_HALF as a setting. Live: vk_ssgi.cpp reads it every frame
+    // and makes the half pipelines the first time a frame wants them.
+    if (const char* label = Item("Fewer glossy reflection rays",
+                                 "Меньше лучей глянцевых отражений")) {
+        ImGui::BeginDisabled(!s.graphics_gi_probes || !s.graphics_gi_reflections ||
+                             !s.graphics_gi_reflections_full_res);
+        Checkbox(label, s.graphics_gi_reflections_fewer_rays);
+        ImGui::EndDisabled();
+        Hint(BbSettings::MenuText(
+            "Live, off by default. Needs Full-resolution glossy reflections. Traces one glossy "
+            "reflection ray per flat 2x2 pixel block, and one per pixel at edges, on very smooth "
+            "surfaces and where the roughness changes. At one heavy spot the indirect light pass "
+            "took 0.77 ms instead of 0.89 ms.",
+            "Работает сразу, по умолчанию выкл. Нужны глянцевые отражения в полном разрешении. "
+            "Трассирует один луч глянцевого отражения на ровный блок 2x2 пикселя и по лучу на "
+            "пиксель на краях, на очень гладких поверхностях и там, где меняется шероховатость. В "
+            "одном тяжёлом месте проход непрямого света занял 0.77 мс вместо 0.89 мс."));
+        if (!PreviousPathsNote()) { // bbport (r39_master-debug)
+            EnvNote("BB_SSGI_HALF");
+        }
     }
     if (const char* label = Item("Glossy reflection strength", "Сила глянцевых отражений")) {
         ImGui::BeginDisabled(!s.graphics_gi_probes || !s.graphics_gi_reflections);
@@ -1067,8 +1240,227 @@ void PictureSection() {
     ImGui::EndDisabled();
 }
 
+// bbport (r39_master-debug): a measuring or tracing row of the Debug tab. The row writes a
+// debug_* key of lantern.ini; at the next start the key puts its variable into the process
+// environment (BbSettings::DebugSwitchesAtStart) unless the variable is already set. The note
+// under the row asks the state at the start, not getenv: a variable this engine put there
+// itself is not one that decides instead of the setting.
+void DebugSwitchRow(int id, const char* label, const char* hint) {
+    auto& s = BbSettings::Get();
+    Checkbox(label, s.debug_switches[id]);
+    Hint(hint);
+    if (s.debug_switches[id] != s.startup_debug_switches[id]) {
+        ImGui::TextDisabled("%s", BbSettings::MenuText("Applied when the game restarts.",
+                                                       "Применяется после перезапуска игры."));
+    }
+    if (BbSettings::DebugSwitchesAtStart().env_set[id]) {
+        ImGui::TextDisabled(BbSettings::MenuText("%s is set: it decides instead of this setting.",
+                                                 "Задана %s: она решает вместо этой настройки."),
+                            BbSettings::DebugSwitches[id].env);
+    }
+}
+
 void DebugSection() {
     auto& s = BbSettings::Get();
+    // bbport (r39_master-debug): the master switch back to the earlier paths, then the measuring
+    // and tracing switches.
+    Section("Engine (troubleshooting)", "Движок (поиск неполадок)");
+    if (const char* label = Item("Previous engine paths", "Прежние пути движка")) {
+        bool previous = s.engine_previous_paths;
+        if (ImGui::Checkbox(label, &previous)) {
+            Store(s.engine_previous_paths, previous, true);
+            BbSettings::ApplyPreviousPaths(); // live: the experiment bits change now
+        }
+        Hint(BbSettings::MenuText(
+            "Off by default; for troubleshooting. On: the engine goes back to its rendering paths "
+            "from before the performance work, which is slower, and much slower with ray traced "
+            "lamp shadows. Use it to see whether a problem comes from that work. Switches at once: "
+            "most paths that have a run-time switch. Half-resolution lamp shadows, Half-resolution "
+            "ray traced sun shadows, Fewer glossy reflection rays and the update of far ray traced "
+            "objects every 8th frame then act as off, and Far sun shadows acts as Every frame, "
+            "whatever their settings say. Not switched back: the fix for a ghost image. Switches "
+            "only when the game restarts: the small motion vector store and, on processors with two "
+            "core groups of different cache size, render threads are no longer kept on the group "
+            "with the larger cache. Changes that have no switch stay. The session log notes when "
+            "this is on or changes.",
+            "По умолчанию выключено; для поиска неполадок. Вкл.: движок возвращается к путям "
+            "отрисовки, какими они были до работ по производительности; это медленнее, а с "
+            "трассированными тенями ламп намного медленнее. Так можно проверить, вызвана ли "
+            "проблема этими работами. Переключается сразу: большинство путей, у которых есть "
+            "переключатель на ходу. «Тени ламп в половинном разрешении», «Трассированные тени "
+            "солнца в половинном разрешении», «Меньше лучей глянцевых отражений» и обновление "
+            "далёких объектов трассировки раз в 8 кадров при этом работают как выключенные, а "
+            "«Дальние тени солнца» работают как «Каждый кадр», что бы ни стояло в их настройках. Не "
+            "возвращается: исправление призрачного изображения. Только после перезапуска игры: "
+            "малое хранилище векторов движения, а на процессорах с двумя группами ядер с разным "
+            "размером кэша потоки отрисовки больше не закрепляются за группой с большим кэшем. "
+            "Изменения без переключателя остаются. В журнале сеанса отмечается, когда это включено "
+            "или меняется."));
+        if (s.engine_previous_paths != s.startup_engine_previous_paths) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Part of this applies only when the game restarts.",
+                                                           "Часть этого применяется только после перезапуска игры."));
+        }
+    }
+    Section("Measuring and tracing", "Измерения и журналы");
+    if (const char* text = Item("Developer tools, not picture or speed options; all off by default. "
+                                "A change applies when the game restarts. Output goes to the "
+                                "session log: with the Windows launcher, last_session.log in the "
+                                "logs folder; on Linux, the log file in the logs folder, written "
+                                "only while the launcher's option to save the log is on.",
+                                "Инструменты разработчика, а не настройки картинки или скорости; по "
+                                "умолчанию всё выключено. Изменение применяется после перезапуска "
+                                "игры. Вывод идёт в журнал сеанса: с лаунчером Windows это "
+                                "last_session.log в папке logs; в Linux это файл журнала в папке "
+                                "logs, который пишется, только пока в лаунчере включено сохранение "
+                                "журнала.")) {
+        ImGui::PushTextWrapPos();
+        ImGui::TextDisabled("%s", text);
+        ImGui::PopTextWrapPos();
+    }
+    if (const char* label = Item("Frame statistics",
+                                 "Статистика кадров")) {
+        DebugSwitchRow(BbSettings::DebugFrameStats, label,
+                       BbSettings::MenuText("Off by default. Detailed frame statistics in the session log "
+                                            "every 5 seconds, and the timers and counters that feed them "
+                                            "(a little extra work in every frame). Also prints the Scene "
+                                            "image table. The launcher's own frame statistics option sets "
+                                            "BB_FRAME_STATS too and then decides. Same as "
+                                            "BB_FRAME_STATS=1. Applies when the game restarts.",
+                                            "По умолчанию выключено. Подробная статистика кадров в "
+                                            "журнале сеанса каждые 5 секунд, а также таймеры и счётчики "
+                                            "для неё (немного лишней работы в каждом кадре). Заодно "
+                                            "печатается «Таблица изображений сцены». Собственная "
+                                            "настройка статистики кадров в лаунчере тоже задаёт "
+                                            "BB_FRAME_STATS, и тогда решает она. То же, что "
+                                            "BB_FRAME_STATS=1. Применяется после перезапуска игры."));
+    }
+    if (const char* label = Item("GPU profile",
+                                 "Профиль GPU")) {
+        DebugSwitchRow(BbSettings::DebugGpuProfile, label,
+                       BbSettings::MenuText("Off by default. A table of GPU time per render pass in the "
+                                            "session log every 5 seconds. Printing the table causes one "
+                                            "long frame each time (about 55 ms measured), and FPS is a "
+                                            "little lower all the time (about 79 instead of 81 at one "
+                                            "heavy spot), so frame times are not clean while this is on. "
+                                            "Also turns on Submission diagnostics and the Scene image "
+                                            "table. Same as BB_GPU_PROFILE=1. Applies when the game "
+                                            "restarts.",
+                                            "По умолчанию выключено. Таблица времени GPU по проходам "
+                                            "отрисовки в журнале сеанса каждые 5 секунд. Печать таблицы "
+                                            "каждый раз даёт один длинный кадр (измерено около 55 мс), а "
+                                            "FPS всё время немного ниже (около 79 вместо 81 в одном "
+                                            "тяжёлом месте), поэтому время кадров при этом неточное. "
+                                            "Заодно включаются «Диагностика отправки» и «Таблица "
+                                            "изображений сцены». То же, что BB_GPU_PROFILE=1. Применяется "
+                                            "после перезапуска игры."));
+    }
+    if (const char* label = Item("GPU profile: split rows",
+                                 "Профиль GPU: раздельные строки")) {
+        DebugSwitchRow(BbSettings::DebugGpuProfileSplit, label,
+                       BbSettings::MenuText("Off by default. Only with GPU profile on: work recorded "
+                                            "after a compute dispatch or a copy that has no label of its "
+                                            "own gets its own row in the table, instead of being charged "
+                                            "to that dispatch or copy. Same as BB_GPU_PROFILE_SPLIT=1. "
+                                            "Applies when the game restarts.",
+                                            "По умолчанию выключено. Только при включённом «Профиль GPU»: "
+                                            "работа, записанная после вычислительного вызова или "
+                                            "копирования и не имеющая своей метки, получает в таблице "
+                                            "отдельную строку, а не приписывается этому вызову или "
+                                            "копированию. То же, что BB_GPU_PROFILE_SPLIT=1. Применяется "
+                                            "после перезапуска игры."));
+    }
+    if (const char* label = Item("Spike trace (slow frames)",
+                                 "Журнал скачков (медленные кадры)")) {
+        DebugSwitchRow(BbSettings::DebugSpikeTrace, label,
+                       BbSettings::MenuText("Off by default. For frames over 1.4 times the median frame "
+                                            "time: where their time went. Up to 8 Spike lines in the "
+                                            "session log every 5 seconds. Same as BB_SPIKE_TRACE=1. "
+                                            "Applies when the game restarts.",
+                                            "По умолчанию выключено. Для кадров длиннее 1.4 медианного "
+                                            "времени кадра: на что ушло их время. До 8 строк Spike в "
+                                            "журнале сеанса каждые 5 секунд. То же, что BB_SPIKE_TRACE=1. "
+                                            "Применяется после перезапуска игры."));
+    }
+    if (const char* label = Item("Submission diagnostics",
+                                 "Диагностика отправки")) {
+        DebugSwitchRow(BbSettings::DebugSubmitDiag, label,
+                       BbSettings::MenuText("Off by default. Every 600 frames: how often and why work was "
+                                            "submitted to the GPU, and how long threads waited for the "
+                                            "GPU (Submit diag lines in the session log). Same as "
+                                            "BB_SUBMIT_DIAG=1. Applies when the game restarts.",
+                                            "По умолчанию выключено. Каждые 600 кадров: как часто и "
+                                            "почему работа отправлялась на GPU и сколько потоки ждали GPU "
+                                            "(строки Submit diag в журнале сеанса). То же, что "
+                                            "BB_SUBMIT_DIAG=1. Применяется после перезапуска игры."));
+    }
+    if (const char* label = Item("Scene image table",
+                                 "Таблица изображений сцены")) {
+        DebugSwitchRow(BbSettings::DebugSceneTrips, label,
+                       BbSettings::MenuText("Off by default. Every 600 frames: a table of the resolves "
+                                            "and fills of the scene images and what asked for each, in "
+                                            "the session log (it begins with Scene proxy resolves and "
+                                            "fills). Printed only while an upscaler renders the scene "
+                                            "below the output size. Same as BB_SCENE_TRIPS=1. Applies "
+                                            "when the game restarts.",
+                                            "По умолчанию выключено. Каждые 600 кадров: таблица "
+                                            "преобразований и заполнений изображений сцены и того, что их "
+                                            "запросило, в журнале сеанса (начинается со слов Scene proxy "
+                                            "resolves and fills). Печатается, только пока апскейлер "
+                                            "рисует сцену в разрешении ниже выходного. То же, что "
+                                            "BB_SCENE_TRIPS=1. Применяется после перезапуска игры."));
+    }
+    if (const char* label = Item("Lamp shadow trace",
+                                 "Журнал теней ламп")) {
+        DebugSwitchRow(BbSettings::DebugRtLampTrace, label,
+                       BbSettings::MenuText("Off by default. Once per run, and only where lamp shadows "
+                                            "are drawn in more than 100 batches in a frame: the first "
+                                            "90 Lamp trace lines of the next frame (lamp draws) then go "
+                                            "to the session log. With Ray traced lamp shadows on, the "
+                                            "lamps are normally one batch a frame and nothing is printed, "
+                                            "unless Previous engine paths is on. Same as "
+                                            "BB_RT_LAMP_TRACE=1. Applies when the game restarts.",
+                                            "По умолчанию выключено. Один раз за запуск и только там, где "
+                                            "тени ламп рисуются более чем 100 пакетами за кадр: тогда в "
+                                            "журнал сеанса попадают первые 90 строк Lamp trace следующего "
+                                            "кадра (отрисовки ламп). При включённых «Трассированные тени "
+                                            "ламп» лампы обычно идут одним пакетом за кадр, и ничего не "
+                                            "печатается, если не включено «Прежние пути движка». То же, "
+                                            "что BB_RT_LAMP_TRACE=1. Применяется после перезапуска игры."));
+    }
+    if (const char* label = Item("Draw order counters",
+                                 "Счётчики порядка отрисовки")) {
+        DebugSwitchRow(BbSettings::DebugDrawOrder, label,
+                       BbSettings::MenuText("Off by default. Every 600 frames: one Draw order line in the "
+                                            "session log with a frame's draws, pipeline changes and how "
+                                            "many binds were left out. While Previous engine paths is on, "
+                                            "nothing is counted. Same as BB_DRAW_ORDER=1. Applies when "
+                                            "the game restarts.",
+                                            "По умолчанию выключено. Каждые 600 кадров: одна строка Draw "
+                                            "order в журнале сеанса: отрисовки за кадр, смены конвейера и "
+                                            "сколько привязок пропущено. Пока включено «Прежние пути "
+                                            "движка», ничего не считается. То же, что BB_DRAW_ORDER=1. "
+                                            "Применяется после перезапуска игры."));
+    }
+    if (const char* label = Item("Sun shadow map: ignore other readers",
+                                 "Карта теней солнца: не учитывать других читателей")) {
+        DebugSwitchRow(BbSettings::DebugSunAtlasIgnoreReader, label,
+                       BbSettings::MenuText("Off by default. A diagnostic for measuring, not for play. "
+                                            "With High or Ultra in Shadow rendering method, the far parts "
+                                            "of the game's own sun shadow map are then left undrawn even "
+                                            "while the water or another effect still reads them: far sun "
+                                            "shadows can be missing on the water. Does nothing while "
+                                            "Previous engine paths is on. Same as "
+                                            "BB_SUN_ATLAS_IGNORE_READER=1. Applies when the game "
+                                            "restarts.",
+                                            "По умолчанию выключено. Диагностика для измерений, не для "
+                                            "игры. При «Высокий» или «Ультра» в методе отрисовки теней "
+                                            "дальние части собственной карты теней солнца игры перестают "
+                                            "рисоваться, даже когда их ещё читает вода или другой эффект: "
+                                            "дальние тени солнца на воде могут пропасть. Пока включено "
+                                            "«Прежние пути движка», ничего не делает. То же, что "
+                                            "BB_SUN_ATLAS_IGNORE_READER=1. Применяется после перезапуска "
+                                            "игры."));
+    }
     Section("Shader and lighting (restart required)", "Шейдеры и освещение (после перезапуска)");
     if (const char* label = Item("Point/spot light GGX", "GGX для точечных источников")) {
         Checkbox(label, s.graphics_local_ggx);
@@ -1806,6 +2198,54 @@ void MaskSection() {
             "Точные векторы для анимированных объектов: одежда и оружие меньше рассыпаются "
             "при движении. Статичная сцена не получает дополнительный проход. "
             "Изменение применяется после перезапуска игры."));
+    }
+    // bbport (r37_menu-options): the motion-vector vertex store. vk_object_motion.cpp makes it at
+    // start from the start value, so a change applies at restart.
+    if (const char* label = Item("Motion vector store",
+                                 "Хранилище векторов движения")) {
+        // bbport (r40_master-bits): the first choice was "Auto (large; small on AMD cards with
+        // 8 GB or less)" and was cut off in the combo. It is the text of the Live resolution
+        // changes combo now; the hint below says what Auto picks.
+        const char* names[] = {BbSettings::MenuText("Auto (based on GPU)", "Авто (по видеокарте)"),
+                               BbSettings::MenuText("Large (8,388,608 vertices)",
+                                                    "Большое (8 388 608 вершин)"),
+                               BbSettings::MenuText("Small (4,194,304 vertices)",
+                                                    "Малое (4 194 304 вершины)")};
+        int mode = std::clamp(s.object_motion_store.load(), 0, BbSettings::MotionStoreCount - 1);
+        ImGui::BeginDisabled(!s.object_motion);
+        const bool changed = ImGui::Combo(label, &mode, names, BbSettings::MotionStoreCount);
+        ImGui::EndDisabled();
+        Store(s.object_motion_store, mode, changed);
+        Hint(BbSettings::MenuText(
+            "How many animated vertices can get their own motion vectors each frame. A draw that "
+            "does not fit gets camera motion only, which can show as ghosting with DLSS. At one "
+            "heavy spot the small store left about 315 of 701 moving draws a frame out; the large "
+            "one stored every one, for about 0.05-0.1 ms and 128 MiB more graphics memory (256 MiB "
+            "in all). Auto: large, small on AMD cards with 8 GB of graphics memory or less. Needs "
+            "Character motion vectors. Applied when the game restarts.",
+            "Сколько анимированных вершин за кадр получают свои векторы движения. Отрисовка, "
+            "которая не поместилась, получает только движение камеры, что с DLSS может давать "
+            "шлейф. В одном тяжёлом месте малое хранилище оставляло без векторов около 315 из "
+            "701 движущейся отрисовки за кадр; большое вмещало все за 0.05-0.1 мс и на 128 МиБ "
+            "больше видеопамяти (всего 256 МиБ). Авто: большое, малое на картах AMD с 8 ГБ "
+            "видеопамяти и меньше. Нужны векторы движения персонажей. Применяется после перезапуска "
+            "игры."));
+        if (s.object_motion_store != s.startup_object_motion_store) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Applied when the game restarts.",
+                                                           "Применяется после перезапуска игры."));
+        }
+        // bbport (r39_master-debug): engine_previous_paths on at the start made the small store,
+        // whatever this row says (a set BB_OBJECT_MOTION_VERTICES decides over both).
+        if (const char* env = std::getenv("BB_OBJECT_MOTION_VERTICES");
+            s.startup_engine_previous_paths && !(env && *env)) {
+            ImGui::PushTextWrapPos();
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Previous engine paths (debug tab) was on when the game "
+                                                           "started: the small store is in use.",
+                                                           "«Прежние пути движка» (вкладка «отладка») было включено при "
+                                                           "запуске игры: используется малое хранилище."));
+            ImGui::PopTextWrapPos();
+        }
+        EnvNote("BB_OBJECT_MOTION_VERTICES");
     }
     if (const char* label = Item("Show motion vectors (debug)", "Показать векторы движения (отладка)")) {
         bool show_motion = s.debug_view == BbSettings::DebugMotion;
@@ -2583,12 +3023,18 @@ void Menu() {
         BbSettings::AoNeedsRestart() ||
         s.graphics_shadow_resolution != s.startup_shadow_resolution ||
         s.graphics_local_shadow_resolution != s.startup_local_shadow_resolution ||
+        s.graphics_sun_far_shadows != s.startup_sun_far_shadows || // bbport (r15_far-shadow-setting)
+        s.object_motion_store != s.startup_object_motion_store || // bbport (r37_menu-options)
+        s.engine_previous_paths != s.startup_engine_previous_paths || // bbport (r39_master-debug)
         BbSettings::ResolutionNeedsRestart();
     for (int e = 0; e < BbSettings::EffectCount; ++e) {
         if (e == BbSettings::EffectSsao || e == BbSettings::EffectGtao) {
             continue;
         }
         restart |= BbSettings::EffectChangeNeedsRestart(e, s.effects[e], s.startup_effects[e]);
+    }
+    for (int d = 0; d < BbSettings::DebugSwitchCount; ++d) { // bbport (r39_master-debug)
+        restart |= s.debug_switches[d] != s.startup_debug_switches[d];
     }
     restart |= Vulkan::OptiScaler::Detect().loaded &&
                (s.optiscaler_compat != s.startup_optiscaler.compat ||

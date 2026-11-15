@@ -86,8 +86,17 @@ void Shutdown() {
 
 } // namespace LanternAntiLag
 
+// bbport: declared in vk_streamline_loader.h, which needs the engine's Vulkan setup
+// (vk_common.h) that this file's <vulkan/vulkan_core.h> would clash with.
+namespace Vulkan::Streamline {
+void BeforeGameInput();
+}
+
 extern "C" void bbgpu_anti_lag_before_input(void) {
     using namespace LanternAntiLag;
+    // bbport: NVIDIA Reflex's sleep (Streamline, DLSS Frame Generation) has the same place: before
+    // the game reads its input (vk_streamline.cpp, "Reflex frame numbers").
+    Vulkan::Streamline::BeforeGameInput();
     if (!running.load(std::memory_order_acquire)) {
         return;
     }

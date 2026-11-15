@@ -31,6 +31,9 @@ public:
     void Generate(VideoCore::ImageId source);
     float Composite(const Shader::Info& fragment,
                     std::span<vk::DescriptorImageInfo> image_infos);
+    /// bbport: before a draw's targets: a Froyok composite's pyramid waiting since the
+    /// recombination (Generate) is built now.
+    void BeforeComposite(const Shader::Info* fragment);
 
 private:
     struct Image {
@@ -77,6 +80,14 @@ private:
     bool tried{}, failed{}, ready{}, reported{};
     std::array<ViewEntry, 4> view_cache{};
     u64 view_uses = 0;
+    // bbport: no Froyok composite in this many frames: the pyramid waits for one (Generate).
+    static constexpr u64 LazyFrames = 60;
+    u64 frames = 0, composite_frame = 0;
+    VideoCore::ImageId pending{};
+    u64 pending_uid = 0;
+    // The line printed every 600 frames (BB_GPU_PROFILE or BB_FRAME_STATS).
+    u32 stat_built = 0, stat_late = 0, stat_unread = 0, stat_waiting = 0, stat_proxy = 0,
+        stat_composites = 0, stat_without = 0;
 };
 
 } // namespace Vulkan

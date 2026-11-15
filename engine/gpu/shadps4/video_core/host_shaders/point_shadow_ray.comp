@@ -9,19 +9,31 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(scalar, set = 0, binding = 0) readonly buffer Data { uint d[]; } data;
 layout(set = 0, binding = 1) uniform sampler2D depth_tex;
 layout(set = 0, binding = 2, r11f_g11f_b10f) uniform image2D cur0;
-layout(set = 0, binding = 3, r11f_g11f_b10f) uniform readonly image2D snap0;
+// snap0, snap1: the light targets as they were before the lamps were drawn; with MODE_APART the
+// lamps' light alone (drawn there instead of into the light targets), which this pass moves into
+// the light targets and zeroes.
+layout(set = 0, binding = 3, r11f_g11f_b10f) uniform image2D snap0;
 layout(set = 0, binding = 4, r11f_g11f_b10f) uniform image2D cur1;
-layout(set = 0, binding = 5, r11f_g11f_b10f) uniform readonly image2D snap1;
+layout(set = 0, binding = 5, r11f_g11f_b10f) uniform image2D snap1;
 layout(set = 0, binding = 6) uniform accelerationStructureEXT scene;
 layout(set = 0, binding = 7, rgba16f) uniform readonly image2D history_prev;
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D history_cur;
+#ifdef HALF
+// bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 only (the point_shadow_ray_half_comp build).
+// half_answers: one texel per 2x2 block, written by the first pass: (shadow ratio, view depth,
+// normal in octahedral form); a ratio below 0: no answer for the block. half_counts: what the
+// two passes did (PointShadow::OnFrameEnd prints it).
+layout(set = 0, binding = 9, rgba16f) uniform image2D half_answers;
+layout(scalar, set = 0, binding = 10) buffer HalfCounts { uint n[]; } half_counts;
+uint half_rays = 0u; // rays this invocation cast (visibility)
+#endif
 
 layout(push_constant) uniform Constants {
     uint first_light;
     uint frame_index;
     vec2 size;
     float length_m;
-    float thickness_m;
+    uint mode; // the screen-space pass has its thickness here
     float strength;
     float fade_start_m;
     float fade_end_m;
@@ -72,8 +84,12 @@ float visibility(vec3 origin, float reach, vec3 L) {
     if (!(tmax > reach)) {
         return 1.0;
     }
+#ifdef HALF
+    ++half_rays;
+#endif
     rayQueryEXT query;
-    rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0xffu,
+    // 0x04: everything but cut-out cards (vk_rt_shadow.cpp LampMask).
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0x04u,
                           origin, reach * 0.5, ray_to / ray_len, tmax);
     rayQueryProceedEXT(query);
     return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT ? 1.0
@@ -86,6 +102,7 @@ bool inside(uint tile, ivec2 lo, ivec2 hi) {
     return r.x < hi.x && lo.x < r.z && r.y < hi.y && lo.y < r.w;
 }
 
+const uint MODE_APART = 1u;
 const uint HISTORY_READ = 1u;
 const uint HISTORY_WRITE = 2u;
 const float STABLE_FRAMES = 3.0;
@@ -93,15 +110,135 @@ const float STABLE_CHANGE = 0.05;
 
 shared uint group_trace;
 
+#ifdef HALF
+// bbport (r32_lamp-half): more bits of `mode` (vk_point_shadow.cpp ModeHalf*).
+const uint MODE_HALF_FIRST = 2u; // pixel (2x, 2y) of each 2x2 block, 16x16 pixels a workgroup
+const uint MODE_HALF_FILL = 4u;  // the other three pixels of each block
+const uint MODE_HALF_COUNT = 8u; // count this pass (half_counts)
+// Second-pass answers to "take the block's answer?" (HalfAnswer); 4: a first-pass pixel.
+const uint HALF_TAKEN = 0u, HALF_NO_ANSWER = 1u, HALF_DIFFER = 2u, HALF_SURFACE = 3u,
+           HALF_FIRST_PIXEL = 4u;
+const float HALF_AGREE = 1.0 / 64.0;
+
+vec2 OctEncode(vec3 v) {
+    v /= abs(v.x) + abs(v.y) + abs(v.z);
+    const vec2 s = vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+    return v.z >= 0.0 ? v.xy : (1.0 - abs(v.yx)) * s;
+}
+
+vec3 OctDecode(vec2 e) {
+    vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    const vec2 s = vec2(v.x >= 0.0 ? 1.0 : -1.0, v.y >= 0.0 ? 1.0 : -1.0);
+    if (v.z < 0.0) {
+        v.xy = (1.0 - abs(v.yx)) * s;
+    }
+    return normalize(v);
+}
+
+// Second pass: whether this pixel can take the first pass's answer of its 2x2 block (v), and if
+// not, why. Not exact: a caster thinner than two pixels between the first-pass pixels of a
+// uniform neighbourhood is missed. Every block read here was written by this batch's first pass
+// (its dispatch covers the rect's blocks, and it stores an answer or -1 for each).
+uint HalfAnswer(ivec2 px, float z, vec3 n, out float v) {
+    v = 1.0;
+    const ivec2 block = px >> 1;
+    const ivec2 lo = rect.xy >> 1;
+    const ivec2 hi = (rect.zw - 1) >> 1;
+    const vec4 own = imageLoad(half_answers, block);
+    if (!(own.x >= 0.0)) {
+        return HALF_NO_ANSWER;
+    }
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const float q = imageLoad(half_answers, clamp(block + ivec2(x, y), lo, hi)).x;
+            if (!(q >= 0.0)) {
+                return HALF_NO_ANSWER;
+            }
+            if (abs(q - own.x) > HALF_AGREE) {
+                return HALF_DIFFER;
+            }
+        }
+    }
+    // The block's pixel on the same surface: the history's depth tolerance, normals within
+    // about 25 degrees.
+    if (!(abs(own.y - z) < 0.03 * z + 0.02) || !(dot(OctDecode(own.zw), n) > 0.9)) {
+        return HALF_SURFACE;
+    }
+    v = own.x;
+    return HALF_TAKEN;
+}
+
+// half_counts words: 0 counted second passes, 1 first-pass pixels traced, 2 their rays, 3
+// first-pass pixels from history, 4 second-pass pixels that took the first pass's answer, 5
+// second-pass pixels traced, 6 their rays, 7 second-pass pixels from history, 8 second-pass
+// workgroups with a lamp-shadowed pixel, 9 of those with no ray, 10-12 why second-pass pixels
+// were traced (HALF_NO_ANSWER, HALF_DIFFER, HALF_SURFACE).
+const uint HALF_SLOTS = 13u;
+shared uint half_n[HALF_SLOTS];
+shared uint half_done;
+
+// Every invocation of a workgroup that got past its tile list calls this once; the last one
+// adds the workgroup's counts to half_counts.
+void HalfCount(bool first, uint slot, uint why) {
+    if ((mode & MODE_HALF_COUNT) == 0u) {
+        return;
+    }
+    if (slot != 0u) {
+        atomicAdd(half_n[slot], 1u);
+    }
+    if (half_rays != 0u) {
+        atomicAdd(half_n[first ? 2u : 6u], half_rays);
+    }
+    if (!first && why >= HALF_NO_ANSWER && why <= HALF_SURFACE) {
+        atomicAdd(half_n[9u + why], 1u);
+    }
+    memoryBarrierShared();
+    if (atomicAdd(half_done, 1u) != 63u) {
+        return;
+    }
+    memoryBarrierShared();
+    for (uint i = 1u; i < HALF_SLOTS; ++i) {
+        const uint v = atomicAdd(half_n[i], 0u);
+        if (v != 0u) {
+            atomicAdd(half_counts.n[i], v);
+        }
+    }
+    if (!first && atomicAdd(half_n[4], 0u) + atomicAdd(half_n[5], 0u) + atomicAdd(half_n[7], 0u) != 0u) {
+        atomicAdd(half_counts.n[8], 1u);
+        if (atomicAdd(half_n[6], 0u) == 0u) {
+            atomicAdd(half_counts.n[9], 1u);
+        }
+    }
+}
+#endif
+
 void main() {
     if (gl_LocalInvocationIndex == 0u) {
         shared_inverse = transpose(mat4(row(0u), row(4u), row(8u), row(12u)));
         group_count = 0u;
         group_trace = 0u;
+#ifdef HALF
+        for (uint i = 0u; i < HALF_SLOTS; ++i) {
+            half_n[i] = 0u;
+        }
+        half_done = 0u;
+        if ((mode & (MODE_HALF_FILL | MODE_HALF_COUNT)) == (MODE_HALF_FILL | MODE_HALF_COUNT) &&
+            gl_WorkGroupID.xy == uvec2(rect.xy) >> 3u) {
+            atomicAdd(half_counts.n[0], 1u); // one counted pass (its first workgroup)
+        }
+#endif
     }
     barrier();
+#ifdef HALF
+    // bbport (r32_lamp-half): a first-pass workgroup covers 16x16 pixels.
+    const bool first = (mode & MODE_HALF_FIRST) != 0u, fill = (mode & MODE_HALF_FILL) != 0u;
+    const int span = first ? 16 : 8;
+    const ivec2 group_lo = ivec2(gl_WorkGroupID.xy) * span;
+    const ivec2 group_hi = group_lo + span;
+#else
     const ivec2 group_lo = ivec2(gl_WorkGroupID.xy) * 8;
     const ivec2 group_hi = group_lo + 8;
+#endif
     for (uint t = gl_LocalInvocationIndex; t < light_count; t += 64u) {
         if (inside(t, group_lo, group_hi)) {
             const uint slot = atomicAdd(group_count, 1u);
@@ -113,6 +250,11 @@ void main() {
     barrier();
     const uint listed = group_count;
     if (listed == 0u) {
+#ifdef HALF
+        if (first) {
+            imageStore(half_answers, ivec2(gl_GlobalInvocationID.xy), vec4(-1.0)); // no answer
+        }
+#endif
         return;
     }
     const bool overflow = listed > MAX_GROUP_TILES;
@@ -120,31 +262,58 @@ void main() {
     const uint history_at = floatBitsToUint(length_m);
     const uint history_flags = history_at != 0u ? data.d[history_at] : 0u;
 
+#ifdef HALF
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy) * (first ? 2 : 1);
+#else
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+#endif
     bool live = px.x >= rect.x && px.y >= rect.y && px.x < rect.z && px.y < rect.w;
-    vec3 s0 = vec3(0.0), c0 = vec3(0.0), s1 = vec3(0.0), c1 = vec3(0.0);
-    if (live) {
+#ifdef HALF
+    // The second pass leaves pixel (2x, 2y) of each block to the first (which also moved its
+    // lamp light: its lamp texels are zero now, so it is not `lit` here either).
+    const bool done_first = fill && ((px.x | px.y) & 1) == 0;
+    live = live && !done_first;
+#endif
+    // s: the light without the lamps, d: the lamps' light.
+    vec3 s0 = vec3(0.0), d0 = vec3(0.0), s1 = vec3(0.0), d1 = vec3(0.0);
+    const bool apart = (mode & MODE_APART) != 0u;
+    // apart: the pixel has lamp light to move into the light targets, shadowed or not.
+    bool lit = false;
+    if (apart) {
+        if (px.x < int(size.x) && px.y < int(size.y)) {
+            d0 = imageLoad(snap0, px).rgb;
+            d1 = imageLoad(snap1, px).rgb;
+            lit = any(notEqual(d0, vec3(0.0))) || any(notEqual(d1, vec3(0.0)));
+        }
+        if (lit) {
+            s0 = imageLoad(cur0, px).rgb;
+            s1 = imageLoad(cur1, px).rgb;
+        }
+        live = live && lit;
+    } else if (live) {
         s0 = imageLoad(snap0, px).rgb;
-        c0 = imageLoad(cur0, px).rgb;
         s1 = imageLoad(snap1, px).rgb;
-        c1 = imageLoad(cur1, px).rgb;
+        const vec3 c0 = imageLoad(cur0, px).rgb;
+        const vec3 c1 = imageLoad(cur1, px).rgb;
         live = !(all(lessThanEqual(c0, s0)) && all(lessThanEqual(c1, s1)));
+        d0 = max(c0 - s0, vec3(0.0));
+        d1 = max(c1 - s1, vec3(0.0));
     }
     const vec2 uv = (vec2(px) + 0.5) / size;
     vec3 P = vec3(0.0);
     float fade = 0.0;
     if (live) {
-        const float d0 = textureLod(depth_tex, uv, 0.0).x;
-        live = d0 < 1.0 && d0 > 0.0;
+        const float depth = textureLod(depth_tex, uv, 0.0).x;
+        live = depth < 1.0 && depth > 0.0;
         if (live) {
-            P = viewPosAt(uv, d0);
+            P = viewPosAt(uv, depth);
             live = P.z > 0.0;
             fade = 1.0 - smoothstep(fade_start_m, fade_end_m, P.z);
             live = live && fade > 0.0;
         }
     }
     if (live) {
-        const vec3 delta = max(c0 - s0, vec3(0.0)) + max(c1 - s1, vec3(0.0));
+        const vec3 delta = d0 + d1;
         const vec3 base_light = s0 + s1;
         live = max(max(delta.r, delta.g), delta.b) * strength * fade >
                  max(max(base_light.r, base_light.g), base_light.b) * (1.0 / 512.0) + 1e-7;
@@ -253,12 +422,37 @@ void main() {
         atomicOr(group_trace, 1u);
     }
     barrier();
+#ifdef HALF
     if (!live) {
+        if (first) {
+            imageStore(half_answers, px >> 1, vec4(-1.0)); // no answer
+        }
+        HalfCount(first, 0u, 0u);
+    }
+#endif
+    if (!live) {
+        if (lit) {
+            // Lamp light that gets no shadow (sky, too far, too weak, no lamp in reach).
+            imageStore(cur0, px, vec4(s0 + d0, 1.0));
+            imageStore(cur1, px, vec4(s1 + d1, 1.0));
+            imageStore(snap0, px, vec4(0.0));
+            imageStore(snap1, px, vec4(0.0));
+        }
         return;
     }
     float ratio;
     float stable;
+#ifdef HALF
+    uint half_why = 0u; // traced: why (HalfAnswer, or HALF_FIRST_PIXEL); 0 not traced
+#endif
     if (group_trace != 0u) {
+#ifdef HALF
+        float taken = 1.0;
+        half_why = fill ? HalfAnswer(px, P.z, n, taken) : HALF_FIRST_PIXEL;
+        if (half_why == HALF_TAKEN) {
+            vsum = taken * wsum; // the block's answer, in place of this pixel's rays
+        } else
+#endif
         if (exact) {
             if (exact_pending) {
                 for (uint i = 0u; i < tile_count; ++i) {
@@ -307,6 +501,19 @@ void main() {
         imageStore(history_cur, px, vec4(ratio, P.z, stable, 1.0));
     }
     const float scale = mix(1.0, ratio, strength * fade);
-    imageStore(cur0, px, vec4(s0 + max(c0 - s0, vec3(0.0)) * scale, 1.0));
-    imageStore(cur1, px, vec4(s1 + max(c1 - s1, vec3(0.0)) * scale, 1.0));
+    imageStore(cur0, px, vec4(s0 + d0 * scale, 1.0));
+    imageStore(cur1, px, vec4(s1 + d1 * scale, 1.0));
+    if (apart) {
+        imageStore(snap0, px, vec4(0.0));
+        imageStore(snap1, px, vec4(0.0));
+    }
+#ifdef HALF
+    if (first) {
+        imageStore(half_answers, px >> 1,
+                   n == vec3(0.0) ? vec4(-1.0) : vec4(ratio, P.z, OctEncode(n)));
+    }
+    const uint slot = group_trace == 0u ? (first ? 3u : 7u)
+                                        : (first ? 1u : (half_why == HALF_TAKEN ? 4u : 5u));
+    HalfCount(first, slot, half_why);
+#endif
 }

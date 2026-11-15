@@ -102,6 +102,25 @@ typedef int (*BackingMaker)(uint64_t phys, uint64_t size);
 
 uint64_t runtime_disabled_optimizations;
 uint64_t runtime_experiment_bits;
+// bbport (r39_master-debug): the word BbToggle::Experiment loads (one load of one word, as
+// before) is the experiment bits of BB_TOGGLE_FILE ORed with the bits the engine_previous_paths
+// setting forces. It is composed here, where it is written: each writer (the watcher thread for
+// the file; the start and the menu thread for the forced bits) stores its part and publishes the
+// OR under one lock that only writers take, so the word is always the OR of the two newest
+// parts, whichever thread wrote last.
+static HostMutex experiment_lock = HOST_MUTEX_INIT;
+static uint64_t experiment_file_bits, experiment_forced_bits; // under experiment_lock
+
+static void experiment_publish(uint64_t *part, uint64_t bits) {
+    host_lock(&experiment_lock);
+    *part = bits;
+    __atomic_store_n(&runtime_experiment_bits, experiment_file_bits | experiment_forced_bits, __ATOMIC_RELEASE);
+    host_unlock(&experiment_lock);
+}
+
+void runtime_experiment_force(uint64_t bits) {
+    experiment_publish(&experiment_forced_bits, bits);
+}
 __thread RuntimeRecoverBuf *runtime_fault_recover;
 
 static HostRwlock table_lock = HOST_RWLOCK_INIT;
@@ -1071,7 +1090,7 @@ static void *toggle_watch(void *path) {
             if (fscanf(file, "%llu %llu", &value, &experiment) < 1) value = 0;
             fclose(file);
         }
-        __atomic_store_n(&runtime_experiment_bits, (uint64_t)experiment, __ATOMIC_RELEASE);
+        experiment_publish(&experiment_file_bits, (uint64_t)experiment); // bbport (r39_master-debug)
         if (value != last) {
             __atomic_store_n(&runtime_disabled_optimizations, (uint64_t)value, __ATOMIC_RELEASE);
             printf("Runtime: disabled optimizations mask=%llu\n", value);

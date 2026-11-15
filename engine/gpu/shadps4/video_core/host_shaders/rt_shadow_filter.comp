@@ -10,11 +10,18 @@ layout(set = 0, binding = 1) uniform sampler2D depth_tex;
 layout(set = 0, binding = 2) uniform sampler2D raw_tex;
 layout(set = 0, binding = 3, rgba8) uniform image2D shadow_img;
 layout(scalar, set = 0, binding = 4) readonly buffer Ub { uint d[]; } ubuf;
+#ifdef R25
+// bbport (r25_rt-sun-trace): counters (as rt_shadow.comp's; RtShadow::Record prints them).
+layout(scalar, set = 0, binding = 5) buffer R25Counts { uint n[]; } r25_buf;
+#endif
 
 layout(push_constant) uniform Constants {
     uint buf_off;
     int radius;
     vec2 size;
+#ifdef R25
+    uint r25_flags; // bbport (r25_rt-sun-trace): 1 the exact saving below, 2 count this frame
+#endif
 };
 
 uint base;
@@ -34,6 +41,117 @@ float viewZAt(vec2 uv, float depth) {
     return dot(invZ, c) / dot(invW, c);
 }
 
+#ifdef R25
+// bbport (r25_rt-sun-trace): r25_flags bits, as rt_shadow.comp's.
+const uint R25_EXACT = 1u, R25_COUNT = 2u;
+// What a pixel needed (FilterPixel's answer).
+const uint F_NONE = 0u, F_SKY = 1u, F_FAR = 2u, F_BLUR = 3u, F_PLAIN = 4u;
+
+// The filter for one pixel, as before; each return now gives what the pixel needed.
+uint FilterPixel(ivec2 pixel) {
+    if (any(greaterThanEqual(pixel, ivec2(size)))) {
+        return F_NONE;
+    }
+    const vec2 px = 1.0 / size;
+    const vec2 uv = (vec2(pixel) + 0.5) * px;
+    const float d0 = textureLod(depth_tex, uv, 0.0).x;
+    if (!(d0 < 1.0) || !(d0 > 0.0)) {
+        return F_SKY;
+    }
+    invMat = transpose(mat4(row(0), row(4), row(8), row(12)));
+    const uint ub = ((buf_off >> 8) & 0xffu) >> 2;
+    const float fade = clamp(uintBitsToFloat(ubuf.d[ub + 73u]) *
+                                 (uintBitsToFloat(ubuf.d[ub + 72u]) -
+                                  length(viewPosAt(uv, d0))),
+                             0.0, 1.0);
+    if ((r25_flags & R25_EXACT) != 0u && fade == 0.0) {
+        // r25 exact saving: lit = 1 - 0 * (1 - vis) is 1 for every vis in [0, 1] (the ray
+        // result is R8 unorm and the blur a weighted mean of it), so neither the ray result nor
+        // the blur is read. rt_shadow.comp's Shade stores nothing for pixels only such pixels
+        // would read.
+        vec4 c = imageLoad(shadow_img, pixel);
+        c.a = 1.0;
+        imageStore(shadow_img, pixel, c);
+        return F_FAR;
+    }
+    float center = textureLod(raw_tex, uv, 0.0).x;
+    float low = center, high = center;
+    const vec4 near = textureGather(raw_tex, uv + 0.5 * px, 0);
+    const vec4 far = textureGather(raw_tex, uv - 0.5 * px, 0);
+    low = min(low, min(min(near.x, near.y), min(near.z, min(far.x, min(far.y, far.w)))));
+    high = max(high, max(max(near.x, near.y), max(near.z, max(far.x, max(far.y, far.w)))));
+    float vis = center;
+    invZ = vec4(invMat[0][2], invMat[1][2], invMat[2][2], invMat[3][2]);
+    invW = vec4(invMat[0][3], invMat[1][3], invMat[2][3], invMat[3][3]);
+    const float z0 = viewZAt(uv, d0);
+    bool blurred = false;
+    if (high - low > 0.001 && radius > 0) {
+        blurred = true;
+        const float tolerance = 0.03 + 0.012 * z0;
+        float sum = center;
+        float weight = 1.0;
+        for (int y = -radius; y <= radius; ++y) {
+            for (int x = -radius; x <= radius; ++x) {
+                if (x == 0 && y == 0) {
+                    continue;
+                }
+                const vec2 at = uv + vec2(x, y) * px;
+                const float z = viewZAt(at, textureLod(depth_tex, at, 0.0).x);
+                const float gap = abs(z - z0) / tolerance;
+                const float w = max(1.0 - gap, 0.0) / (1.0 + float(x * x + y * y) * 0.25);
+                sum += textureLod(raw_tex, at, 0.0).x * w;
+                weight += w;
+            }
+        }
+        vis = sum / weight;
+    }
+    vec4 c = imageLoad(shadow_img, pixel);
+    const float lit = 1.0 - fade * (1.0 - vis);
+    c.a = lit;
+    imageStore(shadow_img, pixel, c);
+    return fade == 0.0 ? F_FAR : (blurred ? F_BLUR : F_PLAIN);
+}
+
+// r25 counters, r25_buf words: 0 frames counted, 9 pixels with fade 0, 10 blurred (fade > 0),
+// 11 plain (fade > 0), 12 workgroups with no pixel of fade > 0 (no ray result read with
+// R25_EXACT), 13 workgroups with a pixel of the image. Words 1-8: rt_shadow.comp.
+shared uint r25_n[4];
+
+void main() {
+    base = (buf_off & 0xffu) >> 2;
+    const bool count = (r25_flags & R25_COUNT) != 0u;
+    const uint me = gl_LocalInvocationIndex;
+    if (count) {
+        if (me < 4u) {
+            r25_n[me] = 0u;
+        }
+        barrier();
+    }
+    const uint cls = FilterPixel(ivec2(gl_GlobalInvocationID.xy));
+    if (count) {
+        if (cls >= F_FAR) {
+            atomicAdd(r25_n[cls - F_FAR], 1u);
+        }
+        if (cls != F_NONE) {
+            atomicOr(r25_n[3], 1u);
+        }
+        memoryBarrierShared();
+        barrier();
+        if (me < 3u && r25_n[me] != 0u) {
+            atomicAdd(r25_buf.n[9u + me], r25_n[me]);
+        }
+        if (me == 3u && r25_n[3] != 0u) {
+            atomicAdd(r25_buf.n[13], 1u);
+            if (r25_n[1] + r25_n[2] == 0u) {
+                atomicAdd(r25_buf.n[12], 1u);
+            }
+        }
+        if (me == 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u) {
+            atomicAdd(r25_buf.n[0], 1u);
+        }
+    }
+}
+#else
 void main() {
     base = (buf_off & 0xffu) >> 2;
     const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
@@ -86,3 +204,4 @@ void main() {
     c.a = lit;
     imageStore(shadow_img, pixel, c);
 }
+#endif

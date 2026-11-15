@@ -15,6 +15,7 @@
 #include "video_core/host_shaders/volumetric_light_integrate_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_comp.h"
 #include "video_core/host_shaders/volumetric_light_tint_comp.h"
+#include "bbport_toggles.h"
 #include "video_core/host_shaders/volumetric_light_composite_comp.h"
 #include "video_core/host_shaders/volumetric_light_filter_comp.h"
 #include "video_core/host_shaders/point_volumetric_comp.h"
@@ -35,15 +36,17 @@ constexpr u32 FogBytes = FogLightsAt + FogMaxLights * 64;
 static_assert(FogBytes <= 65536, "vkCmdUpdateBuffer takes at most 64 KiB");
 struct Params {
     u32 offsets, steps;
-    float reach, density, strength, anisotropy, bias, tilt;
+    float reach, density, strength, anisotropy, bias;
+    u32 cascades; // sun atlas cascades drawn in full (SetAtlasCascades)
 };
 static_assert(sizeof(Params) == 32);
 struct TintParams {
     u32 offset_bytes, record_count;
     float blend;
     u32 skip_fallback;
+    u32 serial; // 1: the old one-thread loop (experiment bit 134217728)
 };
-static_assert(sizeof(TintParams) == 16);
+static_assert(sizeof(TintParams) == 20);
 // The fog's color moves 95% of the way to a new value in about 1.5 s (three time constants). After
 // a longer gap than this (the first frame, a load) there is no earlier color worth fading from.
 constexpr float TintFadeConstant = 0.5f, TintSnapAfter = 1.0f;
@@ -241,6 +244,7 @@ void VolumetricLight::Integrate(VideoCore::ImageId shadow_target,
                                 const vk::DescriptorImageInfo& depth,
                                 const ContactShadow::Inputs& in) {
     Reset();
+    atlas_reach = 0.0f;
     if (!Enabled() || !shadow_target || !depth.imageView || !in.shadow_map ||
         !in.constants || !in.uniforms) return;
     if (in.constants_range < (in.constants_offset_word & 255u) + 336u ||
@@ -270,7 +274,8 @@ void VolumetricLight::Integrate(VideoCore::ImageId shadow_target,
         float(BbSettings::Get().effects[BbSettings::EffectVolumetricLight].load(
             std::memory_order_relaxed));
     const Params params{in.constants_offset_word, steps, reach, density, live_strength,
-                        anisotropy, 0.02f, 0.0f};
+                        anisotropy, 0.02f, std::min<u32>(atlas_cascades, 4)};
+    atlas_reach = live_strength > 0.0f ? reach : 0.0f;
     const vk::DescriptorImageInfo di{*sampler, depth.imageView, depth.imageLayout};
     const vk::DescriptorImageInfo si{*sampler, in.shadow_map, in.shadow_layout};
     const vk::DescriptorImageInfo out{{}, *fog_view, vk::ImageLayout::eGeneral};
@@ -370,7 +375,18 @@ void VolumetricLight::Tint(const vk::DescriptorBufferInfo& lighting, u32 offset_
     const TintParams params{
         offset_bytes, u32(std::min<vk::DeviceSize>((lighting.range - offset_bytes) / RecordBytes, 256)),
         steady && seconds <= TintSnapAfter ? 1.0f - std::exp(-seconds / TintFadeConstant) : 1.0f,
-        steady ? 1u : 0u};
+        steady ? 1u : 0u,
+        // bbport: one GPU thread per record and a reduction in shared memory, which picks the
+        // same record bit for bit. The old single thread walked the records one load round trip
+        // after another while the GPU waited (0.09-0.13 ms with ray tracing on). Experiment bit
+        // 134217728 restores it.
+        BbToggle::Experiment(134217728) ? 1u : 0u};
+    static int tint_serial_reported = -1;
+    if (tint_serial_reported != int(params.serial)) {
+        tint_serial_reported = int(params.serial);
+        std::printf("Volumetric lighting: tint over %u records, %s\n", params.record_count,
+                    params.serial ? "one thread for all (old)" : "one thread per record");
+    }
     scheduler.EndRendering();
     const vk::DescriptorBufferInfo state{tint_state->Handle(), 0, 16};
     EffectPass::Mark(8, "volumetric tint");

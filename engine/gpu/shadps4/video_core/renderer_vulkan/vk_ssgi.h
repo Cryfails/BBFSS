@@ -77,6 +77,28 @@ private:
 
     Pass prep, gather, gather_ray, denoise, composite, probe_trace, probe_composite;
     Pass probe_reflect, probe_resolve;
+    // bbport (r30_ssgi-half, r37_menu-options): the full-resolution glossy rays traced once per
+    // flat 2x2 block (ssgi_probe.comp REFLECT and RESOLVE with HALF; changes the picture), while
+    // BB_SSGI_HALF=1 or, with the variable not set, while lantern.ini's
+    // graphics_gi_reflections_fewer_rays is (read every frame; HalfReady makes the pipelines the
+    // first time a frame wants them). Counters in a device-local buffer,
+    // copied to the host on counted frames (1 in 8); a line every 600 frames.
+    struct HalfBuffer {
+        vk::Buffer buffer;
+        VmaAllocation allocation{};
+        void* mapped = nullptr;
+    };
+    static constexpr u32 HalfSlots = 16;
+    int half_env = -1;       ///< BB_SSGI_HALF: -1 not set, 1 for "1", 0 for anything else
+    bool half_tried = false; ///< HalfReady made its attempt
+    bool half_made = false;  ///< the half pipelines and counters exist
+    bool HalfReady();
+    bool half_cleared = false;
+    u64 half_recorded = 0;
+    u32 half_frames = 0;
+    Pass probe_reflect_half, probe_resolve_half;
+    HalfBuffer half_counts, half_readback;
+    std::array<u32, HalfSlots> half_last{};
     OwnImage geo;
     std::array<OwnImage, 2> light;
     std::array<OwnImage, 2> filtered;

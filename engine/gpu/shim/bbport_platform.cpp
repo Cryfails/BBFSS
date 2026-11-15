@@ -5,11 +5,13 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 #include <windows.h>
 #include <psapi.h>
 #include "bbport_platform.h"
+#include "bbport_settings.h" // bbport (r39_master-debug)
 #include "bbport_threads.h"
 
 namespace BbPlatform {
@@ -176,6 +178,99 @@ void MakeCritical(bool bulk) {
 
 unsigned CapSpinUs(unsigned wanted) {
     return Raising() && Available() < 16 ? std::min(wanted, 50u) : wanted;
+}
+
+namespace {
+// bbport: the logical CPUs of the core group with the largest L3 cache, when the groups differ
+// (AMD X3D processors with two core groups: only one has the stacked cache). 0 = no placement.
+// Measured on a 7900X3D at a heavy spot: Windows ran the GPU pipeline threads on the small-cache
+// group; on the large-cache group stage B needs 1.93 instead of 2.32 us per packet (72% busy
+// instead of 87%). BB_GPU_CCD=off disables it, BB_GPU_CCD=0x<mask> names the logical CPUs.
+DWORD_PTR GpuThreadMask() {
+    static const DWORD_PTR chosen = []() -> DWORD_PTR {
+        DWORD_PTR process = 0, system = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system) || !process) {
+            return 0;
+        }
+        const char* env = std::getenv("BB_GPU_CCD");
+        if (env && (!std::strcmp(env, "off") || !std::strcmp(env, "0"))) {
+            return 0;
+        }
+        DWORD_PTR mask = 0;
+        if (env && env[0] == '0' && (env[1] == 'x' || env[1] == 'X')) {
+            mask = static_cast<DWORD_PTR>(std::strtoull(env, nullptr, 16));
+        } else {
+            DWORD length = 0;
+            GetLogicalProcessorInformationEx(RelationCache, nullptr, &length);
+            if (!length) {
+                return 0;
+            }
+            std::vector<char> buffer(length);
+            if (!GetLogicalProcessorInformationEx(
+                    RelationCache,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buffer.data()),
+                    &length)) {
+                return 0;
+            }
+            DWORD largest = 0, smallest = ~DWORD{0};
+            for (DWORD at = 0; at < length;) {
+                const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+                    buffer.data() + at);
+                if (!entry->Size) {
+                    break;
+                }
+                if (entry->Relationship == RelationCache && entry->Cache.Level == 3 &&
+                    entry->Cache.GroupMask.Group == 0) {
+                    const DWORD size = entry->Cache.CacheSize;
+                    if (size > largest) {
+                        largest = size;
+                        mask = entry->Cache.GroupMask.Mask;
+                    }
+                    smallest = std::min(smallest, size);
+                }
+                at += entry->Size;
+            }
+            if (!largest || smallest == largest) {
+                return 0; // one core group, or all alike: nothing to choose
+            }
+        }
+        mask &= process;
+        // Six pipeline threads: fewer than 8 logical CPUs would crowd them.
+        if (std::popcount(static_cast<unsigned long long>(mask)) < 8) {
+            return 0;
+        }
+        // bbport (r39_master-debug): engine_previous_paths on at the start: no placement, as
+        // before this was added (a set BB_GPU_CCD still decides). Asked here, after the choice,
+        // so the line is printed only where the threads would have been placed.
+        if (!(env && env[0]) && BbSettings::Get().startup_engine_previous_paths) {
+            std::printf("Threads: GPU pipeline threads not placed on logical CPUs 0x%llx "
+                        "(engine_previous_paths=1)\n",
+                        static_cast<unsigned long long>(mask));
+            return 0;
+        }
+        std::printf("Threads: GPU pipeline threads kept on logical CPUs 0x%llx (the core group with "
+                    "the largest L3 cache; BB_GPU_CCD=off disables)\n",
+                    static_cast<unsigned long long>(mask));
+        return mask;
+    }();
+    return chosen;
+}
+}
+
+void PlaceGpuThread(const char* name) {
+    static constexpr const char* kNames[] = {"shadPS4:GpuCommandProcessor", "bb:DrawRec",
+                                             "bb:DrawAhead", "bb:VkRecorder"};
+    if (!name) {
+        return;
+    }
+    for (const char* prefix : kNames) {
+        if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+            if (const DWORD_PTR mask = GpuThreadMask()) {
+                SetThreadAffinityMask(GetCurrentThread(), mask);
+            }
+            return;
+        }
+    }
 }
 
 }

@@ -43,6 +43,15 @@ namespace Vulkan {
 
 namespace {
 
+// bbport: BB_GPU_PROFILE sub-labels inside TemporalUpscaler::Run, so that its row is not read as
+// the upscaler alone: motion vectors, frame generation inputs, reactive mask, evaluation, merge,
+// and what follows Run up to the next label. Profiling only; nothing else changes.
+void MarkUpscalerPart(u64 part, const char* name) {
+    if (auto* profiler = GpuProfiler::Get()) {
+        profiler->Mark(0xF5A2'0000ull | part, [name] { return std::string{name}; });
+    }
+}
+
 FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 height,
                             vk::ImageUsageFlags usage, vk::ImageAspectFlags aspect,
                             FfxVkPortableResourceState state) {
@@ -593,6 +602,8 @@ void TemporalUpscaler::OnDispatch(u64 cs_hash) {
     if (cs_hash != trigger_hash) {
         return;
     }
+    // bbport: the consumer of the fills, resolves and drops below (SceneUse).
+    const SceneUseScope scene_use{"upscaler and HDR native at the trigger, cs", cs_hash};
     if (!done_this_frame && !failed && (!Scaled() || early_upscale)) {
         done_this_frame = true;
         // bbport: a frame with several G-buffer passes is a menu's 3D preview (character
@@ -830,8 +841,9 @@ void TemporalUpscaler::CreatePipelines() {
         return pipeline;
     };
     {
-        // Merge: three storage images, then the motion and object motion images (debug).
-        std::array<vk::DescriptorSetLayoutBinding, 5> bindings{};
+        // Merge: three storage images, then the motion and object motion images (debug) and
+        // the scene colour's proxy (its alpha).
+        std::array<vk::DescriptorSetLayoutBinding, 6> bindings{};
         for (u32 i = 0; i < bindings.size(); ++i) {
             bindings[i] = {.binding = i,
                            .descriptorType = i < 3 ? vk::DescriptorType::eStorageImage
@@ -846,7 +858,7 @@ void TemporalUpscaler::CreatePipelines() {
         }));
         const vk::PushConstantRange push{.stageFlags = vk::ShaderStageFlagBits::eCompute,
                                          .offset = 0,
-                                         .size = sizeof(u32)};
+                                         .size = 3 * sizeof(u32)}; // mode, sharpen, alpha
         merge_pipeline_layout = Check(device.createPipelineLayoutUnique({
             .setLayoutCount = 1,
             .pSetLayouts = &*merge_desc_layout,
@@ -1042,7 +1054,8 @@ void TemporalUpscaler::RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color,
     taa_next = 1 - taa_next;
 }
 
-void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
+// The sharpening applied on top of the upscaler's own (0 = none).
+static float ExtraSharpenStrength() {
     const auto& settings = BbSettings::Get();
     // FSR 3 and 4 sharpen up to 1 themselves (RCAS). DLSS has no sharpening of its own (NVIDIA
     // retired its Sharpness parameter), nor has XeSS-SR, so for them this pass applies the whole 0..2.
@@ -1051,7 +1064,12 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
                           ? 0.0f
                           : 1.0f;
     const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - own;
-    if (!settings.sharpen || extra <= 0.0f) {
+    return settings.sharpen && extra > 0.0f ? extra : 0.0f;
+}
+
+void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
+    const float extra = ExtraSharpenStrength();
+    if (extra <= 0.0f) {
         return;
     }
     const auto device = instance.GetDevice();
@@ -1379,6 +1397,22 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
     return true;
 }
 
+// bbport: with reduced scene targets the upscaler reads the proxies of the scene colour and
+// depth, but the native images were made current first: a resolve of each dirty proxy to the
+// output size (~0.07 ms colour, ~0.14 ms depth at 3840x2160). Only the merge's alpha (native
+// colour) and the UI depth blit (native depth) read them. Both now read the proxies: the merge
+// upscales the alpha as the resolve does, the UI depth blit is nearest from the proxy (what the
+// nearest resolve and the blit after it gave), and the merge's whole-image write leaves the native
+// colour current without a resolve. Experiment mask 131072 (or BB_PROXY_UPSCALE_INPUTS=0): the
+// native images, as before.
+static bool ProxyUpscalerInputs() {
+    static const bool env = [] {
+        const char* value = std::getenv("BB_PROXY_UPSCALE_INPUTS");
+        return !value || value[0] != '0';
+    }();
+    return env && !BbToggle::Experiment(131072);
+}
+
 void TemporalUpscaler::Run() {
     BB_SECTION(Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
@@ -1409,10 +1443,20 @@ void TemporalUpscaler::Run() {
         CachedView(color, vk::Format::eR16G16B16A16Sfloat, vk::ImageAspectFlagBits::eColor);
 
     scheduler.EndRendering();
-    runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
-                    vk::AccessFlagBits2::eShaderRead);
-    runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
-                    vk::AccessFlagBits2::eShaderRead);
+    // bbport: reduced inputs are the proxies (ProxyUpscalerInputs): the native depth is not read
+    // here, nor the native colour while its proxy is newer (the merge takes alpha from the proxy).
+    const bool proxy_inputs = reduced && ProxyUpscalerInputs();
+    const bool alpha_from_proxy = proxy_inputs && scene_targets.NativeStale(color);
+    if (!proxy_inputs) {
+        runtime.Transit(&depth, vk::ImageLayout::eGeneral,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+    }
+    if (!alpha_from_proxy) {
+        runtime.Transit(&color, vk::ImageLayout::eGeneral,
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                        vk::AccessFlagBits2::eShaderRead);
+    }
     runtime.FlushBarriers();
     vk::Image input_color = color.GetImage(), input_depth = depth.GetImage();
     vk::ImageView input_color_view = color_view, input_depth_view = depth_view;
@@ -1451,6 +1495,7 @@ void TemporalUpscaler::Run() {
     };
     const auto all = vk::PipelineStageFlagBits2::eAllCommands;
     const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+    MarkUpscalerPart(1, "upscaler: motion vectors");
     // Previous contents are not needed: the layouts start from undefined every frame.
     own_barrier(vk::Image(motion_image), vk::ImageLayout::eUndefined, all,
                 vk::AccessFlagBits2::eNone, vk::ImageLayout::eGeneral,
@@ -1462,8 +1507,10 @@ void TemporalUpscaler::Run() {
     own_barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral,
                 vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
                 vk::ImageLayout::eGeneral, all, vk::AccessFlagBits2::eShaderRead);
+    MarkUpscalerPart(2, "upscaler: frame generation inputs");
     CaptureFrameGenInputs(input_depth_view, w, h);
 
+    MarkUpscalerPart(3, "upscaler: reactive mask");
     const bool has_reactive = mask_ready || RecordReactive(input_color_view);
 
     const auto now = std::chrono::steady_clock::now();
@@ -1473,6 +1520,7 @@ void TemporalUpscaler::Run() {
     }
     last_frame = now;
 
+    MarkUpscalerPart(4, "upscaler: evaluate (DLSS, FSR, XeSS or TAA)");
     bool dispatched = false;
     BbSections::Scope eval_scope{BbSections::UpscalerEval};
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
@@ -1559,7 +1607,15 @@ void TemporalUpscaler::Run() {
     if (dispatched) {
         reset = false;
         dispatched_last_frame = true;
-        if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa) {
+        // bbport: the merge below applies the extra sharpen itself, reading the neighbours from
+        // the output (no 4K RGBA32F copy, no separate pass and its barriers). Experiment bit
+        // 65536 restores the separate pass.
+        const bool fold_sharpen = !BbToggle::Experiment(65536);
+        const float merge_sharpen =
+            BbSettings::Get().upscaler != BbSettings::UpscalerTaa && fold_sharpen
+                ? ExtraSharpenStrength()
+                : 0.0f;
+        if (BbSettings::Get().upscaler != BbSettings::UpscalerTaa && !fold_sharpen) {
             ExtraSharpen(vk::Image(output_image), false, ow, oh);
         }
         // bbport: BB_DUMP_TRIGGER on this (HDR scene color) path too: the upscaler's inputs and
@@ -1584,10 +1640,15 @@ void TemporalUpscaler::Run() {
                            {{object, w, h, 16, "objects", "rgba32f"}});
             }
         }
+        MarkUpscalerPart(5, "upscaler: merge");
         // The result replaces the scene color's RGB (its alpha carries data for the post).
         own_barrier(vk::Image(output_image), vk::ImageLayout::eGeneral, all, rw,
                     vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
                     vk::AccessFlagBits2::eShaderRead);
+        if (alpha_from_proxy) {
+            // The merge writes every pixel of it and reads alpha from the proxy.
+            scene_targets.NativeOverwritten(color);
+        }
         runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
         runtime.FlushBarriers();
@@ -1604,7 +1665,11 @@ void TemporalUpscaler::Run() {
         const vk::DescriptorImageInfo objects_info{
             .imageView = objects ? objects : *motion_view,
             .imageLayout = vk::ImageLayout::eGeneral};
-        const std::array<vk::WriteDescriptorSet, 5> writes = {{
+        // The scene colour's proxy for its alpha (alpha_from_proxy); else any image in eGeneral.
+        const vk::DescriptorImageInfo proxy_info{
+            .imageView = alpha_from_proxy ? input_color_view : *motion_view,
+            .imageLayout = vk::ImageLayout::eGeneral};
+        const std::array<vk::WriteDescriptorSet, 6> writes = {{
             {.dstBinding = 0,
              .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eStorageImage,
@@ -1625,6 +1690,10 @@ void TemporalUpscaler::Run() {
              .descriptorCount = 1,
              .descriptorType = vk::DescriptorType::eSampledImage,
              .pImageInfo = &objects_info},
+            {.dstBinding = 5,
+             .descriptorCount = 1,
+             .descriptorType = vk::DescriptorType::eSampledImage,
+             .pImageInfo = &proxy_info},
         }};
         // Debug (menu or toggle 1 << 28): the reactive mask in red over a darkened frame;
         // or the motion vectors (menu).
@@ -1637,9 +1706,19 @@ void TemporalUpscaler::Run() {
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *merge_pipeline);
         cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *merge_pipeline_layout, 0,
                                     writes);
+        // 0: the native scene colour's alpha; 1/2: the proxy's, upscaled linear/nearest as its
+        // resolve would.
+        const u32 alpha_source =
+            alpha_from_proxy ? (scene_targets.ResolvesLinear(color) ? 1u : 2u) : 0u;
+        const struct {
+            u32 mode;
+            float sharpen;
+            u32 alpha_source;
+        } merge_params{mode, merge_sharpen, alpha_source};
         cmdbuf.pushConstants(*merge_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                             sizeof(mode), &mode);
+                             sizeof(merge_params), &merge_params);
         cmdbuf.dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
+        MarkUpscalerPart(6, "upscaler: after Run (unlabelled work up to the next label)");
     }
 }
 
@@ -1998,7 +2077,18 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
     // Copy depth if blit is supported; otherwise just clear it (UI depth test still works).
     const bool copy = depth_id && depth_blit &&
         texture_cache.GetImage(depth_id).info.pixel_format == ui_depth_format;
-    if (copy) {
+    // bbport: a scene depth whose proxy is newer is blitted from the proxy (ProxyUpscalerInputs):
+    // nearest from the proxy is what the nearest resolve and the blit after it gave.
+    const bool from_proxy = copy && ProxyUpscalerInputs() && scene_targets.Reduced() &&
+                            scene_targets.EligibleScene(texture_cache.GetImage(depth_id)) &&
+                            scene_targets.NativeStale(texture_cache.GetImage(depth_id));
+    vk::Image proxy_source{};
+    if (from_proxy) {
+        VideoCore::ImageViewInfo view;
+        view.format = texture_cache.GetImage(depth_id).info.pixel_format;
+        proxy_source = scene_targets.Read(depth_id, view, vk::PipelineStageFlagBits2::eTransfer,
+                                          vk::AccessFlagBits2::eTransferRead).image;
+    } else if (copy) {
         runtime.Transit(&texture_cache.GetImage(depth_id), vk::ImageLayout::eTransferSrcOptimal,
                         vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
         runtime.FlushBarriers();
@@ -2010,11 +2100,14 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
     vk::ImageBlit region{};
     if (copy) {
         const auto& image = texture_cache.GetImage(depth_id);
-        source = vk::Image(image.backing->image);
+        const auto proxy = scene_targets.ProxySize(image);
+        source = from_proxy ? proxy_source : vk::Image(image.backing->image);
         region = {
             .srcSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
             .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
-                vk::Offset3D{s32(image.info.size.width), s32(image.info.size.height), 1}},
+                from_proxy ? vk::Offset3D{s32(proxy.width), s32(proxy.height), 1}
+                           : vk::Offset3D{s32(image.info.size.width),
+                                          s32(image.info.size.height), 1}},
             .dstSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
             .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
                 vk::Offset3D{s32(ui_width), s32(ui_height), 1}},
@@ -2022,7 +2115,9 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
     }
     // bbport: recorded on the recording thread (direct recording here waited for it to finish
     // everything queued, every frame).
-    scheduler.Record([depth = vk::Image(ui_depth_image), range, source,
+    const vk::ImageLayout source_layout =
+        from_proxy ? vk::ImageLayout::eGeneral : vk::ImageLayout::eTransferSrcOptimal;
+    scheduler.Record([depth = vk::Image(ui_depth_image), range, source, source_layout,
                       region](vk::CommandBuffer cmd) {
         vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -2041,7 +2136,7 @@ void TemporalUpscaler::PrepareUiDepth(VideoCore::ImageId depth_id) {
             barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
             barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
             cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-            cmd.blitImage(source, vk::ImageLayout::eTransferSrcOptimal, depth,
+            cmd.blitImage(source, source_layout, depth,
                           vk::ImageLayout::eTransferDstOptimal, region, vk::Filter::eNearest);
         }
         barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;

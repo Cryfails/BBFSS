@@ -17,7 +17,10 @@ unsigned Available();
 void MakeBackground();
 void MakeCritical(bool bulk = false);
 unsigned CapSpinUs(unsigned wanted);
+// Keeps a GPU pipeline thread (by its name) on the core group with the largest L3 cache.
+void PlaceGpuThread(const char* name);
 #else
+inline void PlaceGpuThread(const char*) {}
 inline void MakeCritical(bool = false) {}
 inline unsigned CapSpinUs(unsigned wanted) { return wanted; }
 inline unsigned Available() {

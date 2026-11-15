@@ -31,6 +31,8 @@ namespace BloodborneLauncher.Core
             new("exp_native_calls", L.T("Direct draw calls"), "1", "1", true),
             new("exp_occlusion", L.T("Occlusion culling"), "0", "0", true),
             new("legacy_shaders", L.T("Legacy shader compiler"), "0", "0", true),
+            // lantern.ini's troubleshooting switch (More > Engine): a beta is tested with it off.
+            new("engine_previous_paths", L.T("Previous engine paths"), "0", "0"),
         };
 
         public static string Folder => Path.Combine(Paths.ConfigDir, "my-settings");

@@ -5,7 +5,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,8 +20,10 @@
 #endif
 #include "bbport_heap_sites.h"
 #include "bbport_platform.h"
+#include "bbport_sections.h"
 #include "bbport_toggles.h"
 #include "bbport_wait_trace.h"
+#include "common/thread.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "lantern_frame_report.h"
@@ -195,7 +201,824 @@ static void LogLoad(double seconds, u64 flips, double worst_ms, u64 slow) {
     last = now;
 }
 
+// bbport (r23_spike-trace) ---------------------------------------------------------------------
+// BB_SPIKE_TRACE=1: every flip interval (as Frame stats measures it) over 1.4x the median of the
+// last 240 is broken down from counters the engine keeps anyway (bbport_toggles.h, BbSpike);
+// every 5 s up to 8 "Spike (r23):" lines (the slowest such frames) and one "Spikes (r23):"
+// summary, printed on the bb:Stats thread. Off: a branch per flip. On: about 90 relaxed loads a
+// flip, nothing allocated per frame.
+// Experiment 281474976710656 set (old): the 5 s Frame stats block and the 60 s Load/Memory lines
+// run here on bb:VideoOut, in Presentation::Flip between this frame's timestamp and
+// sys_video_out_flip_done: their printing time (stdout unbuffered, a pipe to the launcher) delays
+// the next flip's pickup, is counted in the next frame interval and holds back the previous
+// display buffer's release. Clear (default): the same code on bb:Stats, with the window's values.
+// (The 5 s block runs only with BB_FRAME_STATS=1; the 60 s lines in every session.)
+namespace R23 {
+
+constexpr u64 AsyncStatsOffBit = 281474976710656ull;
+
+/// One report at a time, on whichever thread it runs. Never destroyed (used up to exit).
+static std::mutex& ReportMutex() {
+    static std::mutex* const mutex = new std::mutex;
+    return *mutex;
+}
+
+struct Worker {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::function<void()>> jobs;
+    std::atomic<u64> started{0}, busy_ns{0};
+    std::atomic<bool> busy{false};
+};
+
+/// The bb:Stats thread (started on first use): runs posted reports in order.
+static Worker& StatsWorker() {
+    static Worker* const worker = [] {
+        auto* w = new Worker; // never destroyed: the thread is detached
+        std::thread([w] {
+            Common::SetCurrentThreadName("bb:Stats");
+            for (;;) {
+                std::function<void()> job;
+                {
+                    std::unique_lock lock{w->mutex};
+                    w->ready.wait(lock, [w] { return !w->jobs.empty(); });
+                    job = std::move(w->jobs.front());
+                    w->jobs.pop_front();
+                }
+                w->busy.store(true, std::memory_order_relaxed);
+                w->started.fetch_add(1, std::memory_order_relaxed);
+                const u64 start = BbSpike::NowNs();
+                {
+                    std::scoped_lock lock{ReportMutex()};
+                    job();
+                }
+                w->busy_ns.fetch_add(BbSpike::NowNs() - start, std::memory_order_relaxed);
+                w->busy.store(false, std::memory_order_relaxed);
+            }
+        }).detach();
+        return w;
+    }();
+    return *worker;
+}
+
+static void Post(std::function<void()> job) {
+    Worker& w = StatsWorker();
+    {
+        std::scoped_lock lock{w.mutex};
+        w.jobs.push_back(std::move(job));
+    }
+    w.ready.notify_one();
+}
+
+/// A report: on bb:Stats; with the experiment bit set here, as before.
+static void RunReport(std::function<void()> job) {
+    if (BbToggle::Experiment(AsyncStatsOffBit)) {
+        std::scoped_lock lock{ReportMutex()};
+        job();
+        return;
+    }
+    Post(std::move(job));
+}
+
+// bbport (r29_bursts): a BbReport::Capture's text (bbport_toggles.h), written here in one piece
+// after the reports posted before it.
+static void WriteCaptured(std::string&& text) {
+    Post([text = std::move(text)] {
+        std::fwrite(text.data(), 1, text.size(), stdout);
+        std::fflush(stdout);
+    });
+}
+[[maybe_unused]] static const bool r29_writer =
+    (BbReport::writer.store(&WriteCaptured, std::memory_order_release), true);
+
+enum Cause : u32 {
+    CauseVideoOut,
+    CauseStageB,
+    CauseStageBEnd,
+    CauseStageA,
+    CauseStageAReport,
+    CauseGameCpu,
+    CauseGameWait,
+    CauseWaits,
+    CausePresent,
+    CauseBinds,
+    CauseFaults,
+    CauseCompile,
+    CauseGpu,
+    Causes,
+    CauseNone = Causes,
+};
+constexpr const char* CauseNames[Causes + 1] = {
+    "bb:VideoOut's previous flip (its reports)",
+    "stage B recording",
+    "stage B frame end (its reports)",
+    "stage A not idle (decoding, or waiting on stage B)",
+    "stage A 5 s report",
+    "game thread frame less its GPU waits",
+    "game thread waiting for the GPU",
+    "CPU waits on the GPU or copies",
+    "present wait",
+    "sparse binds",
+    "write faults",
+    "pipeline compiles",
+    "GPU busy",
+    "none found",
+};
+enum Flag : u32 {
+    FlagResidency = 1,
+    FlagToggle = 2,
+    FlagStatsThread = 4,
+    FlagGameOpen = 8,
+    FlagGpu = 16,
+    FlagSections = 32,
+};
+
+struct Record {
+    double t_s = 0, frame_ms = 0, median_ms = 0, excess_ms = 0;
+    std::array<double, Causes> ms{}; ///< per cause, ms in the interval
+    double stage_b_ms = 0, game_frame_ms = 0, gpu_span_ms = 0, stats_thread_ms = 0;
+    u64 gpu_frame = 0, rt_triangles = 0;
+    u32 game_frames = 0, binds = 0, bind_waits = 0, compiles = 0, rt_builds = 0, tlas_builds = 0;
+    u32 textures_freed = 0, flags = 0, cause = CauseNone;
+    std::array<u32, 3> top{};      ///< stage B's largest BB_SECTIONS rows ("packet" left out)
+    std::array<float, 3> top_ms{};
+    // bbport (r27_flush-split): stage B's three largest Flush split steps in the interval (own
+    // ms summed over its tasks), its longest task and that task's kind, bb:Motion's rescans.
+    std::array<u32, 3> split_top{};
+    std::array<float, 3> split_ms{};
+    float split_task_ms = 0, motion_scan_ms = 0, motion_busy_ms = 0, motion_wake_max_ms = 0;
+    const char* split_kind = nullptr;
+    u32 motion_scans = 0;
+    // bbport (r29_bursts): stage A's DrawPipe waits for stage B, stage B's packets run, the
+    // longest delay from a guest submission queued while stage A idled to stage A running (and
+    // how many), staging buffers freed.
+    float a_wait_ms = 0, pickup_ms = 0;
+    u32 b_packets = 0, pickups = 0, staging_freed = 0;
+    // bbport (r35_pending-ops): the interval's longest PopPendingOperations call: ms, operations
+    // run, frees carried, frees waiting after the last call, its costliest kind (count, ms), its
+    // longest operation (kind, ms).
+    float pend_ms = 0, pend_kind_ms = 0, pend_op_ms = 0;
+    u32 pend_ops = 0, pend_carried = 0, pend_kind_ops = 0, pend_waiting = 0;
+    const char* pend_kind = nullptr;
+    const char* pend_op_kind = nullptr;
+};
+
+constexpr u32 MedianFrames = 240;
+constexpr u32 MedianBins = 1024; ///< 0.1 ms each; the last one holds everything longer
+constexpr u32 Delay = 6;         ///< flips a record waits for its GPU time (four frames late)
+constexpr u32 Worst = 8;
+
+struct Trace {
+    bool started = false;
+    u64 last_ns = 0, ns0 = 0, tsc0 = 0, window_ns = 0, onflip_ns = 0;
+    double tsc_per_ns = 0;
+    // counters at the last flip
+    u64 b_busy = 0, b_end = 0, a_idle = 0, a_print = 0, game_frames = 0, game_wait = 0;
+    std::array<u64, 4> waits{};
+    u64 present = 0, binds = 0, bind_waits = 0, bind_ns = 0, faults = 0, compile_ns = 0;
+    u64 compiles = 0, rt_builds = 0, rt_tris = 0, tlas = 0, textures = 0, gpu_read = 0;
+    u64 stats_started = 0, stats_ns = 0, experiments = 0, disabled = 0;
+    u32 second = 0;
+    std::array<u64, BbSections::Count> sections{};
+    // bbport (r27_flush-split): counters at the last flip, and at the 600-flip window's start
+    std::array<u64, BbSpike::Splits> split{}, split_w{}, split_long_ns_w{}, split_long_by_w{};
+    std::array<u64, BbSpike::SplitKinds> split_kinds_w{};
+    u64 motion_scans = 0, motion_scan_ns = 0, motion_scans_w = 0, motion_scan_ns_w = 0;
+    u64 motion_busy = 0, motion_busy_w = 0, motion_wakes_w = 0, motion_wake_ns_w = 0;
+    float motion_wake_max_w = 0; ///< ms, the longest per-flip value in the 600-flip window
+    u64 split_long_w = 0, split_long_flush_w = 0;
+    u32 split_frames = 0;
+    u64 a_wait = 0, b_packets = 0, pickups = 0, staging_freed = 0; // bbport (r29_bursts)
+    // bbport (r35_pending-ops): at the 600-flip window's start
+    std::array<u64, BbSpike::PendingKinds> pend_count_w{}, pend_ns_w{};
+    u64 pend_carried_w = 0;
+    // running median of the last MedianFrames intervals (histogram, the median's bin followed)
+    std::array<u16, MedianBins> bins{};
+    std::array<u16, MedianFrames> ring{};
+    u32 ring_n = 0, ring_at = 0, median_bin = 0, below = 0;
+    // records waiting for their GPU time, then judged
+    std::array<Record, Delay> delay{};
+    u32 delay_n = 0, delay_at = 0;
+    std::array<double, Causes> usual{}; ///< running average of each column, non-spike frames
+    std::array<bool, Causes> usual_set{};
+    // this window
+    u32 frames = 0, spikes = 0;
+    std::array<u32, Causes + 1> by_cause{};
+    std::array<Record, Worst> worst{};
+    u32 worst_n = 0;
+};
+static Trace trace; // bb:VideoOut only
+
+/// Counters the Frame stats block resets (exchange(0)) count from 0 again: the part since then.
+static u64 Delta(u64 now, u64& last) {
+    const u64 delta = now >= last ? now - last : now;
+    last = now;
+    return delta;
+}
+
+static void AddInterval(Trace& t, double ms) {
+    const u32 bin = u32(std::min<double>(ms * 10.0, double(MedianBins - 1)));
+    if (t.ring_n == MedianFrames) {
+        const u32 old = t.ring[t.ring_at];
+        --t.bins[old];
+        t.below -= old < t.median_bin ? 1 : 0;
+    } else {
+        ++t.ring_n;
+    }
+    t.ring[t.ring_at] = u16(bin);
+    t.ring_at = (t.ring_at + 1) % MedianFrames;
+    ++t.bins[bin];
+    t.below += bin < t.median_bin ? 1 : 0;
+    const u32 k = t.ring_n / 2; // sorted[n / 2], as Frame pacing takes it
+    while (t.below > k) {
+        --t.median_bin;
+        t.below -= t.bins[t.median_bin];
+    }
+    while (t.below + t.bins[t.median_bin] <= k) {
+        t.below += t.bins[t.median_bin];
+        ++t.median_bin;
+    }
+}
+
+static double MedianMs(const Trace& t) {
+    return (t.median_bin + 0.5) * 0.1;
+}
+
+static void Judge(Trace& t, Record& r) {
+    ++t.frames;
+    if (r.median_ms <= 0.0 || r.frame_ms <= 1.4 * r.median_ms) {
+        for (u32 c = 0; c < Causes; ++c) {
+            if (c == CauseGpu && !(r.flags & FlagGpu)) {
+                continue;
+            }
+            t.usual[c] = t.usual_set[c] ? t.usual[c] + (r.ms[c] - t.usual[c]) / 64.0 : r.ms[c];
+            t.usual_set[c] = true;
+        }
+        return;
+    }
+    ++t.spikes;
+    double best = 0.0;
+    r.cause = CauseNone;
+    for (u32 c = 0; c < Causes; ++c) {
+        if (c == CauseGpu && !(r.flags & FlagGpu)) {
+            continue;
+        }
+        const double excess = r.ms[c] - (t.usual_set[c] ? t.usual[c] : 0.0);
+        if (excess > best) {
+            best = excess;
+            r.cause = c;
+        }
+    }
+    r.excess_ms = best;
+    if (best < 0.25 * (r.frame_ms - r.median_ms)) {
+        r.cause = CauseNone; // nothing measured explains a quarter of the extra time
+    }
+    ++t.by_cause[r.cause];
+    if (t.worst_n < Worst) {
+        t.worst[t.worst_n++] = r;
+        return;
+    }
+    u32 lowest = 0;
+    for (u32 i = 1; i < Worst; ++i) {
+        lowest = t.worst[i].frame_ms < t.worst[lowest].frame_ms ? i : lowest;
+    }
+    if (r.frame_ms > t.worst[lowest].frame_ms) {
+        t.worst[lowest] = r;
+    }
+}
+
+static void PrintSpike(const Record& r) {
+    char line[2560]; // bbport (r35_pending-ops): was 2048 (r29_bursts), 1536
+    int n = 0;
+    const auto put = [&](int written) {
+        n = std::min<int>(n + std::max(written, 0), int(sizeof(line)) - 1);
+    };
+    const auto& m = r.ms;
+    put(std::snprintf(line + n, sizeof(line) - n,
+                      "Spike (r23): %.1f ms frame at %.1f s, median %.2f ms (%.2fx); largest: %s",
+                      r.frame_ms, r.t_s, r.median_ms, r.frame_ms / r.median_ms,
+                      CauseNames[r.cause]));
+    if (r.cause != CauseNone) {
+        put(std::snprintf(line + n, sizeof(line) - n, " (+%.1f ms over its usual)", r.excess_ms));
+    }
+    put(std::snprintf(line + n, sizeof(line) - n,
+                      "; ms in it: VideoOut's previous flip %.1f, stage B %.1f (frame end %.1f)",
+                      m[CauseVideoOut], r.stage_b_ms, m[CauseStageBEnd]));
+    if (r.flags & FlagSections) {
+        for (u32 i = 0; i < 3 && r.top_ms[i] > 0.0f; ++i) {
+            put(std::snprintf(line + n, sizeof(line) - n, "%s%s %.1f", i ? ", " : " [",
+                              BbSections::Names[r.top[i]], double(r.top_ms[i])));
+        }
+        put(std::snprintf(line + n, sizeof(line) - n, "%s", r.top_ms[0] > 0.0f ? "]" : ""));
+    }
+    put(std::snprintf(line + n, sizeof(line) - n,
+                      ", stage A not idle %.1f (5 s report %.1f), game frame %.1f%s (less its "
+                      "GPU waits %.1f, its GPU waits %.1f, %u ended), waits on the GPU or copies "
+                      "%.1f, present wait "
+                      "%.1f, sparse binds %u (%u waited) %.1f, write faults %.1f, compiles %u %.1f",
+                      m[CauseStageA], m[CauseStageAReport], r.game_frame_ms,
+                      (r.flags & FlagGameOpen) ? " still open" : "", m[CauseGameCpu],
+                      m[CauseGameWait], r.game_frames, m[CauseWaits], m[CausePresent], r.binds,
+                      r.bind_waits, m[CauseBinds], m[CauseFaults], r.compiles, m[CauseCompile]));
+    if (r.flags & FlagGpu) {
+        put(std::snprintf(line + n, sizeof(line) - n, ", GPU busy %.1f of %.1f", m[CauseGpu],
+                          r.gpu_span_ms));
+    }
+    // bbport (r27_flush-split): stage B's three largest steps by own time in this interval
+    put(std::snprintf(line + n, sizeof(line) - n, "; flush split:"));
+    for (u32 i = 0; i < 3 && r.split_ms[i] > 0.0f; ++i) {
+        put(std::snprintf(line + n, sizeof(line) - n, "%s %s %.2f", i ? "," : "",
+                          BbSpike::SplitNames[r.split_top[i]], double(r.split_ms[i])));
+    }
+    put(std::snprintf(line + n, sizeof(line) - n,
+                      "%s (longest stage B task %s %.2f ms), bb:Motion busy %.2f ms, longest "
+                      "wake %.2f ms, index rescans %u (%.2f ms)",
+                      r.split_ms[0] > 0.0f ? "" : " none",
+                      r.split_task_ms > 0.0f && r.split_kind ? r.split_kind : "none",
+                      double(r.split_task_ms), double(r.motion_busy_ms),
+                      double(r.motion_wake_max_ms), r.motion_scans, double(r.motion_scan_ms)));
+    // bbport (r29_bursts)
+    put(std::snprintf(line + n, sizeof(line) - n,
+                      "; stage A waited for stage B %.1f ms, stage B ran %u packets, stage A "
+                      "picked up guest submissions queued while it idled %u times, after %.2f ms "
+                      "at most, staging buffers freed %u",
+                      double(r.a_wait_ms), r.b_packets, r.pickups, double(r.pickup_ms),
+                      r.staging_freed));
+    // bbport (r35_pending-ops)
+    if (r.pend_ms > 0.0f) {
+        put(std::snprintf(line + n, sizeof(line) - n,
+                          "; pending ops (r35): longest call %.2f ms ran %u (carried %u to later "
+                          "frames, %u waiting), costliest kind %s %u ops %.2f ms, longest one %s "
+                          "%.2f ms",
+                          double(r.pend_ms), r.pend_ops, r.pend_carried, r.pend_waiting,
+                          r.pend_kind ? r.pend_kind : "-", r.pend_kind_ops,
+                          double(r.pend_kind_ms), r.pend_op_kind ? r.pend_op_kind : "-",
+                          double(r.pend_op_ms)));
+    } else {
+        put(std::snprintf(line + n, sizeof(line) - n, "; pending ops (r35): none run (%u waiting)",
+                          r.pend_waiting));
+    }
+    put(std::snprintf(line + n, sizeof(line) - n, "; events:"));
+    const int before = n;
+    if (r.flags & FlagResidency) {
+        put(std::snprintf(line + n, sizeof(line) - n, " residency second,"));
+    }
+    if (r.flags & FlagToggle) {
+        put(std::snprintf(line + n, sizeof(line) - n, " toggles changed,"));
+    }
+    if (r.flags & FlagStatsThread) {
+        put(std::snprintf(line + n, sizeof(line) - n, " bb:Stats printing (%.1f ms),",
+                          r.stats_thread_ms));
+    }
+    if (r.rt_builds || r.tlas_builds) {
+        put(std::snprintf(line + n, sizeof(line) - n,
+                          " ray tracing full builds %u BLAS (%llu triangles) %u TLAS,", r.rt_builds,
+                          static_cast<unsigned long long>(r.rt_triangles), r.tlas_builds));
+    }
+    if (r.textures_freed) {
+        put(std::snprintf(line + n, sizeof(line) - n, " textures freed %u,", r.textures_freed));
+    }
+    if (n == before) {
+        put(std::snprintf(line + n, sizeof(line) - n, " none,"));
+    }
+    line[n - 1] = '\n'; // the last comma
+    std::fwrite(line, 1, size_t(n), stdout);
+}
+
+static void PrintWindow(std::array<Record, Worst>& worst, u32 count, u32 frames, u32 spikes,
+                        const std::array<u32, Causes + 1>& by_cause, double median) {
+    std::sort(worst.begin(), worst.begin() + count,
+              [](const Record& a, const Record& b) { return a.frame_ms > b.frame_ms; });
+    for (u32 i = 0; i < count; ++i) {
+        PrintSpike(worst[i]);
+    }
+    char line[1024];
+    int n = 0;
+    const auto put = [&](int written) {
+        n = std::min<int>(n + std::max(written, 0), int(sizeof(line)) - 1);
+    };
+    put(std::snprintf(line, sizeof(line),
+                      "Spikes (r23): %u frames over 1.4x median (of %u judged, median now %.2f "
+                      "ms); by largest cause:",
+                      spikes, frames, median));
+    std::array<bool, Causes + 1> shown{};
+    for (u32 round = 0; round <= Causes; ++round) {
+        u32 pick = Causes + 1;
+        for (u32 c = 0; c <= Causes; ++c) {
+            if (!shown[c] && by_cause[c] && (pick > Causes || by_cause[c] > by_cause[pick])) {
+                pick = c;
+            }
+        }
+        if (pick > Causes) {
+            break;
+        }
+        shown[pick] = true;
+        put(std::snprintf(line + n, sizeof(line) - n, " %s %u,", CauseNames[pick], by_cause[pick]));
+    }
+    if (spikes == 0) {
+        put(std::snprintf(line + n, sizeof(line) - n, " -,"));
+    }
+    line[n - 1] = '\n';
+    std::fwrite(line, 1, size_t(n), stdout);
+    std::fflush(stdout);
+}
+
+// bbport (r27_flush-split): every 600 flips, on bb:Stats: the stage B tasks over 2 ms in those
+// frames (by largest step, by task, their own ms by step), all stage B tasks' own ms by step, and
+// bb:Motion's index rescans.
+struct SplitWindow {
+    std::array<double, BbSpike::Splits> all_ms{}, long_ms{}, long_by{};
+    std::array<double, BbSpike::SplitKinds> kinds{};
+    std::array<const char*, BbSpike::SplitKinds> kind_names{};
+    u64 tasks = 0, flushed = 0, scans = 0, wakes = 0;
+    double scan_ms = 0, busy_ms = 0, wake_ms = 0, wake_max_ms = 0;
+    // bbport (r35_pending-ops): PopPendingOperations in the window, by kind; frees carried, the
+    // longest wait (frames), the most waiting after a call; the experiment bit at the end.
+    std::array<const char*, BbSpike::PendingKinds> pend_names{};
+    std::array<u64, BbSpike::PendingKinds> pend_ops{};
+    std::array<double, BbSpike::PendingKinds> pend_ms{};
+    u64 pend_carried = 0, pend_wait_max = 0, pend_backlog_max = 0;
+    bool pend_old = false;
+};
+
+/// ", name value" for each value over `floor`, largest first.
+template <std::size_t N>
+static void PutRanked(std::string& out, const std::array<double, N>& values,
+                      const char* const* names, const char* format, double floor) {
+    std::array<u32, N> order{};
+    u32 count = 0;
+    for (u32 i = 0; i < N; ++i) {
+        if (values[i] > floor && names[i]) {
+            order[count++] = i;
+        }
+    }
+    std::sort(order.begin(), order.begin() + count,
+              [&](u32 a, u32 b) { return values[a] > values[b]; });
+    char item[192];
+    for (u32 k = 0; k < count; ++k) {
+        std::snprintf(item, sizeof(item), format, k ? "," : "", names[order[k]],
+                      values[order[k]]);
+        out += item;
+    }
+    if (count == 0) {
+        out += " -";
+    }
+}
+
+static void PrintSplits(const SplitWindow& w) {
+    char head[256];
+    std::snprintf(head, sizeof(head),
+                  "Flush splits (r27): %llu stage B tasks over %.0f ms in the last 600 frames "
+                  "(%llu with a Flush); by largest step:",
+                  static_cast<unsigned long long>(w.tasks), double(BbSpike::SplitLongNs) / 1e6,
+                  static_cast<unsigned long long>(w.flushed));
+    std::string out = head;
+    PutRanked(out, w.long_by, BbSpike::SplitNames, "%s %s %.0f", 0.0);
+    out += "; by task:";
+    PutRanked(out, w.kinds, w.kind_names.data(), "%s %s %.0f", 0.0);
+    out += "; their ms by step:";
+    PutRanked(out, w.long_ms, BbSpike::SplitNames, "%s %s %.1f", 0.05);
+    out += "; all stage B tasks' ms by step:";
+    PutRanked(out, w.all_ms, BbSpike::SplitNames, "%s %s %.1f", 0.05);
+    std::snprintf(head, sizeof(head),
+                  "; bb:Motion busy %.1f ms, wakes by stage B %llu (%.1f ms, longest in a frame "
+                  "%.2f ms), index rescans %llu (%.1f ms)\n",
+                  w.busy_ms, static_cast<unsigned long long>(w.wakes), w.wake_ms, w.wake_max_ms,
+                  static_cast<unsigned long long>(w.scans), w.scan_ms);
+    out += head;
+    // bbport (r35_pending-ops)
+    {
+        u64 ops = 0;
+        double ms = 0;
+        std::array<u32, BbSpike::PendingKinds> order{};
+        u32 count = 0;
+        for (u32 k = 0; k < BbSpike::PendingKinds; ++k) {
+            ops += w.pend_ops[k];
+            ms += w.pend_ms[k];
+            if (w.pend_ops[k] != 0 && w.pend_names[k]) {
+                order[count++] = k;
+            }
+        }
+        std::sort(order.begin(), order.begin() + count,
+                  [&](u32 a, u32 b) { return w.pend_ms[a] > w.pend_ms[b]; });
+        char r35[512];
+        std::snprintf(r35, sizeof(r35),
+                      "Pending ops (r35): %llu run in the last 600 frames (%.1f ms), %llu frees "
+                      "carried to a later frame (over %.1f ms a frame; experiment "
+                      "576460752303423488 %s), longest wait %llu frames, most waiting %llu; by "
+                      "kind (ops, ms):",
+                      static_cast<unsigned long long>(ops), ms,
+                      static_cast<unsigned long long>(w.pend_carried),
+                      double(BbPendingOps::BudgetNs) / 1e6, w.pend_old ? "set: none" : "clear",
+                      static_cast<unsigned long long>(w.pend_wait_max),
+                      static_cast<unsigned long long>(w.pend_backlog_max));
+        out += r35;
+        for (u32 i = 0; i < count; ++i) {
+            const u32 k = order[i];
+            std::snprintf(r35, sizeof(r35), "%s %s %llu %.1f", i ? "," : "", w.pend_names[k],
+                          static_cast<unsigned long long>(w.pend_ops[k]), w.pend_ms[k]);
+            out += r35;
+        }
+        out += count ? "\n" : " -\n";
+    }
+    std::fwrite(out.data(), 1, out.size(), stdout);
+    std::fflush(stdout);
+}
+
+static void PostSplits(Trace& t) {
+    constexpr auto relaxed = std::memory_order_relaxed;
+    SplitWindow w;
+    const auto take = [](u64 now, u64& last) {
+        const u64 delta = now - last;
+        last = now;
+        return delta;
+    };
+    for (u32 s = 0; s < BbSpike::Splits; ++s) {
+        w.all_ms[s] = double(take(BbSpike::split_ns[s].load(relaxed), t.split_w[s])) / 1e6;
+        w.long_ms[s] =
+            double(take(BbSpike::split_long_ns[s].load(relaxed), t.split_long_ns_w[s])) / 1e6;
+        w.long_by[s] = double(take(BbSpike::split_long_by[s].load(relaxed), t.split_long_by_w[s]));
+    }
+    for (u32 k = 0; k < BbSpike::SplitKinds; ++k) {
+        w.kind_names[k] = BbSpike::split_kinds[k].name.load(relaxed);
+        w.kinds[k] = double(take(BbSpike::split_kinds[k].count.load(relaxed), t.split_kinds_w[k]));
+    }
+    w.tasks = take(BbSpike::split_long.load(relaxed), t.split_long_w);
+    w.flushed = take(BbSpike::split_long_flush.load(relaxed), t.split_long_flush_w);
+    w.scans = take(BbSpike::motion_scans.load(relaxed), t.motion_scans_w);
+    w.scan_ms = double(take(BbSpike::motion_scan_ns.load(relaxed), t.motion_scan_ns_w)) / 1e6;
+    w.busy_ms = double(take(BbSpike::motion_busy_ns.load(relaxed), t.motion_busy_w)) / 1e6;
+    w.wakes = take(BbSpike::motion_wakes.load(relaxed), t.motion_wakes_w);
+    w.wake_ms = double(take(BbSpike::motion_wake_ns.load(relaxed), t.motion_wake_ns_w)) / 1e6;
+    w.wake_max_ms = double(std::exchange(t.motion_wake_max_w, 0.0f));
+    // bbport (r35_pending-ops)
+    for (u32 k = 0; k < BbSpike::PendingKinds; ++k) {
+        w.pend_names[k] = BbSpike::pending_kinds[k].name.load(relaxed);
+        w.pend_ops[k] = take(BbSpike::pending_kinds[k].count.load(relaxed), t.pend_count_w[k]);
+        w.pend_ms[k] =
+            double(take(BbSpike::pending_kinds[k].ns.load(relaxed), t.pend_ns_w[k])) / 1e6;
+    }
+    w.pend_carried = take(BbSpike::pending_carried.load(relaxed), t.pend_carried_w);
+    w.pend_wait_max = BbSpike::pending_wait_max.exchange(0, relaxed);
+    w.pend_backlog_max = BbSpike::pending_backlog_max.exchange(0, relaxed);
+    w.pend_old = BbToggle::Experiment(BbPendingOps::OldBit);
+    Post([w] { PrintSplits(w); });
+}
+
+/// At the start of each OnFlip (bb:VideoOut): the interval since the last one, broken down.
+static u64 Flip() {
+    Trace& t = trace;
+    const u64 now = BbSpike::NowNs();
+    const u64 tsc = __rdtsc();
+    Record r;
+    const double frame_ms = t.started ? double(now - t.last_ns) / 1e6 : 0.0;
+    if (t.started && now - t.ns0 >= 1000000000ull) {
+        t.tsc_per_ns = double(tsc - t.tsc0) / double(now - t.ns0);
+    }
+    const double cycle_ms = t.tsc_per_ns > 0.0 ? 1.0 / (t.tsc_per_ns * 1e6) : 0.0;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    // Stage B: packet cycles; its display-pass frame end (reports included).
+    const auto* busy = BbSpike::stage_b_busy.load(std::memory_order_acquire);
+    r.stage_b_ms = double(Delta(busy ? busy->load(relaxed) : 0, t.b_busy)) * cycle_ms;
+    r.ms[CauseStageBEnd] = double(Delta(BbSpike::stage_b_end_ns.load(relaxed), t.b_end)) / 1e6;
+    r.ms[CauseStageB] = std::max(0.0, r.stage_b_ms - r.ms[CauseStageBEnd]);
+    // Stage A: the interval less its idle time (an idle wait still open counts up to now).
+    const u64 idle_done = BbSpike::stage_a_idle_ns.load(relaxed);
+    const u64 idle_since = BbSpike::stage_a_idle_since.load(relaxed);
+    const u64 idle = idle_done + (idle_since && now > idle_since ? now - idle_since : 0);
+    const u64 idle_delta = idle > t.a_idle ? idle - t.a_idle : 0;
+    t.a_idle = std::max(t.a_idle, idle);
+    r.ms[CauseStageAReport] =
+        double(Delta(BbSpike::stage_a_print_ns.load(relaxed), t.a_print)) / 1e6;
+    r.ms[CauseStageA] =
+        std::max(0.0, frame_ms - double(idle_delta) / 1e6 - r.ms[CauseStageAReport]);
+    // The game thread: its longest frame (sceGnmSubmitDone to the next) that ended in this
+    // interval, else the one still open; its waits for the GPU (WaitPreviousFrame and the like).
+    r.game_frames = u32(Delta(BbSpike::game_frames.load(relaxed), t.game_frames));
+    const u64 game_longest = BbSpike::game_max_ns.exchange(0, relaxed);
+    const u64 game_last = BbSpike::game_last_ns.load(relaxed);
+    if (r.game_frames != 0) {
+        r.game_frame_ms = double(game_longest) / 1e6;
+    } else if (game_last != 0 && now > game_last) {
+        r.game_frame_ms = double(now - game_last) / 1e6;
+        r.flags |= FlagGameOpen;
+    }
+    r.ms[CauseGameWait] = double(Delta(BbStats::gnm_frame_wait_ns.load(relaxed), t.game_wait)) / 1e6;
+    r.ms[CauseGameCpu] = std::max(0.0, r.game_frame_ms - r.ms[CauseGameWait]);
+    // CPU threads blocked: Scheduler::Wait on a tick, fence and copy waits (SiteWait), waits for
+    // the recording threads and for the copy threads.
+    const u64 waits = Delta(BbStats::tick_wait_ns.load(relaxed), t.waits[0]) +
+                      Delta(BbStats::host_copies_wait_ns.load(relaxed), t.waits[1]) +
+                      Delta(BbStats::sync_recording_ns.load(relaxed), t.waits[2]) +
+                      Delta(BbStats::copy_threads_wait_ns.load(relaxed), t.waits[3]);
+    r.ms[CauseWaits] = double(waits) / 1e6;
+    r.ms[CausePresent] = double(Delta(BbStats::present_wait_ns.load(relaxed), t.present)) / 1e6;
+    r.binds = u32(Delta(BbSpike::binds.load(relaxed), t.binds));
+    r.bind_waits = u32(Delta(BbSpike::bind_waits.load(relaxed), t.bind_waits));
+    r.ms[CauseBinds] = double(Delta(BbSpike::bind_ns.load(relaxed), t.bind_ns)) / 1e6;
+    r.ms[CauseFaults] = double(Delta(BbStats::t_write_faults.load(relaxed), t.faults)) / 1e6;
+    r.ms[CauseCompile] =
+        double(Delta(Vulkan::g_bb_compile_ns_total.load(relaxed), t.compile_ns)) / 1e6;
+    r.compiles = u32(Delta(Vulkan::g_bb_compiles_total.load(relaxed), t.compiles));
+    r.rt_builds = u32(Delta(BbSpike::rt_builds.load(relaxed), t.rt_builds));
+    r.rt_triangles = Delta(BbSpike::rt_build_triangles.load(relaxed), t.rt_tris);
+    r.tlas_builds = u32(Delta(BbSpike::tlas_builds.load(relaxed), t.tlas));
+    r.textures_freed = u32(Delta(BbStats::gc_freed_images.load(relaxed), t.textures));
+    r.ms[CauseVideoOut] = double(t.onflip_ns) / 1e6; // the last OnFlip, inside this interval
+    // Events: a new coarse second (the buffer cache's 1 Hz residency work), a toggle change,
+    // bb:Stats printing.
+    const u32 second = BbStats::coarse_second.load(relaxed);
+    if (second != t.second) {
+        r.flags |= FlagResidency;
+        t.second = second;
+    }
+    const u64 experiments = __atomic_load_n(&runtime_experiment_bits, __ATOMIC_RELAXED);
+    const u64 disabled = __atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED);
+    if (experiments != t.experiments || disabled != t.disabled) {
+        r.flags |= FlagToggle;
+        t.experiments = experiments;
+        t.disabled = disabled;
+    }
+    Worker& w = StatsWorker();
+    const u64 jobs = Delta(w.started.load(relaxed), t.stats_started);
+    r.stats_thread_ms = double(Delta(w.busy_ns.load(relaxed), t.stats_ns)) / 1e6;
+    if (jobs != 0 || w.busy.load(relaxed) || r.stats_thread_ms > 0.0) {
+        r.flags |= FlagStatsThread;
+    }
+    if (BbSections::Enabled()) {
+        for (u32 s = 0; s < BbSections::Count; ++s) {
+            const double ms = double(Delta(BbSections::cycles[s].load(relaxed), t.sections[s])) *
+                              cycle_ms;
+            if (s == BbSections::Packet || ms <= 0.0) {
+                continue;
+            }
+            for (u32 i = 0; i < 3; ++i) {
+                if (ms > double(r.top_ms[i])) {
+                    for (u32 j = 2; j > i; --j) {
+                        r.top[j] = r.top[j - 1];
+                        r.top_ms[j] = r.top_ms[j - 1];
+                    }
+                    r.top[i] = s;
+                    r.top_ms[i] = float(ms);
+                    break;
+                }
+            }
+        }
+        r.flags |= cycle_ms > 0.0 ? FlagSections : 0u;
+    }
+    // bbport (r27_flush-split): stage B's own time by step in this interval (the three largest),
+    // its longest task, bb:Motion's index rescans.
+    for (u32 s = 0; s < BbSpike::Splits; ++s) {
+        const double ms = double(Delta(BbSpike::split_ns[s].load(relaxed), t.split[s])) / 1e6;
+        for (u32 i = 0; i < 3; ++i) {
+            if (ms > double(r.split_ms[i])) {
+                for (u32 j = 2; j > i; --j) {
+                    r.split_top[j] = r.split_top[j - 1];
+                    r.split_ms[j] = r.split_ms[j - 1];
+                }
+                r.split_top[i] = s;
+                r.split_ms[i] = float(ms);
+                break;
+            }
+        }
+    }
+    r.split_task_ms = float(double(BbSpike::split_max_ns.exchange(0, relaxed)) / 1e6);
+    r.split_kind = BbSpike::split_max_kind.load(relaxed);
+    r.motion_scans = u32(Delta(BbSpike::motion_scans.load(relaxed), t.motion_scans));
+    r.motion_scan_ms =
+        float(double(Delta(BbSpike::motion_scan_ns.load(relaxed), t.motion_scan_ns)) / 1e6);
+    r.motion_busy_ms =
+        float(double(Delta(BbSpike::motion_busy_ns.load(relaxed), t.motion_busy)) / 1e6);
+    r.motion_wake_max_ms = float(double(BbSpike::motion_wake_max_ns.exchange(0, relaxed)) / 1e6);
+    t.motion_wake_max_w = std::max(t.motion_wake_max_w, r.motion_wake_max_ms);
+    // bbport (r29_bursts): stage A's waits for stage B, stage B's packets, stage A's pickups,
+    // staging frees.
+    r.a_wait_ms = float(double(Delta(BbSpike::stage_a_wait_ns.load(relaxed), t.a_wait)) / 1e6);
+    const auto* packets = BbSpike::stage_b_packets.load(std::memory_order_acquire);
+    r.b_packets = u32(Delta(packets ? packets->load(relaxed) : 0, t.b_packets));
+    r.pickups = u32(Delta(BbSpike::stage_a_pickups.load(relaxed), t.pickups));
+    r.pickup_ms = float(double(BbSpike::stage_a_pickup_max_ns.exchange(0, relaxed)) / 1e6);
+    r.staging_freed = u32(Delta(BbSpike::staging_freed.load(relaxed), t.staging_freed));
+    // bbport (r35_pending-ops): the longest PopPendingOperations call since the last flip
+    r.pend_ms =
+        float(double(BbSpike::pending_call_ns.exchange(0, std::memory_order_acquire)) / 1e6);
+    if (r.pend_ms > 0.0f) {
+        r.pend_ops = BbSpike::pending_call_ops.load(relaxed);
+        r.pend_carried = BbSpike::pending_call_carried.load(relaxed);
+        r.pend_kind = BbSpike::pending_call_kind.load(relaxed);
+        r.pend_kind_ops = BbSpike::pending_call_kind_ops.load(relaxed);
+        r.pend_kind_ms = float(double(BbSpike::pending_call_kind_ns.load(relaxed)) / 1e6);
+        r.pend_op_kind = BbSpike::pending_call_op_kind.load(relaxed);
+        r.pend_op_ms = float(double(BbSpike::pending_call_op_ns.load(relaxed)) / 1e6);
+    }
+    r.pend_waiting = u32(BbSpike::pending_backlog.load(relaxed));
+    // GPU time (BB_GPU_PROFILE=1): frames read since the last flip, given to waiting records.
+    r.gpu_frame = BbStats::gpu_frames.load(relaxed);
+    const u64 written = BbSpike::gpu_written.load(std::memory_order_acquire);
+    if (written - t.gpu_read > BbSpike::gpu.size()) {
+        t.gpu_read = written - BbSpike::gpu.size();
+    }
+    for (; t.gpu_read < written; ++t.gpu_read) {
+        const auto& e = BbSpike::gpu[t.gpu_read % BbSpike::gpu.size()];
+        const u64 frame = e.frame.load(relaxed);
+        for (u32 i = 0; i < t.delay_n; ++i) {
+            Record& d = t.delay[i];
+            if (d.gpu_frame == frame && !(d.flags & FlagGpu)) {
+                d.ms[CauseGpu] = double(e.busy_ns.load(relaxed)) / 1e6;
+                d.gpu_span_ms = double(e.span_ns.load(relaxed)) / 1e6;
+                d.flags |= FlagGpu;
+                break;
+            }
+        }
+    }
+    if (!t.started) {
+        t.started = true;
+        t.ns0 = t.window_ns = t.last_ns = now;
+        t.tsc0 = tsc;
+        Post([] {
+            std::printf("Spike trace (r23): on; a frame is a flip interval on bb:VideoOut over 1.4x "
+                        "the median of the last %u, judged %u flips later; stage B sections need "
+                        "BB_SECTIONS=1, write faults BB_FRAME_STATS=1, GPU busy BB_GPU_PROFILE=1 "
+                        "(frame matched within about one); Frame stats printed on %s "
+                        "(experiment 281474976710656)\n",
+                        MedianFrames, Delay,
+                        BbToggle::Experiment(AsyncStatsOffBit) ? "bb:VideoOut, set" : "bb:Stats, clear");
+        });
+        Post([] { // bbport (r27_flush-split)
+            std::printf("Flush split (r27): on; each Spike line ends with stage B's three largest "
+                        "steps by own time (Rasterizer::Flush and what it calls, OnSubmit's calls, "
+                        "the tasks' own code; ms summed over the interval's tasks), its longest "
+                        "task, bb:Motion's busy time, its longest wake by stage B and its index "
+                        "rescans; every 600 flips a \"Flush splits (r27):\" line for the stage B "
+                        "tasks over %.0f ms\n",
+                        double(BbSpike::SplitLongNs) / 1e6);
+        });
+        Post([] { // bbport (r29_bursts)
+            std::printf("Report writes (r29): stage B's 600-frame reports (frame end: Froyok "
+                        "bloom, Draw cost, Sun atlas, Uniform buffers; the two scene proxy tables) "
+                        "written on %s (experiment 9007199254740992); each Spike line also gives "
+                        "stage A's waits for stage B, stage B's packets, stage A's pickups of "
+                        "guest submissions and staging buffers freed; flush split step \"staging "
+                        "trim\"\n",
+                        BbToggle::Experiment(BbReport::InlineBit) ? "stage B, set"
+                                                                  : "bb:Stats, clear");
+        });
+        Post([] { // bbport (r35_pending-ops)
+            std::printf("Pending ops (r35): on; each Spike line gives the interval's longest "
+                        "Scheduler::PopPendingOperations call (operations run, frees carried and "
+                        "waiting, its costliest kind, its longest operation); every 600 flips a "
+                        "\"Pending ops (r35):\" line by kind; frees past %.1f ms a frame carried "
+                        "to the next frames: %s (experiment 576460752303423488)\n",
+                        double(BbPendingOps::BudgetNs) / 1e6,
+                        BbToggle::Experiment(BbPendingOps::OldBit) ? "no, set" : "yes, clear");
+        });
+        return now;
+    }
+    r.t_s = double(now - t.ns0) / 1e9;
+    r.frame_ms = frame_ms;
+    if (t.ring_n >= 60) {
+        r.median_ms = MedianMs(t);
+    }
+    AddInterval(t, frame_ms);
+    if (t.delay_n == Delay) {
+        Judge(t, t.delay[t.delay_at]);
+    } else {
+        ++t.delay_n;
+    }
+    t.delay[t.delay_at] = r;
+    t.delay_at = (t.delay_at + 1) % Delay;
+    t.last_ns = now;
+    if (now - t.window_ns >= 5000000000ull) {
+        Post([worst = t.worst, count = t.worst_n, frames = t.frames, spikes = t.spikes,
+              by_cause = t.by_cause, median = MedianMs(t)]() mutable {
+            PrintWindow(worst, count, frames, spikes, by_cause, median);
+        });
+        t.worst_n = t.frames = t.spikes = 0;
+        t.by_cause = {};
+        t.window_ns = now;
+    }
+    if (++t.split_frames >= 600) { // bbport (r27_flush-split)
+        t.split_frames = 0;
+        PostSplits(t);
+    }
+    return now;
+}
+
+/// Lives through OnFlip: the trace's flip at its start; its own time at the end (in the next
+/// interval: printing here delays the next flip's pickup).
+struct FlipScope {
+    u64 start = BbSpike::on ? Flip() : 0;
+    ~FlipScope() {
+        if (start != 0) {
+            trace.onflip_ns = BbSpike::NowNs() - start;
+        }
+    }
+};
+
+} // namespace R23
+
 void OnFlip() {
+    R23::FlipScope r23_flip; // bbport (r23_spike-trace)
     {
         static auto next_ram = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         static auto load_start = std::chrono::steady_clock::now(), load_last = load_start;
@@ -210,10 +1033,13 @@ void OnFlip() {
         load_worst_ms = std::max(load_worst_ms, flip_ms);
         if (const auto now = flip_time; now >= next_ram) {
             next_ram = now + std::chrono::seconds(60);
-            LogRam();
-            LogLoad(std::chrono::duration<double>(now - load_start).count(), load_flips,
-                    load_worst_ms, load_slow);
-            std::fflush(stdout);
+            // bbport (r23_spike-trace): on bb:Stats (experiment 281474976710656 set: here)
+            R23::RunReport([seconds = std::chrono::duration<double>(now - load_start).count(),
+                            flips = load_flips, worst = load_worst_ms, slow = load_slow] {
+                LogRam();
+                LogLoad(seconds, flips, worst, slow);
+                std::fflush(stdout);
+            });
             load_start = now;
             load_flips = load_slow = 0;
             load_worst_ms = 0.0;
@@ -409,6 +1235,9 @@ void OnFlip() {
         ++frames;
         const double window = std::chrono::duration<double>(now - window_start).count();
         if (window >= 5.0) {
+            // bbport (r23_spike-trace): the block below, unchanged, runs on bb:Stats with this
+            // window's values (experiment 281474976710656 set: here, as before).
+            auto r23_report = [frames = frames, window, worst_ms = worst_ms, intervals = intervals] {
             const u32 compiles = Vulkan::g_bb_compiles.exchange(0);
             const u64 compile_ns = Vulkan::g_bb_compile_ns.exchange(0);
             const u64 direct = Vulkan::Scheduler::direct_recordings.exchange(0);
@@ -619,6 +1448,8 @@ void OnFlip() {
                             median, std::sqrt(std::max(0.0, sq / intervals.size() - mean * mean)),
                             sorted[std::min(sorted.size() - 1, sorted.size() * 99 / 100)], spikes);
             }
+            };
+            R23::RunReport(std::move(r23_report));
             intervals.clear();
             window_start = now;
             frames = 0;

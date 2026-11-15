@@ -11,6 +11,9 @@ namespace BloodborneLauncher.Views
     {
         private readonly TextBlock _upscalerHint, _dlssHint, _frameGenHint;
         private TextBlock? _motionBlurHint;
+        private readonly TextBlock _sunHalfHint, _lampHalfHint, _farRefitHint, _fewerRaysHint;
+        private readonly TextBlock _farShadowsHint, _motionStoreHint;
+        private readonly object _farShadows, _motionStore;
         private readonly SettingRow _presetCard, _renderScaleCard, _sharpenCard, _sharpnessCard, _mipBiasCard;
         private readonly SettingRow _frameGenFramesCard, _frameGenDynamicCard, _reflexCard, _frameGenCapCard;
 
@@ -151,16 +154,53 @@ namespace BloodborneLauncher.Views
             IniCombo(SymbolRegular.Lightbulb24, L.T("Lamp shadow resolution"), L.T("Applied when the game starts"), Choices.LocalShadowResolution, "graphics_local_shadow_resolution");
             ComboRow(SymbolRegular.Lightbulb24, L.T("Shadow rendering method"),
                 L.T("Normal uses the game's own dynamic sun shadows. High draws the sun's shadows with virtual shadow maps from the ray tracing system's cached scene geometry: sharper and stable at distance, costs more, and requires a GPU with hardware ray tracing (selecting it turns the ray tracing system on). Ultra traces the sun's shadows, also requires hardware ray tracing and is the most expensive. Takes effect on the next game start."),
-                Choices.SunShadowMethods, () => Choices.SunShadowMode(Ini), v => Choices.SetSunShadowMode(Ini, v));
+                Choices.SunShadowMethods, () => Choices.SunShadowMode(Ini), v => Choices.SetSunShadowMode(Ini, v), changed: UpdatePerformance);
             ComboRow(SymbolRegular.Lightbulb24, L.T("Global Illumination Quality (Indirect Lighting)"),
                 L.T("Off adds no indirect lighting. Medium is screen-space indirect light with a single bounce. High uses screen-space radiance probes for the diffuse bounce and rough specular reflections and costs more. Ultra traces indirect light against the scene, needs a GPU with ray tracing and is the most expensive. Takes effect on the next game start."),
-                Choices.GiQualities, () => Choices.GiMode(Ini), v => Choices.SetGiMode(Ini, v));
+                Choices.GiQualities, () => Choices.GiMode(Ini), v => Choices.SetGiMode(Ini, v), changed: UpdatePerformance);
             IniCombo(SymbolRegular.Lightbulb24, L.T("Motion blur quality"), L.T("Applied when the game starts"), Choices.MotionBlurQuality, "graphics_motion_blur_quality");
             IniSlider(SymbolRegular.Lightbulb24, L.T("Indirect lighting strength"), 0, 12, "graphics_gi_strength", fallback: 1.5);
             IniSlider(SymbolRegular.Lightbulb24, L.T("Reflection strength"), 0, 3, "graphics_ssr_intensity");
             IniSlider(SymbolRegular.Lightbulb24, L.T("Volumetric sunlight strength"), 0, 3, "graphics_volumetric_intensity");
             IniSlider(SymbolRegular.Lightbulb24, L.T("Lamp fog strength"), 0, 3, "graphics_point_fog_intensity");
             IniSlider(SymbolRegular.Lightbulb24, L.T("Lamp fog glow size"), 0.03, 0.2, "graphics_point_fog_glow_size", step: 0.01, fallback: 0.08);
+
+            // The engine's faster modes of the lighting above and the size of its motion-vector store.
+            // The in-game menu has the same rows and switches the four toggles live; the engine reads
+            // lantern.ini when it starts, so a change made here applies at the next start.
+            Group(L.T("Performance"));
+            Body.Children.Add(Text(L.T("Options that give up a little picture quality for speed or video memory. A change here applies at the next game start; the in-game menu (Insert or L3 + R3) has the same options and switches the first four at once."), "Faint"));
+            IniToggle(SymbolRegular.TopSpeed24, L.T("Half-resolution ray traced sun shadows"),
+                L.T("Faster ray traced sun shadows: 0.24 ms instead of 0.56 ms at one heavy spot. An object thinner than about 2 pixels can lose its shadow. Needs Ultra (Ray Traced Shadows) in Shadow rendering method. Off by default."),
+                "graphics_rt_sun_half");
+            _sunHalfHint = ((SettingRow)Body.Children[^1]).Hint;
+            IniToggle(SymbolRegular.TopSpeed24, L.T("Half-resolution lamp shadows"),
+                L.T("Faster ray traced lamp shadows: about +2.6% FPS at one heavy spot. An object thinner than about 2 pixels can lose its shadow. Needs Ray traced lamp shadows, which is in the in-game menu. Off by default."),
+                "graphics_lamp_shadow_half");
+            _lampHalfHint = ((SettingRow)Body.Children[^1]).Hint;
+            IniToggle(SymbolRegular.TopSpeed24, L.T("Far animated objects in ray tracing: update every 8th frame"),
+                L.T("About +2.5% FPS at one heavy spot. An animated object that is only in the far sun shadow bands updates its ray tracing shape every 8th frame, so its ray traced shadow can be up to 7 frames old. Needs Ultra (Ray Traced Shadows), Ultra (RTGI) or Ray traced lamp shadows. Off by default."),
+                "graphics_rt_far_refit");
+            _farRefitHint = ((SettingRow)Body.Children[^1]).Hint;
+            IniToggle(SymbolRegular.TopSpeed24, L.T("Fewer glossy reflection rays"),
+                L.T("Faster indirect light: 0.77 ms instead of 0.89 ms at one heavy spot. Traces one glossy reflection ray per flat 2x2 pixel block, and one per pixel at edges and on very smooth surfaces. Needs High (probe-based GI), and Screen probe glossy reflections and Full-resolution glossy reflections from the in-game menu. Off by default."),
+                "graphics_gi_reflections_fewer_rays");
+            _fewerRaysHint = ((SettingRow)Body.Children[^1]).Hint;
+            // How often the game draws its two far sun shadow bands. The engine hooks the game's
+            // loop when the game starts, so the in-game menu's row waits for a restart as well.
+            _farShadows = IniCombo(SymbolRegular.TopSpeed24, L.T("Far sun shadows"),
+                L.T("More FPS from fewer shadow draws. The game draws the sun's shadow in four distance bands; this sets how often it draws the far two (the near two are always drawn every frame). Drawn less often, the shadow of a far moving thing (a distant enemy) can lag behind it: by up to 1 frame with In turn, by up to 7 frames with Every 8th frame. Shadows of things that stand still stay right. Applied when the game starts."),
+                Choices.SunFarShadows, "graphics_sun_far_shadows", changed: UpdatePerformance);
+            _farShadowsHint = ((SettingRow)Body.Children[^1]).Hint;
+            _motionStore = IniCombo(SymbolRegular.ArrowMove24, L.T("Motion vector store"),
+                L.T("How many animated vertices get their own motion vectors each frame. What does not fit gets camera motion only, which can show as ghosting with DLSS. Needs Object motion vectors. Applied when the game starts."),
+                Choices.MotionStore, "object_motion_store", changed: UpdatePerformance);
+            _motionStoreHint = ((SettingRow)Body.Children[^1]).Hint;
+            UpdatePerformance();
+            // The game writes lantern.ini too (its in-game menu). A save reads the file first, so
+            // the lines under the rows follow it; so they do when the game starts or exits.
+            Ws.Saved += UpdatePerformance;
+            Ws.GameStateChanged += RefreshPerformance;
 
             Ws.PortChanged += UpdateUpscaler;
         }
@@ -263,7 +303,56 @@ namespace BloodborneLauncher.Views
             _ => SymbolRegular.Color24,
         };
 
-        public override void OnShown() => UpdateUpscaler();
+        public override void OnShown()
+        {
+            UpdateUpscaler();
+            RefreshPerformance();
+        }
+
+        /// <summary>Reads lantern.ini again first: the in-game menu may have changed what a row
+        /// needs since the launcher read the file.</summary>
+        private void RefreshPerformance()
+        {
+            Ini.Refresh();
+            UpdatePerformance();
+        }
+
+        /// <summary>The note of the choice a choice row shows now, cut as ComboRow cuts it.</summary>
+        private static string? ChoiceNote(object row, IReadOnlyList<Choice> choices)
+        {
+            var index = row is Segmented segmented ? segmented.SelectedIndex : row is ComboBox box ? box.SelectedIndex : -1;
+            return index >= 0 && index < choices.Count && choices[index].Note is { } note ? Brief(note, 110) : null;
+        }
+
+        /// <summary>Under each performance toggle, what it needs while lantern.ini has that off (the
+        /// engine's own rule for each row of its in-game menu). The toggle stays usable: some of the
+        /// things needed are set in the in-game menu only. While Previous engine paths (More >
+        /// Engine) is on, every row of the group says that instead.</summary>
+        private void UpdatePerformance()
+        {
+            // engine_previous_paths: the engine then leaves this group's faster modes out and starts
+            // with the small motion-vector store, whatever the rows say (bbport_overlay.cpp,
+            // PreviousPathsNote; vk_object_motion.cpp).
+            if (Ini.Flag("engine_previous_paths"))
+            {
+                foreach (var hint in new[] { _sunHalfHint, _lampHalfHint, _farRefitHint, _fewerRaysHint, _farShadowsHint })
+                    SetHint(hint, L.T("Previous engine paths (More > Engine) is on: this setting is not used"));
+                SetHint(_motionStoreHint, L.T("Previous engine paths (More > Engine) is on: the game starts with the small store"));
+                return;
+            }
+            // A choice row's line is its choice's note (ComboRow): put back after the line above.
+            SetHint(_farShadowsHint, ChoiceNote(_farShadows, Choices.SunFarShadows));
+            SetHint(_motionStoreHint, ChoiceNote(_motionStore, Choices.MotionStore));
+            var lamps = Ini.Flag("graphics_rt_point_shadows");
+            // High and Ultra as the engine sees them: graphics_rt_bounce stays 1 under High, where the
+            // probes replace it and no ray tracing scene is built for it (RtShadow::SceneWanted).
+            var gi = Choices.GiMode(Ini);
+            SetHint(_sunHalfHint, Choices.SunShadowMode(Ini) == "rt" ? null : L.T("Needs Ultra (Ray Traced Shadows) in Shadow rendering method"));
+            SetHint(_lampHalfHint, lamps ? null : L.T("Needs Ray traced lamp shadows: turn it on in the in-game menu (Insert or L3 + R3)"));
+            SetHint(_farRefitHint, lamps || Ini.Flag("graphics_rt_sun") || gi == "ultra" ? null : L.T("Needs Ultra (Ray Traced Shadows), Ultra (RTGI) or Ray traced lamp shadows"));
+            SetHint(_fewerRaysHint, gi != "high" ? L.T("Needs High (probe-based GI) in Global Illumination Quality (Indirect Lighting)")
+                : Ini.Flag("graphics_gi_reflections") && Ini.Flag("graphics_gi_reflections_full_res") ? null : L.T("Needs Screen probe glossy reflections and Full-resolution glossy reflections: turn them on in the in-game menu (Insert or L3 + R3)"));
+        }
 
         private static bool DlssFound() =>
             Paths.DlssRuntime != null; // the engine has DLSS built in; NVIDIA's runtime sits beside it
