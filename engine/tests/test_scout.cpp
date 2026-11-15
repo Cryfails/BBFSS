@@ -44,6 +44,13 @@ int main() {
     Check(InScannedRows(2412951) && !InScannedRows(2900950) && !InScannedRows(3000950) && !InScannedRows(2430950),
           "scanned rows: listed maps but not area 29");
 
+    Check(EnvSwitch("1", false) && !EnvSwitch("0", true), "a part's env switch: 1 on, 0 off");
+    Check(EnvSwitch(nullptr, true) && !EnvSwitch(nullptr, false) && EnvSwitch("", true) && !EnvSwitch("", false),
+          "unset or empty keeps the default");
+    Check(EnvSwitch("2", true) && !EnvSwitch("yes", false) && EnvSwitch("00", true) && !EnvSwitch("10", false) &&
+              !EnvSwitch(" 1", false),
+          "anything but exactly 0 or 1 keeps the default");
+
     Check(FirstWait(true, 0, true, true, true, false, false) == Wait::Online, "online comes first");
     Check(FirstWait(false, -1, true, false, false, false, false) == Wait::NoPlayer, "no character before loading");
     Check(FirstWait(false, 0, false, false, true, false, true) == Wait::Dead, "dead beats boss");

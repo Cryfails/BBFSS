@@ -42,7 +42,9 @@ constexpr auto kBossConfirmAfter = std::chrono::seconds(1);
 constexpr std::uint32_t kFlagFirst = 2100, kFlagLast = 3699;
 constexpr std::uint32_t kWideStep = 50000;
 
-std::atomic<bool> g_installed{false}, g_on{false}, g_busy{false}, g_calm{false}, g_copy{false}, g_lamps_ready{false};
+std::atomic<bool> g_installed{false}, g_on{false}, g_busy{false}, g_copy{false}, g_lamps_ready{false};
+// The parts: set from the environment at Install, then by the menu (SetParts).
+std::atomic<bool> g_no_death{true}, g_unseen{true}, g_calm{false};
 std::atomic<std::uint32_t> g_request{0};
 std::atomic<const char*> g_scan_failed{nullptr};
 std::mutex g_mu;
@@ -427,7 +429,9 @@ void Install() {
     g_list = flag("BB_SCOUT_LIST");
     g_trace = flag("BB_SCOUT_TRACE");
     g_flags = flag("BB_SCOUT_FLAGS");
-    g_calm = flag("BB_SCOUT_CALM");
+    g_no_death = ScoutRules::EnvSwitch(std::getenv("BB_SCOUT_NODEATH"), true);
+    g_unseen = ScoutRules::EnvSwitch(std::getenv("BB_SCOUT_UNSEEN"), true);
+    g_calm = ScoutRules::EnvSwitch(std::getenv("BB_SCOUT_CALM"), false);
     g_dlc = flag("BB_DLC");
     g_all_rows = flag("BB_SCOUT_ALL_ROWS");
     if (const char* wait = std::getenv("BB_SCOUT_WAIT_S"); wait && *wait)
@@ -460,7 +464,24 @@ void Install() {
 }
 
 bool On() { return g_on.load(std::memory_order_relaxed); }
+bool NoDeath() { return g_no_death.load(std::memory_order_relaxed); }
+bool Unseen() { return g_unseen.load(std::memory_order_relaxed); }
 bool Calm() { return g_calm.load(std::memory_order_relaxed); }
+
+Parts CurrentParts() {
+    return {NoDeath(), Unseen(), Calm()};
+}
+
+void SetParts(Parts parts) {
+    const Parts was = CurrentParts();
+    if (parts.no_death == was.no_death && parts.unseen == was.unseen && parts.calm == was.calm) return;
+    // The cheats see the change on their next frame and switch each flag as scout on/off does.
+    g_no_death = parts.no_death;
+    g_unseen = parts.unseen;
+    g_calm = parts.calm;
+    Say("parts: no death %s, unseen %s, calm %s", parts.no_death ? "on" : "off", parts.unseen ? "on" : "off",
+        parts.calm ? "on" : "off");
+}
 
 const char* Unavailable() {
     if (BbOnlineGate::Reason()) return kOnline;
@@ -482,8 +503,9 @@ const char* SetOn(bool on) {
     }
     if (g_on.exchange(true)) return nullptr;
     g_busy = true;
-    Say("on: no death and full health, unseen (Player Hide, Player Silence), lamp travel%s; saves folder %s",
-        Calm() ? ", calm enemies (All No Attack)" : "", g_override.c_str());
+    Say("on: %s%slamp travel%s; saves folder %s", NoDeath() ? "no death and full health, " : "",
+        Unseen() ? "unseen (Player Hide, Player Silence), " : "", Calm() ? ", calm enemies (All No Attack)" : "",
+        g_override.c_str());
     return nullptr;
 }
 

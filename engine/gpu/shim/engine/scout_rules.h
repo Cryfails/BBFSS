@@ -45,6 +45,13 @@ constexpr bool ParseLamp(const char* s, std::uint32_t* out) {
     return true;
 }
 
+// A part's start switch (BB_SCOUT_NODEATH, BB_SCOUT_UNSEEN, BB_SCOUT_CALM): exactly "1" is on,
+// exactly "0" is off, anything else or unset keeps the part's default.
+constexpr bool EnvSwitch(const char* s, bool fallback) {
+    if (!s || !s[0] || s[1]) return fallback;
+    return s[0] == '1' ? true : s[0] == '0' ? false : fallback;
+}
+
 enum class Wait { None, Online, NoPlayer, Dead, Loading, Cutscene, Boss, NotSettled };
 // The first reason a travel has to wait, in this order.
 constexpr Wait FirstWait(bool online, std::int32_t hp, bool loading, bool cutscene, bool boss, bool boss_ok, bool settled) {

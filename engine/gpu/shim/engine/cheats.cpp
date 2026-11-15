@@ -486,8 +486,8 @@ bool SharedWorld() {
 int SettingOf(const Extra& e, const BbSettings::Values& s) {
     switch (e.which) {
     case Stamina: return s.cheat_stamina.load(std::memory_order_relaxed);
-    case Stealth: return s.cheat_stealth.load(std::memory_order_relaxed) || Scout::On();
-    case NoDeath: return Scout::On();
+    case Stealth: return s.cheat_stealth.load(std::memory_order_relaxed) || (Scout::On() && Scout::Unseen());
+    case NoDeath: return Scout::On() && Scout::NoDeath();
     case Calm: return Scout::On() && Scout::Calm();
     case KeepEchoes: return s.cheat_keep_echoes.load(std::memory_order_relaxed);
     case NoDurability: return s.cheat_no_durability.load(std::memory_order_relaxed);

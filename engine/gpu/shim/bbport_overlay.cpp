@@ -2584,16 +2584,16 @@ void ScoutSection() {
             Scout::SetOn(on);
         }
         Hint(BbSettings::MenuText(
-            "For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player "
-            "Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full "
+            "For tests on a copy of your saves. By default sets the game's debug flags Player No Dead, Player Hide and "
+            "Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full "
             "and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to "
             "a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + "
             "D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 "
             "(taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every "
             "start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves "
             "folder is a copy made by the scout script.",
-            "Для тестов на копии сохранений. Включает отладочные флаги игры Player No Dead, Player Hide и Player "
-            "Silence (враги вас не видят и не слышат) и возвращает полное здоровье, когда оно ниже полного и выше 0, "
+            "Для тестов на копии сохранений. По умолчанию включает отладочные флаги игры Player No Dead, Player Hide "
+            "и Player Silence (враги вас не видят и не слышат) и возвращает полное здоровье, когда оно ниже полного и выше 0, "
             "кроме первых 1,5 с после загрузки или перехода в другой блок карты. Перемещение ведёт к фонарю из "
             "списка перемещений игры, у которого есть своё название в текстах игры, здесь или в панели F7 (L3 + "
             "крестовина вниз); оно не проверяет, зажжён ли фонарь, и пропускает подземелья чаш, а области 34-36 "
@@ -2603,10 +2603,48 @@ void ScoutSection() {
         if (const char* why = Scout::Unavailable()) {
             ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), ScoutWhy(why));
         }
+        ImGui::PopID();
+    }
+    // The parts: usable only while scout mode is on; each switches its own flags at once, as on/off does.
+    ImGui::BeginDisabled(!Scout::On());
+    ImGui::Indent();
+    Scout::Parts parts = Scout::CurrentParts();
+    if (const char* label = Item("No death", "Без смерти")) {
+        ImGui::PushID("scout no death");
+        if (ImGui::Checkbox(label, &parts.no_death)) {
+            Scout::SetParts(parts);
+        }
+        Hint(BbSettings::MenuText(
+            "Sets Player No Dead and sets your health back to full when it is below full and above 0. Hits still land.",
+            "Включает Player No Dead и возвращает полное здоровье, когда оно ниже полного и выше 0. Удары "
+            "по-прежнему попадают."));
         CheatUnavailable(BbEngine::Cheats::NoDeath);
+        ImGui::PopID();
+    }
+    if (const char* label = Item("Unseen", "Незаметность")) {
+        ImGui::PushID("scout unseen");
+        if (ImGui::Checkbox(label, &parts.unseen)) {
+            Scout::SetParts(parts);
+        }
+        Hint(BbSettings::MenuText(
+            "Sets Player Hide and Player Silence: enemies neither see nor hear you. The Stealth cheat sets the same flags.",
+            "Включает Player Hide и Player Silence: враги вас не видят и не слышат. Чит «Скрытность» включает те же "
+            "флаги."));
         CheatUnavailable(BbEngine::Cheats::Stealth);
         ImGui::PopID();
     }
+    if (const char* label = Item("Calm enemies", "Спокойные враги")) {
+        ImGui::PushID("scout calm");
+        if (ImGui::Checkbox(label, &parts.calm)) {
+            Scout::SetParts(parts);
+        }
+        Hint(BbSettings::MenuText("Sets the game's debug flag All No Attack. Its effect in play is not confirmed yet.",
+                                  "Включает отладочный флаг игры All No Attack. Его действие в игре ещё не подтверждено."));
+        CheatUnavailable(BbEngine::Cheats::Calm);
+        ImGui::PopID();
+    }
+    ImGui::Unindent();
+    ImGui::EndDisabled();
     if (!Scout::On()) {
         return;
     }
