@@ -442,8 +442,11 @@ int Main(std::vector<std::wstring> arguments) {
         // BB_MODS_CONFIG_OVERRIDE, when set, is this run's mods list instead of BB_MODS_CONFIG, and
         // mods are on for the run (the launcher always sets both from its own settings). Automated
         // tests use it to compare a mod on against off without touching the player's mods.json.
+        // A path that is not a file stops the start, so a mistyped path cannot load every mod.
         // Not set: nothing changes.
         const std::string mods_override = Env("BB_MODS_CONFIG_OVERRIDE", "");
+        if (!mods_override.empty() && !fs::is_regular_file(Path(mods_override), error))
+            throw Error("BB_MODS_CONFIG_OVERRIDE is not a file: " + mods_override);
         if (!mods_override.empty()) Log("Mods: list for this run (BB_MODS_CONFIG_OVERRIDE): %s", mods_override.c_str());
         merged = BuildModsOverlay(original, out, Path(Env("BB_MODS_DIR", Utf8(data / "mods"))),
                                   Path(mods_override.empty() ? Env("BB_MODS_CONFIG", Utf8(data / "mods.json")) : mods_override),
