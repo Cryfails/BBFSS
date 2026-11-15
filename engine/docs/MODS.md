@@ -72,7 +72,11 @@ The order and the disabled mods are saved in the data folder's `mods.json`:
 
 New folders are enabled automatically and added at the end in alphabetical order.
 `BB_MODS_CONFIG` changes the profile's path. `BB_MOD_TRACE=1` with `BB_MODS_DIR` prints the first
-reads of the files actually used, for diagnosis.
+reads of the files actually used, for diagnosis. On Windows the start program (bb-start) also takes
+`BB_MODS_CONFIG_OVERRIDE`: when set, it is that run's profile instead of `BB_MODS_CONFIG`, mods are on
+for the run, and the log says `Mods: list for this run (BB_MODS_CONFIG_OVERRIDE): <path>`. The
+launcher always sets `BB_MODS_CONFIG` and `BB_MODS_ENABLED` from its own settings, so automated tests
+use the override to choose the mods without touching the player's `mods.json`.
 
 # Third-party patches (shadPS4 XML and TOML)
 

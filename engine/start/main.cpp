@@ -439,9 +439,15 @@ int Main(std::vector<std::wstring> arguments) {
                 Log("Engine: Lamp2Lamp off: %s", e.what());
             }
         }
+        // BB_MODS_CONFIG_OVERRIDE, when set, is this run's mods list instead of BB_MODS_CONFIG, and
+        // mods are on for the run (the launcher always sets both from its own settings). Automated
+        // tests use it to compare a mod on against off without touching the player's mods.json.
+        // Not set: nothing changes.
+        const std::string mods_override = Env("BB_MODS_CONFIG_OVERRIDE", "");
+        if (!mods_override.empty()) Log("Mods: list for this run (BB_MODS_CONFIG_OVERRIDE): %s", mods_override.c_str());
         merged = BuildModsOverlay(original, out, Path(Env("BB_MODS_DIR", Utf8(data / "mods"))),
-                                  Path(Env("BB_MODS_CONFIG", Utf8(data / "mods.json"))), Env("BB_MODS_ENABLED", "1") == "1",
-                                  first_layers);
+                                  Path(mods_override.empty() ? Env("BB_MODS_CONFIG", Utf8(data / "mods.json")) : mods_override),
+                                  !mods_override.empty() || Env("BB_MODS_ENABLED", "1") == "1", first_layers);
     } catch (const std::exception& e) {
         Log("Mods: %s", e.what());
         return 1;
