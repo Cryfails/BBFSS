@@ -18,11 +18,23 @@
 
 namespace Vulkan {
 
+/// bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW when it is not set: 0 the pixel's own
+/// last frames, 1 the 5x5 window confined to the 8x8 workgroup (r57, as before), 2 the window
+/// centred on every pixel (one more dispatch, see LampShadowTune::window_centred). The one line to
+/// change to make 2 the default; tests/test_lamp_shadow_tune.cpp follows it, and the torch lab's
+/// default runs (tests/test_rt_shadows.cpp --lamps) then run value 2. 0 as the default also
+/// needs the tune test's r57 asserts changed (they hold for a default with the window: 1 or 2).
+inline constexpr std::uint32_t LampWindowDefault = 1;
+static_assert(LampWindowDefault <= 2, "BB_LAMP_SHADOW_WINDOW has the values 0, 1 and 2");
+
 struct LampShadowTune {
     bool weights = true;         ///< BB_LAMP_SHADOW_WEIGHTS: the game's falloff times N.L; 0: as before
     float wrap = 0.15f;          ///< BB_LAMP_SHADOW_WRAP, 0..1: N.L tolerance; 1: no N.L
     float facing_floor = 0.05f;  ///< BB_LAMP_SHADOW_FLOOR, 0..1: least facing factor; 0: none
     float radius_m = 0.1f;       ///< BB_LAMP_SHADOW_SOFT, 0..0.5: the lamp's radius; 0: a point
+    bool radius_set = false;     ///< bbport (r48_lamp-softness): BB_LAMP_SHADOW_SOFT gave radius_m
+                                 ///< (a number): it wins over graphics_lamp_shadow_softness
+                                 ///< (LampSoftnessRadius)
     float history = 0.9f;        ///< BB_LAMP_SHADOW_HISTORY, 0..0.98: share of the frames before
                                  ///< in the shadow ratio; 0: this frame's ray alone
     float reject = 0.5f;         ///< BB_LAMP_SHADOW_REJECT, 0 or 0.45..1: the history is dropped
@@ -32,6 +44,32 @@ struct LampShadowTune {
     bool follow = true;          ///< BB_LAMP_SHADOW_FOLLOW: the history is looked up where a
                                  ///< moving lamp's motion puts it (LampTrack); 0: where the
                                  ///< surface was
+    bool follow_soft = true;     ///< bbport (r52_follow-soft): BB_LAMP_SHADOW_FOLLOW_SOFT: under a
+                                 ///< moving lamp the history is looked up at both places (where the
+                                 ///< surface was, where the lamp's motion puts it) and mixed by a
+                                 ///< follow state each pixel keeps; 0: one of them, picked by the
+                                 ///< vote of the 5x5 answers around the pixel (r42)
+    bool window = LampWindowDefault >= 1; ///< bbport (r57_lamp-window): BB_LAMP_SHADOW_WINDOW: 1:
+                                 ///< the history is bound by the 5x5 answers around the pixel and
+                                 ///< the frames under a moving lamp are capped by their far
+                                 ///< blockers' swing, as before r57; 0 (rejected: streaks after a stop, a lingering shadow with two lamps): by the pixel's own
+                                 ///< last frames and one fixed swing. The window cannot be centred
+                                 ///< near the 8x8 workgroup's rim and is the source of the
+                                 ///< squares fixed to the screen behind moving shadows (game captures with the clamp off); without it
+                                 ///< a change of less than about 0.86 of the light (a penumbra
+                                 ///< that becomes lit, one lamp's part of two) is not cut but fades
+                                 ///< like the unguarded history, with one lamp or several. With
+                                 ///< BB_LAMP_SHADOW_FOLLOW_SOFT=0 the vote and its cap keep the
+                                 ///< window either way (they have no per-pixel form).
+                                 ///< bbport (r60_lamp-centred-window): 2 is 1 with window_centred
+    bool window_centred = LampWindowDefault == 2; ///< bbport (r60_lamp-centred-window):
+                                 ///< BB_LAMP_SHADOW_WINDOW=2 (with window): the 5x5 window is centred
+                                 ///< on every pixel, wherever the workgroup's rim lies, in tests it
+                                 ///< removed the squares; it costs more than planned and is not the default. The pass that
+                                 ///< averages runs as two dispatches (a trace, a resolve; four at
+                                 ///< half resolution) with one image more, 8 bytes a pixel
+                                 ///< (PointShadow::Flush). Read at start only (the pipelines are
+                                 ///< picked then)
     float carry_m = 2.5f;        ///< BB_LAMP_SHADOW_CARRY, 0..5: what blocks a moving lamp within
                                  ///< this distance of it is taken to move with it, metres
     float around = 1.6f;         ///< BB_LAMP_SHADOW_CLAMP, 0 or 0.5..4: the history may lie this
@@ -48,7 +86,10 @@ struct LampShadowTune {
 
 inline constexpr std::uint32_t LampTuneWordCount = 16;
 // Word 0 (point_shadow_ray.comp loadTune): bit 0 the new weights, bit 1 the game's lamps use the
-// inverse-square curve, bits 8-10 the view (bits 4-6 were r41's rim rays: not used). Word 3: the
+// inverse-square curve, bits 8-10 the view (bits 4-6 were r41's rim rays: not used), bit 20 the
+// soft follow (bbport r52_follow-soft, LampTuneFollowSoft; bits 12-17: not used), bit 21 the
+// window (bbport r57_lamp-window, LampTuneWindow), bit 22 the centred window (bbport
+// r60_lamp-centred-window, LampTuneCentred; only with bit 21). Word 3: the
 // frame counter (the sample points' sequence). The other words of 1-9, floats: 1 clearance, 2
 // radius, 4 self skip, 5 wrap, 6 the inverse-square curve's core squared, 7 view gain, 8 facing
 // floor, 9 reject. Words 10-12 and 13-15: two axes of the world in view space, unit length and
@@ -56,6 +97,16 @@ inline constexpr std::uint32_t LampTuneWordCount = 16;
 // world +y (up).
 inline constexpr std::uint32_t LampTuneNewWeights = 1, LampTuneInverseSquare = 2;
 inline constexpr std::uint32_t LampTuneViewShift = 8, LampTuneViewMax = 6;
+inline constexpr std::uint32_t LampTuneFollowSoft = 1u << 20; // bbport (r52_follow-soft)
+inline constexpr std::uint32_t LampTuneWindow = 1u << 21;     // bbport (r57_lamp-window)
+inline constexpr std::uint32_t LampTuneCentred = 1u << 22;    // bbport (r60_lamp-centred-window)
+// (Bit 22 is free: it is none of the bits above, the view's field, 12-17 or 20-21.)
+static_assert((LampTuneCentred & (LampTuneNewWeights | LampTuneInverseSquare | LampTuneFollowSoft |
+                                  LampTuneWindow | (7u << LampTuneViewShift) | (0x3Fu << 12))) == 0);
+/// bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW as a number, 0 to 2.
+inline constexpr std::uint32_t LampWindowValue(const LampShadowTune& tune) {
+    return tune.window ? (tune.window_centred ? 2u : 1u) : 0u;
+}
 // The least BB_LAMP_SHADOW_REJECT that is not 0: one ray that disagrees with the history moves
 // the shader's mean of the last few frames by 0.4 (1 - FAST_KEEP), and the reject sets in at 0.9
 // of the knob (REJECT_FROM): below 0.45 every such ray would drop the history, and the picture
@@ -112,7 +163,11 @@ inline LampShadowTune ReadLampShadowTune(LampTuneGet get) {
     tune.weights = Whole(get, "BB_LAMP_SHADOW_WEIGHTS", tune.weights ? 1u : 0u, 1u) != 0;
     tune.wrap = Number(get, "BB_LAMP_SHADOW_WRAP", tune.wrap, 0.0f, 1.0f);
     tune.facing_floor = Number(get, "BB_LAMP_SHADOW_FLOOR", tune.facing_floor, 0.0f, 1.0f);
-    tune.radius_m = Number(get, "BB_LAMP_SHADOW_SOFT", tune.radius_m, 0.0f, 0.5f);
+    // bbport (r48_lamp-softness): read with no fallback (a NaN when the variable is not set or
+    // is not a number), so that the pass knows whether it gave the radius.
+    const float soft = Number(get, "BB_LAMP_SHADOW_SOFT", std::nanf(""), 0.0f, 0.5f);
+    tune.radius_set = !std::isnan(soft);
+    tune.radius_m = tune.radius_set ? soft : tune.radius_m;
     tune.history = Number(get, "BB_LAMP_SHADOW_HISTORY", tune.history, 0.0f, 0.98f);
     tune.reject = Number(get, "BB_LAMP_SHADOW_REJECT", tune.reject, 0.0f, 1.0f);
     if (tune.reject > 0.0f) {
@@ -120,6 +175,11 @@ inline LampShadowTune ReadLampShadowTune(LampTuneGet get) {
     }
     tune.trail_m = Number(get, "BB_LAMP_SHADOW_TRAIL", tune.trail_m, 0.0f, 2.0f);
     tune.follow = Whole(get, "BB_LAMP_SHADOW_FOLLOW", tune.follow ? 1u : 0u, 1u) != 0;
+    tune.follow_soft = Whole(get, "BB_LAMP_SHADOW_FOLLOW_SOFT", tune.follow_soft ? 1u : 0u, 1u) != 0; // r52
+    // r57; r60_lamp-centred-window: 2 the centred window (3 or more: 2, below 0: 0)
+    const std::uint32_t window = Whole(get, "BB_LAMP_SHADOW_WINDOW", LampWindowValue(tune), 2u);
+    tune.window = window >= 1;
+    tune.window_centred = window == 2;
     tune.carry_m = Number(get, "BB_LAMP_SHADOW_CARRY", tune.carry_m, 0.0f, 5.0f);
     tune.around = Number(get, "BB_LAMP_SHADOW_CLAMP", tune.around, 0.0f, 4.0f);
     if (tune.around > 0.0f) {
@@ -191,6 +251,50 @@ inline float LampPassRadius(const LampShadowTune& tune, bool takes_history, bool
     return averages && !takes_history ? 0.0f : tune.radius_m;
 }
 
+/// bbport (r48_lamp-softness): the lamp's radius, m, for graphics_lamp_shadow_softness
+/// (bbport_settings.h LampSoftness: 0 sharp, 1 soft, 2 softer; another number: the nearest of
+/// the three, as the menu shows it and the ini saves it; r53_lamp-housekeeping). The ini's text
+/// that is no name is soft (bbport_settings.cpp). BB_LAMP_SHADOW_SOFT, when it gave a number
+/// (radius_set), wins. PointShadow::Flush
+/// takes it at every pass, so the menu switches it live.
+///  - Sharp, 0: a point lamp. Its ray goes to the lamp's centre, the same ray every frame, and
+///    nothing is averaged (LampHistoryFrames 0: the pass neither reads nor writes a history);
+///    the pass traces every lamp that reaches a pixel (LampPassSteps).
+///  - Soft, 0.1 m: the area lamp of r42, one ray a lamp a frame to a point of its disc, averaged
+///    in the history (BB_LAMP_SHADOW_HISTORY 0.9: up to 9 frames before this one).
+///  - Softer, 0.2 m: the same with a disc twice as wide, so every penumbra is twice as wide. The
+///    rays are as many and the history as long: the points a pixel's rays go to walk the disc
+///    in its own measure (samplePoint, the unit square laid over the disc's area), so 9 frames
+///    cover a wide disc as evenly as a narrow one and the noise left in a penumbra pixel does
+///    not grow with the radius. What grows is the share of the screen in penumbra, where the
+///    history does the averaging and the answers around a pixel bind it least, and the share of
+///    its pixels the half-resolution pass's second half traces. A ray is blind within
+///    clearance_m (0.35 m) of its target, a point of the disc at most the radius from the
+///    lamp's centre. So everything within clearance_m minus the radius of the centre (0.15 m at
+///    0.2 m), where the lamp's own model sits, is blind to every ray; beyond clearance_m plus
+///    the radius (0.55 m at 0.2 m) every ray sees it; in between a thin wall or arm can be missed
+///    by the rays whose target lies near it, and a wider disc widens that band (worked out from
+///    the code, not seen in the game).
+inline constexpr std::array<float, 3> LampSoftnessRadii{0.0f, 0.1f, 0.2f};
+inline float LampSoftnessRadius(const LampShadowTune& tune, int softness) {
+    if (tune.radius_set) {
+        return tune.radius_m;
+    }
+    return LampSoftnessRadii[std::size_t(std::clamp(softness, 0, int(LampSoftnessRadii.size()) - 1))];
+}
+
+/// bbport (r48_lamp-softness): the shader's `steps` for a ray traced lamp pass (its push block):
+/// 0 traces every lamp that reaches a pixel; else (`pick`: 1, or 0 with LANTERN_RT_LAMPS_EXACT=1)
+/// the strongest lamp and one of the others, picked by weight anew each frame where the camera
+/// jitters, which the area lamp's history averages. A point lamp (sharp, or
+/// BB_LAMP_SHADOW_SOFT=0) has no history to average the pick in, and the light of a pixel that
+/// three or more lamps reach would change from frame to frame in the weaker lamps' shadows: with
+/// the repair (not experiment 35184372088832, the pass of before r41) it traces every lamp. No
+/// noise, and more rays only where three or more lamps reach a pixel.
+inline std::uint32_t LampPassSteps(const LampShadowTune& tune, bool repair, std::uint32_t pick) {
+    return repair && !(tune.radius_m > 0.0f) ? 0u : pick;
+}
+
 /// What the shader reads at the place the mode word names. inverse_square, core: the lamp
 /// falloff the game's shaders were patched to (startup_local_inverse_square,
 /// startup_local_light_core). view: see LampTuneAxes. frame: the frame counter.
@@ -203,7 +307,10 @@ inline std::array<std::uint32_t, LampTuneWordCount> LampTuneWords(const LampShad
     const auto axes = LampTuneAxes(view);
     const std::uint32_t flags = (tune.weights ? LampTuneNewWeights : 0u) |
                                 (inverse_square ? LampTuneInverseSquare : 0u) |
-                                std::min(tune.view, LampTuneViewMax) << LampTuneViewShift;
+                                std::min(tune.view, LampTuneViewMax) << LampTuneViewShift |
+                                (tune.follow_soft ? LampTuneFollowSoft : 0u) | // bbport (r52_follow-soft)
+                                (tune.window ? LampTuneWindow : 0u) |          // bbport (r57_lamp-window)
+                                (tune.window && tune.window_centred ? LampTuneCentred : 0u); // bbport (r60)
     return {flags,
             bits(tune.clearance_m),
             bits(tune.radius_m),
@@ -310,6 +417,9 @@ public:
     static constexpr float Near = 15.0f;      ///< "near the camera", m
     static constexpr float Lost = 1000.0f;    ///< Step of a lamp that was not there the frame
                                               ///< before, m: no history holds under its shadows
+                                              ///< (bbport r52_follow-soft: point_shadow_ray.comp
+                                              ///< NEW_LAMP_STEP is half of it; tied by this
+                                              ///< comment only)
 
     /// A pass begins. inv_view: its camera, view to world, 12 floats in rows of four; null: not
     /// known (nothing is followed this frame or the next).

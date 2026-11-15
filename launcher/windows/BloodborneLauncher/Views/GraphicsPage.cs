@@ -14,6 +14,9 @@ namespace BloodborneLauncher.Views
         private readonly TextBlock _sunHalfHint, _lampHalfHint, _farRefitHint, _fewerRaysHint;
         private readonly TextBlock _farShadowsHint, _motionStoreHint;
         private readonly object _farShadows, _motionStore;
+        private readonly object _lampSoftness;
+        private readonly TextBlock _lampSoftnessHint;
+        private bool _lampShowing; // ShowLampSoftness is setting the row: nothing is written to the ini
         private readonly SettingRow _presetCard, _renderScaleCard, _sharpenCard, _sharpnessCard, _mipBiasCard;
         private readonly SettingRow _frameGenFramesCard, _frameGenDynamicCard, _reflexCard, _frameGenCapCard;
 
@@ -152,6 +155,13 @@ namespace BloodborneLauncher.Views
             Group(L.T("Lighting"));
             IniCombo(SymbolRegular.Lightbulb24, L.T("Sun shadow resolution"), L.T("Applied when the game starts"), Choices.ShadowResolution, "graphics_shadow_resolution");
             IniCombo(SymbolRegular.Lightbulb24, L.T("Lamp shadow resolution"), L.T("Applied when the game starts"), Choices.LocalShadowResolution, "graphics_local_shadow_resolution");
+            // How soft the ray traced lamp shadows are (the engine's lamp radius: sharp a point,
+            // soft 0.1 m, softer 0.2 m). The in-game menu has the same row and switches it at once.
+            _lampSoftness = ComboRow(SymbolRegular.Lightbulb24, L.T("Lamp shadow softness"),
+                L.T("How soft the edges of ray traced lamp and torch shadows are. Sharp: hard edges, nothing averaged over frames. Soft: soft edges, averaged over about ten frames. Softer: twice as wide; thin things near a lamp cast fainter shadows. Needs Ray traced lamp shadows, which is in the in-game menu. A change here applies at the next game start; the in-game menu switches it at once."),
+                Choices.LampShadowSoftness, () => Choices.LampShadowSoftnessValue(Ini.Get("graphics_lamp_shadow_softness")),
+                v => { if (!_lampShowing) Ini.Set("graphics_lamp_shadow_softness", v); });
+            _lampSoftnessHint = ((SettingRow)Body.Children[^1]).Hint;
             ComboRow(SymbolRegular.Lightbulb24, L.T("Shadow rendering method"),
                 L.T("Normal uses the game's own dynamic sun shadows. High draws the sun's shadows with virtual shadow maps from the ray tracing system's cached scene geometry: sharper and stable at distance, costs more, and requires a GPU with hardware ray tracing (selecting it turns the ray tracing system on). Ultra traces the sun's shadows, also requires hardware ray tracing and is the most expensive. Takes effect on the next game start."),
                 Choices.SunShadowMethods, () => Choices.SunShadowMode(Ini), v => Choices.SetSunShadowMode(Ini, v), changed: UpdatePerformance);
@@ -314,7 +324,25 @@ namespace BloodborneLauncher.Views
         private void RefreshPerformance()
         {
             Ini.Refresh();
+            ShowLampSoftness();
             UpdatePerformance();
+        }
+
+        /// <summary>The softness row follows lantern.ini, which the in-game menu changes live. A value
+        /// the engine does not know is soft there, so it is here (Choices.LampShadowSoftnessValue).
+        /// The segmented row is set without a notice; a drop-down (Classic) notices a new index, and
+        /// its change is not written to the ini (the page's own Ws.SaveSoon still runs, as for any pick).</summary>
+        private void ShowLampSoftness()
+        {
+            var index = Choices.IndexOf(Choices.LampShadowSoftness, Choices.LampShadowSoftnessValue(Ini.Get("graphics_lamp_shadow_softness")));
+            _lampShowing = true;
+            try
+            {
+                if (_lampSoftness is Segmented segmented) segmented.Select(index, notify: false);
+                else if (_lampSoftness is ComboBox box && box.SelectedIndex != index) box.SelectedIndex = index;
+            }
+            finally { _lampShowing = false; }
+            SetHint(_lampSoftnessHint, ChoiceNote(_lampSoftness, Choices.LampShadowSoftness));
         }
 
         /// <summary>The note of the choice a choice row shows now, cut as ComboRow cuts it.</summary>

@@ -17,6 +17,9 @@
 #include "video_core/host_shaders/rt_lab_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_comp.h" // bbport (r42_lamp-soft)
+// bbport (r60_lamp-centred-window): the BB_LAMP_SHADOW_WINDOW=2 builds
+#include "video_core/host_shaders/point_shadow_ray_centred_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_centred_comp.h"
 #include "video_core/host_shaders/rt_still_sig_comp.h" // bbport (r47_still-check)
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/host_shaders/ssgi_gather_ray_comp.h"
@@ -1147,13 +1150,45 @@ int main(int argc, char** argv) {
     vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, 56, RT_UNPROJECT_COMP, sizeof(RT_UNPROJECT_COMP));
     vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, // bbport (r52_follow-soft): 9, 10
                     64, POINT_SHADOW_RAY_COMP, sizeof(POINT_SHADOW_RAY_COMP));
     vk.MakePipeline({VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
                      VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR},
                     128, SSGI_GATHER_RAY_COMP, sizeof(SSGI_GATHER_RAY_COMP));
     if (argc > 1 && std::strcmp(argv[1], "--pipelines") == 0) {
+        // bbport (r52_follow-soft): the half-resolution lamp pass too, with the layout --lamps
+        // gives it: the ray pass's bindings 0-8, the block answers (9), the counters (10), the
+        // follow state (11, 12)
+        vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                        64, POINT_SHADOW_RAY_HALF_COMP, sizeof(POINT_SHADOW_RAY_HALF_COMP),
+                        VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+        // bbport (r60_lamp-centred-window): the BB_LAMP_SHADOW_WINDOW=2 builds, as --lamps makes
+        // them: the full one's bindings and its answers (11); the half one's and its answers (13)
+        vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                        64, POINT_SHADOW_RAY_CENTRED_COMP, sizeof(POINT_SHADOW_RAY_CENTRED_COMP),
+                        VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+        vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                        64, POINT_SHADOW_RAY_HALF_CENTRED_COMP, sizeof(POINT_SHADOW_RAY_HALF_CENTRED_COMP),
+                        VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
         std::puts("RT pipelines: built");
         return 0;
     }
@@ -1249,23 +1284,28 @@ int main(int argc, char** argv) {
                                          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                          VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, // bbport (r52_follow-soft): 9, 10
                                         64, POINT_SHADOW_RAY_COMP, sizeof(POINT_SHADOW_RAY_COMP),
                                         VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
         Buffer lights = vk.MakeBuffer(64 * 1024 * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
         Image zero_image = vk.MakeImage(W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
         std::array<Image, 2> history{vk.MakeImage(W, H, VK_FORMAT_R16G16B16A16_SFLOAT),
                                      vk.MakeImage(W, H, VK_FORMAT_R16G16B16A16_SFLOAT)};
+        // bbport (r52_follow-soft): the follow state beside the history, taken in turn with it
+        std::array<Image, 2> follow{vk.MakeImage(W, H, VK_FORMAT_R32_SFLOAT), vk.MakeImage(W, H, VK_FORMAT_R32_SFLOAT)};
         std::array<Image, 4> lamp_images{};
         for (auto& image : lamp_images) image = vk.MakeImage(W, H, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
         vk.Begin();
         for (auto& image : lamp_images) vk.ToGeneral(image.image);
         vk.ToGeneral(zero_image.image);
         for (auto& image : history) vk.ToGeneral(image.image);
+        for (auto& image : follow) vk.ToGeneral(image.image); // bbport (r52_follow-soft)
         {
             VkClearColorValue zero{};
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            for (auto& image : follow) vkCmdClearColorImage(vk.cmd, image.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
         }
         vk.Stamp(0); vk.Stamp(1);
         vk.End();
@@ -1287,13 +1327,35 @@ int main(int argc, char** argv) {
                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                              VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                                             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+                                             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, // bbport (r52_follow-soft): 11, 12
                                             64, POINT_SHADOW_RAY_HALF_COMP, sizeof(POINT_SHADOW_RAY_HALF_COMP),
                                             VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
             Image half_answers = vk.MakeImage((W + 1) / 2, (H + 1) / 2, VK_FORMAT_R16G16B16A16_SFLOAT);
             Buffer half_counts = vk.MakeBuffer(64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
             std::memset(half_counts.data, 0, 64);
+            // bbport (r60_lamp-centred-window): the BB_LAMP_SHADOW_WINDOW=2 builds (a pass whose tuning
+            // has window_centred runs them, as PointShadow::Ready picks them) and their answers image
+            Pipeline lamp_centred = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                                                    64, POINT_SHADOW_RAY_CENTRED_COMP, sizeof(POINT_SHADOW_RAY_CENTRED_COMP),
+                                                    VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+            Pipeline half_centred = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                                                    64, POINT_SHADOW_RAY_HALF_CENTRED_COMP, sizeof(POINT_SHADOW_RAY_HALF_CENTRED_COMP),
+                                                    VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+            Image lamp_answers = vk.MakeImage(W, H, VK_FORMAT_R32G32_UINT);
             vk.Begin();
+            vk.ToGeneral(lamp_answers.image);
             vk.ToGeneral(half_answers.image);
             vk.Stamp(0); vk.Stamp(1);
             vk.End();
@@ -1332,6 +1394,11 @@ int main(int argc, char** argv) {
                 bool half = false;             // the half-resolution build, in its two passes
                 bool again = false;            // the pass before once more (its lamps and history block as they
                                                // are in the buffer), with this tuning: for a view of that frame
+                // bbport (r60_lamp-centred-window): MODE_APART, the engine's lamps-apart pass (the one
+                // with the history): the light without the lamps in the targets (0 here), the lamps'
+                // light in the snapshots (1), moved into the targets by the pass. The targets then
+                // end as without it (0 + 1 * ratio, 1 where nothing is shadowed).
+                bool apart = false;
             };
             Vulkan::LampTrack track;
             // bbport (r44_half-area-lamp): whether the half-resolution build counts what it does
@@ -1389,12 +1456,20 @@ int main(int argc, char** argv) {
                 VkClearColorValue one{};
                 one.float32[0] = one.float32[1] = one.float32[2] = 1.0f;
                 const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                vkCmdClearColorImage(vk.cmd, lamp_images[0].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
-                vkCmdClearColorImage(vk.cmd, lamp_images[2].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
                 const VkImageCopy whole{.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {W, H, 1}};
-                vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[1].image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
-                vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[3].image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+                if (pass.apart) { // bbport (r60_lamp-centred-window): cur0 0, snap0 1, cur1 and snap1 0
+                    vkCmdClearColorImage(vk.cmd, lamp_images[1].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+                    for (const int k : {0, 2, 3})
+                        vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[std::size_t(k)].image,
+                                       VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+                    mode |= 1u; // MODE_APART
+                } else {
+                    vkCmdClearColorImage(vk.cmd, lamp_images[0].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+                    vkCmdClearColorImage(vk.cmd, lamp_images[2].image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+                    vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[1].image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+                    vkCmdCopyImage(vk.cmd, zero_image.image, VK_IMAGE_LAYOUT_GENERAL, lamp_images[3].image, VK_IMAGE_LAYOUT_GENERAL, 1, &whole);
+                }
                 vk.Barrier();
                 VkDescriptorBufferInfo data{lights.buffer, 0, (TuneAt + Vulkan::LampTuneWordCount) * 4};
                 VkDescriptorImageInfo depth{vk.sampler, lab.depth.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -1407,8 +1482,8 @@ int main(int argc, char** argv) {
                 VkDescriptorImageInfo history_cur{{}, history[cur_history].view, VK_IMAGE_LAYOUT_GENERAL};
                 VkDescriptorImageInfo answers{{}, half_answers.view, VK_IMAGE_LAYOUT_GENERAL};
                 VkDescriptorBufferInfo counts{half_counts.buffer, 0, 64};
-                std::array<VkWriteDescriptorSet, 11> writes{};
-                for (unsigned k = 0; k < 11; ++k) writes[k] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = k, .descriptorCount = 1};
+                std::array<VkWriteDescriptorSet, 14> writes{}; // bbport (r60): 13, the centred window's answers
+                for (unsigned k = 0; k < 14; ++k) writes[k] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = k, .descriptorCount = 1};
                 writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[0].pBufferInfo = &data;
                 writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[1].pImageInfo = &depth;
                 for (int k = 0; k < 4; ++k) { writes[2 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2 + k].pImageInfo = &images[k]; }
@@ -1417,6 +1492,29 @@ int main(int argc, char** argv) {
                 writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[8].pImageInfo = &history_cur;
                 writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[9].pImageInfo = &answers;
                 writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[10].pBufferInfo = &counts;
+                // bbport (r52_follow-soft): the follow state, taken in turn with the history:
+                // bindings 11 and 12 of the half-resolution build, 9 and 10 of the full one
+                VkDescriptorImageInfo follow_prev{{}, follow[cur_history ^ 1].view, VK_IMAGE_LAYOUT_GENERAL};
+                VkDescriptorImageInfo follow_cur{{}, follow[cur_history].view, VK_IMAGE_LAYOUT_GENERAL};
+                writes[11].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[11].pImageInfo = &follow_prev;
+                writes[12].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[12].pImageInfo = &follow_cur;
+                // bbport (r60_lamp-centred-window): the centred window's answers, binding 13 of the
+                // half-resolution build and 11 of the full one (bound only with those builds)
+                VkDescriptorImageInfo centred_answers{{}, lamp_answers.view, VK_IMAGE_LAYOUT_GENERAL};
+                writes[13].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[13].pImageInfo = &centred_answers;
+                std::array<VkWriteDescriptorSet, 12> full_writes{};
+                std::copy_n(writes.begin(), 9, full_writes.begin());
+                full_writes[9] = writes[11];
+                full_writes[9].dstBinding = 9;
+                full_writes[10] = writes[12];
+                full_writes[10].dstBinding = 10;
+                full_writes[11] = writes[13];
+                full_writes[11].dstBinding = 11;
+                // As PointShadow::Ready and Flush: the window centred (BB_LAMP_SHADOW_WINDOW=2) runs
+                // its builds, and the pass that averages (not view 2 or 3) as a trace and a resolve.
+                const bool centred = pass.tune && pass.tune->window && pass.tune->window_centred;
+                const bool split = centred && pass.parity >= 0 && pass.tune->view != 2 && pass.tune->view != 3;
+                constexpr unsigned Trace = 32u, Resolve = 64u; // MODE_TRACE, MODE_RESOLVE
                 LampPush push;
                 push.first_light = TableAt;
                 push.count = 1;
@@ -1435,24 +1533,43 @@ int main(int argc, char** argv) {
                     vk.Barrier();
                 }
                 if (pass.half) {
-                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, half.pipeline);
-                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, half.layout, 0, 11, writes.data());
+                    const Pipeline& p = centred ? half_centred : half; // bbport (r60)
+                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, centred ? 14 : 13, writes.data());
                     const unsigned count = half_count ? 8u : 0u; // MODE_HALF_COUNT
-                    unsigned word = mode | 2u | count; // MODE_HALF_FIRST
-                    std::memcpy(&push.thickness, &word, 4);
-                    vkCmdPushConstants(vk.cmd, half.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                    vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 15) / 16, (H + 15) / 16, 1);
+                    // bbport (r60_lamp-centred-window): split, each half's trace and resolve (the
+                    // resolves count nothing), as PointShadow::Flush records them
+                    const auto dispatch = [&](unsigned word, unsigned x, unsigned y) {
+                        std::memcpy(&push.thickness, &word, 4);
+                        vkCmdPushConstants(vk.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                        vkCmdDispatchBase(vk.cmd, 0, 0, 0, x, y, 1);
+                    };
+                    dispatch(mode | 2u | count | (split ? Trace : 0u), (W + 15) / 16, (H + 15) / 16); // MODE_HALF_FIRST
                     vk.Barrier();
-                    word = mode | 4u | count; // MODE_HALF_FILL
-                    std::memcpy(&push.thickness, &word, 4);
-                    vkCmdPushConstants(vk.cmd, half.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-                    vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
+                    if (split) {
+                        dispatch(mode | 2u | Resolve, (W + 15) / 16, (H + 15) / 16);
+                        vk.Barrier();
+                    }
+                    dispatch(mode | 4u | count | (split ? Trace : 0u), (W + 7) / 8, (H + 7) / 8); // MODE_HALF_FILL
+                    if (split) {
+                        vk.Barrier();
+                        dispatch(mode | 4u | Resolve, (W + 7) / 8, (H + 7) / 8);
+                    }
                 } else {
-                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.pipeline);
-                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.layout, 0, 9, writes.data());
-                    std::memcpy(&push.thickness, &mode, 4);
-                    vkCmdPushConstants(vk.cmd, lamp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                    const Pipeline& p = centred ? lamp_centred : lamp; // bbport (r60)
+                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, centred ? 12 : 11, full_writes.data());
+                    unsigned word = mode | (split ? Trace : 0u);
+                    std::memcpy(&push.thickness, &word, 4);
+                    vkCmdPushConstants(vk.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
                     vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
+                    if (split) {
+                        vk.Barrier();
+                        word = mode | Resolve;
+                        std::memcpy(&push.thickness, &word, 4);
+                        vkCmdPushConstants(vk.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                        vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
+                    }
                 }
                 vk.Barrier();
                 vk.Stamp(1);
@@ -1486,6 +1603,9 @@ int main(int argc, char** argv) {
             // half_counts words); traced_share: the share of the second pass's pixels that cast their
             // own rays, in percent.
             bool at_half = false;
+            // bbport (r60_lamp-centred-window): at_apart: `frame` and `held_view` run the pass with
+            // MODE_APART, as the engine runs its pass with the history (Pass::apart)
+            bool at_apart = false;
             using HalfDid = std::array<std::uint32_t, 16>;
             const auto half_zero = [&] { std::memset(half_counts.data, 0, 64); };
             const auto half_did = [&] {
@@ -1503,7 +1623,7 @@ int main(int argc, char** argv) {
                 const bool history = Vulkan::LampHistoryFrames(tune) > 0.0f;
                 const double ms = run(v, {.tune = &tune, .frame = clock, .parity = history ? int(clock & 1u) : -1,
                                           .read = have_history && history, .before = before, .follow = follow,
-                                          .half = at_half});
+                                          .half = at_half, .apart = at_apart});
                 have_history = history;
                 ++clock;
                 return ms;
@@ -1515,7 +1635,8 @@ int main(int argc, char** argv) {
                 Vulkan::LampShadowTune shown = tune;
                 shown.view = 5;
                 shown.view_gain = 0.5f;
-                run(v, {.tune = &shown, .frame = clock - 1, .parity = int((clock - 1) & 1u), .half = at_half, .again = true});
+                run(v, {.tune = &shown, .frame = clock - 1, .parity = int((clock - 1) & 1u), .half = at_half, .again = true,
+                        .apart = at_apart});
                 auto picture = values(); // red: (1 - held) / 2; a pixel the pass leaves alone keeps 1
                 for (float& p : picture) p = p > 0.75f ? -1.0f : 1.0f - 2.0f * p;
                 return picture;
@@ -1760,12 +1881,73 @@ int main(int argc, char** argv) {
                 float walk = 0.0f, other = 0.0f, shake = 0.0f;
                 unsigned frames = 16;
                 bool follow = true;
+                bool carried = true; // bbport (r57_lamp-window): false: the torch's lamp walks, its carrier stands
+            };
+            // bbport (r57_lamp-window): the lattice score. The squares behind a moving shadow sat on
+            // the workgroups' grid at 0, 3, 4 and 5 px of every 8 (and on even pixels in the
+            // half-resolution build), which the r52 seams (the x mod 8 == 0 lines alone) miss. The
+            // mean step between neighbours (column x - 1 to x, row y - 1 to y) is folded by x and by y
+            // mod 16 over the moving frames, on the steps where the history without its guards shows
+            // a penumbra or a wake on that frame (a value of 0.02 to 0.98 at either pixel; so every
+            // case of one walk is measured on the same steps). Two scores: a fold's largest bin over
+            // its smallest (any grid), and the window's own phases, the mean of the fold mod 8's
+            // bins 0, 3, 4 and 5 (where the 5x5 window changes from one pixel to the next) over that
+            // of bins 1, 2, 6 and 7. Both are near 1 with no grid, but shadows that stay put on the
+            // screen (the carried torch's: camera, character and torch move together) lift some
+            // bins in every run, the reference included: compare the runs, not the number with 1.
+            struct Lattice {
+                std::vector<std::uint8_t>* mask = nullptr; // per moving frame and pixel: measured there
+                bool record = false;                       // this run sets the mask
+                std::array<std::array<double, 16>, 2> sum{}, count{}; // [x, y][the coordinate mod 16]
+            };
+            const auto fold = [&](Lattice& lattice, const std::vector<float>& picture, unsigned k) {
+                const std::size_t at = std::size_t(k) * W * H;
+                if (lattice.record) {
+                    lattice.mask->resize(at + std::size_t(W) * H);
+                    for (std::size_t i = 0; i < picture.size(); ++i)
+                        (*lattice.mask)[at + i] = picture[i] > 0.02f && picture[i] < 0.98f ? 1 : 0;
+                }
+                const std::uint8_t* m = lattice.mask->data() + at;
+                for (unsigned y = 0; y < H; ++y) {
+                    for (unsigned x = 0; x < W; ++x) {
+                        const std::size_t i = std::size_t(y) * W + x;
+                        if (x > 0 && (m[i] | m[i - 1]) != 0) {
+                            lattice.sum[0][x % 16] += std::abs(double(picture[i]) - double(picture[i - 1]));
+                            lattice.count[0][x % 16] += 1.0;
+                        }
+                        if (y > 0 && (m[i] | m[i - W]) != 0) {
+                            lattice.sum[1][y % 16] += std::abs(double(picture[i]) - double(picture[i - W]));
+                            lattice.count[1][y % 16] += 1.0;
+                        }
+                    }
+                }
+            };
+            const auto lattice_bins = [](const Lattice& lattice, int axis, unsigned mod) {
+                std::vector<double> bins(mod, 0.0);
+                for (unsigned b = 0; b < mod; ++b) {
+                    double sum = 0, count = 0;
+                    for (unsigned j = b; j < 16; j += mod) {
+                        sum += lattice.sum[std::size_t(axis)][j];
+                        count += lattice.count[std::size_t(axis)][j];
+                    }
+                    bins[b] = sum / std::max(count, 1.0);
+                }
+                return bins;
+            };
+            const auto lattice_score = [&](const Lattice& lattice, int axis, unsigned mod) {
+                const std::vector<double> bins = lattice_bins(lattice, axis, mod);
+                const auto [lo, hi] = std::minmax_element(bins.begin(), bins.end());
+                return *hi / std::max(*lo, 1e-12);
+            };
+            const auto window_score = [&](const Lattice& lattice, int axis) {
+                const std::vector<double> b = lattice_bins(lattice, axis, 8);
+                return (b[0] + b[3] + b[4] + b[5]) / std::max(b[1] + b[2] + b[6] + b[7], 1e-12);
             };
             Views moved_view = view;
             std::vector<float> moved_held; // held_view of the last frame
             HalfDid moved_did{};           // at_half: what the two passes did on the last frame
             const auto moving = [&](const Vulkan::LampShadowTune& tune, const Move& move,
-                                    std::vector<float>* upscaled_out = nullptr) {
+                                    std::vector<float>* upscaled_out = nullptr, Lattice* lattice = nullptr) {
                 restart();
                 Views now = view;
                 wobble = {0, 0, 0};
@@ -1781,10 +1963,12 @@ int main(int argc, char** argv) {
                         std::uniform_real_distribution<float> off(-move.shake, move.shake);
                         wobble = {off(rng), 0.0f, off(rng)};
                     }
-                    place(now, walked, move.other * float(k));
+                    place(now, move.carried ? walked : 0.0f, move.other * float(k));
+                    if (!move.carried) flame = TorchFlame + Vec3{0, 0, -walked};
                     if (k == move.frames) half_zero();
                     frame(now, tune, &before, move.follow);
                     if (upscaled_out) settle(held, values(), k == 1);
+                    if (lattice) fold(*lattice, values(), k - 1);
                 }
                 moved_did = half_did();
                 if (upscaled_out) *upscaled_out = std::move(held);
@@ -1792,6 +1976,39 @@ int main(int argc, char** argv) {
                 auto picture = values();
                 moved_held = Vulkan::LampHistoryFrames(tune) > 0.0f ? held_view(now, tune) : std::vector<float>{};
                 return picture;
+            };
+            // bbport (r52_follow-soft): the squares of a carried torch's shadows lay on the
+            // workgroups' grid: 8 px, 16 px in the half-resolution build's first pass. Seam: the
+            // mean step between neighbouring pixels across those lines (between column x - 1 and
+            // x, or row y - 1 and y, where x or y is a multiple of `step`) minus the mean step
+            // off every 8 px line (so the 16 px seam is not measured against the 8 px lines of
+            // the half-resolution build's second pass), over the picture (all) and over the
+            // steps that touch the reference's penumbra (0.05 to 0.95). About 0 where nothing
+            // lines up with the grid. Printed only: no bound is checked.
+            struct Seam { double all = 0, penumbra = 0; };
+            const auto seam = [&](const std::vector<float>& picture, const std::vector<float>& reference, unsigned step) {
+                std::array<double, 4> sum{}; // across the lines, elsewhere; the same in the penumbra
+                std::array<std::size_t, 4> count{};
+                const auto soft_ref = [&](std::size_t k) { return reference[k] > 0.05f && reference[k] < 0.95f; };
+                const auto add = [&](std::size_t i, std::size_t j, bool across) {
+                    const double d = std::abs(double(picture[i]) - double(picture[j]));
+                    const std::size_t at = across ? 0 : 1;
+                    sum[at] += d;
+                    ++count[at];
+                    if (soft_ref(i) || soft_ref(j)) {
+                        sum[at + 2] += d;
+                        ++count[at + 2];
+                    }
+                };
+                for (unsigned y = 0; y < H; ++y) {
+                    for (unsigned x = 0; x < W; ++x) {
+                        const std::size_t i = std::size_t(y) * W + x;
+                        if (x > 0 && (x % step == 0 || x % 8 != 0)) add(i, i - 1, x % step == 0);
+                        if (y > 0 && (y % step == 0 || y % 8 != 0)) add(i, i - W, y % step == 0);
+                    }
+                }
+                const auto mean = [&](std::size_t k) { return sum[k] / double(std::max<std::size_t>(count[k], 1)); };
+                return Seam{mean(0) - mean(1), mean(2) - mean(3)};
             };
             // (The true picture of the moment `moving` ended at: the scene and the lamp stand as its
             // last frame left them.)
@@ -1802,6 +2019,21 @@ int main(int argc, char** argv) {
                 anchored.follow = false;
                 const auto alone = moving(plain, walk), all = moving(soft, walk);
                 const auto all_held = moved_held;
+                // bbport (r52_follow-soft): word 0 bit 20 (LampTuneFollowSoft) is the bit the
+                // shader reads: after this walk the follow images hold a state somewhere (the
+                // carried torch's blocked rays) with it, and stay as zeroed without it (the pass
+                // stores nothing there).
+                if (checked) {
+                    bool kept_state = false;
+                    for (auto& image : follow) {
+                        for (const float x : lab.Read(image, VK_FORMAT_R32_SFLOAT)) kept_state = kept_state || x != 0.0f;
+                    }
+                    if (kept_state != soft.follow_soft) {
+                        std::fprintf(stderr, "BB_LAMP_SHADOW_FOLLOW_SOFT=%d, but the follow images %s\n",
+                                     soft.follow_soft ? 1 : 0, kept_state ? "hold a state" : "hold nothing");
+                        return 1;
+                    }
+                }
                 const auto guarded = moving(soft, anchored);
                 Vulkan::LampShadowTune loose = soft;
                 loose.trail_m = 0.0f;
@@ -1833,6 +2065,22 @@ int main(int argc, char** argv) {
                             held_mean(all_held, moved_true), c.all, c.penumbra, c.far, e.all, e.penumbra, e.far,
                             held_mean(untrailed_held, moved_true), h.all, h.penumbra, h.far,
                             held_mean(halved_held, moved_true), traced_share(halved_did));
+                {
+                    // bbport (r52_follow-soft): the seams of the same pictures (new line; the
+                    // line above is unchanged)
+                    const Seam sa = seam(alone, moved_true, 8), sd = seam(all, moved_true, 8),
+                               sc = seam(guarded, moved_true, 8), se = seam(untrailed, moved_true, 8),
+                               sh8 = seam(halved, moved_true, 8), sh16 = seam(halved, moved_true, 16);
+                    std::printf("Torch lab, the character goes with its torch, %.1f cm a frame, r52 seams "
+                                "(BB_LAMP_SHADOW_FOLLOW_SOFT=%d): the mean step across the 8 px grid lines minus "
+                                "the mean step elsewhere (all / penumbra): the history without its guards "
+                                "%+.5f / %+.5f; the default %+.5f / %+.5f; looked up where the ground was only "
+                                "%+.5f / %+.5f; with BB_LAMP_SHADOW_TRAIL=0 %+.5f / %+.5f; the default in the "
+                                "half-resolution build %+.5f / %+.5f (across its 16 px lines %+.5f / %+.5f)\n",
+                                speed * 100.0f, soft.follow_soft ? 1 : 0, sa.all, sa.penumbra, sd.all, sd.penumbra,
+                                sc.all, sc.penumbra, se.all, se.penumbra, sh8.all, sh8.penumbra, sh16.all,
+                                sh16.penumbra);
+                }
                 if (checked && !(d.all < a.all && d.penumbra < c.penumbra)) {
                     std::fprintf(stderr, "the guards, or following the lamp, do not help a carried torch\n");
                     return 1;
@@ -1840,6 +2088,238 @@ int main(int argc, char** argv) {
                 if (checked && !(h.all < HalfAllMost * d.all && h.penumbra < HalfPenumbraMost * d.penumbra)) {
                     std::fprintf(stderr, "a carried torch looks worse in the half-resolution build than at full resolution\n");
                     return 1;
+                }
+                // bbport (r57_lamp-window): the lattice scores (new lines; nothing above changes). Per
+                // case and build: the history without its guards (no grid of its own: the reference),
+                // BB_LAMP_SHADOW_WINDOW=1 (the default) and =0 (to try), whatever the environment says.
+                // Checked (with the defaults):
+                //  - the last frame's pictures with 1 and with 0 differ somewhere (else bit 21 does not
+                //    reach the shader; the lab is deterministic, so equal pictures differ by 0);
+                //  - with the soft follow, 0's window-phase score (x and y) at most 1.1 times the
+                //    reference's (with BB_LAMP_SHADOW_FOLLOW_SOFT=0 the vote keeps the window).
+                // Printed only, until a first run gives the numbers and their noise: whether 1's
+                // window-phase score lies above 1.1 times the reference's (the grid the score is made
+                // to see; "no" in every case means it does not see it here), and 0 against 1.
+                // bbport (r60_lamp-centred-window): and BB_LAMP_SHADOW_WINDOW=2 (the window centred),
+                // run with MODE_APART as the engine runs it (the others run without; the two modes
+                // give the same picture, which the r60 apart line below compares once). 0's verdict is
+                // now the folds' largest-over-smallest bin ratios, each against the reference's of the
+                // same fold (r57's numbers: 0 within 1.005 of the reference's in every fold, 1 up to
+                // 1.2 times it in the carried and walking-past cases; the window-phase score saw no
+                // grid). A run "lines up with the grid" where a checked fold (x and y mod 8; at half
+                // resolution mod 16 too; mod 2 is printed only) lies above GridMost times the
+                // reference's. Checked (with the defaults): 0 never lines up with the soft follow.
+                // Printed only, until a first GPU run gives their numbers (r57's rule: a check nobody
+                // has measured could turn the default lab red): whether 2 lines up, judged only in a
+                // case and build where 1 lines up ("blind" elsewhere: r57's numbers have 1 at 1.01 to
+                // 1.06 with BB_LAMP_SHADOW_FOLLOW=0, too near the bound to see a grid); whether the
+                // pictures with 2 and 1 differ (else bit 22 or the trace and resolve do not reach the
+                // shader); whether MODE_APART changes the picture of 1 or 2.
+                {
+                    constexpr double GridMost = 1.05;
+                    struct LatticeCase {
+                        const char* name;
+                        Move move;
+                        bool follow;
+                    };
+                    Move standing = walk;
+                    standing.carried = false;
+                    const std::array<LatticeCase, 3> cases{{{"the character goes with its torch", walk, soft.follow},
+                                                            {"the torch's lamp walks past standing casters", standing,
+                                                             soft.follow},
+                                                            {"the character goes with its torch, BB_LAMP_SHADOW_FOLLOW=0",
+                                                             walk, false}}};
+                    std::string lattice_fault, same_fault;
+                    // bbport (r60_lamp-centred-window): printed only (see above)
+                    std::string centred_fault, centred_same_fault, centred_apart_fault;
+                    bool grid_seen = false;
+                    unsigned judged_2 = 0, blind_2 = 0; // (case, build) pairs where 1 lines up; where it does not
+                    for (const LatticeCase& lc : cases) {
+                        for (const bool half_build : {false, true}) {
+                            // (0 the reference, 1 BB_LAMP_SHADOW_WINDOW=1, 2 =0; bbport r60: 3 =2)
+                            std::array<Vulkan::LampShadowTune, 4> tunes{plain, soft, soft, soft};
+                            tunes[1].window = true;
+                            tunes[0].window = tunes[2].window = false;
+                            tunes[3].window = true;
+                            tunes[0].window_centred = tunes[1].window_centred = tunes[2].window_centred = false;
+                            tunes[3].window_centred = true;
+                            for (auto& t : tunes) t.follow = lc.follow;
+                            std::vector<std::uint8_t> mask;
+                            mask.reserve(std::size_t(lc.move.frames) * W * H);
+                            std::array<Lattice, 4> lattices{};
+                            for (std::size_t r = 0; r < 4; ++r) {
+                                lattices[r].mask = &mask;
+                                lattices[r].record = r == 0;
+                            }
+                            at_half = half_build;
+                            std::array<std::vector<float>, 4> last;
+                            for (std::size_t r = 0; r < 4; ++r) {
+                                at_apart = r == 3; // bbport (r60): 2 as the engine runs it
+                                last[r] = moving(tunes[r], lc.move, nullptr, &lattices[r]);
+                            }
+                            at_apart = false;
+                            // bbport (r60_lamp-centred-window): once (the first case, the first speed, both
+                            // builds): 1 with MODE_APART and 2 without, against the runs above. Every pixel
+                            // the same is what the modes must give (the light the pass moves is 0 + 1 * ratio
+                            // in both); a difference is the apart path of the trace or the resolve.
+                            if (&lc == &cases[0] && speed == 0.067f) {
+                                at_apart = true;
+                                const auto apart_1 = moving(tunes[1], lc.move);
+                                at_apart = false;
+                                const auto plain_2 = moving(tunes[3], lc.move);
+                                std::array<std::size_t, 2> differ{};
+                                std::array<double, 2> most{};
+                                for (std::size_t i = 0; i < last[1].size(); ++i) {
+                                    const double d1 = std::abs(double(apart_1[i]) - double(last[1][i]));
+                                    const double d2 = std::abs(double(plain_2[i]) - double(last[3][i]));
+                                    differ[0] += d1 > 0.0 ? 1 : 0;
+                                    differ[1] += d2 > 0.0 ? 1 : 0;
+                                    most[0] = std::max(most[0], d1);
+                                    most[1] = std::max(most[1], d2);
+                                }
+                                std::printf("Torch lab, r60 apart, %s, %.1f cm a frame, %s: the last frame with MODE_APART "
+                                            "against without (printed only; the same is expected): BB_LAMP_SHADOW_WINDOW=1 "
+                                            "%zu pixels differ (most %.5f), =2 %zu pixels differ (most %.5f)\n",
+                                            lc.name, speed * 100.0f, half_build ? "half-resolution build" : "full resolution",
+                                            differ[0], most[0], differ[1], most[1]);
+                                if (checked && centred_apart_fault.empty() && (differ[0] != 0 || differ[1] != 0)) {
+                                    centred_apart_fault = lc.name;
+                                }
+                            }
+                            at_half = false;
+                            const std::vector<std::pair<int, unsigned>> folds =
+                                half_build ? std::vector<std::pair<int, unsigned>>{{0, 8}, {1, 8}, {0, 16}, {1, 16}, {0, 2}, {1, 2}}
+                                           : std::vector<std::pair<int, unsigned>>{{0, 8}, {1, 8}};
+                            // bbport (r60_lamp-centred-window): each run's largest checked fold ratio
+                            // over the reference's of the same fold (mod 2 not checked)
+                            std::array<double, 4> over{};
+                            for (std::size_t r = 1; r < 4; ++r) {
+                                for (const auto& [axis, mod] : folds) {
+                                    if (mod == 2) continue;
+                                    over[r] = std::max(over[r], lattice_score(lattices[r], axis, mod) /
+                                                                    std::max(lattice_score(lattices[0], axis, mod), 1e-12));
+                                }
+                            }
+                            std::array<std::string, 4> text;
+                            std::array<double, 4> phase{}; // the window-phase score, the larger of x and y
+                            for (std::size_t r = 0; r < 4; ++r) {
+                                phase[r] = std::max(window_score(lattices[r], 0), window_score(lattices[r], 1));
+                                char part[96];
+                                std::snprintf(part, sizeof(part), "window phases %.3f; largest over smallest bin ",
+                                              phase[r]);
+                                text[r] = part;
+                                bool first_fold = true;
+                                for (const auto& [axis, mod] : folds) {
+                                    std::snprintf(part, sizeof(part), "%s%c%u %.3f", first_fold ? "" : ", ",
+                                                  axis == 0 ? 'x' : 'y', mod, lattice_score(lattices[r], axis, mod));
+                                    text[r] += part;
+                                    first_fold = false;
+                                }
+                            }
+                            double apart = 0;
+                            std::size_t apart_n = 0;
+                            for (std::size_t i = 0; i < last[1].size(); ++i) {
+                                const double d = std::abs(double(last[1][i]) - double(last[2][i]));
+                                apart += d;
+                                apart_n += d > 0.01 ? 1 : 0;
+                            }
+                            apart /= double(std::max<std::size_t>(last[1].size(), 1));
+                            // bbport (r60_lamp-centred-window): 2 against 1, as 0 against 1 above
+                            double centred_apart = 0;
+                            std::size_t centred_apart_n = 0;
+                            for (std::size_t i = 0; i < last[1].size(); ++i) {
+                                const double d = std::abs(double(last[1][i]) - double(last[3][i]));
+                                centred_apart += d;
+                                centred_apart_n += d > 0.01 ? 1 : 0;
+                            }
+                            centred_apart /= double(std::max<std::size_t>(last[1].size(), 1));
+                            const bool seen = phase[1] > 1.1 * phase[0];
+                            grid_seen = grid_seen || seen;
+                            std::printf("Torch lab, r57 lattice, %s, %.1f cm a frame, %s (%u frames, on the steps where "
+                                        "the history without its guards shows a penumbra or a wake; the mean step "
+                                        "between neighbours: the window-phase score, bins 0, 3, 4, 5 over 1, 2, 6, 7 of "
+                                        "the fold mod 8, the larger of x and y; and per fold mod %s the largest over the "
+                                        "smallest bin): the history without its guards %s; BB_LAMP_SHADOW_WINDOW=1 %s; "
+                                        "BB_LAMP_SHADOW_WINDOW=0 %s. 1 above 1.1 times the reference (the grid seen): "
+                                        "%s; 0 over 1: %.3f; the last frame with 0 against 1: mean difference %.5f, "
+                                        "%zu pixels apart by more than 0.01\n",
+                                        lc.name, speed * 100.0f, half_build ? "half-resolution build" : "full resolution",
+                                        lc.move.frames, half_build ? "8, 16 and 2" : "8", text[0].c_str(),
+                                        text[1].c_str(), text[2].c_str(), seen ? "yes" : "no",
+                                        phase[2] / std::max(phase[1], 1e-12), apart, apart_n);
+                            // bbport (r60_lamp-centred-window): 2 is judged only where 1 lines up
+                            const bool sees = over[1] > GridMost;
+                            std::printf("Torch lab, r60 lattice, %s, %.1f cm a frame, %s: BB_LAMP_SHADOW_WINDOW=2 (with "
+                                        "MODE_APART) %s. The largest checked fold ratio (mod %s) over the reference's of "
+                                        "the same fold (above %.2f: lines up with the grid): 1 %.3f (%s), 0 %.3f (%s), 2 "
+                                        "%.3f (%s); the last frame with 2 against 1: mean difference %.5f, %zu pixels "
+                                        "apart by more than 0.01\n",
+                                        lc.name, speed * 100.0f, half_build ? "half-resolution build" : "full resolution",
+                                        text[3].c_str(), half_build ? "8 and 16" : "8", GridMost, over[1],
+                                        sees ? "lines up" : "does not", over[2], over[2] > GridMost ? "lines up" : "does not",
+                                        over[3],
+                                        !sees                ? "blind: 1 does not line up here"
+                                        : over[3] > GridMost ? "lines up"
+                                                             : "does not",
+                                        centred_apart, centred_apart_n);
+                            judged_2 += sees ? 1u : 0u;
+                            blind_2 += sees ? 0u : 1u;
+                            if (!lc.move.carried) {
+                                // A standing caster's penumbra under the walking lamp: is it darker or
+                                // lighter on the mean than the true picture of the last frame (a frame
+                                // cap that depends on this frame's ray would make it darker)?
+                                const auto standing_true = truth(moved_view, soft, 64);
+                                std::array<double, 3> bias{};
+                                std::size_t n = 0;
+                                for (std::size_t i = 0; i < standing_true.size(); ++i) {
+                                    if (!(standing_true[i] > 0.05f && standing_true[i] < 0.95f)) continue;
+                                    ++n;
+                                    for (std::size_t r = 0; r < 3; ++r) bias[r] += double(last[r][i]) - standing_true[i];
+                                }
+                                for (double& b : bias) b /= double(std::max<std::size_t>(n, 1));
+                                std::printf("Torch lab, r57, %s, %.1f cm a frame, %s: the last frame's mean of the picture "
+                                            "minus the true one over the true penumbra (%zu pixels; below 0 darker; printed "
+                                            "only): the history without its guards %+.4f; BB_LAMP_SHADOW_WINDOW=1 %+.4f; "
+                                            "BB_LAMP_SHADOW_WINDOW=0 %+.4f\n",
+                                            lc.name, speed * 100.0f, half_build ? "half-resolution build" : "full resolution",
+                                            n, bias[0], bias[1], bias[2]);
+                            }
+                            const std::string where =
+                                std::string(lc.name) + (half_build ? ", half-resolution build" : ", full resolution");
+                            if (checked && same_fault.empty() && !(apart > 0.0)) same_fault = where;
+                            // bbport (r60_lamp-centred-window): the verdict is the bin ratios (r57: the
+                            // window-phase score within 1.1 times the reference's)
+                            if (checked && soft.follow_soft && lattice_fault.empty() && !(over[2] <= GridMost)) {
+                                lattice_fault = where;
+                            }
+                            if (checked && centred_same_fault.empty() && !(centred_apart > 0.0)) centred_same_fault = where;
+                            if (checked && sees && centred_fault.empty() && !(over[3] <= GridMost)) centred_fault = where;
+                        }
+                    }
+                    std::printf("Torch lab, r57 lattice, %.1f cm a frame: the window's grid is seen by the score with "
+                                "BB_LAMP_SHADOW_WINDOW=1 in %s case (printed only; \"no case\" means the score is blind "
+                                "to it in this lab)\n",
+                                speed * 100.0f, grid_seen ? "at least one" : "no");
+                    if (!same_fault.empty()) {
+                        std::fprintf(stderr, "BB_LAMP_SHADOW_WINDOW=0 and =1 give the same picture: word 0 bit 21 does not "
+                                             "reach the shader (%s, %.1f cm a frame)\n", same_fault.c_str(), speed * 100.0f);
+                        return 1;
+                    }
+                    if (!lattice_fault.empty()) {
+                        std::fprintf(stderr, "without the window a moving shadow still lines up with the window's grid (%s, "
+                                             "%.1f cm a frame)\n", lattice_fault.c_str(), speed * 100.0f);
+                        return 1;
+                    }
+                    // bbport (r60_lamp-centred-window): printed only, until a first GPU run gives the
+                    // numbers (each "would fail" below is to become a check then)
+                    std::printf("Torch lab, r60 lattice, %.1f cm a frame (printed only): BB_LAMP_SHADOW_WINDOW=1 lines up "
+                                "with the grid in %u of %u case and build pairs (2 is judged in those, blind in the "
+                                "other %u); 2 lines up where 1 does: %s; 2 and 1 give the same picture: %s; MODE_APART "
+                                "changes the picture: %s\n",
+                                speed * 100.0f, judged_2, judged_2 + blind_2, blind_2,
+                                centred_fault.empty() ? "no" : ("would fail (" + centred_fault + ")").c_str(),
+                                centred_same_fault.empty() ? "no" : ("would fail (" + centred_same_fault + ")").c_str(),
+                                centred_apart_fault.empty() ? "no" : ("would fail (" + centred_apart_fault + ")").c_str());
                 }
             }
             for (const bool two : {false, true}) {
@@ -1914,15 +2394,23 @@ int main(int argc, char** argv) {
             for (const bool two : {false, true}) {
                 second = two;
                 // (which: 0 the default, 1 the history without its guards; bbport r44_half-area-lamp:
-                // 2 the default in the half-resolution build)
-                std::array<std::array<double, 5>, 3> left{};
+                // 2 the default in the half-resolution build; bbport r57_lamp-window: 3 the default
+                // with BB_LAMP_SHADOW_WINDOW=0, printed only; bbport r60_lamp-centred-window: 4 and 5
+                // with BB_LAMP_SHADOW_WINDOW=2 at full and at half resolution, with MODE_APART as the
+                // engine runs it; printed beside the default's bounds, not yet checked)
+                std::array<std::array<double, 5>, 6> left{};
                 place(view, 0.0f, 0.0f);
                 const auto old_true = truth(view, soft, 64);
                 place(view, 0.0f, 30.0f);
                 const auto new_true = truth(view, soft, 64);
-                for (int which = 0; which < 3; ++which) {
-                    const Vulkan::LampShadowTune& tune = which == 1 ? plain : soft;
-                    at_half = which == 2;
+                Vulkan::LampShadowTune own = soft;
+                own.window = false;
+                Vulkan::LampShadowTune centred = soft; // bbport (r60)
+                centred.window = centred.window_centred = true;
+                for (int which = 0; which < 6; ++which) {
+                    const Vulkan::LampShadowTune& tune = which == 1 ? plain : which == 3 ? own : which >= 4 ? centred : soft;
+                    at_half = which == 2 || which == 5;
+                    at_apart = which >= 4; // bbport (r60)
                     restart();
                     place(view, 0.0f, 0.0f);
                     for (unsigned k = 0; k < 24; ++k) frame(view, tune);
@@ -1945,6 +2433,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 at_half = false;
+                at_apart = false;
                 std::printf("Torch lab, a figure is gone from one frame to the next, %s: share of the old picture left "
                             "where the true one changed, after 1 / 2 / 4 / 8 / 16 frames: the default %.3f / %.3f / %.3f "
                             "/ %.3f / %.3f; the history without its guards %.3f / %.3f / %.3f / %.3f / %.3f; the default "
@@ -1952,6 +2441,12 @@ int main(int argc, char** argv) {
                             two ? "two lamps" : "one lamp", left[0][0], left[0][1], left[0][2], left[0][3], left[0][4],
                             left[1][0], left[1][1], left[1][2], left[1][3], left[1][4], left[2][0], left[2][1],
                             left[2][2], left[2][3], left[2][4]);
+                // bbport (r57_lamp-window): new line, no check (no bound exists for it yet; the
+                // checks below take the knobs as the environment has them).
+                std::printf("Torch lab, r57, a figure is gone from one frame to the next, %s: the same with "
+                            "BB_LAMP_SHADOW_WINDOW=0 (not checked; the per-pixel bound cuts only a change of more than "
+                            "about 0.86): %.3f / %.3f / %.3f / %.3f / %.3f\n",
+                            two ? "two lamps" : "one lamp", left[3][0], left[3][1], left[3][2], left[3][3], left[3][4]);
                 if (checked && !(left[0][1] < 0.2 && left[0][2] < 0.15 && left[0][2] < 0.5 * left[1][2])) {
                     std::fprintf(stderr, "a shadow that is gone lingers (%s)\n", two ? "two lamps" : "one lamp");
                     return 1;
@@ -1961,6 +2456,19 @@ int main(int argc, char** argv) {
                                  two ? "two lamps" : "one lamp");
                     return 1;
                 }
+                // bbport (r60_lamp-centred-window): the window centred is meant to bind as the confined
+                // one: the default's bounds (which 0 fails with two lamps), printed only until a first
+                // GPU run gives the numbers
+                const auto within = [&](std::size_t k) {
+                    return left[k][1] < 0.2 && left[k][2] < 0.15 && left[k][2] < 0.5 * left[1][2];
+                };
+                std::printf("Torch lab, r60, a figure is gone from one frame to the next, %s: the same with "
+                            "BB_LAMP_SHADOW_WINDOW=2 and MODE_APART %.3f / %.3f / %.3f / %.3f / %.3f (%s the default's "
+                            "bounds); in the half-resolution build %.3f / %.3f / %.3f / %.3f / %.3f (%s them); printed "
+                            "only\n",
+                            two ? "two lamps" : "one lamp", left[4][0], left[4][1], left[4][2], left[4][3], left[4][4],
+                            within(4) ? "within" : "outside", left[5][0], left[5][1], left[5][2], left[5][3], left[5][4],
+                            within(5) ? "within" : "outside");
             }
             second = false;
             // A flame that flickers: the torch's lamp is up to 2 cm off its place, anew every frame,
@@ -2178,6 +2686,32 @@ int main(int argc, char** argv) {
                 std::printf("Torch lab: mode 0 of this shader (the experiment bit's path; not the shader before r41) %.3f ms, the point lamp %.3f ms, the area lamp with its "
                             "history %.3f ms; the half-resolution build: with point lamps %.3f ms, with the area lamp "
                             "and its history %.3f ms\n", best[0], best[1], best[2], best[3], best[4]);
+                // bbport (r60_lamp-centred-window): the area lamp with its history, the window confined
+                // (1) and centred (2), at full and at half resolution (settled, without counters, with
+                // MODE_APART as the engine runs it); printed only, a small scene
+                std::array<Vulkan::LampShadowTune, 2> windows{soft, soft};
+                windows[0].window = true;
+                windows[0].window_centred = false;
+                windows[1].window = windows[1].window_centred = true;
+                std::array<double, 4> window_best{1e9, 1e9, 1e9, 1e9};
+                half_count = false;
+                at_apart = true;
+                for (int w = 0; w < 2; ++w) {
+                    for (const bool h : {false, true}) {
+                        restart();
+                        at_half = h;
+                        for (int i = 0; i < 48; ++i) {
+                            const double ms = frame(view, windows[std::size_t(w)]);
+                            if (i >= 8) window_best[std::size_t(w * 2 + (h ? 1 : 0))] = std::min(window_best[std::size_t(w * 2 + (h ? 1 : 0))], ms);
+                        }
+                    }
+                }
+                at_half = false;
+                at_apart = false;
+                half_count = true;
+                std::printf("Torch lab, r60: the area lamp with its history, BB_LAMP_SHADOW_WINDOW=1 %.3f ms, =2 %.3f ms; "
+                            "the half-resolution build =1 %.3f ms, =2 %.3f ms (printed only)\n",
+                            window_best[0], window_best[2], window_best[1], window_best[3]);
             }
             vk.destroy_as(vk.device, tlas.handle, nullptr);
             vk.Free(tlas.instances); vk.Free(tlas.storage); vk.Free(tlas.scratch);
@@ -2299,6 +2833,10 @@ int main(int argc, char** argv) {
                 const unsigned tune_at = used + 30 + Vulkan::LampHistoryTailWords; // after the history block
                 const unsigned torch_at = tune_at + Vulkan::LampTuneWordCount;
                 unsigned torch_count = 0;
+                // bbport (r60_lamp-centred-window): this section runs the build without CENTRED only
+                // (lamp.pipeline, one dispatch), which does not read word 0 bit 22: with
+                // BB_LAMP_SHADOW_WINDOW=2 in the environment it measures the window of 1 here. The
+                // torch lab (--lamps) runs the centred builds.
                 const auto run_lamps = [&](bool per_tile, unsigned pick = 0, unsigned frame = 0, int parity = -1,
                                            LampRun more = {}) {
                     if (more.tune) {
@@ -2337,14 +2875,19 @@ int main(int argc, char** argv) {
                     const int cur_history = parity < 0 ? 0 : parity;
                     VkDescriptorImageInfo history_prev{{}, history[cur_history ^ 1].view, VK_IMAGE_LAYOUT_GENERAL};
                     VkDescriptorImageInfo history_cur{{}, history[cur_history].view, VK_IMAGE_LAYOUT_GENERAL};
-                    std::array<VkWriteDescriptorSet, 9> writes{};
-                    for (unsigned k = 0; k < 9; ++k) writes[k] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = k, .descriptorCount = 1};
+                    // bbport (r52_follow-soft): the follow state, taken in turn with the history
+                    VkDescriptorImageInfo follow_prev{{}, follow[cur_history ^ 1].view, VK_IMAGE_LAYOUT_GENERAL};
+                    VkDescriptorImageInfo follow_cur{{}, follow[cur_history].view, VK_IMAGE_LAYOUT_GENERAL};
+                    std::array<VkWriteDescriptorSet, 11> writes{};
+                    for (unsigned k = 0; k < 11; ++k) writes[k] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = k, .descriptorCount = 1};
                     writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; writes[0].pBufferInfo = &data;
                     writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; writes[1].pImageInfo = &depth;
                     for (int k = 0; k < 4; ++k) { writes[2 + k].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[2 + k].pImageInfo = &images[k]; }
                     writes[6].descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR; writes[6].pNext = &as;
                     writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[7].pImageInfo = &history_prev;
                     writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[8].pImageInfo = &history_cur;
+                    writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[9].pImageInfo = &follow_prev;
+                    writes[10].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; writes[10].pImageInfo = &follow_cur;
                     const auto snapshot = [&](std::array<int, 4> r) {
                         const VkImageCopy region{.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffset = {r[0], r[1], 0},
                             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffset = {r[0], r[1], 0},
@@ -2355,7 +2898,7 @@ int main(int argc, char** argv) {
                     };
                     const auto dispatch = [&](LampPush push) {
                         vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.pipeline);
-                        vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.layout, 0, 9, writes.data());
+                        vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, lamp.layout, 0, 11, writes.data());
                         vkCmdPushConstants(vk.cmd, lamp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
                         const unsigned gx0 = unsigned(push.rect[0]) / 8, gy0 = unsigned(push.rect[1]) / 8;
                         const unsigned gx1 = (unsigned(push.rect[2]) + 7) / 8, gy1 = (unsigned(push.rect[3]) + 7) / 8;
@@ -2502,6 +3045,8 @@ int main(int argc, char** argv) {
                         same.weights = false;
                         same.radius_m = 0.0f;
                         same.self_m = 0.0f;
+                        // (bbport r52_follow-soft: same.follow_soft stays at its default; these runs
+                        // hand no history block, and without one the bit changes nothing.)
                         const auto differing = [&](unsigned pick, const Vulkan::LampShadowTune* tune, bool torch) {
                             run_lamps(false, pick, 0, -1, {.torch = torch});
                             const auto before = lamp_values();
@@ -2533,6 +3078,11 @@ int main(int argc, char** argv) {
                         };
                         Vulkan::LampShadowTune repaired, point;
                         point.radius_m = 0.0f;
+                        // bbport (r52_follow-soft): BB_LAMP_SHADOW_FOLLOW_SOFT as the environment has
+                        // it (0: the passes below run as before r52)
+                        repaired.follow_soft = point.follow_soft =
+                            Vulkan::ReadLampShadowTune([](const char* name) -> const char* { return std::getenv(name); })
+                                .follow_soft;
                         for (const bool torch : {false, true}) {
                             run_lamps(false, 0, 0, -1, {.torch = torch});
                             const double kept_before = kept(lamp_values());

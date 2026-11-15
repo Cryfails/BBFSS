@@ -4,6 +4,12 @@
 // bbport (r42_lamp-soft): the area lamp's knobs, the frames of history, and the lamps of a pass
 // told apart and followed from one frame to the next (LampTrack).
 // bbport (r44_half-area-lamp): which pass of a frame has the area lamp (LampPassRadius).
+// bbport (r48_lamp-softness): graphics_lamp_shadow_softness as the lamp's radius
+// (LampSoftnessRadius, BB_LAMP_SHADOW_SOFT winning) and a point lamp's steps (LampPassSteps).
+// bbport (r52_follow-soft): BB_LAMP_SHADOW_FOLLOW_SOFT and its bit in word 0.
+// bbport (r57_lamp-window): BB_LAMP_SHADOW_WINDOW and its bit in word 0.
+// bbport (r60_lamp-centred-window): its value 2 (bit 22), and a CPU model of the ghost clamp's
+// 5x5 statistic: centred on every pixel it does not change as the workgroups' grid moves.
 #include <array>
 #include <bit>
 #include <cassert>
@@ -12,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <utility>
+#include <vector>
 #include "gpu/shadps4/video_core/renderer_vulkan/lamp_shadow_tune.h"
 
 using namespace Vulkan;
@@ -55,6 +62,164 @@ std::array<std::uint32_t, 16> Record(float x, float y, float z, float reach, flo
     }
     return r;
 }
+
+// bbport (r60_lamp-centred-window): word 0's window bits of the default (LampWindowDefault), so
+// that the asserts below hold whichever of 1 and 2 is the default.
+constexpr std::uint32_t DefaultWindowBits =
+    (LampWindowDefault >= 1 ? LampTuneWindow : 0u) | (LampWindowDefault == 2 ? LampTuneCentred : 0u);
+
+// bbport (r60_lamp-centred-window): a CPU model of the ghost clamp's 5x5 statistic (count, sum,
+// sum of squares of the answers, point_shadow_ray.comp). It is a hand copy of the shader's index
+// arithmetic (loadTile and the centred loop), not a test of the shader: a fault made in the
+// shader alone is caught only by a GPU run (rt-shadow-test --lamps). What it checks: that tile
+// arithmetic, written as the shader has it, gives every pixel the statistic of its own 5x5
+// neighbourhood, which Direct works out on its own (its own bounds from the rect and the
+// screen, its own test for an answer). Not modelled: the half-resolution fill pass (its window
+// over the first pass's answers at even pixels, and its trace not storing over them), workgroups
+// without a tile, the cast codes beside the answers (CastCode below checks their packing alone).
+//
+// The answers the trace stored, by pass pixel: pass pixel (x, y) is full pixel (apart x, apart y),
+// apart 1, or 2 in the half-resolution build's first pass. Below 0: none. size and rect in full
+// pixels, as the push block has them (the rect may reach past the screen).
+struct Field {
+    int apart = 1;
+    std::array<int, 2> size{};               // the screen
+    std::array<int, 4> rect{};               // the pass's rect
+    int pw = 0, ph = 0;                      // pass pixels on the screen: (size + apart - 1) / apart
+    int w = 0, h = 0;                        // pass pixels stored: more, so a read past the screen
+                                             // finds an answer (and a missed clip shows)
+    std::vector<float> answer;               // w * h
+};
+struct Stat {
+    float count = 0.0f, sum = 0.0f, sum2 = 0.0f;
+    bool operator==(const Stat&) const = default;
+};
+// The statistic of pass pixel (x, y) from its own 5x5 neighbourhood, in the shader's order, on
+// its own: a neighbour counts where it lies in the rect and on the screen (as bounds on pass
+// pixels, rounded up from the full pixels' bounds) and has an answer.
+Stat Direct(const Field& f, int x, int y) {
+    const auto up = [&](int v) { return (v + f.apart - 1) / f.apart; }; // the first pass pixel at or past v
+    const int x0 = up(f.rect[0]), y0 = up(f.rect[1]);
+    const int x1 = std::min(up(f.rect[2]), up(f.size[0])), y1 = std::min(up(f.rect[3]), up(f.size[1]));
+    Stat s;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            const int nx = x + dx, ny = y + dy;
+            if (nx < x0 || ny < y0 || nx >= x1 || ny >= y1) {
+                continue;
+            }
+            const float a = f.answer[std::size_t(ny * f.w + nx)];
+            if (a < 0.0f) {
+                continue;
+            }
+            s.count += 1.0f;
+            s.sum += a;
+            s.sum2 += a * a;
+        }
+    }
+    return s;
+}
+// BB_LAMP_SHADOW_WINDOW=2, as the shader: loadTile (full pixel q = lo + apart * (cell - 2), "no
+// answer" outside the rect or the screen) and the centred loop (cell (lid + 2 + d), counted where
+// a >= 0). lo: the workgroup's first full pixel; (lx, ly): the invocation.
+Stat Centred(const Field& f, int lox, int loy, int lx, int ly) {
+    std::array<float, 144> tile{};
+    for (std::uint32_t i = 0; i < 144u; ++i) {
+        const int qx = lox + f.apart * (int(i % 12u) - 2), qy = loy + f.apart * (int(i / 12u) - 2);
+        float a = -1.0f;
+        if (qx >= f.rect[0] && qy >= f.rect[1] && qx < f.rect[2] && qy < f.rect[3] && qx < f.size[0] &&
+            qy < f.size[1]) {
+            a = f.answer[std::size_t((qy / f.apart) * f.w + qx / f.apart)];
+        }
+        tile[i] = a;
+    }
+    Stat s;
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            const float a = tile[std::size_t((ly + 2 + y) * 12 + lx + 2 + x)];
+            if (a >= 0.0f) {
+                s.count += 1.0f;
+                s.sum += a;
+                s.sum2 += a * a;
+            }
+        }
+    }
+    return s;
+}
+// BB_LAMP_SHADOW_WINDOW=1: the window moved in from the workgroup's rim (around_lo), over the
+// workgroup's own answers only (its pixels in the rect and on the screen).
+Stat Confined(const Field& f, int gx, int gy, int lx, int ly) {
+    const int ax = std::clamp(lx - 2, 0, 3), ay = std::clamp(ly - 2, 0, 3);
+    Stat s;
+    for (int y = ay; y < ay + 5; ++y) {
+        for (int x = ax; x < ax + 5; ++x) {
+            const int px = gx + x, py = gy + y, fx = f.apart * px, fy = f.apart * py;
+            if (fx < f.rect[0] || fy < f.rect[1] || fx >= f.rect[2] || fy >= f.rect[3] || fx >= f.size[0] ||
+                fy >= f.size[1]) {
+                continue;
+            }
+            const float a = f.answer[std::size_t(py * f.w + px)];
+            if (a >= 0.0f) {
+                s.count += 1.0f;
+                s.sum += a;
+                s.sum2 += a * a;
+            }
+        }
+    }
+    return s;
+}
+// Every pass pixel's statistic with the workgroups' origins shifted by `shift` pass pixels (as the
+// picture moves under the fixed grid of 8x8 workgroups); centred: value 2, else value 1.
+std::vector<Stat> Statistic(const Field& f, int shift, bool centred) {
+    std::vector<Stat> out(std::size_t(f.pw * f.ph));
+    for (int y = 0; y < f.ph; ++y) {
+        for (int x = 0; x < f.pw; ++x) {
+            const int gx = (x - shift + 8) / 8 * 8 - 8 + shift, gy = (y - shift + 8) / 8 * 8 - 8 + shift;
+            out[std::size_t(y * f.pw + x)] = centred ? Centred(f, f.apart * gx, f.apart * gy, x - gx, y - gy)
+                                                     : Confined(f, gx, gy, x - gx, y - gy);
+        }
+    }
+    return out;
+}
+
+// bbport (r60_lamp-centred-window): the cast code's way through the answers image, written from
+// the GLSL rules (not from the shader's text): packHalf2x16 puts the code, as a half float, in the
+// high 16 bits (round to nearest even here; the code's classes do not depend on the rounding),
+// the record / 16 goes in the low 16 bits, unpackHalf2x16(...).y reads the code back.
+std::uint16_t ToHalf(float v) {
+    const std::uint32_t b = std::bit_cast<std::uint32_t>(v);
+    const std::uint32_t sign = (b >> 16) & 0x8000u;
+    const std::uint32_t mag = b & 0x7FFFFFFFu;
+    const int exp = int(mag >> 23) - 127 + 15;
+    if (mag == 0u || exp < -10) {
+        return std::uint16_t(sign);
+    }
+    assert(exp < 31); // the codes lie within -5 and 64
+    std::uint32_t man = (mag & 0x7FFFFFu) | 0x800000u;
+    const int shift = exp >= 1 ? 13 : 14 - exp;
+    std::uint32_t h = man >> shift;
+    const std::uint32_t rest = man & ((1u << shift) - 1u), halfway = 1u << (shift - 1);
+    if (rest > halfway || (rest == halfway && (h & 1u) != 0u)) {
+        ++h;
+    }
+    if (exp >= 1) {
+        h = (std::uint32_t(exp) << 10) + (h - 0x400u); // (a carry out of the mantissa moves the exponent)
+    }
+    return std::uint16_t(sign | h);
+}
+float FromHalf(std::uint16_t h) {
+    const int exp = (h >> 10) & 31;
+    const float man = float(h & 0x3FFu);
+    const float v = exp == 0 ? std::ldexp(man, -24) : std::ldexp(1.0f + man / 1024.0f, exp - 15);
+    return (h & 0x8000u) != 0u ? -v : v;
+}
+// What the texel's y holds (storeAnswer) and what is read back of it (the resolve).
+std::uint32_t PackCast(float code, std::uint32_t record) {
+    const std::uint32_t at = (record & 15u) == 0u && record < (1u << 20) ? record >> 4 : 0u;
+    return (std::uint32_t(ToHalf(code)) << 16) | at;
+}
+float CastOf(std::uint32_t y) { return FromHalf(std::uint16_t(y >> 16)); }
+std::uint32_t RecordOf(std::uint32_t y) { return (y & 0xFFFFu) << 4; }
 } // namespace
 
 int main() {
@@ -247,6 +412,59 @@ int main() {
             assert(LampPassRadius(point, (k & 1) != 0, (k & 2) != 0, (k & 4) != 0) == 0.0f);
         }
     }
+    // bbport (r48_lamp-softness): graphics_lamp_shadow_softness (0 sharp, 1 soft, 2 softer) as the
+    // lamp's radius; BB_LAMP_SHADOW_SOFT, when it gives a number, wins; a point lamp traces every
+    // lamp (steps 0), an area lamp keeps the pick.
+    {
+        const LampShadowTune d = Read(std::array<Pair, 0>{});
+        assert(!d.radius_set);
+        static_assert(LampSoftnessRadii.size() == 3);
+        assert(LampSoftnessRadius(d, 0) == 0.0f && LampSoftnessRadius(d, 1) == 0.1f &&
+               LampSoftnessRadius(d, 2) == 0.2f);
+        assert(LampSoftnessRadius(d, 1) == d.radius_m); // soft: the radius of before (r42)
+        // out of range: the nearest choice, as the menu shows it and the ini saves it (r53)
+        assert(LampSoftnessRadius(d, -1) == 0.0f && LampSoftnessRadius(d, 3) == 0.2f &&
+               LampSoftnessRadius(d, 7) == 0.2f);
+        // Softer is wider than soft, and the lamp's centre stays inside the blind sphere at the
+        // end of every ray to its disc (a target lies at most the radius from the centre).
+        assert(LampSoftnessRadii[2] > LampSoftnessRadii[1] && LampSoftnessRadii[2] < d.clearance_m);
+        for (int k = 0; k < 3; ++k) {
+            LampShadowTune pass = d;
+            pass.radius_m = LampSoftnessRadius(d, k);
+            // Sharp keeps no history; soft and softer average the same 9 frames.
+            const float frames = LampHistoryFrames(pass);
+            assert(k == 0 ? frames == 0.0f : std::abs(frames - 9.0f) < 1e-4f);
+            // The pass that takes the history, at full and at half resolution: the setting's
+            // radius; a pass beside it: the point lamp, as before.
+            assert(LampPassRadius(pass, true, false, false) == pass.radius_m);
+            assert(LampPassRadius(pass, true, true, false) == pass.radius_m);
+            assert(LampPassRadius(pass, false, false, false) == 0.0f);
+            assert(LampPassRadius(pass, true, true, true) == 0.0f); // experiment 2305843009213693952
+            // Sharp traces every lamp; with the pick (1) soft and softer keep it, and so does the
+            // pass of before r41 (no repair); LANTERN_RT_LAMPS_EXACT=1 (0) traces every lamp.
+            assert(LampPassSteps(pass, true, 1u) == (k == 0 ? 0u : 1u));
+            assert(LampPassSteps(pass, false, 1u) == 1u);
+            assert(LampPassSteps(pass, true, 0u) == 0u && LampPassSteps(pass, false, 0u) == 0u);
+        }
+        // The variable, when it gives a number, wins over every value of the setting (0 too).
+        for (const char* value : {"0", "0.35", "0.05 "}) {
+            const LampShadowTune t = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_SOFT", value}}});
+            assert(t.radius_set);
+            for (int k = -1; k < 4; ++k) {
+                assert(LampSoftnessRadius(t, k) == t.radius_m);
+            }
+        }
+        const LampShadowTune point = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_SOFT", "0"}}});
+        assert(point.radius_m == 0.0f && LampSoftnessRadius(point, 2) == 0.0f && LampPassSteps(point, true, 1u) == 0u);
+        const LampShadowTune high = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_SOFT", "5"}}});
+        assert(high.radius_set && LampSoftnessRadius(high, 0) == 0.5f); // clamped, and it still wins
+        // Not set, empty or not a number: the setting decides.
+        for (const char* value : {"", "0.2m", "soft", "nan"}) {
+            const LampShadowTune t = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_SOFT", value}}});
+            assert(!t.radius_set && t.radius_m == d.radius_m);
+            assert(LampSoftnessRadius(t, 0) == 0.0f && LampSoftnessRadius(t, 2) == 0.2f);
+        }
+    }
     // A cut: the way back to the camera of the frame before is more than 2 m or about 20 degrees.
     {
         std::array<float, 12> back{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -272,7 +490,9 @@ int main() {
         const LampShadowTune d;
         const auto words = LampTuneWords(d, false, 0.05f);
         assert(words.size() == LampTuneWordCount);
-        assert(words[0] == 1u); // new weights, view 0
+        // new weights, view 0, the soft follow (r52), the window (bbport r57_lamp-window; r60: of
+        // the default)
+        assert(words[0] == (1u | LampTuneFollowSoft | DefaultWindowBits));
         assert(F(words[1]) == 0.35f && F(words[2]) == 0.1f && words[3] == 0u);
         assert(F(words[4]) == 0.06f && F(words[5]) == 0.15f && F(words[7]) == 0.5f);
         // The frame counter goes into word 3 as it is, and changes nothing else.
@@ -316,7 +536,7 @@ int main() {
         t.view = 4;
         t.reject = 0.75f;
         const auto other = LampTuneWords(t, true, 0.1f);
-        assert(other[0] == (2u | 4u << 8));
+        assert(other[0] == (2u | 4u << 8 | LampTuneFollowSoft | DefaultWindowBits)); // (r57: the window)
         assert(F(other[9]) == 0.75f);
         assert(Near(F(other[6]), 0.01f));
         // A core that is not a positive number counts as 0, as in LocalFalloff::Patch.
@@ -324,7 +544,287 @@ int main() {
         assert(F(LampTuneWords(d, true, std::nanf(""))[6]) == 0.0f);
         // The view cannot leave its field.
         t.view = 100;
-        assert(LampTuneWords(t, false, 0.0f)[0] == 6u << 8);
+        assert(LampTuneWords(t, false, 0.0f)[0] == (6u << 8 | LampTuneFollowSoft | DefaultWindowBits));
+    }
+    // bbport (r52_follow-soft): BB_LAMP_SHADOW_FOLLOW_SOFT is on unless the variable says 0 (out
+    // of range is clamped, text that is not a whole number leaves the default). In the words it is
+    // word 0's bit 20 and nothing else; bits 12-17 stay clear. (That the shader reads the same
+    // bit is checked by rt-shadow-test --lamps: the follow images hold a state only with it.)
+    {
+        const LampShadowTune d = Read(std::array<Pair, 0>{});
+        assert(d.follow_soft);
+        const LampShadowTune off = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_FOLLOW_SOFT", "0"}}});
+        assert(!off.follow_soft);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_FOLLOW_SOFT", "1"}}}).follow_soft);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_FOLLOW_SOFT", "7"}}}).follow_soft);
+        assert(!Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_FOLLOW_SOFT", "-2"}}}).follow_soft);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_FOLLOW_SOFT", "no"}}}).follow_soft);
+        // The other knobs are read as without it.
+        LampShadowTune again = off;
+        again.follow_soft = d.follow_soft;
+        assert(LampTuneWords(again, false, 0.05f) == LampTuneWords(d, false, 0.05f));
+        assert(off.follow == d.follow && off.radius_m == d.radius_m && off.view == d.view);
+        const float c = std::cos(0.3f), s = std::sin(0.3f);
+        const std::array<float, 12> view{c, 0.0f, -s, 1.0f, 0.0f, 1.0f, 0.0f, 2.0f, s, 0.0f, c, 3.0f};
+        for (const float* v : {static_cast<const float*>(nullptr), view.data()}) {
+            for (const bool inverse : {false, true}) {
+                const auto on_words = LampTuneWords(d, inverse, 0.05f, v, 41u);
+                const auto off_words = LampTuneWords(off, inverse, 0.05f, v, 41u);
+                assert((on_words[0] ^ off_words[0]) == LampTuneFollowSoft);
+                assert((on_words[0] & LampTuneFollowSoft) != 0 && (off_words[0] & LampTuneFollowSoft) == 0);
+                assert((on_words[0] & (0x3Fu << 12)) == 0 && (off_words[0] & (0x3Fu << 12)) == 0);
+                for (std::size_t k = 1; k < LampTuneWordCount; ++k) {
+                    assert(on_words[k] == off_words[k]);
+                }
+            }
+        }
+        // Nor is it in the history block's words.
+        assert(LampHistoryTail(d) == LampHistoryTail(off));
+    }
+    // bbport (r57_lamp-window): BB_LAMP_SHADOW_WINDOW is on (the window, as before r57) unless the
+    // variable says 0 (out of range is clamped, text that is not a whole number leaves the
+    // default). In the words it is word 0's bit 21 and nothing else: bits 12-17 stay clear and bit
+    // 20 (the soft follow) keeps its own value. (That the shader reads the same bit is checked by
+    // rt-shadow-test --lamps: its r57 lattice block fails when the pictures with 0 and with 1 are
+    // the same.)
+    {
+        static_assert(LampTuneWindow == 1u << 21 && (LampTuneWindow & LampTuneFollowSoft) == 0);
+        static_assert((LampTuneWindow & (0x3Fu << 12)) == 0 && (LampTuneWindow & (7u << LampTuneViewShift)) == 0);
+        const LampShadowTune d = Read(std::array<Pair, 0>{});
+        static_assert(LampWindowDefault == 1 || LampWindowDefault == 2); // (r60: either has the window)
+        assert(d.window);
+        assert((LampTuneWords(d, false, 0.05f)[0] & LampTuneWindow) == LampTuneWindow);
+        const LampShadowTune off = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "0"}}});
+        assert(!off.window);
+        assert((LampTuneWords(off, false, 0.05f)[0] & LampTuneWindow) == 0);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "1"}}}).window);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "5"}}}).window);
+        assert(!Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "-1"}}}).window);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "no"}}}).window);
+        assert(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", ""}}}).window);
+        // Round trip: the bit the words carry gives the knob back, for both values of the soft
+        // follow, and the other knobs are read as without it.
+        LampShadowTune again = off;
+        again.window = d.window;
+        again.window_centred = d.window_centred; // (r60)
+        assert(LampTuneWords(again, false, 0.05f) == LampTuneWords(d, false, 0.05f));
+        assert(off.follow_soft == d.follow_soft && off.around == d.around && off.view == d.view);
+        const float c = std::cos(0.3f), s = std::sin(0.3f);
+        const std::array<float, 12> view{c, 0.0f, -s, 1.0f, 0.0f, 1.0f, 0.0f, 2.0f, s, 0.0f, c, 3.0f};
+        for (const bool soft : {false, true}) {
+            for (const bool window : {false, true}) {
+                LampShadowTune t = d;
+                t.follow_soft = soft;
+                t.window = window;
+                t.window_centred = false; // (r60: bit 22 below)
+                t.view = 3;
+                const auto words = LampTuneWords(t, true, 0.05f, view.data(), 77u);
+                assert(((words[0] & LampTuneWindow) != 0) == window);
+                assert(((words[0] & LampTuneFollowSoft) != 0) == soft);
+                assert((words[0] & (0x3Fu << 12)) == 0);
+                assert(((words[0] >> LampTuneViewShift) & 7u) == 3u);
+                LampShadowTune other = t;
+                other.window = !window;
+                const auto flipped = LampTuneWords(other, true, 0.05f, view.data(), 77u);
+                assert((words[0] ^ flipped[0]) == LampTuneWindow);
+                for (std::size_t k = 1; k < LampTuneWordCount; ++k) {
+                    assert(words[k] == flipped[k]);
+                }
+            }
+        }
+        // Nor is it in the history block's words.
+        assert(LampHistoryTail(d) == LampHistoryTail(off));
+    }
+    // bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2 is the window (bit 21) centred
+    // (bit 22); 3 or more is 2, below 0 is 0, text that is no whole number leaves the default
+    // (LampWindowDefault). Bit 22 is set only with bit 21, and nothing else of the words moves with
+    // it; 0 and 1 give the words they gave before r60. (That the shader reads it is checked by
+    // rt-shadow-test --lamps: its lattice block fails when the pictures with 1 and 2 are the same.)
+    {
+        static_assert(LampTuneCentred == 1u << 22);
+        static_assert((LampTuneCentred & (LampTuneWindow | LampTuneFollowSoft | (0x3Fu << 12) |
+                                          (7u << LampTuneViewShift) | LampTuneNewWeights |
+                                          LampTuneInverseSquare)) == 0);
+        const LampShadowTune d = Read(std::array<Pair, 0>{});
+        assert(LampWindowValue(d) == LampWindowDefault);
+        assert(d.window_centred == (LampWindowDefault == 2));
+        const LampShadowTune two = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "2"}}});
+        assert(two.window && two.window_centred && LampWindowValue(two) == 2u);
+        const LampShadowTune one = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "1"}}});
+        assert(one.window && !one.window_centred && LampWindowValue(one) == 1u);
+        const LampShadowTune zero = Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "0"}}});
+        assert(!zero.window && !zero.window_centred && LampWindowValue(zero) == 0u);
+        assert(LampWindowValue(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "5"}}})) == 2u);
+        assert(LampWindowValue(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "-1"}}})) == 0u);
+        assert(LampWindowValue(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "two"}}})) == LampWindowDefault);
+        assert(LampWindowValue(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", "2.5"}}})) == LampWindowDefault);
+        assert(LampWindowValue(Read(std::array<Pair, 1>{{{"BB_LAMP_SHADOW_WINDOW", " 2 "}}})) == 2u);
+        // The words of 0 and 1 are those of before r60 (bit 21 as r57 had it, no bit 22); 2 adds
+        // bit 22 alone.
+        const float c = std::cos(0.3f), s = std::sin(0.3f);
+        const std::array<float, 12> view{c, 0.0f, -s, 1.0f, 0.0f, 1.0f, 0.0f, 2.0f, s, 0.0f, c, 3.0f};
+        for (const bool soft : {false, true}) {
+            for (const std::uint32_t v : {0u, 4u, 6u}) {
+                LampShadowTune t0 = zero, t1 = one, t2 = two;
+                for (LampShadowTune* t : {&t0, &t1, &t2}) {
+                    t->follow_soft = soft;
+                    t->view = v;
+                }
+                const auto w0 = LampTuneWords(t0, true, 0.05f, view.data(), 9u);
+                const auto w1 = LampTuneWords(t1, true, 0.05f, view.data(), 9u);
+                const auto w2 = LampTuneWords(t2, true, 0.05f, view.data(), 9u);
+                assert((w0[0] & (LampTuneWindow | LampTuneCentred)) == 0);
+                assert((w1[0] & (LampTuneWindow | LampTuneCentred)) == LampTuneWindow);
+                assert((w2[0] ^ w1[0]) == LampTuneCentred && (w1[0] ^ w0[0]) == LampTuneWindow);
+                assert(((w2[0] & LampTuneFollowSoft) != 0) == soft && ((w2[0] >> LampTuneViewShift) & 7u) == v);
+                for (std::size_t k = 1; k < LampTuneWordCount; ++k) {
+                    assert(w0[k] == w1[k] && w1[k] == w2[k]);
+                }
+                // r57's word 0, as LampTuneWords made it before r60
+                const std::uint32_t r57 = (t1.weights ? LampTuneNewWeights : 0u) | LampTuneInverseSquare |
+                                          v << LampTuneViewShift | (soft ? LampTuneFollowSoft : 0u);
+                assert(w0[0] == r57 && w1[0] == (r57 | LampTuneWindow));
+            }
+        }
+        // Bit 22 without the window is never written (2 is the window centred, not a window of its own).
+        LampShadowTune odd = zero;
+        odd.window_centred = true;
+        assert((LampTuneWords(odd, false, 0.05f)[0] & (LampTuneWindow | LampTuneCentred)) == 0);
+        assert(LampWindowValue(odd) == 0u);
+        // Round trip: the value the bits carry reads back as the same knob.
+        for (const LampShadowTune& t : {zero, one, two}) {
+            const std::uint32_t w = LampTuneWords(t, false, 0.05f)[0];
+            const std::uint32_t back = (w & LampTuneWindow) ? ((w & LampTuneCentred) ? 2u : 1u) : 0u;
+            assert(back == LampWindowValue(t));
+            char text[4] = {char('0' + back), 0, 0, 0};
+            const std::array<Pair, 1> env{{{"BB_LAMP_SHADOW_WINDOW", text}}};
+            const LampShadowTune again = Read(env);
+            assert(LampWindowValue(again) == back && LampTuneWords(again, false, 0.05f) == LampTuneWords(t, false, 0.05f));
+        }
+        // Nor is it in the history block's words.
+        assert(LampHistoryTail(two) == LampHistoryTail(one) && LampHistoryTail(one) == LampHistoryTail(zero));
+    }
+    // bbport (r60_lamp-centred-window): the CPU model of the 5x5 statistic (only the tile's index
+    // arithmetic: see Field). Fields of answers with holes (no answer), exact 0s and 1s (so a
+    // count of "above 0" in place of "0 or more" shows), rects that do not cover the screen, end on
+    // even and odd full pixels or reach past the screen (so a missed clip shows); the workgroups'
+    // grid shifted by 0 to 7 pass pixels (full pixels 0 to 7; at the half-resolution build's first
+    // pass, two apart, full pixels 0 to 14). Value 2 (the 12x12 tile, as point_shadow_ray.comp
+    // loadTile and its centred loop index it) gives every pixel the statistic of its own 5x5
+    // neighbourhood (Direct), to the bit, at every shift; value 1 (the window confined to the
+    // workgroup) does not, and changes with the shift: the squares.
+    {
+        struct Case {
+            std::array<int, 2> size;
+            std::array<int, 4> rect;
+        };
+        constexpr std::array<Case, 4> cases{{{{122, 94}, {6, 10, 115, 88}},
+                                             {{121, 93}, {3, 5, 140, 100}},
+                                             {{64, 48}, {0, 0, 64, 48}},
+                                             {{100, 70}, {17, 9, 58, 66}}}};
+        for (const int apart : {1, 2}) {
+            for (const Case& c : cases) {
+                Field f;
+                f.apart = apart;
+                f.size = c.size;
+                f.rect = c.rect;
+                f.pw = (c.size[0] + apart - 1) / apart;
+                f.ph = (c.size[1] + apart - 1) / apart;
+                f.w = f.pw + 10;
+                f.h = f.ph + 10;
+                f.answer.resize(std::size_t(f.w * f.h));
+                std::uint32_t seed = 12345u + std::uint32_t(apart) + std::uint32_t(c.size[0]);
+                std::size_t zeros = 0;
+                for (float& a : f.answer) {
+                    seed = seed * 747796405u + 2891336453u;
+                    const std::uint32_t r = (seed >> 9) & 0x3FFFu;
+                    const std::uint32_t kind = r % 5u; // none, 0, 1, or (twice as often) a fraction
+                    a = kind == 0u ? -1.0f : kind == 1u ? 0.0f : kind == 2u ? 1.0f : float(r & 0x3FFu) / 1023.0f;
+                    zeros += a == 0.0f ? 1 : 0;
+                }
+                assert(zeros > 100);
+                std::vector<Stat> direct(std::size_t(f.pw * f.ph));
+                for (int y = 0; y < f.ph; ++y) {
+                    for (int x = 0; x < f.pw; ++x) {
+                        direct[std::size_t(y * f.pw + x)] = Direct(f, x, y);
+                    }
+                }
+                const auto first1 = Statistic(f, 0, false);
+                bool confined_differs = false, confined_moves = false;
+                for (int shift = 0; shift < 8; ++shift) {
+                    const auto centred = Statistic(f, shift, true);
+                    const auto confined = Statistic(f, shift, false);
+                    for (std::size_t i = 0; i < direct.size(); ++i) {
+                        assert(centred[i] == direct[i]); // bit for bit
+                        assert(std::memcmp(&centred[i], &direct[i], sizeof(Stat)) == 0);
+                        confined_differs = confined_differs || !(confined[i] == direct[i]);
+                        confined_moves = confined_moves || !(confined[i] == first1[i]);
+                    }
+                }
+                assert(confined_differs && confined_moves);
+                // A pixel's own answer is always in its window: count >= 1 where it has one and
+                // lies in the rect.
+                for (int y = 0; y < f.ph; ++y) {
+                    for (int x = 0; x < f.pw; ++x) {
+                        const int fx = apart * x, fy = apart * y;
+                        const bool in = fx >= c.rect[0] && fy >= c.rect[1] && fx < c.rect[2] && fy < c.rect[3];
+                        assert(!in || !(f.answer[std::size_t(y * f.w + x)] >= 0.0f) ||
+                               direct[std::size_t(y * f.pw + x)].count >= 1.0f);
+                    }
+                }
+            }
+        }
+    }
+    // bbport (r60_lamp-centred-window): the cast code through the answers image (storeAnswer, read
+    // back by the resolve): the classes the blend takes from it are those of the ray it stands for.
+    // Written from the shader's rules in plain words: blocker "near" (-2 under a moving lamp), "far"
+    // (0 or more: the swing), else none; the follow evidence e +1 near, -1 further off, 0 free or no
+    // ray to the strongest lamp (a block's answer taken, -5, has none: it copies its block's state).
+    {
+        struct Want {
+            float code;
+            bool near, far;
+            float e;
+        };
+        constexpr std::array<Want, 5> fixed{{{-1.0f, false, false, 0.0f},
+                                             {-2.0f, true, false, 1.0f},
+                                             {-3.0f, false, false, 1.0f},
+                                             {-4.0f, false, false, -1.0f},
+                                             {-5.0f, false, false, 0.0f}}};
+        // What the resolve reads of a code (point_shadow_ray.comp: the centred loop and castEvidence)
+        const auto near_of = [](float c) { return c < -1.5f && c > -2.5f; };
+        const auto far_of = [](float c) { return c >= 0.0f; };
+        const auto evidence = [](float c) {
+            if (c >= 0.0f || (c < -3.5f && c > -4.5f)) {
+                return -1.0f;
+            }
+            return c < -1.5f && c > -3.5f ? 1.0f : 0.0f;
+        };
+        const std::array<std::uint32_t, 4> records{0u, 16u, 48u * 16u, (1u << 20) - 16u};
+        for (const std::uint32_t record : records) {
+            for (const Want& w : fixed) {
+                const std::uint32_t y = PackCast(w.code, record);
+                const float c = CastOf(y);
+                assert(c == w.code && RecordOf(y) == record);
+                assert(near_of(c) == w.near && far_of(c) == w.far && evidence(c) == w.e);
+            }
+            // The far blocker's swing, 0 to 64: far, e -1, back within half a unit in the last place
+            // of a half float (relative 2^-11).
+            for (int k = 0; k <= 6400; ++k) {
+                const float swing = k == 6400 ? 64.0f : float(k) * 0.01f + float(k % 7) * 1e-4f;
+                const std::uint32_t y = PackCast(swing, record);
+                const float c = CastOf(y);
+                assert(far_of(c) && !near_of(c) && evidence(c) == -1.0f && RecordOf(y) == record);
+                assert(std::abs(c - swing) <= std::max(swing * 0x1.0p-11f, 0x1.0p-25f));
+            }
+            assert(CastOf(PackCast(-0.0f, record)) == 0.0f && far_of(CastOf(PackCast(-0.0f, record))));
+        }
+        // A record off the 16-word steps, or past 2^20, is stored as none (0).
+        assert(RecordOf(PackCast(-1.0f, 24u)) == 0u && RecordOf(PackCast(-1.0f, 1u << 20)) == 0u);
+        // The half float of a whole number is exact.
+        for (int k = -5; k <= 64; ++k) {
+            assert(FromHalf(ToHalf(float(k))) == float(k));
+        }
     }
     // The weight. Halfway to the radius the game's curve (1 - d/r)^2 gives a quarter, the old
     // one (1 - d^2/r^2)^2 gave 0.5625: a distant lamp counted 2.25 times too much.

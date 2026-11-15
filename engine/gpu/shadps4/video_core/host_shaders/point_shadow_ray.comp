@@ -24,6 +24,33 @@ layout(set = 0, binding = 8, rgba16f) uniform image2D history_cur;
 #else
 layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D history_cur;
 #endif
+// bbport (r52_follow-soft): the follow state, one float a pixel, kept beside the history (two
+// images taken in turn with it): how sure the pass is that what blocks the pixel's strongest
+// lamp moves with that lamp, as log-odds (above 0 it does, below 0 it stands, 0 no opinion, at
+// most FOLLOW_MOST either way). With word 0 bit 20 (t_follow_soft) written wherever the
+// averaging (HISTORY_BLEND) writes its history and read only through history texels that passed
+// the depth test (historyAt); without it neither read nor written.
+#ifdef HALF
+layout(set = 0, binding = 11, r32f) uniform readonly image2D follow_prev;
+layout(set = 0, binding = 12, r32f) uniform image2D follow_cur;
+#else
+layout(set = 0, binding = 9, r32f) uniform readonly image2D follow_prev;
+layout(set = 0, binding = 10, r32f) uniform writeonly image2D follow_cur;
+#endif
+#ifdef CENTRED
+// bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2 only (the builds made with CENTRED,
+// point_shadow_ray_centred_comp and point_shadow_ray_half_centred_comp; the two builds without it
+// are the pass as before, word for word). The pass that averages runs as two dispatches of this
+// shader: MODE_TRACE casts the rays and stores what they said here; MODE_RESOLVE casts none and does
+// the rest (the history, the light) with the ghost clamp's window centred on every pixel (see main).
+// One texel a pixel: x this frame's answer (its float bits; below 0: the pixel has none), y the cast
+// code (castCode, a half float in the high 16 bits) and the strongest lamp's record / 16 (low 16).
+#ifdef HALF
+layout(set = 0, binding = 13, rg32ui) uniform uimage2D lamp_answers;
+#else
+layout(set = 0, binding = 11, rg32ui) uniform uimage2D lamp_answers;
+#endif
+#endif
 #ifdef HALF
 // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 only (the point_shadow_ray_half_comp build).
 // half_answers: one texel per 2x2 block, written by the first pass: (shadow ratio, view depth,
@@ -90,6 +117,11 @@ const uint MODE_REPAIR = 16u;
 bool new_w = false;             // weights follow the game's falloff and the surface's facing
 bool inv_sq = false;            // the game's lamps use the inverse-square curve
 uint t_view = 0u;               // debug view (BB_LAMP_SHADOW_VIEW)
+bool t_follow_soft = false;     // bbport (r52_follow-soft): BB_LAMP_SHADOW_FOLLOW_SOFT
+bool t_window = true;           // bbport (r57_lamp-window): BB_LAMP_SHADOW_WINDOW (true: the pass of before)
+#ifdef CENTRED
+bool t_centred = false;         // bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2 (with t_window)
+#endif
 float t_clear = LAMP_CLEARANCE; // blind sphere at the lamp, m
 float t_radius = 0.0;           // the lamp's radius, m; 0: a point
 uint t_frame = 0u;              // the frame counter (the sample points' sequence)
@@ -119,6 +151,11 @@ void loadTune() {
     new_w = (f & 1u) != 0u;
     inv_sq = (f & 2u) != 0u;
     t_view = (f >> 8u) & 7u;
+    t_follow_soft = (f & (1u << 20u)) != 0u; // bbport (r52_follow-soft); bits 12-17 are not used
+    t_window = (f & (1u << 21u)) != 0u;      // bbport (r57_lamp-window)
+#ifdef CENTRED
+    t_centred = (f & (1u << 22u)) != 0u;     // bbport (r60_lamp-centred-window)
+#endif
     t_clear = word(at + 1u);
     t_radius = word(at + 2u);
     t_frame = data.d[at + 3u];
@@ -300,13 +337,23 @@ const uint HISTORY_WRITE = 2u;
 // (LampTrack::Step; very large: the lamp was not there the frame before).
 const uint HISTORY_BLEND = 4u;
 const float FAST_KEEP = 0.6; // the last frame's share in the mean of the last few frames
+// bbport (r57_lamp-window): how many frames that mean stands for (its variance is that of so many
+// answers): (1 + FAST_KEEP) / (1 - FAST_KEEP), 4.
+const float FAST_COUNT = (1.0 + FAST_KEEP) / (1.0 - FAST_KEEP);
+// bbport (r57_lamp-window): without the window, the swing of the "stands" share under a moving
+// lamp (the shadow's step over the lamp's): one value for every pixel, so that the cap of its
+// frames does not depend on whether this frame's ray was blocked (a cap on the blocked frames
+// alone weighs the dark answers more and darkens a standing penumbra). 1: a blocker halfway
+// between the lamp and the surface. A guess, not measured.
+const float OWN_SWING = 1.0;
 // The reject sets in at this share of t_reject. One ray that disagrees with the history moves
 // the mean of the last few frames by 1 - FAST_KEEP = 0.4 at most, and must not drop the history
 // (in a penumbra every other ray disagrees): lamp_shadow_tune.h keeps t_reject at 0.45 or more.
 const float REJECT_FROM = 0.9;
 // The history against this frame's answers around the pixel (see main): the variance a pixel's
 // answers are taken to have at the least (over the answers counted; 0.25 is a coin's), and how
-// far the history may lie outside before it is given up (from, wholly).
+// far the history may lie outside before it is given up (from, wholly). bbport (r57_lamp-window):
+// without the window, against the pixel's own last few frames (over FAST_COUNT).
 const float AROUND_FLOOR = 0.05;
 const float AROUND_FROM = 0.05;
 const float AROUND_ALL = 0.3;
@@ -366,6 +413,63 @@ bool blendHistory(vec3 P, uint history_at, vec3 moved, out float ratio, out floa
     return true;
 }
 
+// bbport (r52_follow-soft): the follow share of the history, worked out per pixel from what the
+// pixel has itself: its own ray's blocker, the follow state the history holds at the two places
+// it may be looked up at, and how well each place fits this frame's answer. Nothing of it comes
+// from the workgroup's shared answers.
+const float FOLLOW_EVIDENCE = 3.0; // log-odds one blocked ray adds (near the lamp) or takes (far)
+const float FOLLOW_MOST = 5.0;     // the state's bound either way (logistic: 0.993)
+const float FOLLOW_KEEP = 0.95;    // the share of the state kept a frame; the rest fades to 0
+const float FOLLOW_AGREE = 0.5;    // weight of this frame's answer's fit to each place (not kept)
+const float UNSURE_FROM = 0.2;     // the history is shortened where the share is unsure and the
+const float UNSURE_ALL = 0.6;      // two places differ: from, wholly
+const float NEW_LAMP_STEP = 500.0; // m, half of LampTrack::Lost (1000 m): the step the host hands
+                                   // for a lamp that was not there the frame before
+
+// bbport (r52_follow-soft): the follow state the frame before left at q. A value the pass does
+// not store (not a number, or beyond FOLLOW_MOST) counts as no opinion.
+float stateAt(ivec2 q) {
+    const float x = imageLoad(follow_prev, q).x;
+    return abs(x) <= FOLLOW_MOST ? x : 0.0;
+}
+
+// bbport (r52_follow-soft): blendHistory's look-up at one place, not made whole: sum = the found
+// taps' bilinear weights times (ratio, frames, fast), found = those weights' sum, lam = those
+// weights times the follow state there. Nothing found: all three 0.
+void historyAt(vec3 P, uint history_at, vec3 moved, out vec3 sum, out float found, out float lam) {
+    sum = vec3(0.0);
+    found = 0.0;
+    lam = 0.0;
+    const vec4 v = vec4(P, 1.0);
+    const vec3 p = vec3(dot(row(history_at + 2u), v), dot(row(history_at + 6u), v), dot(row(history_at + 10u), v)) - moved;
+    const vec4 clip = vec4(dot(row(history_at + 14u), vec4(p, 1.0)), dot(row(history_at + 18u), vec4(p, 1.0)),
+                           dot(row(history_at + 22u), vec4(p, 1.0)), dot(row(history_at + 26u), vec4(p, 1.0)));
+    if (!(clip.w > 1e-4)) {
+        return;
+    }
+    const vec2 ndc = clip.xy / clip.w;
+    const vec2 was = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+    if (any(lessThan(was, vec2(0.0))) || any(greaterThanEqual(was, size))) {
+        return;
+    }
+    const vec2 centre = was - 0.5;
+    const ivec2 h0 = ivec2(floor(centre));
+    const vec2 part = centre - vec2(h0);
+    for (int k = 0; k < 4; ++k) {
+        const ivec2 o = ivec2(k & 1, k >> 1);
+        const float w = (o.x == 0 ? 1.0 - part.x : part.x) * (o.y == 0 ? 1.0 - part.y : part.y);
+        const ivec2 q = h0 + o;
+        if (w > 0.004 && all(greaterThanEqual(q, ivec2(0))) && all(lessThan(q, ivec2(size)))) {
+            const vec4 h = imageLoad(history_prev, q);
+            if (h.g > 0.0 && abs(h.g - p.z) < 0.03 * p.z + 0.02) {
+                sum += w * h.rba;
+                found += w;
+                lam += w * stateAt(q);
+            }
+        }
+    }
+}
+
 shared uint group_trace;
 // bbport (r42_lamp-soft): averaging (HISTORY_BLEND), what each pixel of the workgroup found on
 // this frame: its answer (the shadow ratio its rays gave; below 0: the pass does not shadow the
@@ -378,6 +482,66 @@ shared uint group_trace;
 // averaged ratio as its answer, and a pixel the first pass did has none.
 shared float group_answer[64];
 shared float group_cast[64];
+
+#ifdef CENTRED
+// bbport (r60_lamp-centred-window): more bits of `mode` (vk_point_shadow.cpp ModeTrace, ModeResolve),
+// set by the host only on the pass that averages (HISTORY_BLEND) with word 0 bit 22 set.
+const uint MODE_TRACE = 32u;
+const uint MODE_RESOLVE = 64u;
+// What the trace stores of the ray to the pixel's strongest lamp: in one value the two things the
+// blend below takes from it, the blocker (group_cast: -1 none, -2 near the moving lamp, else the far
+// blocker's swing, 0 to 64; both only under a moving lamp) and the follow evidence e (+1 near, -1
+// further off, 0 free; under a lamp that stands too).
+const float CAST_FREE = -1.0;       // free, or no ray to the strongest lamp: blocker -1, e 0
+const float CAST_NEAR = -2.0;       // blocked near the moving lamp: blocker -2, e +1
+const float CAST_NEAR_STILL = -3.0; // blocked near the lamp, which stands: blocker -1, e +1
+const float CAST_FAR_STILL = -4.0;  // blocked further off, the lamp stands: blocker -1, e -1
+const float CAST_TAKEN = -5.0;      // HALF_TAKEN (the block's answer, no ray): blocker -1
+                                    // (0 or more: blocked further off under the moving lamp, the
+                                    // blocker's swing; e -1)
+// The resolve's tile: the workgroup's 8x8 pixels (8x8 first-pass pixels, two apart, in the
+// half-resolution build's first pass) and two more on every side, so that the 5x5 window of every
+// pixel lies wholly in it, centred on the pixel.
+const int TILE_SIDE = 12;
+shared float tile_answer[144];
+shared float tile_cast[144];
+
+// The follow evidence e a cast code stands for.
+float castEvidence(float c) {
+    if (c >= 0.0 || (c < -3.5 && c > -4.5)) {
+        return -1.0;
+    }
+    return c < -1.5 && c > -3.5 ? 1.0 : 0.0;
+}
+
+// The trace's texel for pixel p (one off the screen is not stored). answer below 0: none. top: the
+// strongest lamp's record (0: none); records start on 16-word steps below 2^20 (vk_point_shadow.cpp
+// static_asserts), anything else is stored as none.
+void storeAnswer(ivec2 p, float answer, float code, uint top) {
+    if (all(lessThan(p, ivec2(size)))) {
+        const uint at = (top & 15u) == 0u && top < (1u << 20u) ? top >> 4u : 0u;
+        imageStore(lamp_answers, p,
+                   uvec4(floatBitsToUint(answer), (packHalf2x16(vec2(0.0, code)) & 0xFFFF0000u) | at, 0u, 0u));
+    }
+}
+
+// The resolve's tile, loaded by the whole workgroup (every invocation calls it, and a barrier
+// follows). lo: the workgroup's first pixel; apart: 1, or 2 between first-pass pixels. A place
+// outside the pass's rect or the screen has no answer: nothing traced it this frame.
+void loadTile(ivec2 lo, int apart) {
+    for (uint i = gl_LocalInvocationIndex; i < 144u; i += 64u) {
+        const ivec2 q = lo + apart * (ivec2(int(i % 12u), int(i / 12u)) - 2);
+        float a = -1.0, c = CAST_FREE;
+        if (all(greaterThanEqual(q, rect.xy)) && all(lessThan(q, rect.zw)) && all(lessThan(q, ivec2(size)))) {
+            const uvec2 t = imageLoad(lamp_answers, q).xy;
+            a = uintBitsToFloat(t.x);
+            c = unpackHalf2x16(t.y).y;
+        }
+        tile_answer[i] = a;
+        tile_cast[i] = c;
+    }
+}
+#endif
 
 #ifdef HALF
 // bbport (r32_lamp-half): more bits of `mode` (vk_point_shadow.cpp ModeHalf*).
@@ -508,6 +672,13 @@ void main() {
     const ivec2 group_lo = ivec2(gl_WorkGroupID.xy) * 8;
     const ivec2 group_hi = group_lo + 8;
 #endif
+#ifdef CENTRED
+    // bbport (r60_lamp-centred-window): the resolve lists the tiles as its trace did (the same test,
+    // so the same workgroups return below: one without a tile does in both, as with value 1, and
+    // its trace has stored "no answer" for its pixels, which the windows around it read from the
+    // image), but casts no ray (tile_count below)
+    const bool resolve_mode = (mode & MODE_RESOLVE) != 0u;
+#endif
     for (uint t = gl_LocalInvocationIndex; t < light_count; t += 64u) {
         if (inside(t, group_lo, group_hi)) {
             const uint slot = atomicAdd(group_count, 1u);
@@ -520,15 +691,35 @@ void main() {
     const uint listed = group_count;
     if (listed == 0u) {
 #ifdef HALF
+#ifdef CENTRED
+        if (first && !resolve_mode) { // (bbport r60_lamp-centred-window: the trace stored it)
+#else
         if (first) {
+#endif
             imageStore(half_answers, ivec2(gl_GlobalInvocationID.xy), vec4(-1.0)); // no answer
+        }
+#endif
+#ifdef CENTRED
+        if ((mode & MODE_TRACE) != 0u) { // bbport (r60_lamp-centred-window): no answer here
+#ifdef HALF
+            const ivec2 p = ivec2(gl_GlobalInvocationID.xy) * (first ? 2 : 1);
+            if (!fill || ((p.x | p.y) & 1) != 0) { // (not over the first pass's pixel)
+                storeAnswer(p, -1.0, CAST_FREE, 0u);
+            }
+#else
+            storeAnswer(ivec2(gl_GlobalInvocationID.xy), -1.0, CAST_FREE, 0u);
+#endif
         }
 #endif
         return;
     }
     loadTune(); // bbport (r41_lamp-shadows): after the return of a workgroup with no tile
     const bool overflow = listed > MAX_GROUP_TILES;
+#ifdef CENTRED
+    const uint tile_count = resolve_mode ? 0u : overflow ? light_count : listed; // (r60: the resolve weighs no lamp)
+#else
     const uint tile_count = overflow ? light_count : listed;
+#endif
     const uint history_at = floatBitsToUint(length_m);
     const uint history_flags = history_at != 0u ? data.d[history_at] : 0u;
 #ifdef HALF
@@ -537,6 +728,29 @@ void main() {
     if ((history_flags & HISTORY_BLEND) == 0u) {
         t_radius = 0.0;
     }
+#endif
+#ifdef CENTRED
+    // bbport (r60_lamp-centred-window): the two dispatches' roles, the same for the whole workgroup
+    // (push constant, tuning word, history flags). Only the pass that averages has the window; views
+    // 2 and 3 (lamps, rays) are drawn by one dispatch (the host does not split them). A split the
+    // shader does not take is done whole by its trace dispatch, and its resolve does nothing.
+    const bool centred = t_centred && (history_flags & HISTORY_BLEND) != 0u && t_view != 2u && t_view != 3u;
+    const bool trace_only = (mode & MODE_TRACE) != 0u && centred;
+    const bool resolve = resolve_mode && centred;
+    if (resolve_mode && !centred) {
+        return;
+    }
+#ifdef HALF
+    const bool resolve_normal = first; // the first pass's block answer holds the normal
+    // The window's places: first-pass pixels two apart in the first pass (25 answers within 4
+    // pixels, as the workgroup-confined window had); every pixel in the second, whose window then
+    // takes the first pass's answers too (the confined one could not: they were not in its
+    // workgroup's shared arrays).
+    const int resolve_apart = first ? 2 : 1;
+#else
+    const bool resolve_normal = false;
+    const int resolve_apart = 1;
+#endif
 #endif
 
 #ifdef HALF
@@ -550,6 +764,15 @@ void main() {
     // lamp light: its lamp texels are zero now, so it is not `lit` here either).
     const bool done_first = fill && ((px.x | px.y) & 1) == 0;
     live = live && !done_first;
+#endif
+#ifdef CENTRED
+    // bbport (r60_lamp-centred-window): the resolve shadows the pixels the trace answered for. The
+    // tests below then hold for them again: where it answered, the trace changed none of their inputs.
+    uvec2 stored = uvec2(0u);
+    if (resolve && live) {
+        stored = imageLoad(lamp_answers, px).xy;
+        live = uintBitsToFloat(stored.x) >= 0.0;
+    }
 #endif
     // s: the light without the lamps, d: the lamps' light.
     vec3 s0 = vec3(0.0), d0 = vec3(0.0), s1 = vec3(0.0), d1 = vec3(0.0);
@@ -619,6 +842,9 @@ void main() {
     uint seed = (uint(px.x) * 1973u + uint(px.y) * 9277u + (soft ? t_frame : frame_index) * 26699u) | 1u;
     vec2 xi = vec2(0.0);
     if (live) {
+#ifdef CENTRED
+        if (!resolve || resolve_normal) // bbport (r60_lamp-centred-window): the resolve weighs no lamp
+#endif
         n = surfaceNormal(uv, P);
         reach = bias_m + 0.0015 * P.z;
         origin = P + n * reach;
@@ -682,7 +908,16 @@ void main() {
             }
         }
     }
+#ifdef CENTRED
+    // bbport (r60_lamp-centred-window): the resolve listed no tile (wsum 0); its strongest lamp is the
+    // one the trace found
+    live = live && (resolve || wsum > 0.0);
+    if (resolve) {
+        top_at = live ? (stored.y & 0xFFFFu) << 4u : 0u;
+    }
+#else
     live = live && wsum > 0.0;
+#endif
 
     float old_ratio = 1.0;
     float old_stable = 0.0;
@@ -750,6 +985,15 @@ void main() {
 #endif
     if (!live) {
         // (averaging: see above)
+#ifdef CENTRED
+    } else if (resolve) {
+        // bbport (r60_lamp-centred-window): the answer the trace's rays gave (a block's answer:
+        // the trace took it, CAST_TAKEN)
+        ratio = uintBitsToFloat(stored.x);
+#ifdef HALF
+        half_why = unpackHalf2x16(stored.y).y < -4.5 ? HALF_TAKEN : HALF_FIRST_PIXEL;
+#endif
+#endif
     } else if (group_trace != 0u) {
 #ifdef HALF
         float taken = 1.0;
@@ -842,6 +1086,48 @@ void main() {
     //    where the surface was, and the first kind trails by the lamp's whole step. A lamp
     //    that was not there the frame before (a very large step) has no history under its
     //    shadows.
+    //  - bbport (r52_follow-soft): with BB_LAMP_SHADOW_FOLLOW_SOFT (word 0 bit 20, the default)
+    //    no vote picks the place. Each pixel keeps a follow state (follow_prev, follow_cur):
+    //    its own blocked ray adds FOLLOW_EVIDENCE where the blocker lies within word 32 of the
+    //    lamp and takes it away where it lies further off, and the state fades by FOLLOW_KEEP a
+    //    frame; its "moves with the lamp" part is found where the lamp's motion puts it, its
+    //    "stands" part where the surface was. The history is read at both places and mixed by
+    //    w, the logistic of the state plus how well each place fits this frame's answer. What
+    //    is not followed trails: the state's "moves" share by the lamp's whole step, its
+    //    "stands" share by the swing of the far blockers around the pixel. Where w is unsure
+    //    and the two places differ the history is shortened (UNSURE_FROM, UNSURE_ALL). Where
+    //    nothing is found where the surface was, the other place is taken only with a state
+    //    above 0. Under a lamp that was not there the frame before (NEW_LAMP_STEP) nothing is
+    //    looked up. The 5x5 answers still bound the history (word 33) and give the swing,
+    //    nothing else.
+    //  - bbport (r57_lamp-window): the 5x5 window cannot be centred on a pixel near the
+    //    workgroup's rim, so every pixel of a run of 3, 1, 1 and 3 columns (or rows) shares one
+    //    window, and a history kept or given up by it was kept or given up by the whole run: under
+    //    a moving shadow that left squares fixed to the screen, on the 8 px grid (16 px in the
+    //    half-resolution build's first pass, whose dots its second pass then spread). With
+    //    BB_LAMP_SHADOW_WINDOW=0 (word 0 bit 21 clear; the default is 1, the window) no answer
+    //    of another pixel reaches this one at full resolution (the half-resolution build still
+    //    shares the answers of 3x3 blocks that agree, HalfAnswer, and copies a taken block's
+    //    history): the bound is centred on the pixel's own mean of its last few frames with the
+    //    deviation FAST_COUNT one-lamp answers (0 or 1) would have, and the swing that caps the
+    //    frames of the "stands" share is OWN_SWING for every pixel. That bound is wide: it
+    //    binds only a change of more than about 0.86 of the light at once, with one lamp or
+    //    several, and a smaller one (a penumbra that becomes lit, one lamp's part of two) fades
+    //    like the history without its guards, so the wake of a moving caster is no longer
+    //    removed as above. With BB_LAMP_SHADOW_FOLLOW_SOFT=0 the vote and its swing still come
+    //    from the window (they have no per-pixel form): only the soft follow makes the pass
+    //    free of it.
+    //  - bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2 (word 0 bits 21 and 22, the
+    //    builds made with CENTRED) centres the window on every pixel: the pass that averages runs
+    //    as a trace (MODE_TRACE: the rays, stored in lamp_answers) and a resolve (MODE_RESOLVE: the
+    //    rest, with the 5x5 answers read from a 12x12 tile of lamp_answers), so a pixel's bound,
+    //    swing and vote depend on the answers at its own 5x5 neighbourhood only, wherever the
+    //    workgroups' rims lie: meant to leave none of the window's squares (not measured). The
+    //    half-resolution build still shares the answers of 3x3 blocks that agree (HalfAnswer) and
+    //    copies a taken block's history and follow state, as with 0 and 1. Every use of the window
+    //    above holds as with value 1 (the soft follow's swing included, and the vote with
+    //    BB_LAMP_SHADOW_FOLLOW_SOFT=0). In the second half-resolution pass the window also holds
+    //    the first pass's answers at the pixels (2x, 2y) (value 1's could not reach them).
     const float answer = ratio; // what this frame's rays said (view 1)
     float frames = 0.0;         // the frames of history in the ratio (view 5)
     vec3 looked = vec3(0.0, 0.0, 1.0); // view 6
@@ -857,8 +1143,49 @@ void main() {
         if (top_step > 0.0 && top_left >= 0.0) {
             blocker = top_left < word(history_at + 32u) ? -2.0 : min(top_went / max(top_left, 0.05), 64.0);
         }
+#ifdef CENTRED
+        if (trace_only) {
+            // bbport (r60_lamp-centred-window): the trace stores this frame's answer, the cast code
+            // (castEvidence: what the window reads of blocker, and e) and the strongest lamp, and
+            // is done: the resolve does the rest once every workgroup's answers are stored. (The
+            // whole workgroup returns here: no barrier is left to reach.)
+            float code = CAST_FREE;
+            if (live && top_at != 0u && top_left >= 0.0) {
+                const bool near = top_left < word(history_at + 32u);
+                if (top_step > 0.0) {
+                    code = near ? CAST_NEAR : blocker;
+                } else {
+                    code = near ? CAST_NEAR_STILL : CAST_FAR_STILL;
+                }
+            }
+#ifdef HALF
+            if (live && half_why == HALF_TAKEN) {
+                code = CAST_TAKEN;
+            }
+            if (live || !fill || ((px.x | px.y) & 1) != 0) { // (not over the first pass's answer)
+                storeAnswer(px, live ? answer : -1.0, code, live ? top_at : 0u);
+            }
+            if (live) {
+                HalfCount(first, group_trace == 0u ? (first ? 3u : 7u)
+                                                   : (first ? 1u : (half_why == HALF_TAKEN ? 4u : 5u)),
+                          half_why);
+            }
+#else
+            storeAnswer(px, live ? answer : -1.0, code, live ? top_at : 0u);
+#endif
+            return;
+        }
+        if (resolve) {
+            // bbport (r60_lamp-centred-window): the 5x5 answers around every pixel of the workgroup
+            loadTile(group_lo, resolve_apart);
+        } else {
+            group_answer[gl_LocalInvocationIndex] = live ? answer : -1.0;
+            group_cast[gl_LocalInvocationIndex] = blocker;
+        }
+#else
         group_answer[gl_LocalInvocationIndex] = live ? answer : -1.0;
         group_cast[gl_LocalInvocationIndex] = blocker;
+#endif
         barrier();
         if (!live) {
             return;
@@ -873,55 +1200,188 @@ void main() {
             const vec4 h = imageLoad(history_cur, px & ~1);
             frames = max(h.b - 1.0, 0.0);
             imageStore(history_cur, px, vec4(ratio, P.z, h.b, h.a));
+            if (t_follow_soft) { // bbport (r52_follow-soft)
+                imageStore(follow_cur, px, imageLoad(follow_cur, px & ~1));
+            }
         } else {
 #endif
         // The 5x5 answers around the pixel, moved in from the workgroup's rim so that every
-        // pixel has 25 places to ask (this pixel's own is always one of them).
-        const ivec2 around_lo = clamp(ivec2(gl_LocalInvocationID.xy) - 2, ivec2(0), ivec2(3));
+        // pixel has 25 places to ask (this pixel's own is always one of them). bbport
+        // (r57_lamp-window): read only where something takes them (see above); the shared
+        // arrays are still written and the barrier still reached by every invocation.
         float count = 0.0, sum = 0.0, sum2 = 0.0, near_n = 0.0, far_n = 0.0, swing = 0.0;
-        for (int y = around_lo.y; y < around_lo.y + 5; ++y) {
-            for (int x = around_lo.x; x < around_lo.x + 5; ++x) {
-                const float a = group_answer[y * 8 + x];
-                if (a >= 0.0) {
-                    count += 1.0;
-                    sum += a;
-                    sum2 += a * a;
-                    if (top_step > 0.0) {
-                        const float c = group_cast[y * 8 + x];
-                        if (c >= 0.0) {
-                            far_n += 1.0;
-                            swing += c;
-                        } else if (c < -1.5) {
-                            near_n += 1.0;
+#ifdef CENTRED
+        if (resolve) {
+            // bbport (r60_lamp-centred-window): the 5x5 answers centred on the pixel, from the
+            // tile (cell (2, 2) is the workgroup's first pixel), in the same order wherever the
+            // workgroup's rim lies: so a pixel's window, and what it binds, is that of its own
+            // neighbourhood only, and moves with it. (t_window is set with bit 22: the bound, the
+            // swing and the vote below take it as they took the confined one.) A cast code of a
+            // lamp that stands (-3, -4) or of a taken block (-5) counts as neither near nor far,
+            // as its blocker -1 did.
+            const ivec2 own = ivec2(gl_LocalInvocationID.xy) + 2;
+            for (int y = -2; y <= 2; ++y) {
+                for (int x = -2; x <= 2; ++x) {
+                    const int i = (own.y + y) * TILE_SIDE + own.x + x;
+                    const float a = tile_answer[i];
+                    if (a >= 0.0) {
+                        count += 1.0;
+                        sum += a;
+                        sum2 += a * a;
+                        if (top_step > 0.0) {
+                            const float c = tile_cast[i];
+                            if (c >= 0.0) {
+                                far_n += 1.0;
+                                swing += c;
+                            } else if (c < -1.5 && c > -2.5) {
+                                near_n += 1.0;
+                            }
+                        }
+                    }
+                }
+            }
+        } else
+#endif
+        if (t_window || !t_follow_soft) {
+            const ivec2 around_lo = clamp(ivec2(gl_LocalInvocationID.xy) - 2, ivec2(0), ivec2(3));
+            for (int y = around_lo.y; y < around_lo.y + 5; ++y) {
+                for (int x = around_lo.x; x < around_lo.x + 5; ++x) {
+                    const float a = group_answer[y * 8 + x];
+                    if (a >= 0.0) {
+                        count += 1.0;
+                        sum += a;
+                        sum2 += a * a;
+                        if (top_step > 0.0) {
+                            const float c = group_cast[y * 8 + x];
+                            if (c >= 0.0) {
+                                far_n += 1.0;
+                                swing += c;
+                            } else if (c < -1.5) {
+                                near_n += 1.0;
+                            }
                         }
                     }
                 }
             }
         }
-        // carried: what shadows this place moves with the lamp. slip: how far the place the
-        // history is looked up at is off for every frame it holds, m.
-        const bool carried = near_n > far_n;
-        const bool follows = carried && top_moved != vec3(0.0);
-        float slip = 0.0;
-        if (top_step > 0.0) {
-            if (carried) {
-                slip = follows ? 0.0 : top_step;
-            } else if (far_n > 0.0) {
-                slip = top_step * swing / far_n;
-            }
-            looked = follows ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
-        } else {
-            looked = vec3(0.0, 0.2, 0.2);
-        }
         float fast = answer;
         float held_ratio = 1.0, held_frames = 0.0, held_fast = 1.0;
-        if ((history_flags & HISTORY_READ) != 0u &&
-            blendHistory(P, history_at, follows ? top_moved : vec3(0.0), held_ratio, held_frames, held_fast)) {
+        float slip = 0.0;
+        bool held = false;
+        // bbport (r52_follow-soft): unsure: 4 w (1 - w) times how far the two places' ratios lie
+        // apart (0 with bit 20 clear); lam_kept: the follow state this pixel keeps (0 with bit
+        // 20 clear).
+        float unsure = 0.0;
+        float lam_kept = 0.0;
+        if (t_follow_soft) {
+            // bbport (r52_follow-soft): the evidence of this pixel's own ray to its strongest
+            // lamp: +1 blocked within word 32 of the lamp, -1 blocked further off, 0 free or not
+            // cast. Taken while the lamp stands as well, so the state is there when it moves.
+            // (A per-pixel contact term, a near blocker hit right above the receiver counted as
+            // standing, would change e here; there is none.)
+            float e = 0.0;
+            if (top_at != 0u && top_left >= 0.0) {
+                e = top_left < word(history_at + 32u) ? 1.0 : -1.0;
+            }
+#ifdef CENTRED
+            if (resolve) { // bbport (r60_lamp-centred-window): the trace's ray, in its cast code
+                e = castEvidence(unpackHalf2x16(stored.y).y);
+            }
+#endif
+            const bool two = top_moved != vec3(0.0);
+            // A lamp that was not there the frame before has no history under its shadows (its
+            // step is LampTrack::Lost): nothing is looked up, the state starts from the evidence.
+            const bool new_lamp = top_step >= NEW_LAMP_STEP;
+            float w_f = 0.0; // the share looked up where the lamp's motion puts it
+            if ((history_flags & HISTORY_READ) != 0u && !new_lamp) {
+                vec3 sa, sf;
+                float fa, ff, la, lf;
+                historyAt(P, history_at, vec3(0.0), sa, fa, la);
+                sf = sa;
+                ff = fa;
+                lf = la;
+                if (two) {
+                    historyAt(P, history_at, top_moved, sf, ff, lf);
+                }
+                // The state's "moves with the lamp" part (above 0) is taken where the lamp's
+                // motion puts it, its "stands" part (below 0) where the surface was, each made
+                // whole over the taps found there (0 where none is); then faded, and moved by
+                // this pixel's own evidence.
+                const float la_whole = fa > 0.01 ? la / fa : 0.0, lf_whole = ff > 0.01 ? lf / ff : 0.0;
+                const float prior = max(lf_whole, 0.0) + min(la_whole, 0.0);
+                lam_kept = clamp(prior * FOLLOW_KEEP + FOLLOW_EVIDENCE * e, -FOLLOW_MOST, FOLLOW_MOST);
+                if (two) {
+                    float agree = 0.0;
+                    if (fa > 0.01 && ff > 0.01) {
+                        const float ra = sa.x / fa, rf = sf.x / ff;
+                        const float ca = clamp(ra, 0.05, 0.95), cf = clamp(rf, 0.05, 0.95);
+                        agree = FOLLOW_AGREE *
+                                (answer * log(cf / ca) + (1.0 - answer) * log((1.0 - cf) / (1.0 - ca)));
+                        unsure = abs(ra - rf);
+                    }
+                    w_f = 1.0 / (1.0 + exp(-(lam_kept + agree)));
+                    // Nothing found where the surface was: the place the lamp's motion puts it
+                    // is taken only where the state says what blocks the pixel moves with the
+                    // lamp (the trail below bounds only the share that is not followed); else
+                    // nothing is held and the pixel starts again.
+                    if (!(fa > 0.01) && lam_kept <= 0.0) {
+                        w_f = 0.0;
+                    }
+                    unsure *= 4.0 * w_f * (1.0 - w_f);
+                }
+                const float got = (1.0 - w_f) * fa + w_f * ff;
+                if (got > 0.01) {
+                    const vec3 both = (1.0 - w_f) * sa + w_f * sf;
+                    held_ratio = both.x / got;
+                    held_frames = both.y;
+                    held_fast = both.z / got;
+                    held = true;
+                }
+            } else {
+                lam_kept = FOLLOW_EVIDENCE * e;
+            }
+            // What is not followed trails: the state's share that moves with the lamp by the
+            // lamp's whole step, its share that stands by the far blockers' mean swing (0 with
+            // no opinion; bbport r57_lamp-window: OWN_SWING without the window); m a frame, as
+            // the vote's slip below.
+            const float s = 1.0 / (1.0 + exp(-lam_kept));
+            if (top_step > 0.0) {
+                const float c_plus = max(2.0 * s - 1.0, 0.0), c_minus = max(1.0 - 2.0 * s, 0.0);
+                // bbport (r57_lamp-window): without the window, OWN_SWING
+                const float k = t_window ? (far_n > 0.0 ? swing / far_n : 0.0) : OWN_SWING;
+                slip = (1.0 - w_f) * top_step * (c_plus + c_minus * k);
+                looked = vec3(0.0, w_f, 1.0 - w_f);
+            } else {
+                looked = 0.25 * vec3(0.0, s, 1.0 - s);
+            }
+        } else {
+            // carried: what shadows this place moves with the lamp. slip: how far the place the
+            // history is looked up at is off for every frame it holds, m.
+            const bool carried = near_n > far_n;
+            const bool follows = carried && top_moved != vec3(0.0);
+            if (top_step > 0.0) {
+                if (carried) {
+                    slip = follows ? 0.0 : top_step;
+                } else if (far_n > 0.0) {
+                    slip = top_step * swing / far_n;
+                }
+                looked = follows ? vec3(0.0, 1.0, 0.0) : vec3(0.0, 0.0, 1.0);
+            } else {
+                looked = vec3(0.0, 0.2, 0.2);
+            }
+            held = (history_flags & HISTORY_READ) != 0u &&
+                   blendHistory(P, history_at, follows ? top_moved : vec3(0.0), held_ratio, held_frames, held_fast);
+        }
+        if (held) {
             fast = mix(answer, held_fast, FAST_KEEP);
             frames = min(held_frames, word(history_at + 30u));
             const float trail = word(history_at + 31u);
             if (slip > 0.0 && trail > 0.0) {
                 frames = min(frames, trail / slip);
+            }
+            if (t_follow_soft) {
+                // bbport (r52_follow-soft): a share that is a guess between two places apart
+                frames *= 1.0 - smoothstep(UNSURE_FROM, UNSURE_ALL, unsure);
             }
             if (t_reject > 0.0 && frames > 1.5) {
                 // (A history of one frame is never dropped here: its ray and this one are all
@@ -930,8 +1390,18 @@ void main() {
             }
             const float around = word(history_at + 33u);
             if (around > 0.0) {
-                const float mean = sum / count;
-                const float spread = around * sqrt(max(sum2 / count - mean * mean, 0.0) + AROUND_FLOOR / count);
+                float mean, spread;
+                if (t_window) {
+                    mean = sum / count;
+                    spread = around * sqrt(max(sum2 / count - mean * mean, 0.0) + AROUND_FLOOR / count);
+                } else {
+                    // bbport (r57_lamp-window): one lamp's answers are 0 or 1, so a mean of fast
+                    // has the variance fast * (1 - fast) / FAST_COUNT (with two lamps or more the
+                    // answers vary less). The bound is at least 0.18 wide on each side and fast
+                    // lags the change: a change of less than about 0.86 is not bound (see main).
+                    mean = fast;
+                    spread = around * sqrt((fast * (1.0 - fast) + AROUND_FLOOR) / FAST_COUNT);
+                }
                 const float fitted = clamp(held_ratio, min(mean - spread, answer), max(mean + spread, answer));
                 const float taken = smoothstep(AROUND_FROM, AROUND_ALL, abs(fitted - held_ratio));
                 frames *= 1.0 - taken;
@@ -941,6 +1411,9 @@ void main() {
             ratio = mix(answer, held_ratio, frames / (frames + 1.0));
         }
         imageStore(history_cur, px, vec4(ratio, P.z, frames + 1.0, fast));
+        if (t_follow_soft) { // bbport (r52_follow-soft)
+            imageStore(follow_cur, px, vec4(lam_kept));
+        }
 #ifdef HALF
         }
 #endif
@@ -960,6 +1433,9 @@ void main() {
         // averages nothing). 6: where the history was looked up: green where a moving lamp's
         // motion puts it, blue where the surface was under a moving lamp, dim under a lamp
         // that stands; red: how much of it this frame's answers around the pixel took away.
+        // bbport (r52_follow-soft): with the soft follow, 6 under a moving lamp: green the share
+        // of the history looked up where its motion puts it, blue the rest; under a lamp that
+        // stands, dim: the follow state (green moves with the lamp, blue stands).
         // The history and the half-resolution answers hold the ratio as always.
         vec3 shown = vec3(answer);
         if (t_view == 2u) {

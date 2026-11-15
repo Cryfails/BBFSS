@@ -696,6 +696,32 @@ int main(int argc, char** argv) {
            !s.graphics_rt_sun_half && !s.graphics_rt_far_refit);
     assert(s.object_motion_store == BbSettings::MotionStoreAuto &&
            s.startup_object_motion_store == BbSettings::MotionStoreAuto);
+    // bbport (r48_lamp-softness): graphics_lamp_shadow_softness takes names (sharp, soft, softer).
+    // Nothing above sets it: soft; written back; read; saved after a change; an unknown name, a
+    // number or another case is soft; a value out of range in memory is saved as the nearest.
+    assert(s.graphics_lamp_shadow_softness == BbSettings::LampSoftnessSoft);
+    BbSettings::Save();
+    assert(Read(path).find("graphics_lamp_shadow_softness=soft\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_lamp_shadow_softness=sharp\n"; }
+    BbSettings::Load();
+    assert(s.graphics_lamp_shadow_softness == BbSettings::LampSoftnessSharp);
+    s.graphics_lamp_shadow_softness = BbSettings::LampSoftnessSofter;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_lamp_shadow_softness=softer\n") != std::string::npos);
+    s.graphics_lamp_shadow_softness = BbSettings::LampSoftnessSharp;
+    BbSettings::Load();
+    assert(s.graphics_lamp_shadow_softness == BbSettings::LampSoftnessSofter);
+    for (const char* bad : {"hard", "2", "Sharp"}) {
+        { std::ofstream file(path); file << "graphics_lamp_shadow_softness=" << bad << "\n"; }
+        s.graphics_lamp_shadow_softness = BbSettings::LampSoftnessSharp;
+        BbSettings::Load();
+        assert(s.graphics_lamp_shadow_softness == BbSettings::LampSoftnessSoft);
+    }
+    s.graphics_lamp_shadow_softness = 7;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_lamp_shadow_softness=softer\n") != std::string::npos);
+    s.graphics_lamp_shadow_softness = BbSettings::LampSoftnessSoft;
+    BbSettings::Save();
     // bbport (r45_drawn-look): the drawn look's keys. Nothing above sets them: off, with the
     // design's values; written back; read; saved after a change; a value outside its range is
     // the nearest end; a switch that is not 0 or 1 is off; no number is the default.
@@ -792,8 +818,10 @@ int main(int argc, char** argv) {
             bits += int(BbSettings::PreviousPathsMask >> bit & 1);
         }
         assert(bits == 42);
-        // bbport (r41_lamp-shadows): 45 (the lamp shadow repair off) brings faults back, as 14
-        for (const int bit : {0, 1, 2, 3, 4, 8, 14, 23, 28, 45, 51}) { // left out on purpose
+        // bbport (r41_lamp-shadows): 45 (the lamp shadow repair off) brings faults back, as 14;
+        // so do 60 (copy turns), 61 (half-resolution point lamps), 62 (still check) and 63 (lamp
+        // cards), each named in docs/renderer-performance-0.9.43.md (r53_lamp-housekeeping)
+        for (const int bit : {0, 1, 2, 3, 4, 8, 14, 23, 28, 45, 51, 60, 61, 62, 63}) { // left out on purpose
             assert(!(BbSettings::PreviousPathsMask >> bit & 1));
         }
         for (const int bit : {7, 9, 13, 20, 39, 40, 42, 54, 56, 58}) {

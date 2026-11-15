@@ -264,6 +264,21 @@ namespace BloodborneLauncher.Core
             new(L.T("Every 8th frame"), "rare", L.T("About +10% FPS at one heavy spot with ray tracing off, +11% with it on")),
         };
 
+        /// <summary>graphics_lamp_shadow_softness: how soft the ray traced lamp shadows are (the
+        /// lamp's radius: sharp a point, soft 0.1 m, softer 0.2 m; the in-game menu switches it
+        /// live). Soft is the engine's default and what it reads for a value it does not know.</summary>
+        public static readonly Choice[] LampShadowSoftness =
+        {
+            new(L.T("Sharp"), "sharp", L.T("Hard edges, no noise; more rays where three or more lamps light one spot")),
+            new(L.T("Soft (default)"), "soft"),
+            new(L.T("Softer"), "softer", L.T("Edges twice as wide; a torch's stick and other thin things near a lamp cast fainter shadows")),
+        };
+
+        /// <summary>The choice a saved graphics_lamp_shadow_softness text stands for: the engine
+        /// reads a value it does not know as soft (bbport_settings.cpp), so the row shows soft.</summary>
+        public static string LampShadowSoftnessValue(string? saved) =>
+            Array.Exists(LampShadowSoftness, c => c.Value == saved) ? saved! : "soft";
+
         public static readonly Choice[] FpsModes =
         {
             new("60 FPS", "60"),

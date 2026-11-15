@@ -50,6 +50,19 @@ Require(Choices.SunFarShadows.Select(c => c.Value).SequenceEqual(new[] { "game",
 Require(Choices.IndexOf(Choices.SunFarShadows, "game") == 0 && Choices.IndexOf(Choices.SunFarShadows, "") == 0, "Far sun shadows does not start at the game's own");
 Require(Choices.SunFarShadows[0].Note == null && Choices.SunFarShadows.Skip(1).All(c => c.Note is { Length: > 0 and <= 110 }),
     "A far sun shadow choice does not say what it gains in a note the row shows whole");
+// Lamp shadow softness (Graphics > Lighting): starts at the engine's default, soft, and is in no look.
+Require(Choices.LampShadowSoftness.Select(c => c.Value).SequenceEqual(new[] { "sharp", "soft", "softer" }), "The lamp shadow softness values changed");
+Require(IniFile.Defaults.Count(d => d.Key == "graphics_lamp_shadow_softness") == 1 &&
+        IniFile.Defaults.Single(d => d.Key == "graphics_lamp_shadow_softness").Value == "soft",
+    "graphics_lamp_shadow_softness: not in the settings defaults once, at soft");
+Require(!knobs.Contains("graphics_lamp_shadow_softness"), "Lamp shadow softness is part of a look");
+// The row shows what the engine reads: a value it does not know is soft (not the first choice, sharp).
+Require(Choices.LampShadowSoftness.Select(c => Choices.IndexOf(Choices.LampShadowSoftness, Choices.LampShadowSoftnessValue(c.Value))).SequenceEqual(new[] { 0, 1, 2 }) &&
+        new[] { "bogus", "", "Sharp", "2", "hard" }.All(v => Choices.IndexOf(Choices.LampShadowSoftness, Choices.LampShadowSoftnessValue(v)) == 1) &&
+        Choices.LampShadowSoftnessValue(null) == "soft",
+    "A graphics_lamp_shadow_softness the engine does not know does not show as soft");
+Require(Choices.LampShadowSoftness[1].Note == null && Choices.LampShadowSoftness.Where((c, i) => i != 1).All(c => c.Note is { Length: > 0 and <= 110 }),
+    "A lamp shadow softness choice does not say what it changes in a note the row shows whole");
 var performanceShared = SharedSettings.Parse(SharedSettings.ToCode(SharedSettings.Take(performanceIni, new LauncherSettings())));
 Require(performance.All(p => performanceShared.Ini.TryGetValue(p.Key, out var shared) && shared == p.Other), "A performance option is left out of shared settings");
 Console.WriteLine("PASS performance options: " + performance.Length + " settings at their defaults, in shared settings, in no look");

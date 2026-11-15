@@ -34,6 +34,7 @@
 #include "imgui_internal.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
+#include "video_core/renderer_vulkan/lamp_shadow_tune.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_optiscaler.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -888,6 +889,45 @@ void PictureSection() {
         }
         if (!PreviousPathsNote()) { // bbport (r39_master-debug)
             EnvNote("BB_LAMP_SHADOW_HALF");
+        }
+    }
+    // bbport (r48_lamp-softness): how soft the ray traced lamp shadows are, as the lamp's radius
+    // (renderer_vulkan/lamp_shadow_tune.h LampSoftnessRadius: sharp a point, soft 0.1 m, softer
+    // 0.2 m). Live: vk_point_shadow.cpp takes it at every pass and does not read a history made
+    // at another radius. BB_LAMP_SHADOW_SOFT, when set to a number, decides instead.
+    if (const char* label = Item("Lamp shadow softness", "Мягкость теней ламп")) {
+        const char* names[] = {BbSettings::MenuText("Sharp", "Резкие"), BbSettings::MenuText("Soft", "Мягкие"),
+                               BbSettings::MenuText("Softer", "Мягче")};
+        int mode = std::clamp(s.graphics_lamp_shadow_softness.load(), 0, BbSettings::LampSoftnessCount - 1);
+        ImGui::BeginDisabled(!s.graphics_rt_point_shadows);
+        const bool changed = ImGui::Combo(label, &mode, names, BbSettings::LampSoftnessCount);
+        ImGui::EndDisabled();
+        Store(s.graphics_lamp_shadow_softness, mode, changed);
+        Hint(BbSettings::MenuText(
+            "Live, Soft by default. Needs Ray traced lamp shadows. How soft the edges of lamp and "
+            "torch shadows are. Sharp: hard edges. Each lamp is a point, every lamp that reaches a "
+            "spot is traced every frame and nothing is averaged over frames: no noise and no smear "
+            "behind a moving shadow, but more rays where three or more lamps light the same spot. "
+            "Soft: edges that widen with the distance from what casts the shadow, averaged over "
+            "about ten frames. Softer: edges twice as wide, for the same rays (with "
+            "Half-resolution lamp shadows a little more work); thin things close to a lamp, such "
+            "as a torch's stick, cast fainter shadows. Right after switching to Soft or Softer the "
+            "edges are grainy for a few frames.",
+            "Работает сразу, по умолчанию «Мягкие». Нужны трассированные тени ламп. Насколько "
+            "мягкие края у теней ламп и факелов. Резкие: жёсткие края. Каждая лампа — точка, "
+            "каждый кадр трассируется каждая лампа, которая достаёт до места, и ничего не "
+            "усредняется по кадрам: нет ни шума, ни шлейфа за движущейся тенью, но больше лучей "
+            "там, где одно место освещают три лампы и больше. Мягкие: края, которые расширяются с "
+            "расстоянием от того, что отбрасывает тень, усреднённые примерно по десяти кадрам. "
+            "Мягче: края вдвое шире, при том же числе лучей (с «Тени ламп в половинном разрешении» "
+            "немного больше работы); тонкие предметы рядом с лампой, например древко факела, "
+            "отбрасывают более бледные тени. Сразу после переключения на «Мягкие» или «Мягче» края "
+            "несколько кадров зернистые."));
+        // bbport (r53_lamp-housekeeping): the variable decides only when it gives a number
+        // (ReadLampShadowTune); text that is no number leaves the setting in charge
+        if (Vulkan::ReadLampShadowTune([](const char* name) -> const char* { return std::getenv(name); })
+                .radius_set) {
+            EnvNote("BB_LAMP_SHADOW_SOFT");
         }
     }
     // bbport (r37_menu-options): BB_RT_REFIT_EVERY=8 as a setting. Live: vk_rt_shadow.cpp

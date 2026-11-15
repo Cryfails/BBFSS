@@ -36,6 +36,8 @@ namespace BloodborneLauncher.Core
             ("effect_gtao", "1"),
             ("effect_ray_tracing", "0"),
             ("graphics_rt_point_shadows", "0"),
+            // Graphics > Lighting: how soft the ray traced lamp shadows are, the engine's default.
+            ("graphics_lamp_shadow_softness", "soft"),
             ("effect_gi", "1"),
             ("graphics_gi_probes", "1"),
             ("graphics_rt_sun", "0"),

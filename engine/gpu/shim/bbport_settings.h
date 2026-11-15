@@ -166,27 +166,39 @@ enum MotionStore : int { MotionStoreAuto = 0, MotionStoreLarge = 1, MotionStoreS
 inline constexpr const char* MotionStoreNames[] = {"auto", "large", "small"};
 static_assert(sizeof(MotionStoreNames) / sizeof(MotionStoreNames[0]) == MotionStoreCount);
 
+// bbport (r48_lamp-softness): how soft the ray traced lamp shadows are, as the lamp's radius
+// (renderer_vulkan/lamp_shadow_tune.h LampSoftnessRadii): sharp a point (every lamp traced, no
+// history), soft 0.1 m (the default, the lamp of r42), softer 0.2 m. Live (vk_point_shadow.cpp
+// takes it at every pass); BB_LAMP_SHADOW_SOFT, when set to a number, wins.
+enum LampSoftness : int { LampSoftnessSharp = 0, LampSoftnessSoft = 1, LampSoftnessSofter = 2, LampSoftnessCount };
+inline constexpr const char* LampSoftnessNames[] = {"sharp", "soft", "softer"};
+static_assert(sizeof(LampSoftnessNames) / sizeof(LampSoftnessNames[0]) == LampSoftnessCount);
+
 // bbport (r39_master-debug): engine_previous_paths (lantern.ini and the menu's Debug tab; 0|1,
-// default 0). On: these experiment bits are forced (a set bit is the path from before the
-// performance work), ORed with the bits of BB_TOGGLE_FILE, live (ApplyPreviousPaths). In it:
+// default 0). On: these experiment bits are forced (a set bit is the earlier path of that
+// part), ORed with the bits of BB_TOGGLE_FILE, live (ApplyPreviousPaths). In it:
 // the first measured mask (1023959505797356640, the before/after measurements of the work), and
 // 13, 20, 54 and 56 (read in the source to be the earlier path and safe to set at any time; not
 // part of that first mask).
-// bbport (r40_master-bits): 7 and 9 are in it as well, so that the switch goes back to the
-// engine before the work as fully as the run-time switches allow. 7 set: the lamps of ray traced
-// lamp shadows are not drawn apart for one pass; together with 6 that is the lamp pass as it
-// was, a batch with a whole-image snapshot and a shadow pass per tile (vk_point_shadow.h). 9
-// set: the Reflex sleep in the flip step as before, not before the game reads input
+// bbport (r40_master-bits): 7 and 9 are in it as well, so that the switch takes as many of the
+// earlier paths as the run-time switches allow. 7 set: the lamps of ray traced lamp shadows are
+// not drawn apart for one pass; together with 6 that is the old batching (a batch with a
+// whole-image snapshot and a shadow pass per tile, vk_point_shadow.h), which now traces (see
+// below). 9 set: the Reflex sleep in the flip step as before, not before the game reads input
 // (vk_streamline.cpp). The whole mask as it is now, 1114031498345823968 (so with 13, 20, 54 and
-// 56 set too), was measured before 7 and 9 went in, through BB_TOGGLE_FILE (uncapped, one heavy
-// spot, picture and run stable), bits clear against set: 90.2 against 63.6 FPS with ray tracing
-// off, 74.9 against 26.4 with it on, 59.3 against 24.0 game FPS with DLSS frame generation as
-// well. Ray traced lamp shadows cost several times more while the switch is on, as before the
-// work; the row's hint says so. Not in it, although set is the engine before the work (the
-// row's hint names it): 14 (the ghost fix: set brings the fault back). Not in it because set is
-// not an earlier path: 0-4 (upstream's own experiments), 8 (a diagnostic: shared ray tracing
-// copies never refreshed), 23 (no Reflex sleep at all), 28 (acts only with BB_SUN_CASCADE_EVERY)
-// and 51 (acts only with BB_RT_UPKEEP_FREEZE).
+// 56 set too), was measured through BB_TOGGLE_FILE with 7 and 9 set, before they were added to
+// this list (uncapped, one heavy spot, picture and run stable), bits clear against set: 90.2
+// against 63.6 FPS with ray tracing off, 74.9 against 26.4 with it on, 59.3 against 24.0 game
+// FPS with DLSS frame generation as well. Those figures are old paths against new paths in one
+// build, not the engine before the work. With the switch on the lamps are traced one pass per
+// tile (the tile count fix has no bit), which the engine before the work never did, so ray
+// traced lamp shadows cost several times more while it is on; the row's hint says so. That
+// engine was not measured at that spot (engine/docs/renderer-performance-0.9.43.md). Every
+// default-on fix kept out of the list is named in that doc under "Not restored by the switch":
+// 14 (the ghost fix: set brings the fault back; the row's hint names it) and, below, 45 and
+// 60-63. Not in it because set is not an earlier path: 0-4 (upstream's own experiments), 8 (a
+// diagnostic: shared ray tracing copies never refreshed), 23 (no Reflex sleep at all), 28 (acts
+// only with BB_SUN_CASCADE_EVERY) and 51 (acts only with BB_RT_UPKEEP_FREEZE).
 // bbport (r41_lamp-shadows): 45 (35184372088832; set = ray traced lamp shadows before their
 // repair, vk_rt_shadow.h LampRepairOffBit) is not in it either, for the reason 14 is not: set
 // brings picture faults back (doubled and faint torch shadows).
@@ -200,8 +212,10 @@ static_assert(sizeof(MotionStoreNames) / sizeof(MotionStoreNames[0]) == MotionSt
 // cards only what the rule of before did, vk_rt_shadow.h LampCardsOldBit), for the same reason:
 // set brings the plants' whole-polygon lamp shadows back.
 // bbport (r47_still-check): nor is 62 (4611686018427387904; set = a ray tracing caster held for
-// still is built once and never looked at again, vk_rt_shadow.h StillCheckOldBit), for the same
-// reason: set brings the lamp shadow that stays where a carried torch was first drawn back.
+// still is built once and never looked at again, and a small bone palette in memory the GPU wrote
+// is known by its bytes again, not by where it lies (r47b); vk_rt_shadow.h StillCheckOldBit), for
+// the same reason: set brings the lamp shadow that stays where a carried torch was first drawn
+// back.
 inline constexpr int PreviousPathsBits[] = {5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
                                             21, 22, 24, 25, 26, 27, 30, 31, 33, 34, 35, 36, 37, 39,
                                             40, 42, 44, 46, 47, 48, 50, 52, 53, 54, 56, 57, 58, 59};
@@ -432,6 +446,7 @@ struct Values {
     // bbport (r37_menu-options): performance modes that were environment variables only (named
     // after each); a set variable still decides. Live: the renderer reads them every frame.
     std::atomic<bool> graphics_lamp_shadow_half{false};          // BB_LAMP_SHADOW_HALF
+    std::atomic<int> graphics_lamp_shadow_softness{LampSoftnessSoft}; // bbport (r48_lamp-softness), live; BB_LAMP_SHADOW_SOFT
     std::atomic<bool> graphics_gi_reflections_fewer_rays{false}; // BB_SSGI_HALF
     std::atomic<bool> graphics_rt_sun_half{false};               // BB_RT_SUN_HALF
     std::atomic<bool> graphics_rt_far_refit{false};              // BB_RT_REFIT_EVERY=8

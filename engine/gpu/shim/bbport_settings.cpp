@@ -420,6 +420,16 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.graphics_sun_far_shadows = mode < 0 ? SunFarGame : mode;
     } else if (key == "graphics_lamp_shadow_half") { // bbport (r37_menu-options)
         v.graphics_lamp_shadow_half = ZeroOrOne(key, value, false);
+    } else if (key == "graphics_lamp_shadow_softness") { // bbport (r48_lamp-softness)
+        int mode = -1;
+        for (int m = 0; m < LampSoftnessCount; ++m) {
+            if (value == LampSoftnessNames[m]) mode = m;
+        }
+        if (mode < 0) {
+            std::printf("Settings: unknown graphics_lamp_shadow_softness '%s' (expected sharp, soft or "
+                        "softer); soft\n", value.c_str());
+        }
+        v.graphics_lamp_shadow_softness = mode < 0 ? LampSoftnessSoft : mode;
     } else if (key == "graphics_gi_reflections_fewer_rays") {
         v.graphics_gi_reflections_fewer_rays = ZeroOrOne(key, value, false);
     } else if (key == "graphics_rt_sun_half") {
@@ -997,6 +1007,8 @@ void Save() {
     put("graphics_sun_far_shadows",
         SunFarShadowsNames[std::clamp(v.graphics_sun_far_shadows.load(),0,SunFarShadowsCount-1)]); // r15
     put("graphics_lamp_shadow_half",flag(v.graphics_lamp_shadow_half)); // bbport (r37_menu-options)
+    put("graphics_lamp_shadow_softness",
+        LampSoftnessNames[std::clamp(v.graphics_lamp_shadow_softness.load(),0,LampSoftnessCount-1)]); // r48
     put("graphics_gi_reflections_fewer_rays",flag(v.graphics_gi_reflections_fewer_rays));
     put("graphics_rt_sun_half",flag(v.graphics_rt_sun_half));
     put("graphics_rt_far_refit",flag(v.graphics_rt_far_refit));

@@ -16,6 +16,9 @@
 #include "video_core/host_shaders/point_shadow_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_comp.h" // bbport (r32_lamp-half)
+// bbport (r60_lamp-centred-window): the builds of BB_LAMP_SHADOW_WINDOW=2
+#include "video_core/host_shaders/point_shadow_ray_centred_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_centred_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -73,11 +76,28 @@ static_assert(DataWords <= 1u << (32 - TuneAtShift));
 constexpr u32 ModeHalfFirst = 2, ModeHalfFill = 4, ModeHalfCount = 8;
 constexpr u32 HalfSlots = 16;
 constexpr u64 HalfOffBit = 72057594037927936ull;
+// bbport (r60_lamp-centred-window): two more bits of the same word, read only by the builds made
+// with CENTRED (point_shadow_ray.comp MODE_TRACE, MODE_RESOLVE): the pass that averages runs as a
+// trace, which stores every pixel's answer in `answers`, and a resolve, which centres the ghost
+// clamp's 5x5 window on every pixel. Single bits below the tuning words' place, none taken.
+constexpr u32 ModeTrace = 32, ModeResolve = 64;
+static_assert(ModeResolve < 1u << TuneAtShift &&
+              ((ModeTrace | ModeResolve) & (ModeApart | ModeRepair | ModeHalfFirst | ModeHalfFill |
+                                            ModeHalfCount)) == 0);
+// One texel a pixel: the answer's float bits and the cast code (a half float) beside the strongest
+// lamp's record / 16 in 16 bits. A storage format every Vulkan device has: 8 bytes a pixel.
+constexpr auto AnswersFormat = vk::Format::eR32G32Uint;
+// The records start on 16-word steps (after ConstantWords, LightWords each) below 2^20.
+static_assert(ConstantWords % 16 == 0 && LightWords == 16 && DataWords <= 1u << 20);
 // bbport (r44_half-area-lamp): set: a pass at half resolution has point lamps without a history,
 // as before r44 (hard-edged shadows; for pictures of before and after). Read at every pass.
 constexpr u64 HalfPointsBit = 2305843009213693952ull;
+// bbport (r48_lamp-softness): a lamp radius for each graphics_lamp_shadow_softness value
+static_assert(LampSoftnessRadii.size() == std::size_t(BbSettings::LampSoftnessCount));
 constexpr u32 TileWords = 8;
 constexpr auto HistoryFormat = vk::Format::eR16G16B16A16Sfloat;
+// bbport (r52_follow-soft): the follow state (a storage format every Vulkan device has)
+constexpr auto FollowFormat = vk::Format::eR32Sfloat;
 constexpr u32 HistoryRead = 1, HistoryWrite = 2;
 // bbport (r42_lamp-soft): the history holds the shadow ratio averaged over the frames
 // (point_shadow_ray.comp HISTORY_BLEND); frames between two lines that say where the lamps are.
@@ -204,29 +224,87 @@ bool PointShadow::Ready() {
         std::printf("Point shadows: off - this GPU cannot run the pass\n");
         return false;
     }
-    if (rt_shadow.Capturing() &&
+    // bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2: the build with the centred window
+    // and binding 11, its answers image. It cannot be made: the window of 1, said in the log.
+    centred = tune.window && tune.window_centred;
+    if (centred && rt_shadow.Capturing() &&
         !EffectPass::Create(instance, ray_set_layout, ray_layout, ray_pipeline,
                             {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
                              eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
-                             eStorageImage},
+                             eStorageImage, eStorageImage, eStorageImage, eStorageImage},
+                            sizeof(Push), POINT_SHADOW_RAY_CENTRED_COMP, "Ray traced lamps", true)) {
+        std::printf("Ray traced lamps (r60): the centred window's pass could not be made: "
+                    "BB_LAMP_SHADOW_WINDOW=1\n");
+        centred = false;
+        tune.window_centred = false;
+    }
+    // bbport (r52_follow-soft): bindings 9 and 10, the follow state
+    if (!centred && rt_shadow.Capturing() &&
+        !EffectPass::Create(instance, ray_set_layout, ray_layout, ray_pipeline,
+                            {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
+                             eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
+                             eStorageImage, eStorageImage, eStorageImage},
                             sizeof(Push), POINT_SHADOW_RAY_COMP, "Ray traced lamps", true)) {
         std::printf("Ray traced lamps: off - the pass could not be made\n");
     }
     if (ray_pipeline) { // bbport (r41_lamp-shadows, r42_lamp-soft)
+        // bbport (r48_lamp-softness): the radius graphics_lamp_shadow_softness gives now (Flush
+        // takes it again at every pass)
+        tune.radius_m = LampSoftnessRadius(
+            tune, BbSettings::Get().graphics_lamp_shadow_softness.load(std::memory_order_relaxed));
+        // bbport (r53_lamp-housekeeping): at radius 0 (sharp) there is no disc and no history
+        char lamp_text[160];
+        if (tune.radius_m > 0.0f) {
+            std::snprintf(lamp_text, sizeof lamp_text,
+                          "area lamp radius %.2f m, one ray a lamp a frame, history %.2f (up to %.1f frames)",
+                          tune.radius_m, tune.history, LampHistoryFrames(tune));
+        } else {
+            std::snprintf(lamp_text, sizeof lamp_text,
+                          "point lamp (radius 0.00 m), the same ray every frame, nothing averaged over frames");
+        }
         std::printf("Ray traced lamps (r42): weights %s (wrap %.2f, floor %.2f, inverse-square "
-                    "%s); area lamp radius %.2f m, one ray a lamp a frame, history %.2f (up to "
-                    "%.1f frames), kept within %.1f deviations of the answers around a pixel, "
+                    "%s); %s, kept within %.1f deviations of the answers around a pixel, "
                     "reject %.2f, trail %.2f m, follows moving lamps %s (what blocks one within "
                     "%.2f m of it moves with it); starved moving copies %s lamp rays; clearance "
                     "%.2f m, bias %.3f m, self skip %.2f m, view %u (BB_LAMP_SHADOW_*); "
                     "experiment 35184372088832 set = the path before r41\n",
                     tune.weights ? "as the game's falloff and facing" : "as before", tune.wrap,
                     tune.facing_floor,
-                    BbSettings::Get().startup_local_inverse_square ? "on" : "off", tune.radius_m,
-                    tune.history, LampHistoryFrames(tune), tune.around, tune.reject, tune.trail_m,
+                    BbSettings::Get().startup_local_inverse_square ? "on" : "off", lamp_text,
+                    tune.around, tune.reject, tune.trail_m,
                     tune.follow ? "yes" : "no", tune.carry_m,
                     tune.stale ? "are left out of" : "stay in", tune.clearance_m, tune.bias_m,
                     tune.self_m, tune.view);
+        std::printf("Ray traced lamps (r52): soft follow %s (BB_LAMP_SHADOW_FOLLOW_SOFT): under a moving "
+                    "lamp the history is read where the surface was and where the lamp's motion puts it, "
+                    "mixed per pixel by a follow state and by how well each fits this frame's ray (a mix "
+                    "that is unsure where the two differ holds fewer frames), not by the 5x5 vote of its "
+                    "workgroup; with BB_LAMP_SHADOW_FOLLOW=0 only where the surface was; 0 = the vote\n",
+                    tune.follow_soft ? "yes" : "no");
+        // bbport (r57_lamp-window); r60_lamp-centred-window: the window of 2
+        const char* const window_what =
+            tune.window && centred ? "the 5x5 answers centred on every pixel bound the history (2, the centred "
+                                     "window: see the r60 line)"
+            : tune.window      ? "the 5x5 answers of the workgroup bound the history"
+            : tune.follow_soft ? "at full resolution no answer of another pixel reaches a pixel (the half-resolution "
+                                 "build still shares agreeing 3x3 blocks): its history is bound by its own last "
+                                 "frames and capped by one fixed swing; a change of less than about 0.86 of the "
+                                 "light is not cut but fades"
+                               : "the history is bound by the pixel's own last frames, but with "
+                                 "BB_LAMP_SHADOW_FOLLOW_SOFT=0 the vote and its cap still take the 5x5 answers";
+        std::printf("Ray traced lamps (r57): window %s (BB_LAMP_SHADOW_WINDOW): %s; 1 (the default) = the 5x5 "
+                    "answers of the workgroup bound the history and their far blockers cap its frames under a "
+                    "moving lamp, as before r57\n",
+                    tune.window ? "yes" : "no", window_what);
+        // bbport (r60_lamp-centred-window): what the value 2 costs, said whether it is on or not
+        std::printf("Ray traced lamps (r60): centred window %s (BB_LAMP_SHADOW_WINDOW=2; the default is %u): "
+                    "the 5x5 answers that bound the history and cap its frames are centred on every "
+                    "pixel, not confined to its 8x8 workgroup, meant to leave no squares fixed to the "
+                    "screen behind moving shadows (not measured; the half-resolution build still shares "
+                    "agreeing 3x3 blocks and copies a taken block's history); costs one dispatch and "
+                    "barrier more (two at half resolution) and one image of 8 bytes a pixel (16.6 MB at "
+                    "1920x1080, 66.4 MB at 3840x2160), made only with 2\n",
+                    centred ? "yes" : "no", unsigned(LampWindowDefault));
     }
     // bbport (r37_menu-options): the half-resolution build is made by HalfReady, when first wanted.
     constexpr auto Drawn = vk::FormatFeatureFlagBits::eColorAttachment |
@@ -240,20 +318,40 @@ bool PointShadow::Ready() {
 
 // bbport (r32_lamp-half, r37_menu-options): the half-resolution build, made the first time a
 // pass wants it: the ray pass's bindings, then the block answers (9) and the counters (10).
+// bbport (r52_follow-soft): then the follow state (11, 12).
 bool PointShadow::HalfReady() {
     if (half_tried) {
         return half_made;
     }
     half_tried = true;
     using enum vk::DescriptorType;
-    if (ray_pipeline &&
-        EffectPass::Create(instance, half_set_layout, half_layout, half_pipeline,
-                           {eStorageBuffer, eCombinedImageSampler, eStorageImage,
-                            eStorageImage, eStorageImage, eStorageImage,
-                            eAccelerationStructureKHR, eStorageImage, eStorageImage,
-                            eStorageImage, eStorageBuffer},
-                           sizeof(Push), POINT_SHADOW_RAY_HALF_COMP,
-                           "Ray traced lamps (half resolution)", true)) {
+    // bbport (r60_lamp-centred-window): with the centred window (Ready), its build: binding 13
+    // its answers image. If it cannot be made, the plain build (the half-resolution pass then has
+    // the window of 1 and does not split; the full-resolution pass keeps 2), said in the log.
+    half_centred = ray_pipeline && centred &&
+                   EffectPass::Create(instance, half_set_layout, half_layout, half_pipeline,
+                                      {eStorageBuffer, eCombinedImageSampler, eStorageImage,
+                                       eStorageImage, eStorageImage, eStorageImage,
+                                       eAccelerationStructureKHR, eStorageImage, eStorageImage,
+                                       eStorageImage, eStorageBuffer, eStorageImage, eStorageImage,
+                                       eStorageImage},
+                                      sizeof(Push), POINT_SHADOW_RAY_HALF_CENTRED_COMP,
+                                      "Ray traced lamps (half resolution)", true);
+    if (ray_pipeline && centred && !half_centred) {
+        std::printf("Ray traced lamps (r60): the centred window's half-resolution pass could not be made: "
+                    "the half-resolution pass has the window of 1 (BB_LAMP_SHADOW_WINDOW=1), the "
+                    "full-resolution pass keeps 2\n");
+    }
+    const bool made =
+        ray_pipeline &&
+        (half_centred || EffectPass::Create(instance, half_set_layout, half_layout, half_pipeline,
+                                            {eStorageBuffer, eCombinedImageSampler, eStorageImage,
+                                             eStorageImage, eStorageImage, eStorageImage,
+                                             eAccelerationStructureKHR, eStorageImage, eStorageImage,
+                                             eStorageImage, eStorageBuffer, eStorageImage, eStorageImage},
+                                            sizeof(Push), POINT_SHADOW_RAY_HALF_COMP,
+                                            "Ray traced lamps (half resolution)", true));
+    if (made) {
         half_counts = std::make_unique<VideoCore::Buffer>(
             instance, 0, HalfSlots * sizeof(u32), VideoCore::MemoryType::DeviceLocal,
             "Ray traced lamp half counters");
@@ -292,7 +390,8 @@ bool PointShadow::BeginApart(u32 width, u32 height) {
     const bool have_history =
         history[0].image && history[0].width == width && history[0].height == height;
     const u64 pixels = u64(width) * height;
-    const u64 needed = (have ? 0 : 2 * 4 * pixels) + (have_history ? 0 : 2 * 8 * pixels);
+    // bbport (r52_follow-soft): the history's 8 bytes a pixel and the follow state's 4, twice
+    const u64 needed = (have ? 0 : 2 * 4 * pixels) + (have_history ? 0 : 2 * (8 + 4) * pixels);
     if (needed && !EffectPass::HasRoom(instance, needed)) {
         return false;
     }
@@ -453,7 +552,8 @@ void PointShadow::OnFrameEnd() {
         const double second = d[4] + d[5] + d[7];
         std::printf("; r44: %u of the half-resolution passes averaged area lamps over the frames "
                     "(the others had point lamps: experiment 2305843009213693952 or "
-                    "35184372088832 set, BB_LAMP_SHADOW_SOFT=0, BB_LAMP_SHADOW_HISTORY=0, not the "
+                    "35184372088832 set, graphics_lamp_shadow_softness=sharp or "
+                    "BB_LAMP_SHADOW_SOFT=0, BB_LAMP_SHADOW_HISTORY=0, not the "
                     "pass that takes the history, or a history that could not be read for 8 "
                     "frames), the second pass traced %.1f%% of its pixels\n",
                     half_line_soft, second > 0.0 ? 100.0 * d[5] / second : 0.0);
@@ -1154,6 +1254,24 @@ void PointShadow::Flush(bool animate_noise) {
     // averaging a pass at half resolution has point lamps, and with experiment
     // 2305843009213693952 set (half_points) it is the pass of before r44: point lamps without
     // a history (LampPassRadius).
+    // bbport (r48_lamp-softness): the lamp's radius as graphics_lamp_shadow_softness has it now
+    // (BB_LAMP_SHADOW_SOFT, when it gave a number, wins: LampSoftnessRadius), taken at every pass
+    // before anything below is worked out from it, so the menu switches it live. A history
+    // written at another radius is not read (history_radius_m, below): it would blend two
+    // softnesses.
+    const int softness = BbSettings::Get().graphics_lamp_shadow_softness.load(std::memory_order_relaxed);
+    tune.radius_m = LampSoftnessRadius(tune, softness);
+    if (use_rays && tune.radius_m != told_radius_m) {
+        told_radius_m = tune.radius_m;
+        std::printf("Ray traced lamps (r48): lamp radius %.2f m (%s%s)%s\n", tune.radius_m,
+                    tune.radius_set ? "BB_LAMP_SHADOW_SOFT" : "graphics_lamp_shadow_softness=",
+                    tune.radius_set ? ""
+                                    : BbSettings::LampSoftnessNames[std::clamp(
+                                          softness, 0, BbSettings::LampSoftnessCount - 1)],
+                    tune.radius_m > 0.0f
+                        ? "; the history starts again at this radius"
+                        : ": point lamps without a history, every lamp that reaches a pixel traced");
+    }
     const bool history_pass = use_rays && !history_written && history_ours;
     const bool half_points = use_half && BbToggle::Experiment(HalfPointsBit);
     const bool beside = use_rays && !half_points && !history_pass && LampHistoryFrames(tune) > 0.0f;
@@ -1192,14 +1310,19 @@ void PointShadow::Flush(bool animate_noise) {
             return;
         }
         bool made = false;
-        if (!history[0].image || history[0].width != width || history[0].height != height) {
-            if (!EffectPass::HasRoom(instance, 2ull * 8 * width * height)) {
+        // bbport (r52_follow-soft): the follow state is made with the history, its room counted
+        // with it: without room for both, neither (and no pass).
+        if (!history[0].image || history[0].width != width || history[0].height != height ||
+            !follow[0].image || follow[0].width != width || follow[0].height != height) {
+            if (!EffectPass::HasRoom(instance, 2ull * (8 + 4) * width * height)) {
                 data.clear();
                 return;
             }
             for (int i = 0; i < 2; ++i) {
                 EnsureImage(history[i], width, height, HistoryFormat, "Ray traced lamp history");
                 history_laid_out[i] = false;
+                EnsureImage(follow[i], width, height, FollowFormat, "Ray traced lamp follow state");
+                follow_laid_out[i] = false;
             }
             made = true;
         }
@@ -1207,10 +1330,32 @@ void PointShadow::Flush(bool animate_noise) {
             history_fresh = false;
             history_written = false; // the new images hold nothing: this frame's history starts again
         }
+        // bbport (r60_lamp-centred-window): the centred window's answers (binding 11 of the full
+        // build, which every ray traced pass binds), one image of 8 bytes a pixel. Made here, at
+        // this pass's size, only when there is none: without room for it, no pass. Only the pass
+        // that splits uses it and gives it its own size (below, once `split` is known), so a
+        // pass of another size beside it (two ray passes of different size a frame) does not
+        // make it anew. Nothing is read from it that the pass's trace did not write first
+        // (point_shadow_ray.comp loadTile), so it is not cleared.
+        if (centred && !answers.image) {
+            if (!EffectPass::HasRoom(instance, 8ull * width * height)) {
+                data.clear();
+                return;
+            }
+            if (EnsureImage(answers, width, height, AnswersFormat, "Ray traced lamp answers")) {
+                answers_laid_out = false;
+                std::printf("Ray traced lamps (r60): the centred window's answers, %ux%u, %.1f MB\n", width,
+                            height, 8.0 * width * height / 1e6);
+            }
+        }
     }
     u32 history_at = 0;
     bool clear_history = false;
     std::array<bool, 2> lay_out{};
+    std::array<bool, 2> follow_lay_out{}; // bbport (r52_follow-soft)
+    // bbport (r60_lamp-centred-window): the pass runs as a trace and a resolve (the shader takes
+    // the same decision: the pass averages, the centred window, not view 2 or 3)
+    bool split = false;
     // (history_ours: above.)
     if (use_rays && !history_written && history_ours) {
         const auto camera = camera_motion.PassMatrices();
@@ -1224,10 +1369,15 @@ void PointShadow::Flush(bool animate_noise) {
         const bool blend = keep > 0.0f;
         const bool kept = blend || lamp_reuse;
         u32 flags = blend ? HistoryWrite | HistoryBlend : lamp_reuse ? HistoryWrite : 0u;
+        // bbport (r60_lamp-centred-window): the half-resolution pass splits only with its centred
+        // build (HalfReady may have made the plain one)
+        split = centred && (!use_half || half_centred) && blend && pass_tune.view != 2 && pass_tune.view != 3;
         constexpr std::array<float, 12> Identity{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         auto reproject = Identity;
-        if (kept && history_fresh && history_blended == blend && last_valid && camera.valid &&
-            ok) {
+        // bbport (r48_lamp-softness): nor is one written at another lamp radius (the softness
+        // changed): as across a camera cut, the pass starts again from this frame's rays.
+        if (kept && history_fresh && history_blended == blend &&
+            history_radius_m == pass_tune.radius_m && last_valid && camera.valid && ok) {
             reproject = Multiply(last_view, camera.inv_view);
             // bbport (r42_lamp-soft): an averaged history is not read across a cut (the camera
             // jumped: what of the frame before passes the depth test there does so by chance)
@@ -1273,7 +1423,8 @@ void PointShadow::Flush(bool animate_noise) {
                 "point lamps without a history: the pass runs at half resolution "
                 "(graphics_lamp_shadow_half or BB_LAMP_SHADOW_HALF) and experiment "
                 "2305843009213693952 is set, the half-resolution pass of before r44",
-                "point lamps without a history (BB_LAMP_SHADOW_SOFT=0)",
+                "point lamps without a history, every lamp that reaches a pixel traced "
+                "(graphics_lamp_shadow_softness=sharp or BB_LAMP_SHADOW_SOFT=0)",
                 "area lamps, one ray a lamp a frame, not averaged (BB_LAMP_SHADOW_HISTORY=0)",
                 "area lamps, one ray a lamp a frame, averaged over the frames in the pass's "
                 "history",
@@ -1330,11 +1481,34 @@ void PointShadow::Flush(bool animate_noise) {
         pending_valid = camera.valid && ok;
         history_written = kept;
         history_blend = blend;
+        history_radius_m = pass_tune.radius_m; // bbport (r48_lamp-softness)
         clear_history = kept;
+    }
+    // bbport (r60_lamp-centred-window): the pass that splits gives the answers image its size.
+    // Without room for that, this pass runs whole (the shader then takes the window of 1), said
+    // once in the log.
+    if (split && (answers.width != width || answers.height != height)) {
+        if (EffectPass::HasRoom(instance, 8ull * width * height) &&
+            EnsureImage(answers, width, height, AnswersFormat, "Ray traced lamp answers")) {
+            answers_laid_out = false;
+            std::printf("Ray traced lamps (r60): the centred window's answers, %ux%u, %.1f MB\n", width, height,
+                        8.0 * width * height / 1e6);
+        } else {
+            split = false;
+            if (!std::exchange(answers_short, true)) {
+                std::printf("Ray traced lamps (r60): no room for the centred window's answers at %ux%u: the "
+                            "pass runs with the window of 1 until there is\n", width, height);
+            }
+        }
+    }
+    if (split) {
+        answers_short = false;
     }
     if (use_rays) {
         lay_out = {!history_laid_out[0], !history_laid_out[1]};
         history_laid_out = {true, true};
+        follow_lay_out = {!follow_laid_out[0], !follow_laid_out[1]};
+        follow_laid_out = {true, true};
     }
     const vk::ImageView history_prev = use_rays ? *history[history_index ^ 1u].view : vk::ImageView{};
     const vk::ImageView history_cur = use_rays ? *history[history_index].view : vk::ImageView{};
@@ -1342,6 +1516,17 @@ void PointShadow::Flush(bool animate_noise) {
     const std::array<vk::Image, 2> history_images{
         use_rays ? vk::Image(history[0].image) : vk::Image{},
         use_rays ? vk::Image(history[1].image) : vk::Image{}};
+    // bbport (r52_follow-soft): the follow state, taken in turn with the history
+    const vk::ImageView follow_prev = use_rays ? *follow[history_index ^ 1u].view : vk::ImageView{};
+    const vk::ImageView follow_cur = use_rays ? *follow[history_index].view : vk::ImageView{};
+    const std::array<vk::Image, 2> follow_images{
+        use_rays ? vk::Image(follow[0].image) : vk::Image{},
+        use_rays ? vk::Image(follow[1].image) : vk::Image{}};
+    // bbport (r60_lamp-centred-window): the centred window's answers (null without it)
+    const bool with_answers = use_rays && centred;
+    const bool answers_lay_out = with_answers && !std::exchange(answers_laid_out, true);
+    const vk::ImageView answers_view = with_answers ? *answers.view : vk::ImageView{};
+    const vk::Image answers_image = with_answers ? vk::Image(answers.image) : vk::Image{};
     const auto device = instance.GetDevice();
     std::array<vk::ImageView, 2> target_views;
     vk::ImageView depth_view{};
@@ -1406,7 +1591,8 @@ void PointShadow::Flush(bool animate_noise) {
         .fade_start_m = use_rays ? 60.0f : fade_start_m,
         .fade_end_m = use_rays ? 100.0f : fade_end_m,
         .light_count = 0,
-        .steps = use_rays ? lamp_pick : steps,
+        // bbport (r48_lamp-softness): a point lamp traces every lamp (LampPassSteps)
+        .steps = use_rays ? LampPassSteps(tune, repair, lamp_pick) : steps,
         .bias_m = repair ? tune.bias_m : bias_m, // bbport (r41_lamp-shadows): BB_LAMP_SHADOW_BIAS
         .rect = {},
     };
@@ -1428,6 +1614,9 @@ void PointShadow::Flush(bool animate_noise) {
          layout = use_rays ? *ray_layout : *layout, use_rays, scene = rt_shadow.Scene(), covered,
          table, tile_count, history_prev, history_cur, history_cur_image,
          history_images, lay_out, clear_history,
+         follow_prev, follow_cur, follow_images, follow_lay_out, // bbport (r52_follow-soft)
+         with_answers, answers_lay_out, answers_view, answers_image, split, // bbport (r60)
+         half_with_answers = with_answers && use_half && half_centred,     // bbport (r60)
          // bbport (r32_lamp-half): null unless this pass runs in two halves
          half_pipe = use_half ? *half_pipeline : vk::Pipeline{},
          half_pipe_layout = use_half ? *half_layout : vk::PipelineLayout{},
@@ -1453,6 +1642,40 @@ void PointShadow::Flush(bool animate_noise) {
                 };
                 cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
             }
+            // bbport (r52_follow-soft): the follow images on their first use, as the history's
+            // (and zeroed below: nothing reads a texel the pass has not written, this keeps them
+            // defined all the same)
+            for (int i = 0; i < 2; ++i) {
+                if (!follow_lay_out[i]) {
+                    continue;
+                }
+                const vk::ImageMemoryBarrier2 to_general{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = follow_images[i],
+                    .subresourceRange = ColorRange,
+                };
+                cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
+            }
+            if (answers_lay_out) { // bbport (r60_lamp-centred-window): on its first use
+                const vk::ImageMemoryBarrier2 to_general{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .dstStageMask = Compute,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = answers_image,
+                    .subresourceRange = ColorRange,
+                };
+                cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
+            }
             const vk::MemoryBarrier2 to_transfer{
                 .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                 .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
@@ -1468,6 +1691,12 @@ void PointShadow::Flush(bool animate_noise) {
                 cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &history_free});
                 const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
                 cmdbuf.clearColorImage(history_cur_image, vk::ImageLayout::eGeneral, zero, ColorRange);
+            }
+            for (int i = 0; i < 2; ++i) { // bbport (r52_follow-soft)
+                if (follow_lay_out[i]) {
+                    const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+                    cmdbuf.clearColorImage(follow_images[i], vk::ImageLayout::eGeneral, zero, ColorRange);
+                }
             }
             for (u32 at = 0; at < words.size(); at += UpdateWords) {
                 const u32 count = std::min<u32>(UpdateWords, u32(words.size()) - at);
@@ -1506,7 +1735,12 @@ void PointShadow::Flush(bool animate_noise) {
                 .accelerationStructureCount = 1, .pAccelerationStructures = &scene};
             const vk::DescriptorImageInfo prev_info{{}, history_prev, vk::ImageLayout::eGeneral};
             const vk::DescriptorImageInfo cur_info{{}, history_cur, vk::ImageLayout::eGeneral};
-            const std::array<vk::WriteDescriptorSet, 9> ray_writes{
+            const vk::DescriptorImageInfo follow_prev_info{{}, follow_prev, vk::ImageLayout::eGeneral};
+            const vk::DescriptorImageInfo follow_cur_info{{}, follow_cur, vk::ImageLayout::eGeneral};
+            // bbport (r60_lamp-centred-window): with the centred window's builds, binding 11 too
+            const vk::DescriptorImageInfo answers_info{{}, answers_view, vk::ImageLayout::eGeneral};
+            const u32 ray_count = with_answers ? 12u : 11u;
+            const std::array<vk::WriteDescriptorSet, 12> ray_writes{
                 writes[0], writes[1], writes[2], writes[3], writes[4], writes[5],
                 vk::WriteDescriptorSet{.pNext = &scene_info, .dstBinding = 6, .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eAccelerationStructureKHR},
@@ -1515,7 +1749,24 @@ void PointShadow::Flush(bool animate_noise) {
                                        .pImageInfo = &prev_info},
                 vk::WriteDescriptorSet{.dstBinding = 8, .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
-                                       .pImageInfo = &cur_info}};
+                                       .pImageInfo = &cur_info},
+                // bbport (r52_follow-soft): the follow state
+                vk::WriteDescriptorSet{.dstBinding = 9, .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .pImageInfo = &follow_prev_info},
+                vk::WriteDescriptorSet{.dstBinding = 10, .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .pImageInfo = &follow_cur_info},
+                vk::WriteDescriptorSet{.dstBinding = 11, .descriptorCount = 1,
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .pImageInfo = &answers_info}};
+            // bbport (r60_lamp-centred-window): between the trace and the resolve (and after the
+            // resolve of the half-resolution build's first pass): what one dispatch wrote, the
+            // next reads.
+            const auto between = [&cmdbuf] {
+                EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite, Compute,
+                                          vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+            };
             // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1: pixel (2x, 2y) of each 2x2 block
             // (16x16 pixels a workgroup), then the other three, each taking its block's answer
             // or tracing; then what the full-resolution pass does after its dispatch.
@@ -1545,7 +1796,7 @@ void PointShadow::Flush(bool animate_noise) {
                 }
                 const vk::DescriptorImageInfo half_info{{}, half_view, vk::ImageLayout::eGeneral};
                 const vk::DescriptorBufferInfo count_info{half_count_buffer, 0, VK_WHOLE_SIZE};
-                const std::array<vk::WriteDescriptorSet, 11> half_writes{
+                const std::array<vk::WriteDescriptorSet, 14> half_writes{
                     ray_writes[0], ray_writes[1], ray_writes[2], ray_writes[3], ray_writes[4],
                     ray_writes[5], ray_writes[6], ray_writes[7], ray_writes[8],
                     vk::WriteDescriptorSet{.dstBinding = 9, .descriptorCount = 1,
@@ -1553,16 +1804,34 @@ void PointShadow::Flush(bool animate_noise) {
                                            .pImageInfo = &half_info},
                     vk::WriteDescriptorSet{.dstBinding = 10, .descriptorCount = 1,
                                            .descriptorType = vk::DescriptorType::eStorageBuffer,
-                                           .pBufferInfo = &count_info}};
+                                           .pBufferInfo = &count_info},
+                    // bbport (r52_follow-soft): the follow state
+                    vk::WriteDescriptorSet{.dstBinding = 11, .descriptorCount = 1,
+                                           .descriptorType = vk::DescriptorType::eStorageImage,
+                                           .pImageInfo = &follow_prev_info},
+                    vk::WriteDescriptorSet{.dstBinding = 12, .descriptorCount = 1,
+                                           .descriptorType = vk::DescriptorType::eStorageImage,
+                                           .pImageInfo = &follow_cur_info},
+                    // bbport (r60_lamp-centred-window): the centred window's answers
+                    vk::WriteDescriptorSet{.dstBinding = 13, .descriptorCount = 1,
+                                           .descriptorType = vk::DescriptorType::eStorageImage,
+                                           .pImageInfo = &answers_info}};
                 cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, half_pipe);
-                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, half_pipe_layout, 0,
-                                            half_writes);
+                cmdbuf.pushDescriptorSetKHR(
+                    vk::PipelineBindPoint::eCompute, half_pipe_layout, 0,
+                    vk::ArrayProxy<const vk::WriteDescriptorSet>(half_with_answers ? 14u : 13u, half_writes.data()));
                 push.first_light = table;
                 push.light_count = tile_count;
                 push.rect = covered;
                 const u32 mode = std::bit_cast<u32>(push.thickness_m) |
                                  (half_count ? ModeHalfCount : 0u);
-                push.thickness_m = std::bit_cast<float>(mode | ModeHalfFirst);
+                // bbport (r60_lamp-centred-window): split, each half as a trace and a resolve; the
+                // second half's trace reads the block answers and the history the first half's
+                // resolve wrote (HalfAnswer, a taken block's copy), so four dispatches. The
+                // resolves count nothing (each pixel is counted once, by its trace).
+                const u32 trace = split ? ModeTrace : 0u;
+                const u32 resolve = (mode & ~ModeHalfCount) | ModeResolve;
+                push.thickness_m = std::bit_cast<float>(mode | ModeHalfFirst | trace);
                 cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
                                      sizeof(Push), &push);
                 const u32 hx0 = u32(covered[0]) / 16, hy0 = u32(covered[1]) / 16;
@@ -1572,12 +1841,26 @@ void PointShadow::Flush(bool animate_noise) {
                                           Compute,
                                           vk::AccessFlagBits2::eShaderRead |
                                               vk::AccessFlagBits2::eShaderWrite);
-                push.thickness_m = std::bit_cast<float>(mode | ModeHalfFill);
+                if (split) {
+                    push.thickness_m = std::bit_cast<float>(resolve | ModeHalfFirst);
+                    cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(Push), &push);
+                    cmdbuf.dispatchBase(hx0, hy0, 0, hx1 - hx0, hy1 - hy0, 1);
+                    between();
+                }
+                push.thickness_m = std::bit_cast<float>(mode | ModeHalfFill | trace);
                 cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
                                      sizeof(Push), &push);
                 const u32 gx0 = u32(covered[0]) / 8, gy0 = u32(covered[1]) / 8;
                 const u32 gx1 = (u32(covered[2]) + 7) / 8, gy1 = (u32(covered[3]) + 7) / 8;
                 cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                if (split) {
+                    between();
+                    push.thickness_m = std::bit_cast<float>(resolve | ModeHalfFill);
+                    cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(Push), &push);
+                    cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                }
                 const vk::MemoryBarrier2 half_after{
                     .srcStageMask = Compute,
                     .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
@@ -1600,7 +1883,8 @@ void PointShadow::Flush(bool animate_noise) {
             }
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
             if (use_rays) {
-                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, ray_writes);
+                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0,
+                                            vk::ArrayProxy<const vk::WriteDescriptorSet>(ray_count, ray_writes.data()));
             } else {
                 cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
             }
@@ -1611,6 +1895,15 @@ void PointShadow::Flush(bool animate_noise) {
                 cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
                 const u32 gx0 = u32(covered[0]) / 8, gy0 = u32(covered[1]) / 8;
                 const u32 gx1 = (u32(covered[2]) + 7) / 8, gy1 = (u32(covered[3]) + 7) / 8;
+                if (split) { // bbport (r60_lamp-centred-window): the trace, then the resolve
+                    const u32 mode = std::bit_cast<u32>(push.thickness_m);
+                    push.thickness_m = std::bit_cast<float>(mode | ModeTrace);
+                    cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
+                    cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                    between();
+                    push.thickness_m = std::bit_cast<float>(mode | ModeResolve);
+                    cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
+                }
                 cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
                 batch.clear();
             }

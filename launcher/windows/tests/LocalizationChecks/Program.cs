@@ -29,6 +29,7 @@ static void CheckGameLanguages()
     Require(Choices.AoQualities.Select(c => c.Value).SequenceEqual(new[] { "off", "ssao", "gtao", "hq" }), "AO quality choices changed");
     Require(Choices.MotionStore.Select(c => c.Value).SequenceEqual(new[] { "auto", "large", "small" }), "Motion vector store choices changed");
     Require(Choices.SunFarShadows.Select(c => c.Value).SequenceEqual(new[] { "game", "alternate", "rare" }), "Far sun shadows choices changed");
+    Require(Choices.LampShadowSoftness.Select(c => c.Value).SequenceEqual(new[] { "sharp", "soft", "softer" }), "Lamp shadow softness choices changed");
     var brazilian = Choices.GameLanguages.Single(c => c.Value == "17");
     Require(brazilian.Label == "Português (Brasil)", "Brazilian Portuguese must retain its native name");
     var settings = new LauncherSettings();

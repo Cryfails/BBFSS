@@ -219,6 +219,23 @@ private:
     u32 history_index = 0;
     bool history_written = false;
     bool history_fresh = false;
+    // bbport (r52_follow-soft): the follow state beside the history (point_shadow_ray.comp
+    // follow_prev, follow_cur), one R32F a pixel, taken in turn with it (history_index); made
+    // with the history, laid out and zeroed on first use.
+    std::array<OwnImage, 2> follow;
+    std::array<bool, 2> follow_laid_out{};
+    // bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2 and its builds made (Ready): the
+    // pass that averages runs as a trace and a resolve (point_shadow_ray.comp MODE_TRACE,
+    // MODE_RESOLVE), with every pixel's answer in `answers` (RG32UI, 8 bytes a pixel; made by
+    // Flush only while `centred`, sized by the pass that splits, laid out on first use, never
+    // cleared). half_centred: HalfReady made the half-resolution build's centred form (else its
+    // plain one, and the half-resolution pass does not split). answers_short: a pass that would
+    // split had no room for the image (logged once).
+    bool centred = false;
+    bool half_centred = false;
+    OwnImage answers;
+    bool answers_laid_out = false;
+    bool answers_short = false;
     std::array<float, 12> last_view{}, pending_view{};
     std::array<float, 16> last_proj{}, pending_proj{};
     bool last_valid = false, pending_valid = false;
@@ -248,6 +265,9 @@ private:
     std::vector<s8> track_index;
     u32 track_frame = ~0u;
     bool history_blend = false, history_blended = false;
+    // bbport (r48_lamp-softness): the lamp's radius of the pass that wrote the history (-1: none
+    // yet; a history written at another radius is not read), and the radius the log last told.
+    float history_radius_m = -1.0f, told_radius_m = -1.0f;
     int soft_state = -1;
     u32 soft_lines = 0;       ///< lines that said what the lamps are (at most SoftLines)
     u32 blend_unread = 0;     ///< frames in a row on which the averaging pass could not read its history
