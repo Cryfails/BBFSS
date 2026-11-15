@@ -167,6 +167,13 @@ switch on is not a run of the pre-PR engine.
   half-resolution build; with a cold driver cache it was not measured. Off, or not wanted at start: on first
   use, as before. The same objects are made either way, so the picture does not change; the cost
   moves to start. No experiment bit gates it, so the switch does not change it.
+- **Light draw with targets that do not fit (r68).** A lamp light draw whose targets do not match the
+  pass's B10G11R11 storage images is skipped and the next light draw is tried; before, one such draw
+  switched the lamp shadow pass off for the whole session. The game's own draw goes ahead either way.
+  It has no bit and no variable. The log line "Point shadows: light target ... does not fit" appears
+  at the first such draw and then every 600th; its "%ux%u against %ux%u" part compares target 0 with
+  itself when the mismatching target is 0, so it says something only for target 1. In a game run in a
+  dark interior the line appeared and the pass still ran 600 of 600 passes with no "off" line.
 - **Startup-only items.** The motion store size and thread pinning are read once at start.
 
 ## Effect on the claimed numbers

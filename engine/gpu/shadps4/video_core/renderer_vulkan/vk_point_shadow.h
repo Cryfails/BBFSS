@@ -288,6 +288,8 @@ private:
     u32 line_blend = 0, line_read = 0, line_cuts = 0, line_beside = 0, line_half = 0;
     u32 lamp_line_frames = 480;
     void TrackLamps(u32 end, bool blend, bool read, bool line);
+    // bbport (r68_lamp-target-mismatch): light draws skipped because their targets did not fit
+    u64 target_mismatches = 0;
     bool tried = false;
     bool failed = false;
     // bbport (r65_lamp-half-at-start): Ready is running from the constructor (only its log

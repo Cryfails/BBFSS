@@ -796,9 +796,20 @@ void PointShadow::OnLightDraw(VideoCore::ImageId color0, VideoCore::ImageId colo
             (reduced && !scene_targets.Eligible(*targets[i])) ||
             info.size.width != targets[0]->info.size.width ||
             info.size.height != targets[0]->info.size.height) {
-            failed = true;
-            std::printf("Point shadows: the light targets are not matching B10G11R11 storage "
-                        "images; off\n");
+            // bbport (r68_lamp-target-mismatch): this used to switch the pass off for the whole
+            // session. Only this light draw is skipped now (the game's own draw goes ahead) and
+            // the next one is tried again; the line says what did not fit.
+            if (target_mismatches++ % 600 == 0) {
+                std::printf("Point shadows: light target %d does not fit (format %d, wanted %d; "
+                            "uses %08x; %ux%u against %ux%u; reduced path %d, eligible %d); this "
+                            "light draw is skipped, %llu so far\n",
+                            i, static_cast<int>(info.pixel_format), static_cast<int>(TargetFormat),
+                            static_cast<u32>(static_cast<VkImageUsageFlags>(targets[i]->usage_flags)),
+                            info.size.width, info.size.height, targets[0]->info.size.width,
+                            targets[0]->info.size.height, reduced ? 1 : 0,
+                            scene_targets.Eligible(*targets[i]) ? 1 : 0,
+                            static_cast<unsigned long long>(target_mismatches));
+            }
             return;
         }
     }
