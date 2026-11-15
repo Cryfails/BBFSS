@@ -2739,6 +2739,12 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     vk::Pipeline handle = pipeline->HandleIfReady();
     if (!handle) [[unlikely]] {
         if (SkipUncompiledDraw(pipeline)) {
+            // bbport (r47_still-check): what this draw was to store for ray tracing
+            // (EffectsCaptureDraw, above) is not stored
+            if (dc.capture_draw) {
+                rt_shadow->CaptureLeftOut(dc.push_data.motion_param,
+                                          pipeline->GetGraphicsKey().motion_vectors);
+            }
             ResetBindings(false);
             scheduler.KickRecording();
             return;

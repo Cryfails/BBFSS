@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <random>
 #include <vector>
 #include "video_core/host_shaders/contact_shadow_comp.h"
@@ -16,9 +17,11 @@
 #include "video_core/host_shaders/rt_lab_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_comp.h" // bbport (r42_lamp-soft)
+#include "video_core/host_shaders/rt_still_sig_comp.h" // bbport (r47_still-check)
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/host_shaders/ssgi_gather_ray_comp.h"
 #include "gpu/shadps4/video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r41_lamp-shadows)
+#include "gpu/shadps4/video_core/renderer_vulkan/rt_still_check.h" // bbport (r47_still-check)
 
 namespace {
 #define CHECK(call) do { if (VkResult r_ = (call); r_ != VK_SUCCESS) { std::fprintf(stderr, "%s failed: %d\n", #call, int(r_)); std::exit(1); } } while (false)
@@ -881,6 +884,255 @@ struct Lab {
         vk.Barrier();
     }
 };
+
+// bbport (r47_still-check): --still: rt_still_sig.comp and rt_unproject.comp in the order
+// RtShadow::RecordBuilds runs them (slots zeroed, bounds from the positions as the captures
+// stored them, copy to the host, then to world space), on two meshes in one positions buffer.
+// Each mesh's vertex range also holds vertices no triangle uses, filled as an earlier frame's
+// capture would leave them, differently on every run. The signature the GPU writes must be the
+// one rt_still_check.h makes of the vertices the triangles use, word for word; so a mesh
+// captured again in place differs by nothing and a moved one by its move, whatever lies in the
+// unused vertices. Then a mesh that stands still far from a perspective camera, captured under
+// two poses of that camera: its bounds must not differ (the scene's own positions, made with
+// one product, differ by more than the tolerance there).
+bool StillLab(Vk& vk) {
+    struct Unproject { float rows[12]; std::uint32_t first, count; };
+    struct Sign { float rows[12]; float origin[3]; std::uint32_t first; std::uint64_t indices; std::uint32_t count, slot; };
+    static_assert(sizeof(Unproject) == 56 && sizeof(Sign) == 80);
+    // What takes a mesh's stored positions to the world: for the signature (two parts) and for
+    // rt_unproject.comp (one product).
+    struct Place { std::array<float, 12> rows{}; std::array<float, 3> origin{}; std::array<float, 12> product{}; };
+    constexpr std::uint32_t Range = 600, Meshes = 2, Slots = 4, Words = Vulkan::StillSigWords;
+    const Pipeline unproject = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, sizeof(Unproject), RT_UNPROJECT_COMP, sizeof(RT_UNPROJECT_COMP));
+    const Pipeline sign = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, sizeof(Sign), RT_STILL_SIG_COMP, sizeof(RT_STILL_SIG_COMP));
+    Buffer positions = vk.MakeBuffer(Meshes * Range * 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    Buffer sigs = vk.MakeBuffer(Slots * Words * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+    Buffer readback = vk.MakeBuffer(Slots * Words * 4, 0, true);
+    // The triangles leave out every seventh vertex and the last hundred of the range.
+    const auto unused = [](std::uint32_t v) { return v % 7 == 3 || v >= Range - 100; };
+    std::vector<std::uint32_t> used, list;
+    for (std::uint32_t v = 0; v < Range; ++v)
+        if (!unused(v)) used.push_back(v);
+    for (std::size_t i = 0; i + 2 < used.size(); ++i) list.insert(list.end(), {used[i], used[i + 1], used[i + 2]});
+    Buffer indices = vk.MakeBuffer(list.size() * 4, 0, true);
+    std::memcpy(indices.data, list.data(), list.size() * 4);
+    std::mt19937 rng(47);
+    std::uniform_real_distribution<float> coord(-2.0f, 2.0f);
+    std::vector<float> local(Meshes * Range * 3);
+    for (float& c : local) c = coord(rng);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    bool ok = true;
+    using Words8 = std::array<std::uint32_t, Words>;
+    // One frame's commands over what the positions buffer holds: the GPU's signatures of the
+    // two meshes and of a slot nothing writes to. Afterwards the positions are in world space.
+    const auto run = [&](const std::array<Place, Meshes>& place) {
+        vk.Begin();
+        vkCmdFillBuffer(vk.cmd, sigs.buffer, 0, VK_WHOLE_SIZE, 0);
+        vk.Barrier();
+        const VkDescriptorBufferInfo position_info{positions.buffer, 0, VK_WHOLE_SIZE}, sig_info{sigs.buffer, 0, VK_WHOLE_SIZE};
+        const std::array<VkWriteDescriptorSet, 2> writes{{
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 0, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &position_info},
+            {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 1, .descriptorCount = 1,
+             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &sig_info}}};
+        vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sign.pipeline);
+        vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sign.layout, 0, 2, writes.data());
+        for (std::uint32_t m = 0; m < Meshes; ++m) {
+            Sign push{{}, {}, m * Range, indices.address, std::uint32_t(list.size()), m};
+            std::memcpy(push.rows, place[m].rows.data(), sizeof(push.rows));
+            std::memcpy(push.origin, place[m].origin.data(), sizeof(push.origin));
+            vkCmdPushConstants(vk.cmd, sign.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatch(vk.cmd, (push.count + 63) / 64, 1, 1);
+        }
+        vk.Barrier();
+        const VkBufferCopy copy{0, 0, Slots * Words * 4};
+        vkCmdCopyBuffer(vk.cmd, sigs.buffer, readback.buffer, 1, &copy);
+        vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, unproject.pipeline);
+        vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, unproject.layout, 0, 1, writes.data());
+        for (std::uint32_t m = 0; m < Meshes; ++m) {
+            Unproject push{{}, m * Range, Range};
+            std::memcpy(push.rows, place[m].product.data(), sizeof(push.rows));
+            vkCmdPushConstants(vk.cmd, unproject.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatch(vk.cmd, (Range + 63) / 64, 1, 1);
+        }
+        vk.Barrier();
+        vk.End();
+        std::array<Words8, Meshes + 1> got{};
+        std::memcpy(got.data(), readback.data, sizeof(got));
+        return got;
+    };
+    // One capture of both meshes, each moved by its shift; `junk` is what the unused vertices
+    // hold; `broken`: a vertex the second mesh's triangles use is not a number. The bounds, or
+    // none where the signature holds none.
+    const auto capture = [&](const std::array<Vec3, Meshes>& shift, float junk, bool broken) {
+        auto* p = static_cast<float*>(positions.data);
+        std::array<Words8, Meshes> want{};
+        std::array<Place, Meshes> place{};
+        for (std::uint32_t m = 0; m < Meshes; ++m) {
+            place[m].rows = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+            place[m].origin = {shift[m].x, shift[m].y, shift[m].z};
+            place[m].product = {1, 0, 0, shift[m].x, 0, 1, 0, shift[m].y, 0, 0, 1, shift[m].z};
+            for (std::uint32_t v = 0; v < Range; ++v) {
+                const float* l = &local[(m * Range + v) * 3];
+                float* at = p + (m * Range + v) * 4;
+                at[0] = unused(v) ? junk * float(v + 1) : l[0];
+                at[1] = unused(v) ? -junk : l[1];
+                at[2] = unused(v) ? (v % 2 ? nan : junk) : l[2];
+                at[3] = 1.0f;
+            }
+            if (broken && m == 1) p[(m * Range + used[5]) * 4 + 1] = nan;
+            for (const std::uint32_t i : list) {
+                const auto q = Vulkan::StillPoint(place[m].rows, place[m].origin, p + (m * Range + i) * 4);
+                Vulkan::StillSigAdd(want[m].data(), q[0], q[1], q[2]);
+            }
+        }
+        const auto got = run(place);
+        std::array<Vulkan::StillBox, Meshes> boxes{};
+        for (std::uint32_t m = 0; m < Meshes; ++m) {
+            if (got[m] != want[m]) {
+                std::fprintf(stderr, "still check: mesh %u: the shader's signature is not rt_still_check.h's (vertices taken %u against %u, left out %u against %u)\n",
+                             m, got[m][6], want[m][6], got[m][7], want[m][7]);
+                ok = false;
+            }
+            if (Vulkan::DecodeStillSig(got[m].data(), boxes[m]) != !(broken && m == 1)) {
+                std::fprintf(stderr, "still check: mesh %u: the signature %s\n", m, broken && m == 1 ? "of a mesh with a vertex that is not a number was taken" : "holds no bounds");
+                ok = false;
+            }
+        }
+        Vulkan::StillBox none{};
+        if (Vulkan::DecodeStillSig(got[Meshes].data(), none)) {
+            std::fprintf(stderr, "still check: a slot no mesh wrote to holds bounds\n");
+            ok = false;
+        }
+        // The pass after the signatures brought the stored positions to world space.
+        const float* l = &local[used[0] * 3];
+        const float* w = p + used[0] * 4;
+        if (w[0] != l[0] + shift[0].x || w[1] != l[1] + shift[0].y || w[2] != l[2] + shift[0].z) {
+            std::fprintf(stderr, "still check: the positions are not in world space after the signatures\n");
+            ok = false;
+        }
+        return boxes;
+    };
+    const Vec3 a{10.25f, 1.5f, -3.0f}, b{-4.0f, 0.5f, 7.0f};
+    const auto first = capture({a, b}, 1.0e6f, false);
+    const auto again = capture({a, b}, -3.0e5f, false);
+    const auto moved = capture({Vec3{a.x + 0.5f, a.y - 1.0f, a.z + 0.02f}, b}, 77.0f, false);
+    const auto nudged = capture({Vec3{a.x + 0.001f, a.y, a.z}, b}, 1.0e6f, false);
+    capture({a, b}, 1.0e6f, true);
+    const float same_a = Vulkan::StillMoved(first[0], again[0]), same_b = Vulkan::StillMoved(first[1], again[1]);
+    const float far_a = Vulkan::StillMoved(first[0], moved[0]), far_b = Vulkan::StillMoved(first[1], moved[1]);
+    const float near_a = Vulkan::StillMoved(first[0], nudged[0]);
+    std::printf("Still check: %zu indices over %zu of %u vertices a mesh; captured again in place: %.6f m and %.6f m; one mesh moved by "
+                "(0.5 -1 0.02): %.4f m, the other %.6f m; moved by 1 mm: %.5f m (tolerance %.4f m, %.2f m between the passes)\n",
+                list.size(), used.size(), Range, double(same_a), double(same_b), double(far_a), double(far_b), double(near_a),
+                double(Vulkan::StillTolerance), double(Vulkan::StillCrossTolerance));
+    if (same_a != 0.0f || same_b != 0.0f || far_b != 0.0f) {
+        std::fprintf(stderr, "still check: a mesh that did not move differs between two captures\n");
+        ok = false;
+    }
+    if (std::abs(far_a - 1.0f) > 1e-4f || !(far_a > Vulkan::StillCrossTolerance)) {
+        std::fprintf(stderr, "still check: a mesh moved by a metre is not found moved by a metre\n");
+        ok = false;
+    }
+    if (near_a > Vulkan::StillTolerance || !(near_a > 0.0f)) {
+        std::fprintf(stderr, "still check: a move of a millimetre is not within the tolerance, or not seen at all\n");
+        ok = false;
+    }
+
+    // Two poses of a perspective camera about a hundred metres from the world's origin (as in
+    // the game), near plane 0.1 m; the first mesh stands 60 m in front of it, the second 3 m,
+    // neither moves. What a vertex shader stores (clip space, in float) goes through the GPU's
+    // signature; beside it, on the CPU, the bounds of the positions rt_unproject.comp's one
+    // product makes of the same captures.
+    struct Camera {
+        std::array<float, 12> view_to_world{}, world_to_view{};
+        std::array<float, 16> inverse{};
+        float p00 = 0, p11 = 0, a = 0, b = 0;
+    };
+    const auto camera_at = [](double yaw, double pitch, const std::array<double, 3>& at) {
+        const double cy = std::cos(yaw), sy = std::sin(yaw), cp = std::cos(pitch), sp = std::sin(pitch);
+        const double turn[3][3] = {{cy, sy * sp, sy * cp}, {0.0, cp, -sp}, {-sy, cy * sp, cy * cp}};
+        Camera c;
+        for (int r = 0; r < 3; ++r) {
+            double t = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                c.view_to_world[r * 4 + k] = float(turn[r][k]);
+                c.world_to_view[r * 4 + k] = float(turn[k][r]);
+                t -= turn[k][r] * at[k];
+            }
+            c.view_to_world[r * 4 + 3] = float(at[r]);
+            c.world_to_view[r * 4 + 3] = float(t);
+        }
+        const double near_plane = 0.1, far_plane = 3000.0, p00 = 1.0 / std::tan(0.6), p11 = p00 * 16.0 / 9.0;
+        const double za = far_plane / (near_plane - far_plane), zb = near_plane * za;
+        c.p00 = float(p00), c.p11 = float(p11), c.a = float(za), c.b = float(zb);
+        c.inverse = {float(1.0 / p00), 0, 0, 0, 0, float(1.0 / p11), 0, 0, 0, 0, 0, -1, 0, 0, float(1.0 / zb), float(za / zb)};
+        return c;
+    };
+    const std::array<double, 3> eye{-22.3, -107.1, -26.1};
+    const std::array<Camera, 2> cameras{camera_at(0.7, -0.1, eye), camera_at(0.9, -0.15, {eye[0] + 0.3, eye[1] + 0.1, eye[2] - 0.2})};
+    const std::array<double, Meshes> ahead{60.0, 3.0};
+    std::array<std::array<Vulkan::StillBox, Meshes>, 2> seen{}, product{};
+    float off = 0.0f;
+    for (std::uint32_t pose = 0; pose < 2; ++pose) {
+        const Camera& c = cameras[pose];
+        auto* p = static_cast<float*>(positions.data);
+        std::array<Place, Meshes> place{};
+        std::array<Words8, Meshes> want{}, old{};
+        for (std::uint32_t m = 0; m < Meshes; ++m) {
+            Vulkan::StillClipToWorld(c.inverse.data(), c.view_to_world.data(), place[m].rows, place[m].origin);
+            for (int r = 0; r < 3; ++r) {
+                for (int col = 0; col < 4; ++col) {
+                    float sum = c.view_to_world[r * 4 + 3] * c.inverse[12 + col];
+                    for (int k = 0; k < 3; ++k) sum += c.view_to_world[r * 4 + k] * c.inverse[k * 4 + col];
+                    place[m].product[r * 4 + col] = sum;
+                }
+            }
+            for (std::uint32_t v = 0; v < Range; ++v) {
+                // The mesh in the world: in front of the first camera, the same for both poses.
+                const float* l = &local[(m * Range + v) * 3];
+                float world[3], view[3];
+                for (int r = 0; r < 3; ++r) world[r] = float(eye[r] - double(cameras[0].view_to_world[r * 4 + 2]) * ahead[m]) + l[r];
+                for (int k = 0; k < 3; ++k) view[k] = c.world_to_view[k * 4] * world[0] + c.world_to_view[k * 4 + 1] * world[1] + c.world_to_view[k * 4 + 2] * world[2] + c.world_to_view[k * 4 + 3];
+                float* at = p + (m * Range + v) * 4;
+                at[0] = c.p00 * view[0], at[1] = c.p11 * view[1], at[2] = c.a * view[2] + c.b, at[3] = -view[2];
+                if (unused(v)) at[0] = 1.0e6f * float(pose + 1), at[1] = nan;
+            }
+            for (const std::uint32_t i : list) {
+                const float* at = p + (m * Range + i) * 4;
+                const auto q = Vulkan::StillPoint(place[m].rows, place[m].origin, at);
+                Vulkan::StillSigAdd(want[m].data(), q[0], q[1], q[2]);
+                const float* row = place[m].product.data();
+                Vulkan::StillSigAdd(old[m].data(), row[0] * at[0] + row[1] * at[1] + row[2] * at[2] + row[3] * at[3],
+                                    row[4] * at[0] + row[5] * at[1] + row[6] * at[2] + row[7] * at[3],
+                                    row[8] * at[0] + row[9] * at[1] + row[10] * at[2] + row[11] * at[3]);
+            }
+        }
+        const auto got = run(place);
+        for (std::uint32_t m = 0; m < Meshes; ++m) {
+            Vulkan::StillBox cpu{};
+            if (!Vulkan::DecodeStillSig(got[m].data(), seen[pose][m]) || !Vulkan::DecodeStillSig(want[m].data(), cpu) ||
+                !Vulkan::DecodeStillSig(old[m].data(), product[pose][m]) || got[m][6] != want[m][6]) {
+                std::fprintf(stderr, "still check: pose %u, mesh %u: no bounds\n", pose, m);
+                ok = false;
+            }
+            // The GPU may round a sum of products another way than the CPU: not word for word.
+            off = std::max(off, Vulkan::StillMoved(seen[pose][m], cpu));
+        }
+    }
+    const float far_seen = Vulkan::StillMoved(seen[0][0], seen[1][0]), near_seen = Vulkan::StillMoved(seen[0][1], seen[1][1]);
+    const float far_product = Vulkan::StillMoved(product[0][0], product[1][0]), near_product = Vulkan::StillMoved(product[0][1], product[1][1]);
+    std::printf("Still check: a still mesh under two poses of the camera: its bounds differ by %.6f m at 60 m and %.6f m at 3 m "
+                "(the scene's one product: %.5f m and %.5f m); the GPU's bounds are within %.6f m of rt_still_check.h's\n",
+                double(far_seen), double(near_seen), double(far_product), double(near_product), double(off));
+    if (far_seen > Vulkan::StillToleranceLeast / 4 || near_seen > Vulkan::StillToleranceLeast / 4 || off > Vulkan::StillToleranceLeast / 4) {
+        std::fprintf(stderr, "still check: a mesh that stands still reads as moved when the camera moves\n");
+        ok = false;
+    }
+    for (Buffer* buffer : {&positions, &sigs, &readback, &indices}) vk.Free(*buffer);
+    std::puts(ok ? "Still check: ok" : "Still check: FAILED");
+    return ok;
+}
 }
 
 int main(int argc, char** argv) {
@@ -888,6 +1140,9 @@ int main(int argc, char** argv) {
     const char* dump = argc > 1 ? argv[1] : nullptr;
     Vk vk;
     std::printf("GPU: %s, %ux%u, atlas %u\n", vk.name, W, H, Atlas);
+    if (argc > 1 && std::strcmp(argv[1], "--still") == 0) { // bbport (r47_still-check)
+        return StillLab(vk) ? 0 : 1;
+    }
     Lab lab(vk);
     vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, 56, RT_UNPROJECT_COMP, sizeof(RT_UNPROJECT_COMP));
     vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
