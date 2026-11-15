@@ -234,6 +234,8 @@ if [[ ${1:-} == --test ]]; then
     out/thd-signal-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_online_gate.cpp -o out/online-gate-test
     out/online-gate-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_ui_composition.cpp -o out/ui-composition-test
+    out/ui-composition-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. -Igpu/shim tests/test_scout.cpp -o out/scout-test
     out/scout-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_gpu_cache_stamp.cpp -o out/gpu-cache-stamp-test

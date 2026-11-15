@@ -718,6 +718,16 @@ void Load() {
     if (std::getenv("BB_HDR_PEAK")) {
         v.hdr_peak_auto = false;
     }
+    // bbport (r77_parallel-test-runs): BB_CLEAN_SHOT=1 starts with clean shot on (test runs in
+    // small windows, whose pictures must not carry the HUD); any other value or none: off.
+    {
+        const char* clean = std::getenv("BB_CLEAN_SHOT");
+        v.clean_shot.store(clean && std::strcmp(clean, "1") == 0, std::memory_order_relaxed);
+        if (v.clean_shot.load(std::memory_order_relaxed)) {
+            std::printf("Settings: BB_CLEAN_SHOT=1: the game's HUD and menus are left out of every "
+                        "frame that draws the world\n");
+        }
+    }
     v.startup_preset = v.preset;
     v.startup_render_scale = v.render_scale;
     v.startup_frame_gen = v.frame_gen;

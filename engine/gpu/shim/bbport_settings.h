@@ -338,6 +338,12 @@ struct Values {
         fsr3_shading_change_scale{1.0f}, fsr3_accumulation{0.333f}, fsr3_min_disocclusion{-0.333f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
+    // bbport (r77_parallel-test-runs): clean shot: in every frame that draws the world the
+    // renderer leaves out the game's HUD and menus, from the first UI draw onto the finished frame
+    // to the display pass (Rasterizer::CleanShotEarly, UiComposition::CleanShotSkip); loading
+    // screens keep theirs, the engine's own overlay is not hidden. Set only at the start, by
+    // BB_CLEAN_SHOT=1 (Load): no ini key, never saved, no key or menu row changes it.
+    std::atomic<bool> clean_shot{false};
     std::atomic<bool> voice_enabled{true}, voice_push_to_talk{true}, voice_mic_muted{false};
     std::atomic<int> voice_talk_key{25};
     std::atomic<float> voice_volume{1.0f};

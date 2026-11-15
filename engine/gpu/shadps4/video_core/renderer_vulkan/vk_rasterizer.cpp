@@ -834,6 +834,51 @@ void Rasterizer::NotifyUiDraw(const GraphicsPipeline* pipeline) {
                      UiComposition::WidenedUiViewport(viewport.xscale * 2, viewport.yscale * 2));
 }
 
+// bbport (r77_parallel-test-runs): clean shot (BbSettings clean_shot, set at the start by
+// BB_CLEAN_SHOT=1, latched per frame at the display pass into clean_shot_frame). In a frame that
+// drew the world, from its first UI draw (a Scaleform draw into the frame or a clip mask on a
+// stencil buffer of the G-buffer's size, after the G-buffer pass) up to the display pass, every
+// draw into the UI's target or onto its stencil buffer is left out before its targets, bindings
+// and pass (UiComposition::CleanShotSkip has the exact rule): Scaleform's images and clip masks
+// and the UI draws of other shaders (text, the item icons drawn through the masks, the gauges'
+// backgrounds). Draws into other targets stay (Scaleform's own caches, the next frame's passes).
+// The frame reaches its display pass as one without UI, as with the HUD hidden in the game's
+// options; by reading the code the upscale, frame generation's HUD-less image and native HDR's
+// map take their existing no-UI paths. A frame without a G-buffer pass (loading screens) keeps
+// its UI. Off: one plain bool test per draw. On: a popcount per draw, a few register reads and
+// address compares per draw after the world; fewer draws recorded.
+static const std::atomic<bool>& clean_shot = BbSettings::Get().clean_shot; // read once a frame
+bool Rasterizer::CleanShotEarly(const GraphicsPipeline* pipeline) {
+    const auto& regs = Regs();
+    const auto& key = pipeline->GetGraphicsKey();
+    UiComposition::CleanShotDraw draw;
+    draw.world_pass = UiComposition::WorldPass(
+        key.mrt_mask, regs.depth_control.depth_enable && regs.depth_buffer.DepthValid());
+    if (!draw.world_pass && clean_shot_state.phase == UiComposition::CleanShotPhase::NoWorld) {
+        return false;
+    }
+    const auto& cb = regs.color_buffers[0];
+    if ((key.mrt_mask & 1) && cb) {
+        const auto extent = CbExtent(0);
+        draw.color = cb.Address();
+        draw.rgba8 = cb.GetDataFmt() == AmdGpu::DataFormat::Format8_8_8_8;
+        draw.display = FrameCapture::IsDisplayBuffer(draw.color);
+        draw.width = extent.Valid() ? extent.width : cb.Pitch();
+        draw.height = extent.Valid() ? extent.height : cb.Height();
+    }
+    if (!draw.world_pass) {
+        draw.movie = UiComposition::MovieShader(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash);
+        const auto& db = regs.depth_buffer;
+        if (regs.depth_control.stencil_enable && db.StencilValid()) {
+            const auto extent = DbExtent();
+            draw.stencil = db.StencilAddress();
+            draw.stencil_width = extent.Valid() ? extent.width : db.Pitch();
+            draw.stencil_height = extent.Valid() ? extent.height : db.Height();
+        }
+    }
+    return UiComposition::CleanShotSkip(clean_shot_state, draw);
+}
+
 static std::pair<u32, u32> GetDrawOffsets(
     const AmdGpu::Regs& regs, const Shader::Info& info,
     const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
@@ -2487,6 +2532,10 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
         depth_of_field->Reset();
+        // bbport (r77_parallel-test-runs): clean shot is taken for the whole next frame, whose
+        // world is not drawn yet
+        clean_shot_frame = clean_shot.load(std::memory_order_relaxed);
+        clean_shot_state = {};
     }
     if (camera_motion->Enabled() && regs.color_buffers[0] &&
         FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
@@ -2521,6 +2570,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     // bbport (r7_cascades): a draw into a sun cascade kept from an earlier frame is left out
     // before its targets, bindings, barriers and pass (SunHoldEarly, vk_rasterizer_effects.cpp).
     if (sun_hold.active && SunHoldEarly(pipeline)) {
+        return;
+    }
+    // bbport (r77_parallel-test-runs): clean shot leaves the game's HUD and menus out the same
+    // way. Off: one test of a plain bool per draw.
+    if (clean_shot_frame && CleanShotEarly(pipeline)) {
         return;
     }
     dc.bind_prepared = used_prepared;
@@ -2879,6 +2933,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     dc.motion_draw = false;
     dc.capture_draw = false;
     dc.motion_geometry = 0;
+    if (clean_shot_frame && CleanShotEarly(pipeline)) {
+        return; // bbport (r77_parallel-test-runs): as in DrawRecord
+    }
     if (sun_hold.active) { // r7_cascades
         SunHoldOther(&pipeline->GetStage(Shader::SwStage::Vertex),
                      pipeline->GetStages()[u32(Shader::SwStage::Fragment)], true);

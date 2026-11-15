@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/ui_composition.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -332,6 +333,8 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     void NotifyUiDraw(const GraphicsPipeline* pipeline);
+    /// bbport (r77_parallel-test-runs): clean shot leaves this draw of the game's UI out.
+    bool CleanShotEarly(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     /// bbport: a pass drawn into the upscaler's output-size images (UI, display pass): what its
@@ -852,6 +855,11 @@ private:
         std::array<u64, 4> clears{}, expired{}, kept{};
     } sun_keep;
     bool scene_started = false;
+    /// bbport (r77_parallel-test-runs): clean shot as the last display pass read it, for the
+    /// whole frame (a change never splits a frame's UI), and where that frame is and its UI's
+    /// targets (CleanShotEarly).
+    bool clean_shot_frame = false;
+    UiComposition::CleanShotFrame clean_shot_state;
     /// bbport: the scene depth of the frame before (SkipUncompiledDraw).
     VideoCore::ImageId previous_scene_depth{};
     std::unique_ptr<ObjectMotion> object_motion;

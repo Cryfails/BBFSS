@@ -49,7 +49,7 @@ These `graphics_*` keys in `lantern.ini` have no control in the Windows launcher
 | `graphics_light_sharpness` | Light sharpness | `100.0` |
 | `graphics_dof_intensity` | Depth-of-field intensity | `1` |
 
-Experimental environment-only toggles (no ini key): `BB_SKY_ZENITH_FIX=1` enables the sky zenith fix (off by default); `BB_SKY_SEAM_FIX` controls the sky seam fix, which is on by default and disabled with `BB_SKY_SEAM_FIX=0`.
+Experimental environment-only toggles (no ini key): `BB_SKY_ZENITH_FIX=1` enables the sky zenith fix (off by default); `BB_SKY_SEAM_FIX` controls the sky seam fix, which is on by default and disabled with `BB_SKY_SEAM_FIX=0`. `BB_CLEAN_SHOT=1` starts the game with clean shot on, for test runs whose pictures must not carry the HUD: in every frame that draws the world, from the game's first menu-movie (Scaleform) draw onto the finished picture or onto its clip mask after the scene to the end of the frame, every draw onto that picture or its clip masks is left out, whatever draws it (the HUD, menus and subtitles, and dims and fades drawn there too); draws into other images stay, and a frame that draws no world (a loading screen) keeps its UI. The engine's own overlay (FPS counter, notes) is not hidden. The log says `Settings: BB_CLEAN_SHOT=1: ...`; any other value, or none, leaves it off, and it is never saved.
 
 ## Sponsors
 

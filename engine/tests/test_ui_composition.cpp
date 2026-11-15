@@ -66,5 +66,125 @@ int main() {
     assert(!SceneHasUiViewportSize(2560, 1440, ParseUiSize(nullptr)));
     assert(!SceneHasUiViewportSize(2296, 960, ParseUiSize("3360x1440")));
     assert(!SceneHasUiViewportSize(3440, 1440, ParseUiSize("3360x1440")));
-    std::puts("UI composition: PASS (menu without camera, HUD, FSR off, viewport scaling)");
+    // Clean shot (BB_CLEAN_SHOT=1): from the first Scaleform draw into the frame (or clip mask)
+    // after the world (a G-buffer pass) up to the display pass every draw into the UI's target or
+    // onto its stencil buffer is left out, the UI draws of other shaders too; other targets stay.
+    assert(WorldPass(0x1f, true) && WorldPass(0xff, true));
+    assert(!WorldPass(0x1f, false) && !WorldPass(0x0f, true) && !WorldPass(0x1, true));
+    assert(CleanShotNear(1920, 1088, 1920, 1080) && !CleanShotNear(1920, 1089, 1920, 1080));
+    assert(!CleanShotNear(1920, 1080, 0, 0));
+    {
+        constexpr uint64_t gbuffer = 0x1000, hdr = 0x2000, ui = 0x3000, aa = 0x4000,
+                           shadow = 0x5000, cache = 0x6000, ui_stencil = 0x7000,
+                           cache_stencil = 0x8000, display = 0x9000;
+        const auto target = [](uint64_t color, bool rgba8, uint32_t w, uint32_t h) {
+            CleanShotDraw d;
+            d.color = color;
+            d.rgba8 = rgba8;
+            d.width = w;
+            d.height = h;
+            return d;
+        };
+        const auto movie = [](CleanShotDraw d) { d.movie = true; return d; };
+        const auto stencil = [](CleanShotDraw d, uint64_t address, uint32_t w, uint32_t h) {
+            d.stencil = address;
+            d.stencil_width = w;
+            d.stencil_height = h;
+            return d;
+        };
+        CleanShotDraw world = target(gbuffer, false, 1920, 1080);
+        world.world_pass = true;
+        const CleanShotDraw shadow_pass = {}; // depth only
+        const auto mask = stencil(movie({}), ui_stencil, 1920, 1088);
+        const auto icon = stencil(target(ui, true, 1920, 1088), ui_stencil, 1920, 1088);
+        const auto text = target(ui, true, 1920, 1088);
+        {
+            // A world frame: shadow pass, G-buffer, an RGBA8 target of another size drawn by
+            // Scaleform (left alone: it does not start the UI), the HDR scene, the tonemap into the
+            // UI target, then the HUD: a clip mask, an item icon of another shader through it,
+            // text, a Scaleform image, a Scaleform cache fill into another target.
+            CleanShotFrame frame;
+            assert(!CleanShotSkip(frame, shadow_pass) && frame.phase == CleanShotPhase::NoWorld);
+            assert(!CleanShotSkip(frame, world) && frame.phase == CleanShotPhase::World);
+            assert(frame.world_width == 1920 && frame.world_height == 1080);
+            assert(!CleanShotSkip(frame, movie(target(cache, true, 512, 512))));
+            assert(!CleanShotSkip(frame, stencil(movie({}), cache_stencil, 512, 512)));
+            assert(frame.phase == CleanShotPhase::World);
+            assert(!CleanShotSkip(frame, target(hdr, false, 1920, 1080)));
+            assert(!CleanShotSkip(frame, text) && frame.ldr == ui); // the tonemap
+            assert(CleanShotSkip(frame, mask) && frame.phase == CleanShotPhase::Ui);
+            assert(frame.ui_color == ui && frame.ui_stencil == ui_stencil);
+            assert(CleanShotSkip(frame, icon) && CleanShotSkip(frame, text));
+            assert(CleanShotSkip(frame, movie(text)) && CleanShotSkip(frame, mask));
+            assert(!CleanShotSkip(frame, movie(target(cache, true, 512, 512))));
+            assert(!CleanShotSkip(frame, stencil(movie({}), cache_stencil, 512, 512)));
+            assert(!CleanShotSkip(frame, stencil(target(shadow, false, 1024, 1024), shadow, 1024, 1024)));
+            assert(!CleanShotSkip(frame, shadow_pass));
+            // The display pass starts a new frame (Rasterizer::DrawRecord); the next frame's
+            // passes are drawn.
+            frame = {};
+            assert(!CleanShotSkip(frame, shadow_pass) && !CleanShotSkip(frame, text));
+        }
+        {
+            // The UI started by a Scaleform image into the frame (the game's AA wrote another
+            // target last), its stencil buffer from the first draw into it with stencil on.
+            CleanShotFrame frame;
+            assert(!CleanShotSkip(frame, world));
+            assert(!CleanShotSkip(frame, target(aa, true, 1920, 1088)) && frame.ldr == aa);
+            assert(CleanShotSkip(frame, movie(text)) && frame.ui_color == ui && !frame.ui_stencil);
+            assert(!CleanShotSkip(frame, mask)); // stencil buffer not known yet: a mask only
+            assert(CleanShotSkip(frame, icon) && frame.ui_stencil == ui_stencil);
+            assert(CleanShotSkip(frame, mask) && !CleanShotSkip(frame, target(aa, true, 1920, 1088)));
+            // Not the frame: a display buffer, another format, another size.
+            CleanShotFrame other;
+            CleanShotSkip(other, world);
+            auto shown = text;
+            shown.color = display;
+            shown.display = true;
+            assert(!CleanShotSkip(other, movie(shown)));
+            assert(!CleanShotSkip(other, movie(target(ui, false, 1920, 1080))));
+            assert(!CleanShotSkip(other, movie(target(ui, true, 960, 540))));
+            assert(other.phase == CleanShotPhase::World);
+        }
+        {
+            // A clip mask before any frame-size RGBA8 target: the UI's target comes from the
+            // first Scaleform image into the frame.
+            CleanShotFrame frame;
+            CleanShotSkip(frame, world);
+            assert(CleanShotSkip(frame, mask) && frame.ui_color == 0);
+            assert(!CleanShotSkip(frame, text));
+            assert(CleanShotSkip(frame, movie(text)) && frame.ui_color == ui);
+            assert(CleanShotSkip(frame, text));
+        }
+        {
+            // A loading screen: no G-buffer pass, its UI stays.
+            CleanShotFrame frame;
+            assert(!CleanShotSkip(frame, mask) && !CleanShotSkip(frame, movie(text)));
+            assert(!CleanShotSkip(frame, text) && frame.phase == CleanShotPhase::NoWorld);
+        }
+        {
+            // A display pass gone unseen: the next frame's passes into other targets are drawn,
+            // and its G-buffer pass starts a new frame.
+            CleanShotFrame frame;
+            CleanShotSkip(frame, world);
+            CleanShotSkip(frame, text);
+            assert(CleanShotSkip(frame, mask));
+            assert(!CleanShotSkip(frame, shadow_pass) && !CleanShotSkip(frame, world));
+            assert(frame.phase == CleanShotPhase::World && frame.ui_color == 0 && frame.ldr == 0);
+            assert(!CleanShotSkip(frame, text));
+        }
+        {
+            // A start with the guest targets at a 1280x720 output (upscale_before_post=1 with
+            // DLSS Performance at 1280x720): the same rule at that size.
+            CleanShotFrame frame;
+            auto small_world = target(gbuffer, false, 1280, 720);
+            small_world.world_pass = true;
+            const auto small_text = target(ui, true, 1280, 720);
+            assert(!CleanShotSkip(frame, small_world) && !CleanShotSkip(frame, small_text));
+            assert(CleanShotSkip(frame, stencil(movie({}), ui_stencil, 1280, 720)));
+            assert(CleanShotSkip(frame, small_text) && frame.ui_color == ui);
+            assert(!CleanShotSkip(frame, movie(target(cache, true, 1920, 1080))));
+        }
+    }
+    std::puts("UI composition: PASS (menu without camera, HUD, FSR off, viewport scaling, clean shot)");
 }

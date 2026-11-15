@@ -601,6 +601,29 @@ int main(int argc, char** argv) {
 #else
     unsetenv("BB_DLSS_PRESET");
 #endif
+    // bbport (r77_parallel-test-runs): BB_CLEAN_SHOT=1 starts with clean shot on; another value
+    // or none leaves it off.
+#ifdef _WIN32
+    _putenv_s("BB_CLEAN_SHOT", "1");
+#else
+    setenv("BB_CLEAN_SHOT", "1", 1);
+#endif
+    BbSettings::Load();
+    assert(s.clean_shot.load());
+#ifdef _WIN32
+    _putenv_s("BB_CLEAN_SHOT", "yes");
+#else
+    setenv("BB_CLEAN_SHOT", "yes", 1);
+#endif
+    BbSettings::Load();
+    assert(!s.clean_shot.load());
+#ifdef _WIN32
+    _putenv_s("BB_CLEAN_SHOT", "");
+#else
+    unsetenv("BB_CLEAN_SHOT");
+#endif
+    BbSettings::Load();
+    assert(!s.clean_shot.load());
     assert(BbSettings::DlssPresetFromText("m") == 13 && std::string(BbSettings::DlssPresetText(13)) == "m");
     assert(std::string(BbSettings::DlssPresetText(BbSettings::DlssPresetDefault)) == "default");
     assert(BbSettings::DlssPresetFromText("a") == BbSettings::DlssPresetK);
