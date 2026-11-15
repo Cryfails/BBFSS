@@ -769,6 +769,14 @@ int Main(std::vector<std::wstring> arguments) {
     } catch (const std::exception&) {
     }
     const fs::path probe = out / "bb-probe.exe";
+    // BB_USER_DIR_OVERRIDE, when set, is this run's saves folder instead of BB_USER_DIR (which the
+    // launcher always sets from its own settings). Automated tests use it to load a copy of a save
+    // at a known place without touching the player's saves folder. Not set: nothing changes.
+    const std::string user_override = Env("BB_USER_DIR_OVERRIDE", "");
+    if (!user_override.empty()) {
+        SetEnv("BB_USER_DIR", user_override);
+        std::printf("Saves folder for this run (BB_USER_DIR_OVERRIDE): %s\n", user_override.c_str());
+    }
     std::vector<std::wstring> command{(out / "boot-linked.bin").native(), L"--content-profile", (out / "content.bin").native(),
                                       L"--patches", (out / "patches.bin").native(), L"--app0", merged.native(), L"--user",
                                       Path(Env("BB_USER_DIR", Utf8(data / "user"))).native(), L"--timeout",
