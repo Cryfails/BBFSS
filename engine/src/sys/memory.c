@@ -402,12 +402,70 @@ static int space_ready(void) {
     return win_mem_space(LOW_START, USER_END);
 }
 
+// bbport (r78_guest-memory-resident): BB_ZERO_TRIM=1, see the patch header. One pass: the
+// direct and flexible mappings (under the read lock, 64 host pages at a time, each batch checked
+// to be still the same mapping), then the pool view (always mapped).
+static uint64_t zero_trim_batch(uintptr_t at, unsigned pages) {
+    uint64_t mask = win_mem_trim_mask(at, pages), dropped = 0;
+    for (unsigned i = 0; mask; ++i, mask >>= 1)
+        if (mask & 1) dropped += (uint64_t)win_mem_trim_page(at + (uintptr_t)i * HOST_PAGE);
+    return dropped;
+}
+
+static void zero_trim_thread(void) {
+    for (unsigned pass = 1;; ++pass) {
+        win_mem_sleep(15000);
+        uint64_t started = win_mem_ms(), dropped = 0;
+        Range *list = NULL;
+        size_t n = 0;
+        reader_enter();
+        const RangeTable *table = atomic_load_explicit(&ranges, memory_order_relaxed);
+        size_t count = atomic_load_explicit(&range_count, memory_order_relaxed);
+        list = table && count ? malloc(count * sizeof(Range)) : NULL;
+        for (size_t i = 0; list && i < count; ++i)
+            if (table->items[i].kind == RANGE_DIRECT || table->items[i].kind == RANGE_FLEXIBLE) list[n++] = table->items[i];
+        reader_leave();
+        for (size_t k = 0; k < n; ++k) {
+            for (uint64_t at = list[k].start; at < list[k].end; at += 64 * HOST_PAGE) {
+                unsigned pages = (unsigned)lower(64, (list[k].end - at) / HOST_PAGE);
+                reader_enter();
+                const RangeTable *now = atomic_load_explicit(&ranges, memory_order_relaxed);
+                size_t now_count = atomic_load_explicit(&range_count, memory_order_relaxed);
+                size_t i = now ? index_in(now, now_count, at) : now_count;
+                if (i < now_count && now->items[i].start <= at && now->items[i].end >= at + pages * HOST_PAGE &&
+                    now->items[i].kind == list[k].kind &&
+                    now->items[i].phys + (at - now->items[i].start) == list[k].phys + (at - list[k].start))
+                    dropped += zero_trim_batch((uintptr_t)at, pages);
+                reader_leave();
+            }
+        }
+        free(list);
+        for (uint64_t at = 0, total = pool_bytes() + FLEX_SPAN; at < total; at += 64 * HOST_PAGE)
+            dropped += zero_trim_batch((uintptr_t)(backing + at), (unsigned)lower(64, (total - at) / HOST_PAGE));
+        if (pass <= 8 || dropped >= (UINT64_C(64) << 8)) {
+            printf("Runtime: zero trim pass %u: %" PRIu64 " MiB of all-zero pages left RAM in %" PRIu64 " ms\n", pass,
+                   dropped >> 8, win_mem_ms() - started);
+            fflush(stdout);
+        }
+    }
+}
+
+static void zero_trim_start(void) {
+    const char *setting = getenv("BB_ZERO_TRIM");
+    if (!(setting && setting[0] == '1')) return;
+    if (win_mem_spawn(zero_trim_thread)) return;
+    printf("Runtime: zero trim on (BB_ZERO_TRIM=1): every 15 s, resident all-zero pages of the game's "
+           "memory leave RAM\n");
+    fflush(stdout);
+}
+
 static int backing_open(void) {
     if (backing_ready) return 0;
     void *view;
     if (space_ready() || win_mem_section(pool_bytes() + FLEX_SPAN, &view)) return -1;
     backing = view;
     backing_ready = 1;
+    zero_trim_start(); // bbport (r78_guest-memory-resident)
     return 0;
 }
 
