@@ -4,6 +4,7 @@
 #include "engine_state.h"
 #include "bbport_settings.h"
 #include "online_gate.h"
+#include "scout.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -322,6 +323,15 @@ constexpr std::uint8_t kSigStealthMenu[] = {0x48,0x8d,0x35,0xfc,0x48,0x06,0x03,0
 constexpr std::uint8_t kSigSilentMenu[] = {0x48,0x8d,0x35,0xda,0x48,0x06,0x03,0x48,0x8d,0x15,0x88,0xd3,0xc1};
 constexpr std::uint8_t kSigStealthUse[] = {0x48,0x8d,0x05,0xac,0x93,0xae,0x03,0x8a,0x00,0x88,0x43,0x64};
 constexpr std::uint8_t kSigSilentUse[] = {0x48,0x8d,0x05,0xc5,0x95,0xae,0x03,0x80,0x38,0x00};
+// Scout mode's flags. The debug menu registers "Player No Dead" (0x593e888) and "All No Attack"
+// (0x593e893) beside Player Hide; two game sites test No Dead with cmp byte [rax],0 / jne.
+// The flags are single bytes in the data segment's zero-filled part.
+constexpr std::uint64_t kPlayerNoDead = 0x593e888, kAllNoAttack = 0x593e893, kDebugFlagsLast = 0x593e895;
+constexpr std::uint64_t kHp = 0xf8;
+constexpr std::uint8_t kSigNoDeadMenu[] = {0x48,0x8d,0x35,0x0e,0x4a,0x06,0x03,0x48,0x8d,0x15,0xdb,0xd6,0xc1};
+constexpr std::uint8_t kSigNoDeadUseA[] = {0x48,0x8d,0x05,0x50,0xc5,0xc7,0x03,0x80,0x38,0x00,0x0f,0x85};
+constexpr std::uint8_t kSigNoDeadUseB[] = {0x48,0x8d,0x05,0x1e,0x70,0xae,0x03,0x80,0x38,0x00,0x0f,0x85};
+constexpr std::uint8_t kSigNoAttackMenu[] = {0x48,0x8d,0x35,0x84,0x49,0x06,0x03,0x48,0x8d,0x15,0x9c,0xd5,0xc1};
 constexpr std::int64_t kEchoCap = 999999999, kInsightCap = 99;
 constexpr std::uint8_t kSigInsight[] = {0x44,0x03,0xb8,0x84,0x00,0x00,0x00,0x78,0x0d,0x41,0x83,0xff,0x63,0xb9,0x63,
     0x00,0x00,0x00,0x41,0x0f,0x4e,0xcf,0x89,0x88,0x84,0x00,0x00,0x00};
@@ -443,6 +453,7 @@ Extra g_extras[] = {
     {Stamina, Refill, "stamina"}, {Stealth, Flags, "stealth"}, {GunRange, Params, "firearm range"},
     {KeepEchoes, Code, "keep echoes"}, {EchoMultiplier, Params, "echo multiplier"},
     {NoDurability, Refill, "durability"}, {Consumables, Params, "consumables"},
+    {NoDeath, Flags, "no death"}, {Calm, Flags, "calm enemies"},
 };
 Extra& ExtraOf(Which which) {
     for (Extra& e : g_extras)
@@ -475,7 +486,9 @@ bool SharedWorld() {
 int SettingOf(const Extra& e, const BbSettings::Values& s) {
     switch (e.which) {
     case Stamina: return s.cheat_stamina.load(std::memory_order_relaxed);
-    case Stealth: return s.cheat_stealth.load(std::memory_order_relaxed);
+    case Stealth: return s.cheat_stealth.load(std::memory_order_relaxed) || Scout::On();
+    case NoDeath: return Scout::On();
+    case Calm: return Scout::On() && Scout::Calm();
     case KeepEchoes: return s.cheat_keep_echoes.load(std::memory_order_relaxed);
     case NoDurability: return s.cheat_no_durability.load(std::memory_order_relaxed);
     case Consumables: return s.cheat_consumables.load(std::memory_order_relaxed);
@@ -618,7 +631,7 @@ std::vector<std::uint8_t> WantedOf(const Extra& e, int mode) {
     std::vector<std::uint8_t> want = Originals(e.patch);
     if (!mode) return want;
     switch (e.which) {
-    case Stealth: std::fill(want.begin(), want.end(), std::uint8_t(1)); break;
+    case Stealth: case NoDeath: case Calm: std::fill(want.begin(), want.end(), std::uint8_t(1)); break;
     case KeepEchoes: std::memcpy(want.data(), kBloodMarkKeep, sizeof(kBloodMarkKeep)); break;
     case Consumables: for (std::uint8_t& b : want) b = std::uint8_t(b & ~kIsConsume); break;
     case GunRange:
@@ -657,8 +670,20 @@ void LogSwitch(const Extra& e, int mode) {
         break;
     case NoDurability: std::printf("Cheats: weapon durability kept full %s\n", mode ? "on" : "off"); break;
     case Consumables: std::printf(mode ? "Cheats: infinite consumables on\n" : "Cheats: infinite consumables off, params restored\n"); break;
+    case NoDeath: std::printf(mode ? "Cheats: no death on (Player No Dead, health kept full)\n" : "Cheats: no death off, flag restored\n"); break;
+    case Calm: std::printf(mode ? "Cheats: calm enemies on (All No Attack)\n" : "Cheats: calm enemies off, flag restored\n"); break;
     default: break;
     }
+}
+
+// Each Flags cheat owns its own debug flag bytes; one byte each, never the 4-byte write of the
+// "Player No Dead" XML patch, which would also set 0x889-0x88b.
+std::span<const std::uint64_t> FlagsOf(Which which) {
+    static constexpr std::uint64_t no_death[] = {kPlayerNoDead}, calm[] = {kAllNoAttack},
+                                   stealth[] = {kPlayerHide, kPlayerSilence};
+    return which == NoDeath ? std::span<const std::uint64_t>(no_death)
+         : which == Calm    ? std::span<const std::uint64_t>(calm)
+                            : std::span<const std::uint64_t>(stealth);
 }
 
 void Switch(Extra& e, int mode) {
@@ -668,7 +693,7 @@ void Switch(Extra& e, int mode) {
     LogSwitch(e, mode);
     if (e.kind == Flags && mode && !e.patch.snapped) {
         e.patch.bytes.clear();
-        for (std::uint64_t bn : {kPlayerHide, kPlayerSilence}) {
+        for (std::uint64_t bn : FlagsOf(e.which)) {
             std::uint8_t v = 0;
             if (!Read(Slot(bn), &v) || v > 1) { Disable(e, "a debug flag holds an unexpected value"); return; }
             e.patch.bytes.push_back({Slot(bn), v, v});
@@ -699,6 +724,16 @@ void RefillStamina() {
         value[0] > value[1] || value[0] == value[1])
         return;
     std::memcpy(reinterpret_cast<void*>(data + kStamina), &value[1], 4);
+}
+
+// Scout mode: health below full is set back to its maximum (data module +0xf8, maximum at +0xfc).
+// At 0 the character is dead and is left to the game: this never revives.
+void RefillHealth() {
+    const std::uint64_t data = DataModule();
+    std::int32_t value[2] = {};
+    if (!data || !Read(data + kHp, &value) || value[1] < 1 || value[1] > 20000 || value[0] <= 0 || value[0] >= value[1])
+        return;
+    std::memcpy(reinterpret_cast<void*>(data + kHp), &value[1], 4);
 }
 
 ParamTable g_weapons;
@@ -813,6 +848,8 @@ void InstallExtras() {
     check(GunRange, {});
     check(EchoMultiplier, {});
     check(Consumables, {{0x18d0dc0, kSigConsume}});
+    check(NoDeath, {{0x1d2119f, kSigNoDeadMenu}, {0x1cc2331, kSigNoDeadUseA}, {0x1e57863, kSigNoDeadUseB}});
+    check(Calm, {{0x1d212e9, kSigNoAttackMenu}});
     const bool stats = Matches(0x1cfc567, kSigInsight) && Matches(0x1cfc6a4, kSigEchoes);
     g_echoes_unavailable.store(stats ? nullptr : "engine code differs from the verified 1.09 image");
     if (!stats) std::printf("Cheats: add echoes / insight unavailable: engine code differs\n");
@@ -866,6 +903,21 @@ void AddInsight(int amount) {
     if (amount > 0 && g_installed && !g_echoes_unavailable.load()) g_add_insight.fetch_add(std::min(amount, int(kInsightCap)));
 }
 
+void TraceFlags(char* out, std::size_t size) {
+    if (!size) return;
+    out[0] = 0;
+    std::size_t used = 0;
+    for (std::uint64_t bn = kPlayerNoDead; g_installed && bn <= kDebugFlagsLast && used < size; ++bn) {
+        std::uint8_t v = 0;
+        const int n = Read(Slot(bn), &v) ? std::snprintf(out + used, size - used, "%s%03llx=%u", used ? " " : "",
+                                                         static_cast<unsigned long long>(bn & 0xfff), unsigned(v))
+                                         : std::snprintf(out + used, size - used, "%s%03llx=?", used ? " " : "",
+                                                         static_cast<unsigned long long>(bn & 0xfff));
+        if (n < 0) return;
+        used += std::size_t(n);
+    }
+}
+
 void Tick() {
     if (!g_installed) return;
     const auto& s = BbSettings::Get();
@@ -902,6 +954,8 @@ void Tick() {
     }
     Extra& stamina = ExtraOf(Stamina);
     if (!shared && g_settled && !stamina.disabled && stamina.active) RefillStamina();
+    Extra& no_death = ExtraOf(NoDeath);
+    if (!shared && g_settled && !no_death.disabled && no_death.active) RefillHealth();
     if (now < g_check) return;
     g_check = now + kInterval;
     const std::uint64_t record = player_record();

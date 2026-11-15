@@ -21,6 +21,7 @@
 #include "option_menu.h"
 #include "rebirth.h"
 #include "render_guard.h"
+#include "scout.h"
 #include "trophy_sync.h"
 #include "widescreen.h"
 #include "../input/input.h"
@@ -74,6 +75,7 @@ std::int64_t __attribute__((sysv_abi)) OnFrame(std::uint64_t, const std::uint64_
     Camera::Tick();
     Widescreen::Tick();
     Cheats::Tick();
+    Scout::Tick();
     TrophySync::Tick();
     GameStatus::Tick();
     OnlineFixes::Tick();
@@ -150,6 +152,7 @@ void Install(std::uint8_t* image, std::size_t size) {
     const bool rebirth = menus && Rebirth::Install(image, size);
     const bool cheats = Cheats::Install(image, size);
     const bool online = OnlineFixes::Install(image, size);
+    Scout::Install();
     const bool guard = RenderGuard::Install(image, size);
     const bool timing = EffectTiming::Install(image, size);
     const bool frame_rate = FrameRate::Install(image, size);

@@ -27,6 +27,7 @@
 #include "engine/graphics.h"
 #include "engine/native_sss.h"
 #include "engine/online_fixes.h"
+#include "engine/scout.h"
 #include "input/input.h"
 #include "voice.h"
 #include "hud_gauge.h"
@@ -127,6 +128,11 @@ std::atomic<bool> binding_talk_key{false};
 int coop_row = 0, coop_column = 0;
 std::string coop_armed;
 std::chrono::steady_clock::time_point coop_armed_at{};
+// Scout mode's travel panel (F7, or L3 + D-pad Down), only while scout mode is on.
+std::atomic<bool> scout_open{false};
+int scout_row = 0;
+std::uint32_t scout_armed = 0;
+std::chrono::steady_clock::time_point scout_armed_at{};
 bool dirty = false;
 float base_scale = 1.0f;
 ImFont* name_font = nullptr;
@@ -2513,6 +2519,119 @@ void CheatsSection() {
     }
 }
 
+constexpr char kScoutCopyOnly[] = "only on a copy of your saves: start the game with the scout script";
+constexpr char kScoutBuilding[] = "Building the lamp list";
+
+// Scout's own refusal texts have a Russian text; the rest are the cheats' shared texts.
+const char* ScoutWhy(const char* why) {
+    if (!std::strcmp(why, kScoutCopyOnly)) {
+        return BbSettings::MenuText(kScoutCopyOnly, "только на копии сохранений: запустите игру скриптом разведки");
+    }
+    if (!std::strcmp(why, kScoutBuilding)) {
+        return BbSettings::MenuText(kScoutBuilding, "Составляется список фонарей");
+    }
+    return BbSettings::MenuText(why);
+}
+
+const char* ScoutStepText(BbEngine::Scout::Step step) {
+    using Step = BbEngine::Scout::Step;
+    switch (step) {
+    case Step::Building: return BbSettings::MenuText(kScoutBuilding, "Составляется список фонарей");
+    case Step::WaitLoading: return BbSettings::MenuText("Waiting: loading", "Ожидание: загрузка");
+    case Step::WaitCutscene: return BbSettings::MenuText("Waiting: cutscene", "Ожидание: видеоролик");
+    case Step::WaitBoss:
+        return BbSettings::MenuText("Waiting: boss fight (press Travel again to go anyway)",
+                                    "Ожидание: бой с боссом (нажмите «Отправиться» ещё раз, чтобы всё равно отправиться)");
+    case Step::WaitSettled: return BbSettings::MenuText("Waiting: not settled", "Ожидание: персонаж ещё не готов");
+    case Step::WaitDead: return BbSettings::MenuText("Waiting: you are dead", "Ожидание: вы мертвы");
+    case Step::Travelling: return BbSettings::MenuText("Travelling", "В пути");
+    case Step::Arrived: return BbSettings::MenuText("Arrived", "Прибыли");
+    case Step::GaveUp: return BbSettings::MenuText("Gave up", "Отменено");
+    case Step::None: break;
+    }
+    return nullptr;
+}
+
+void ScoutStatus() {
+    const BbEngine::Scout::Status status = BbEngine::Scout::Current();
+    if (const char* text = ScoutStepText(status.step)) {
+        ImGui::TextDisabled("%s%s%s", text, status.lamp.empty() ? "" : ": ", status.lamp.c_str());
+    }
+}
+
+void ScoutSection() {
+    namespace Scout = BbEngine::Scout;
+    Section("Scout mode", "Режим разведки");
+    if (const char* label = Item("Scout mode", "Режим разведки")) {
+        ImGui::PushID("scout");
+        // Session only: nothing goes to lantern.ini, so it is off at every start.
+        bool on = Scout::On();
+        if (ImGui::Checkbox(label, &on)) {
+            Scout::SetOn(on);
+        }
+        Hint(BbSettings::MenuText(
+            "For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player "
+            "Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full "
+            "and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); "
+            "it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the "
+            "DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. "
+            "Refused online and unless the game was started on a copy of the saves.",
+            "Для тестов на копии сохранений. Включает отладочные флаги игры Player No Dead, Player Hide и Player "
+            "Silence (враги вас не видят и не слышат) и возвращает полное здоровье, когда оно ниже полного и выше 0. "
+            "Перемещение ведёт к фонарю из списка перемещений игры, здесь или в панели F7 (L3 + крестовина вниз); "
+            "оно не проверяет, зажжён ли фонарь, и пропускает подземелья чаш, а области дополнения — если "
+            "дополнение не включено. Как выглядит каждое место, зависит от сюжета сохранения. Выключен при каждом "
+            "запуске; выключение возвращает флаги. Недоступен по сети и если игра запущена не на копии сохранений."));
+        if (const char* why = Scout::Unavailable()) {
+            ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), ScoutWhy(why));
+        }
+        CheatUnavailable(BbEngine::Cheats::NoDeath);
+        CheatUnavailable(BbEngine::Cheats::Stealth);
+        ImGui::PopID();
+    }
+    if (!Scout::On()) {
+        return;
+    }
+    if (const char* label = Item("Travel to", "Отправиться к")) {
+        ImGui::PushID("scout travel");
+        static std::uint32_t chosen = 0;
+        const std::vector<Scout::Lamp> lamps = Scout::Lamps();
+        int index = -1;
+        for (int i = 0; i < int(lamps.size()); ++i) {
+            if (lamps[i].id == chosen) {
+                index = i;
+            }
+        }
+        if (index < 0 && !lamps.empty()) {
+            index = 0;
+            chosen = lamps[0].id;
+        }
+        // Lamp names are the game's own text: never translated or searched.
+        if (ImGui::BeginCombo(label, index >= 0 ? lamps[index].name.c_str() : "", ImGuiComboFlags_HeightLarge)) {
+            for (int i = 0; i < int(lamps.size()); ++i) {
+                if (ImGui::Selectable(lamps[i].name.c_str(), i == index)) {
+                    chosen = lamps[i].id;
+                }
+                if (i == index) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+        const char* why = Scout::TravelUnavailable();
+        ImGui::BeginDisabled(why != nullptr || lamps.empty());
+        if (ImGui::Button(BbSettings::MenuText("Travel", "Отправиться"))) {
+            Scout::RequestTravel(chosen);
+        }
+        ImGui::EndDisabled();
+        if (why && std::strcmp(why, kScoutBuilding) != 0) {
+            ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), ScoutWhy(why));
+        }
+        ScoutStatus();
+        ImGui::PopID();
+    }
+}
+
 void MouseSection();
 
 void FpsSection() {
@@ -2876,6 +2995,7 @@ void DrawTab(int tab) {
     case TabGameplay:
         CameraSection();
         CheatsSection();
+        ScoutSection();
         break;
     case TabCoop:
         CoopSection();
@@ -3924,6 +4044,7 @@ void UpdateTextInput(SDL_Window* window) {
 }
 
 void CoopInput(int move, int side, bool select, bool back);
+void ScoutInput(int move, bool select, bool back);
 
 bool HandleEvent(const SDL_Event& event) {
     std::scoped_lock lock{imgui_mutex};
@@ -3945,6 +4066,25 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F2) {
             coop_open = !coop_open;
             coop_armed.clear();
+            scout_open = false;
+            return true;
+        }
+        // With scout mode off, F7 reaches the game untouched.
+        if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F7 && BbEngine::Scout::On()) {
+            scout_open = !scout_open;
+            scout_armed = 0;
+            coop_open = false;
+            return true;
+        }
+        if (!is_open && scout_open && BbEngine::Scout::On()) {
+            if (down) {
+                const SDL_Keycode key = event.key.key;
+                const int move = key == SDLK_UP || key == SDLK_W ? -1 : key == SDLK_DOWN || key == SDLK_S ? 1
+                               : key == SDLK_PAGEUP ? -10 : key == SDLK_PAGEDOWN ? 10 : 0;
+                const bool select = !event.key.repeat && (key == SDLK_RETURN || key == SDLK_SPACE || key == SDLK_E || key == SDLK_KP_ENTER);
+                const bool back = !event.key.repeat && (key == SDLK_ESCAPE || key == SDLK_BACKSPACE || key == SDLK_Q);
+                ScoutInput(move, select, back);
+            }
             return true;
         }
         if (!is_open && coop_open) {
@@ -3992,6 +4132,20 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open && down && l3_down && button == SDL_GAMEPAD_BUTTON_DPAD_UP) {
             coop_open = !coop_open;
             coop_armed.clear();
+            scout_open = false;
+            return true;
+        }
+        if (!is_open && down && l3_down && button == SDL_GAMEPAD_BUTTON_DPAD_DOWN && BbEngine::Scout::On()) {
+            scout_open = !scout_open;
+            scout_armed = 0;
+            coop_open = false;
+            return true;
+        }
+        if (!is_open && scout_open && BbEngine::Scout::On()) {
+            if (down) {
+                const int move = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? -1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? 1 : 0;
+                ScoutInput(move, button == SDL_GAMEPAD_BUTTON_SOUTH, button == SDL_GAMEPAD_BUTTON_EAST);
+            }
             return true;
         }
         if (!is_open && coop_open) {
@@ -4069,7 +4223,7 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps || CompileNoteActive() || RelayNoteActive() || RefusalNoteActive() || SummonNoteActive() || AnnouncementActive() || ReconnectNoteActive() || !ShownPartyLines().empty() || coop_open ||
+    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps || CompileNoteActive() || RelayNoteActive() || RefusalNoteActive() || SummonNoteActive() || AnnouncementActive() || ReconnectNoteActive() || !ShownPartyLines().empty() || coop_open || scout_open ||
                            !BbEngine::OnlineFixes::PartyRows().empty() || BbEngine::OnlineFixes::Spectating() || BbFaceShot::JustTaken());
 }
 
@@ -4078,7 +4232,7 @@ bool MenuOpen() {
 }
 
 bool CapturesInput() {
-    return menu_open || prompt_active || coop_open;
+    return menu_open || prompt_active || coop_open || (scout_open && BbEngine::Scout::On());
 }
 
 enum class CoopKind { LampYes, LampNo, Summon, Member, Player, Visitor, BringAll, End, Join, GoTo, Leave, Voice, Mic, Speak, TalkKey, Volume, Listen, Close };
@@ -4442,6 +4596,76 @@ void CoopMenu() {
     line(y + hint_px + 22.0f * k, width * 0.5f - 30.0f * k, true);
 }
 
+bool ScoutArmedNow(std::uint32_t lamp) {
+    return lamp && scout_armed == lamp && std::chrono::steady_clock::now() - scout_armed_at < std::chrono::seconds(4);
+}
+
+// A travel needs two presses on the same row within 4 s, like the co-op panel's kick and end.
+void ScoutInput(int move, bool select, bool back) {
+    if (back) {
+        scout_open = false;
+        return;
+    }
+    const auto lamps = BbEngine::Scout::Lamps();
+    const int count = int(lamps.size());
+    if (!count) {
+        return;
+    }
+    if (move) {
+        scout_row = ((scout_row + move) % count + count) % count;
+        scout_armed = 0;
+    }
+    scout_row = std::clamp(scout_row, 0, count - 1);
+    if (!select || BbEngine::Scout::TravelUnavailable()) {
+        return;
+    }
+    const std::uint32_t lamp = lamps[scout_row].id;
+    if (ScoutArmedNow(lamp)) {
+        scout_armed = 0;
+        BbEngine::Scout::RequestTravel(lamp);
+    } else {
+        scout_armed = lamp;
+        scout_armed_at = std::chrono::steady_clock::now();
+    }
+}
+
+void ScoutPanel() {
+    constexpr int kRows = 15;
+    const auto lamps = BbEngine::Scout::Lamps();
+    const int count = int(lamps.size());
+    scout_row = count ? std::clamp(scout_row, 0, count - 1) : 0;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f, viewport->WorkPos.y + viewport->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings |
+                                       ImGuiWindowFlags_NoFocusOnAppearing;
+    if (ImGui::Begin("##scout_panel", nullptr, flags)) {
+        ImGui::SeparatorText(BbSettings::MenuText("Scout travel", "Перемещение разведки"));
+        const int first = std::clamp(scout_row - kRows / 2, 0, std::max(0, count - kRows));
+        for (int i = first; i < std::min(count, first + kRows); ++i) {
+            const bool chosen = i == scout_row;
+            const char* label = chosen && ScoutArmedNow(lamps[i].id)
+                                    ? BbSettings::MenuText("Press again to travel", "Нажмите ещё раз, чтобы отправиться")
+                                    : lamps[i].name.c_str();
+            if (chosen) {
+                ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.6f, 1.0f), "> %s", label);
+            } else {
+                ImGui::TextDisabled("  %s", label);
+            }
+        }
+        if (const char* why = BbEngine::Scout::TravelUnavailable(); why && std::strcmp(why, kScoutBuilding) != 0) {
+            ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), ScoutWhy(why));
+        }
+        ScoutStatus();
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", BbSettings::MenuText("Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
+                                                       "Enter / Крест дважды: отправиться      Стрелки: двигаться      Esc / Круг: закрыть"));
+    }
+    ImGui::End();
+}
+
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     const auto now = std::chrono::steady_clock::now();
     const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
@@ -4499,6 +4723,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (coop_open && !menu_open) {
         CoopMenu();
+    }
+    if (scout_open && !BbEngine::Scout::On()) {
+        scout_open = false;
+    }
+    if (scout_open && !menu_open) {
+        ScoutPanel();
     }
     ImGui::Render();
 

@@ -407,6 +407,8 @@ constexpr std::uint8_t kMsgFindEntry[] = {0x89, 0xf0, 0x48, 0x8b, 0x77, 0x08, 0x
 constexpr std::uint32_t kPlaceTextOwn = 0x65, kPlaceTextBook = 0x1e;
 constexpr std::size_t kSaveWrite = 0x14ea560;
 constexpr std::uint8_t kSaveWriteEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x83, 0xec, 0x28};
+// Counts the game's save writes (OnSaveWrite), so scout mode can log when a copy holds a new place.
+std::atomic<unsigned> g_saves_written{0};
 constexpr auto kHostLoadHold = std::chrono::seconds(60);
 constexpr std::uint8_t kLampWarpEntry[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56,
                                            0x53, 0x48, 0x83, 0xec, 0x38, 0x89, 0xfb};
@@ -2373,6 +2375,7 @@ bool GuestWaitsForHost() {
 }
 
 std::int64_t __attribute__((sysv_abi)) OnSaveWrite(std::uint64_t, const std::uint64_t*) {
+    g_saves_written.fetch_add(1, std::memory_order_relaxed);
     const std::uint64_t data = Global(kGameDataMan), rules = Global(kReloadRules), transition = Global(kTransition), holder = Global(kHomeTypeHolder);
     const std::uint64_t record = Field<std::uint64_t>(data, 8);
     if (holder) {
@@ -3816,6 +3819,44 @@ std::string LampPlace(std::uint32_t lamp) {
         if (!name.empty()) return name;
     }
     return "lamp " + std::to_string(lamp);
+}
+
+// Scout mode's travel (scout.cpp). OwnWorldRepair sets g_image offline too, so these work without
+// a party. LampMap and the lamp warp are called directly here, so both entries are checked first.
+const char* LampTravelCode() {
+    if (!g_image) return "the engine's executable was not verified";
+    if (std::memcmp(g_image + kLampWarp, kLampWarpEntry, sizeof kLampWarpEntry) != 0 ||
+        std::memcmp(g_image + kWarpParamFind, kWarpParamFindEntry, sizeof kWarpParamFindEntry) != 0)
+        return "engine code differs from the verified 1.09 image";
+    return nullptr;
+}
+
+std::uint32_t LampMapOf(std::uint32_t lamp) {
+    return LampTravelCode() ? 0 : LampMap(lamp);
+}
+
+bool TravelToLamp(std::uint32_t lamp) {
+    if (LampTravelCode()) return false;
+    Call(Fn(kLampWarp), lamp);
+    return true;
+}
+
+bool BossFight() {
+    return g_image && BossUp();
+}
+
+std::int32_t LocalHp() {
+    if (!g_image) return -1;
+    const std::uint64_t local = LocalPlayer();
+    return local ? Hp(local) : -1;
+}
+
+bool WorldLoading() {
+    return g_image && (Loading() || Field<std::uint8_t>(Global(kTransition), kTransitionAsked));
+}
+
+unsigned SavesWritten() {
+    return g_saves_written.load(std::memory_order_relaxed);
 }
 
 void StopSummon() {
