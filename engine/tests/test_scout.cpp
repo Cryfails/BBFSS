@@ -34,6 +34,8 @@ int main() {
 
     Check(Dungeon(2900000) && Dungeon(2999999) && !Dungeon(2800000) && !Dungeon(3000000), "area 29 is the chalice dungeons");
     Check(!DlcArea(33) && DlcArea(34) && DlcArea(35) && DlcArea(36) && !DlcArea(37), "DLC areas 34-36");
+    Check(NamedPoint(2412951) && NamedPoint(2102961) && NamedPoint(2100950) && !NamedPoint(2402949) && !NamedPoint(2900100),
+          "points 950+ have their own name (KeptTravel::LampText)");
     Check(FirstId({24, 1}) == 2410000 && FirstId({21, 0}) == 2100000, "a map row's first id");
     Check(MapOf(24, 1) == 0x18010000u, "MapOf matches LampMap's 0xAABB0000");
     // LampMap builds row[0] << 24 | (row[1] & 0xff) << 16 from the warp row's u16 area and block.

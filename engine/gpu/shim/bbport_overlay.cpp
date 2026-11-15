@@ -330,9 +330,31 @@ void Hint(const char* text) {
     }
 }
 
+// The refusal texts of the cheats and of scout mode (cheats.h, scout.h), with their Russian text.
+const char* RefusalText(const char* why) {
+    namespace Cheats = BbEngine::Cheats;
+    namespace Scout = BbEngine::Scout;
+    if (!std::strcmp(why, Cheats::kTextOnline)) {
+        return BbSettings::MenuText(Cheats::kTextOnline, "недоступно при игре по сети (выключите сеть в лаунчере, чтобы использовать читы)");
+    }
+    if (!std::strcmp(why, Cheats::kTextNotVerified)) {
+        return BbSettings::MenuText(Cheats::kTextNotVerified, "исполняемый файл движка не прошёл проверку");
+    }
+    if (!std::strcmp(why, Cheats::kTextCodeDiffers)) {
+        return BbSettings::MenuText(Cheats::kTextCodeDiffers, "код игры отличается от проверенного образа 1.09");
+    }
+    if (!std::strcmp(why, Scout::kTextCopyOnly)) {
+        return BbSettings::MenuText(Scout::kTextCopyOnly, "только на копии сохранений: запустите игру скриптом разведки");
+    }
+    if (!std::strcmp(why, Scout::kTextBuilding)) {
+        return BbSettings::MenuText(Scout::kTextBuilding, "Составляется список фонарей");
+    }
+    return BbSettings::MenuText(why);
+}
+
 void CheatUnavailable(BbEngine::Cheats::Which which) {
     if (const char* why = BbEngine::Cheats::Unavailable(which)) {
-        ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), BbSettings::MenuText(why));
+        ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), RefusalText(why));
     }
 }
 
@@ -2519,24 +2541,16 @@ void CheatsSection() {
     }
 }
 
-constexpr char kScoutCopyOnly[] = "only on a copy of your saves: start the game with the scout script";
-constexpr char kScoutBuilding[] = "Building the lamp list";
+constexpr const char* kScoutBuilding = BbEngine::Scout::kTextBuilding;
 
-// Scout's own refusal texts have a Russian text; the rest are the cheats' shared texts.
 const char* ScoutWhy(const char* why) {
-    if (!std::strcmp(why, kScoutCopyOnly)) {
-        return BbSettings::MenuText(kScoutCopyOnly, "только на копии сохранений: запустите игру скриптом разведки");
-    }
-    if (!std::strcmp(why, kScoutBuilding)) {
-        return BbSettings::MenuText(kScoutBuilding, "Составляется список фонарей");
-    }
-    return BbSettings::MenuText(why);
+    return RefusalText(why);
 }
 
 const char* ScoutStepText(BbEngine::Scout::Step step) {
     using Step = BbEngine::Scout::Step;
     switch (step) {
-    case Step::Building: return BbSettings::MenuText(kScoutBuilding, "Составляется список фонарей");
+    case Step::Building: return RefusalText(kScoutBuilding);
     case Step::WaitLoading: return BbSettings::MenuText("Waiting: loading", "Ожидание: загрузка");
     case Step::WaitCutscene: return BbSettings::MenuText("Waiting: cutscene", "Ожидание: видеоролик");
     case Step::WaitBoss:
@@ -2572,16 +2586,20 @@ void ScoutSection() {
         Hint(BbSettings::MenuText(
             "For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player "
             "Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full "
-            "and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); "
-            "it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the "
-            "DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. "
-            "Refused online and unless the game was started on a copy of the saves.",
+            "and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to "
+            "a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + "
+            "D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 "
+            "(taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every "
+            "start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves "
+            "folder is a copy made by the scout script.",
             "Для тестов на копии сохранений. Включает отладочные флаги игры Player No Dead, Player Hide и Player "
-            "Silence (враги вас не видят и не слышат) и возвращает полное здоровье, когда оно ниже полного и выше 0. "
-            "Перемещение ведёт к фонарю из списка перемещений игры, здесь или в панели F7 (L3 + крестовина вниз); "
-            "оно не проверяет, зажжён ли фонарь, и пропускает подземелья чаш, а области дополнения — если "
-            "дополнение не включено. Как выглядит каждое место, зависит от сюжета сохранения. Выключен при каждом "
-            "запуске; выключение возвращает флаги. Недоступен по сети и если игра запущена не на копии сохранений."));
+            "Silence (враги вас не видят и не слышат) и возвращает полное здоровье, когда оно ниже полного и выше 0, "
+            "кроме первых 1,5 с после загрузки или перехода в другой блок карты. Перемещение ведёт к фонарю из "
+            "списка перемещений игры, у которого есть своё название в текстах игры, здесь или в панели F7 (L3 + "
+            "крестовина вниз); оно не проверяет, зажжён ли фонарь, и пропускает подземелья чаш, а области 34-36 "
+            "(считаются дополнением) — если дополнение не включено. Как выглядит каждое место, зависит от сюжета "
+            "сохранения. Выключен при каждом запуске, если его не включает скрипт разведки; выключение возвращает "
+            "флаги. Недоступен по сети и если папка сохранений не является копией, сделанной скриптом разведки."));
         if (const char* why = Scout::Unavailable()) {
             ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"), ScoutWhy(why));
         }
@@ -4072,6 +4090,9 @@ bool HandleEvent(const SDL_Event& event) {
         // With scout mode off, F7 reaches the game untouched.
         if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F7 && BbEngine::Scout::On()) {
             scout_open = !scout_open;
+            if (scout_open) {
+                BbEngine::Scout::PanelOpened("F7");
+            }
             scout_armed = 0;
             coop_open = false;
             return true;
@@ -4137,6 +4158,9 @@ bool HandleEvent(const SDL_Event& event) {
         }
         if (!is_open && down && l3_down && button == SDL_GAMEPAD_BUTTON_DPAD_DOWN && BbEngine::Scout::On()) {
             scout_open = !scout_open;
+            if (scout_open) {
+                BbEngine::Scout::PanelOpened("L3 + D-pad Down");
+            }
             scout_armed = 0;
             coop_open = false;
             return true;

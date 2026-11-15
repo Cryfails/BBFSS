@@ -19,6 +19,10 @@ constexpr std::uint32_t kIdsPerMap = 10000;
 constexpr bool Dungeon(std::uint32_t lamp) { return lamp / 100000 == 29; }
 // Guess, not read from the game: the DLC's maps are areas 34-36.
 constexpr bool DlcArea(std::uint32_t area) { return area >= 34 && area <= 36; }
+// Only points 950 and up have a place text of their own (KeptTravel::LampText, kept_travel.h:71-72);
+// lower points share their map's name. Guess: the game's lamps are the 950+ rows, the rest are
+// other warp rows (story or event warps). Scout's menu lists only the 950+ rows with their own name.
+constexpr bool NamedPoint(std::uint32_t lamp) { return lamp % 1000 >= 950; }
 constexpr std::uint32_t FirstId(MapRow m) { return m.area * 100000 + m.block * 10000; }
 // Same layout as LampMap's result (online_fixes.cpp): 0xAABB0000.
 constexpr std::uint32_t MapOf(std::uint32_t area, std::uint32_t block) { return area << 24 | (block & 0xff) << 16; }

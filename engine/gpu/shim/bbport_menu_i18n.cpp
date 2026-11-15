@@ -383,8 +383,8 @@ constexpr Entry kSpanish[] = {
      "Desactivado por defecto. Un diagnóstico para medir, no para jugar. Con High o Ultra en «Shadow rendering method», las partes lejanas del mapa de sombras del sol propio del juego dejan de dibujarse aunque el agua u otro efecto aún las lea: las sombras lejanas del sol pueden faltar en el agua. No hace nada mientras «Rutas anteriores del motor» está activado. Equivale a BB_SUN_ATLAS_IGNORE_READER=1. Se aplica al reiniciar el juego."},
     {"Scout mode",
      "Modo explorador"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Para pruebas en una copia de tus partidas guardadas. Activa los indicadores de depuración del juego Player No Dead, Player Hide y Player Silence (los enemigos no te ven ni te oyen) y devuelve tu salud al máximo siempre que esté por debajo del máximo y por encima de 0. El viaje lleva a una lámpara de la lista de viaje del juego, aquí o en el panel F7 (L3 + cruceta abajo); no comprueba si la lámpara está encendida y omite las mazmorras del cáliz, y las zonas del DLC salvo que el DLC esté activado. La historia de la partida decide cómo se ve cada lugar. Desactivado en cada inicio; al desactivarlo se restauran los indicadores. Se rechaza en línea y si el juego no se inició con una copia de las partidas guardadas."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Para pruebas en una copia de tus partidas guardadas. Activa los indicadores de depuración del juego Player No Dead, Player Hide y Player Silence (los enemigos no te ven ni te oyen) y devuelve tu salud al máximo siempre que esté por debajo del máximo y por encima de 0, salvo en los primeros 1,5 s tras una carga o tras entrar en otro bloque del mapa. El viaje lleva a una lámpara de la lista de viaje del juego que tenga nombre propio en los textos del juego, aquí o en el panel F7 (L3 + cruceta abajo); no comprueba si la lámpara está encendida y omite las mazmorras del cáliz, y las zonas 34-36 (que se suponen del DLC) salvo que el DLC esté activado. La historia de la partida decide cómo se ve cada lugar. Desactivado en cada inicio salvo que lo active el script del explorador; al desactivarlo se restauran los indicadores. Se rechaza en línea y si la carpeta de partidas no es una copia hecha por el script del explorador."},
     {"Travel to",
      "Viajar a"},
     {"Travel",
@@ -415,6 +415,14 @@ constexpr Entry kSpanish[] = {
      "Cancelado"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Enter / Cruz dos veces: viajar      Flechas / cruceta: mover      Esc / Círculo: cerrar"},
+    {"Unavailable",
+     "No disponible"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "desactivado al jugar en línea (desactiva el modo en línea en el lanzador para usar trucos)"},
+    {"the engine's executable was not verified",
+     "el ejecutable del motor no se verificó"},
+    {"engine code differs from the verified 1.09 image",
+     "el código del juego difiere de la imagen 1.09 verificada"},
 };
 
 constexpr Entry kPortugueseBrazil[] = {
@@ -784,8 +792,8 @@ constexpr Entry kPortugueseBrazil[] = {
      "Desativado por padrão. Um diagnóstico para medir, não para jogar. Com High ou Ultra em «Shadow rendering method», as partes distantes do mapa de sombras do sol do próprio jogo deixam de ser desenhadas mesmo que a água ou outro efeito ainda as leia: as sombras distantes do sol podem faltar na água. Não faz nada enquanto «Caminhos anteriores do motor» está ativado. Equivale a BB_SUN_ATLAS_IGNORE_READER=1. Aplica-se ao reiniciar o jogo."},
     {"Scout mode",
      "Modo explorador"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Para testes em uma cópia dos seus saves. Ativa as flags de depuração do jogo Player No Dead, Player Hide e Player Silence (os inimigos não veem nem ouvem você) e devolve sua vida ao máximo sempre que ela estiver abaixo do máximo e acima de 0. A viagem leva a uma lâmpada da lista de viagem do jogo, aqui ou no painel F7 (L3 + direcional para baixo); não verifica se a lâmpada está acesa e deixa de fora as masmorras do cálice, e as áreas da DLC a menos que a DLC esteja ativada. A história do save decide a aparência de cada lugar. Desligado a cada início; desligar devolve as flags. Recusado online e se o jogo não foi iniciado com uma cópia dos saves."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Para testes em uma cópia dos seus saves. Ativa as flags de depuração do jogo Player No Dead, Player Hide e Player Silence (os inimigos não veem nem ouvem você) e devolve sua vida ao máximo sempre que ela estiver abaixo do máximo e acima de 0, exceto nos primeiros 1,5 s após um carregamento ou após entrar em outro bloco do mapa. A viagem leva a uma lâmpada da lista de viagem do jogo que tenha nome próprio nos textos do jogo, aqui ou no painel F7 (L3 + direcional para baixo); não verifica se a lâmpada está acesa e deixa de fora as masmorras do cálice, e as áreas 34-36 (tidas como a DLC) a menos que a DLC esteja ativada. A história do save decide a aparência de cada lugar. Desligado a cada início, a menos que o script do explorador o ligue; desligar devolve as flags. Recusado online e se a pasta de saves não for uma cópia feita pelo script do explorador."},
     {"Travel to",
      "Viajar para"},
     {"Travel",
@@ -816,6 +824,14 @@ constexpr Entry kPortugueseBrazil[] = {
      "Cancelado"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Enter / X duas vezes: viajar      Setas / direcional: mover      Esc / Círculo: fechar"},
+    {"Unavailable",
+     "Indisponível"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "desligado ao jogar online (desligue o online no inicializador para usar trapaças)"},
+    {"the engine's executable was not verified",
+     "o executável do motor não foi verificado"},
+    {"engine code differs from the verified 1.09 image",
+     "o código do jogo difere da imagem 1.09 verificada"},
 };
 
 constexpr Entry kFrench[] = {
@@ -1187,8 +1203,8 @@ constexpr Entry kFrench[] = {
      "Désactivé par défaut. Un diagnostic pour mesurer, pas pour jouer. Avec High ou Ultra dans « Shadow rendering method », les parties lointaines de la carte d'ombres du soleil propre au jeu ne sont plus dessinées même si l'eau ou un autre effet les lit encore : les ombres lointaines du soleil peuvent manquer sur l'eau. Ne fait rien tant que « Anciens chemins du moteur » est activé. Équivaut à BB_SUN_ATLAS_IGNORE_READER=1. S'applique au redémarrage du jeu."},
     {"Scout mode",
      "Mode éclaireur"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Pour des tests sur une copie de vos sauvegardes. Active les drapeaux de débogage du jeu Player No Dead, Player Hide et Player Silence (les ennemis ne vous voient ni ne vous entendent) et remet votre santé au maximum chaque fois qu'elle est sous le maximum et au-dessus de 0. Le voyage mène à une lanterne de la liste de voyage du jeu, ici ou dans le panneau F7 (L3 + croix directionnelle bas) ; il ne vérifie pas si la lanterne est allumée et exclut les donjons des calices, ainsi que les zones du DLC sauf si le DLC est activé. L'histoire de la sauvegarde décide de l'aspect de chaque lieu. Désactivé à chaque démarrage ; le désactiver remet les drapeaux. Refusé en ligne et si le jeu n'a pas été lancé sur une copie des sauvegardes."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Pour des tests sur une copie de vos sauvegardes. Active les drapeaux de débogage du jeu Player No Dead, Player Hide et Player Silence (les ennemis ne vous voient ni ne vous entendent) et remet votre santé au maximum chaque fois qu'elle est sous le maximum et au-dessus de 0, sauf pendant les 1,5 premières secondes après un chargement ou après l'entrée dans un autre bloc de la carte. Le voyage mène à une lanterne de la liste de voyage du jeu qui a son propre nom dans les textes du jeu, ici ou dans le panneau F7 (L3 + croix directionnelle bas) ; il ne vérifie pas si la lanterne est allumée et exclut les donjons des calices, ainsi que les zones 34-36 (supposées être le DLC) sauf si le DLC est activé. L'histoire de la sauvegarde décide de l'aspect de chaque lieu. Désactivé à chaque démarrage, sauf si le script éclaireur l'active ; le désactiver remet les drapeaux. Refusé en ligne et si le dossier de sauvegardes n'est pas une copie faite par le script éclaireur."},
     {"Travel to",
      "Voyager vers"},
     {"Travel",
@@ -1219,6 +1235,14 @@ constexpr Entry kFrench[] = {
      "Abandonné"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Entrée / Croix deux fois : voyager      Flèches / croix directionnelle : déplacer      Échap / Rond : fermer"},
+    {"Unavailable",
+     "Indisponible"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "désactivé en jeu en ligne (désactivez le jeu en ligne dans le lanceur pour utiliser les triches)"},
+    {"the engine's executable was not verified",
+     "l'exécutable du moteur n'a pas été vérifié"},
+    {"engine code differs from the verified 1.09 image",
+     "le code du jeu diffère de l'image 1.09 vérifiée"},
 };
 
 constexpr Entry kGerman[] = {
@@ -1590,8 +1614,8 @@ constexpr Entry kGerman[] = {
      "Standardmäßig aus. Eine Diagnose zum Messen, nicht zum Spielen. Mit High oder Ultra bei «Shadow rendering method» werden die fernen Teile der spieleigenen Sonnenschattenkarte dann nicht mehr gezeichnet, auch wenn das Wasser oder ein anderer Effekt sie noch liest: ferne Sonnenschatten können auf dem Wasser fehlen. Bewirkt nichts, solange «Vorherige Engine-Pfade» an ist. Entspricht BB_SUN_ATLAS_IGNORE_READER=1. Wirkt nach einem Neustart des Spiels."},
     {"Scout mode",
      "Kundschaftermodus"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Für Tests mit einer Kopie deiner Spielstände. Setzt die Debug-Flags des Spiels Player No Dead, Player Hide und Player Silence (Gegner sehen und hören dich nicht) und setzt deine Gesundheit wieder auf voll, sobald sie unter voll und über 0 ist. Die Reise führt zu einer Laterne aus der Reiseliste des Spiels, hier oder im F7-Feld (L3 + Steuerkreuz unten); sie prüft nicht, ob die Laterne entzündet ist, und lässt Kelchverliese aus, ebenso die DLC-Gebiete, außer das DLC ist aktiv. Die Geschichte des Spielstands bestimmt, wie jeder Ort aussieht. Bei jedem Start aus; Ausschalten stellt die Flags zurück. Abgelehnt im Online-Spiel und wenn das Spiel nicht mit einer Kopie der Spielstände gestartet wurde."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Für Tests mit einer Kopie deiner Spielstände. Setzt die Debug-Flags des Spiels Player No Dead, Player Hide und Player Silence (Gegner sehen und hören dich nicht) und setzt deine Gesundheit wieder auf voll, sobald sie unter voll und über 0 ist, außer in den ersten 1,5 s nach einem Ladevorgang oder nach dem Betreten eines anderen Kartenblocks. Die Reise führt zu einer Laterne aus der Reiseliste des Spiels, die in den Texten des Spiels einen eigenen Namen hat, hier oder im F7-Feld (L3 + Steuerkreuz unten); sie prüft nicht, ob die Laterne entzündet ist, und lässt Kelchverliese aus, ebenso die Gebiete 34-36 (vermutlich das DLC), außer das DLC ist aktiv. Die Geschichte des Spielstands bestimmt, wie jeder Ort aussieht. Bei jedem Start aus, außer das Kundschafter-Skript schaltet ihn ein; Ausschalten stellt die Flags zurück. Abgelehnt im Online-Spiel und wenn der Spielstandordner keine vom Kundschafter-Skript erstellte Kopie ist."},
     {"Travel to",
      "Reisen nach"},
     {"Travel",
@@ -1622,6 +1646,14 @@ constexpr Entry kGerman[] = {
      "Abgebrochen"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Enter / Kreuz zweimal: reisen      Pfeile / Steuerkreuz: bewegen      Esc / Kreis: schließen"},
+    {"Unavailable",
+     "Nicht verfügbar"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "im Online-Spiel aus (schalte Online im Launcher aus, um Cheats zu nutzen)"},
+    {"the engine's executable was not verified",
+     "die ausführbare Datei der Engine wurde nicht geprüft"},
+    {"engine code differs from the verified 1.09 image",
+     "der Spielcode weicht vom geprüften 1.09-Abbild ab"},
 };
 
 constexpr Entry kItalian[] = {
@@ -1993,8 +2025,8 @@ constexpr Entry kItalian[] = {
      "Disattivato per impostazione predefinita. Una diagnostica per misurare, non per giocare. Con High o Ultra in «Shadow rendering method», le parti lontane della mappa delle ombre del sole propria del gioco non vengono più disegnate anche se l'acqua o un altro effetto le legge ancora: le ombre lontane del sole possono mancare sull'acqua. Non fa nulla finché «Percorsi precedenti del motore» è attivo. Equivale a BB_SUN_ATLAS_IGNORE_READER=1. Si applica al riavvio del gioco."},
     {"Scout mode",
      "Modalità esploratore"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Per test su una copia dei tuoi salvataggi. Attiva i flag di debug del gioco Player No Dead, Player Hide e Player Silence (i nemici non ti vedono né ti sentono) e riporta la salute al massimo ogni volta che è sotto il massimo e sopra 0. Il viaggio porta a una lanterna dell'elenco di viaggio del gioco, qui o nel pannello F7 (L3 + croce direzionale giù); non controlla se la lanterna è accesa ed esclude i sotterranei del calice, e le aree del DLC a meno che il DLC non sia attivo. La storia del salvataggio decide l'aspetto di ogni luogo. Disattivata a ogni avvio; disattivarla ripristina i flag. Rifiutata online e se il gioco non è stato avviato su una copia dei salvataggi."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Per test su una copia dei tuoi salvataggi. Attiva i flag di debug del gioco Player No Dead, Player Hide e Player Silence (i nemici non ti vedono né ti sentono) e riporta la salute al massimo ogni volta che è sotto il massimo e sopra 0, tranne nei primi 1,5 s dopo un caricamento o dopo l'ingresso in un altro blocco della mappa. Il viaggio porta a una lanterna dell'elenco di viaggio del gioco che ha un nome proprio nei testi del gioco, qui o nel pannello F7 (L3 + croce direzionale giù); non controlla se la lanterna è accesa ed esclude i sotterranei del calice, e le aree 34-36 (ritenute il DLC) a meno che il DLC non sia attivo. La storia del salvataggio decide l'aspetto di ogni luogo. Disattivata a ogni avvio, a meno che non la attivi lo script esploratore; disattivarla ripristina i flag. Rifiutata online e se la cartella dei salvataggi non è una copia fatta dallo script esploratore."},
     {"Travel to",
      "Viaggia verso"},
     {"Travel",
@@ -2025,6 +2057,14 @@ constexpr Entry kItalian[] = {
      "Annullato"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Invio / Croce due volte: viaggia      Frecce / croce direzionale: muovi      Esc / Cerchio: chiudi"},
+    {"Unavailable",
+     "Non disponibile"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "disattivato giocando online (disattiva l'online nel launcher per usare i trucchi)"},
+    {"the engine's executable was not verified",
+     "l'eseguibile del motore non è stato verificato"},
+    {"engine code differs from the verified 1.09 image",
+     "il codice del gioco differisce dall'immagine 1.09 verificata"},
 };
 
 constexpr Entry kPolish[] = {
@@ -2393,8 +2433,8 @@ constexpr Entry kPolish[] = {
      "Domyślnie wyłączone. Diagnostyka do pomiarów, nie do gry. Przy High lub Ultra w «Shadow rendering method» dalekie części własnej mapy cieni słońca gry nie są wtedy rysowane, nawet gdy woda lub inny efekt nadal je czyta: na wodzie może brakować dalekich cieni słońca. Nic nie robi, gdy «Poprzednie ścieżki silnika» jest włączone. To samo co BB_SUN_ATLAS_IGNORE_READER=1. Działa po ponownym uruchomieniu gry."},
     {"Scout mode",
      "Tryb zwiadowcy"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Do testów na kopii zapisów. Ustawia flagi debugowania gry Player No Dead, Player Hide i Player Silence (wrogowie cię nie widzą ani nie słyszą) i przywraca pełne zdrowie, gdy jest poniżej pełnego i powyżej 0. Podróż prowadzi do latarni z listy podróży gry, tutaj lub w panelu F7 (L3 + krzyżak w dół); nie sprawdza, czy latarnia jest zapalona, i pomija lochy kielicha, a obszary DLC, jeśli DLC nie jest włączone. Historia zapisu decyduje, jak wygląda każde miejsce. Wyłączony przy każdym uruchomieniu; wyłączenie przywraca flagi. Odrzucany w grze sieciowej i gdy gra nie została uruchomiona na kopii zapisów."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Do testów na kopii zapisów. Ustawia flagi debugowania gry Player No Dead, Player Hide i Player Silence (wrogowie cię nie widzą ani nie słyszą) i przywraca pełne zdrowie, gdy jest poniżej pełnego i powyżej 0, z wyjątkiem pierwszych 1,5 s po wczytaniu lub po wejściu do innego bloku mapy. Podróż prowadzi do latarni z listy podróży gry, która ma własną nazwę w tekstach gry, tutaj lub w panelu F7 (L3 + krzyżak w dół); nie sprawdza, czy latarnia jest zapalona, i pomija lochy kielicha, a obszary 34-36 (uznawane za DLC), jeśli DLC nie jest włączone. Historia zapisu decyduje, jak wygląda każde miejsce. Wyłączony przy każdym uruchomieniu, chyba że włączy go skrypt zwiadowcy; wyłączenie przywraca flagi. Odrzucany w grze sieciowej i gdy folder zapisów nie jest kopią zrobioną przez skrypt zwiadowcy."},
     {"Travel to",
      "Podróż do"},
     {"Travel",
@@ -2425,6 +2465,14 @@ constexpr Entry kPolish[] = {
      "Przerwano"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Enter / Krzyżyk dwa razy: podróż      Strzałki / krzyżak: ruch      Esc / Kółko: zamknij"},
+    {"Unavailable",
+     "Niedostępne"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "wyłączone podczas gry sieciowej (wyłącz grę sieciową w launcherze, aby używać kodów)"},
+    {"the engine's executable was not verified",
+     "plik wykonywalny silnika nie został zweryfikowany"},
+    {"engine code differs from the verified 1.09 image",
+     "kod gry różni się od zweryfikowanego obrazu 1.09"},
 };
 
 constexpr Entry kTurkish[] = {
@@ -2793,8 +2841,8 @@ constexpr Entry kTurkish[] = {
      "Varsayılan olarak kapalı. Ölçüm için bir tanılama, oynamak için değil. «Shadow rendering method» High veya Ultra iken, su veya başka bir efekt hâlâ okusa bile oyunun kendi güneş gölge haritasının uzak kısımları çizilmez: suda uzak güneş gölgeleri eksik olabilir. «Önceki motor yolları» açıkken hiçbir şey yapmaz. BB_SUN_ATLAS_IGNORE_READER=1 ile aynıdır. Oyun yeniden başlatıldığında uygulanır."},
     {"Scout mode",
      "Keşif modu"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "Kayıtlarınızın bir kopyasında test için. Oyunun hata ayıklama bayrakları Player No Dead, Player Hide ve Player Silence'ı açar (düşmanlar sizi görmez ve duymaz) ve sağlığınız tamdan düşük ve 0'dan yüksek olduğunda onu yeniden tama çıkarır. Yolculuk, oyunun yolculuk listesindeki bir fenere götürür; burada veya F7 panelinde (L3 + yön tuşu aşağı). Fenerin yakılıp yakılmadığını denetlemez; kadeh zindanlarını ve DLC açık değilse DLC bölgelerini dışarıda bırakır. Her yerin nasıl göründüğüne kaydın hikâyesi karar verir. Her başlangıçta kapalıdır; kapatmak bayrakları geri koyar. Çevrimiçiyken ve oyun kayıtların bir kopyasıyla başlatılmadıysa reddedilir."},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "Kayıtlarınızın bir kopyasında test için. Oyunun hata ayıklama bayrakları Player No Dead, Player Hide ve Player Silence'ı açar (düşmanlar sizi görmez ve duymaz) ve sağlığınız tamdan düşük ve 0'dan yüksek olduğunda onu yeniden tama çıkarır; bir yüklemeden veya başka bir harita bloğuna girdikten sonraki ilk 1,5 sn hariç. Yolculuk, oyunun yolculuk listesindeki, oyunun metinlerinde kendi adı olan bir fenere götürür; burada veya F7 panelinde (L3 + yön tuşu aşağı). Fenerin yakılıp yakılmadığını denetlemez; kadeh zindanlarını ve DLC açık değilse 34-36 bölgelerini (DLC olduğu varsayılır) dışarıda bırakır. Her yerin nasıl göründüğüne kaydın hikâyesi karar verir. Keşif betiği açmadıkça her başlangıçta kapalıdır; kapatmak bayrakları geri koyar. Çevrimiçiyken ve kayıt klasörü keşif betiğinin yaptığı bir kopya değilse reddedilir."},
     {"Travel to",
      "Şuraya git"},
     {"Travel",
@@ -2825,6 +2873,14 @@ constexpr Entry kTurkish[] = {
      "Vazgeçildi"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Enter / Çarpı iki kez: git      Oklar / yön tuşları: hareket      Esc / Daire: kapat"},
+    {"Unavailable",
+     "Kullanılamaz"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "çevrimiçi oynarken kapalı (hileleri kullanmak için başlatıcıda çevrimiçiyi kapatın)"},
+    {"the engine's executable was not verified",
+     "motorun çalıştırılabilir dosyası doğrulanmadı"},
+    {"engine code differs from the verified 1.09 image",
+     "oyun kodu doğrulanmış 1.09 görüntüsünden farklı"},
 };
 
 constexpr Entry kChinese[] = {
@@ -3173,8 +3229,8 @@ constexpr Entry kChinese[] = {
     {"Off by default. A diagnostic for measuring, not for play. With High or Ultra in Shadow rendering method, the far parts of the game's own sun shadow map are then left undrawn even while the water or another effect still reads them: far sun shadows can be missing on the water. Does nothing while Previous engine paths is on. Same as BB_SUN_ATLAS_IGNORE_READER=1. Applies when the game restarts.", "默认关闭。仅用于调试与统计，不适合游玩。Shadow rendering method 为 High 或 Ultra 时，即使水面或其他效果仍在读取，引擎也不再绘制游戏自身平行光阴影图的远处部分：水面上远处的平行光阴影可能不显示。“引擎旧方式”开启时无效。相当于 BB_SUN_ATLAS_IGNORE_READER=1。需重启游戏后生效。"},
     {"Scout mode",
      "跳转模式"},
-    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0. Travel goes to a lamp of the game's warp list, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and the DLC areas unless the DLC is on. The save's story decides how each place looks. Off at every start; off puts the flags back. Refused online and unless the game was started on a copy of the saves.",
-     "用于在存档的复制版本上调试。开启游戏的调试标记 Player No Dead、Player Hide 和 Player Silence（敌人看不见也听不见你），并在血量低于满值且高于 0 时将其恢复为满值。跳转可前去游戏跳转列表中的任一提灯，在此处或 F7 面板中（L3 + 方向键下）；不检查提灯是否已点亮，不包括 Chalice Dungeon，未开启 DLC 时也不包括 DLC 区域。每处的外观由存档的进度决定。每次启动时关闭；关闭后恢复原始标记。联机时以及游戏未使用存档的复制版本启动时不可用。"},
+    {"For tests on a copy of your saves. Sets the game's debug flags Player No Dead, Player Hide and Player Silence (enemies neither see nor hear you), and sets your health back to full whenever it is below full and above 0, except in the first 1.5 s after a load or after you enter another map block. Travel goes to a lamp of the game's warp list that has its own name in the game's text, here or in the F7 panel (L3 + D-pad Down); it does not check whether the lamp is lit, and leaves out chalice dungeons, and areas 34-36 (taken to be the DLC) unless the DLC is on. The save's story decides how each place looks. Off at every start unless the scout script starts it; off puts the flags back. Refused online, and unless the saves folder is a copy made by the scout script.",
+     "用于在存档的复制版本上调试。开启游戏的调试标记 Player No Dead、Player Hide 和 Player Silence（敌人看不见也听不见你），并在血量低于满值且高于 0 时将其恢复为满值（加载后或进入另一区块后的前 1.5 秒除外）。跳转可前去游戏跳转列表中有独立文本的提灯，在此处或 F7 面板中（L3 + 方向键下）；不检查提灯是否已点亮，不包括 Chalice Dungeon，未开启 DLC 时也不包括区域 34-36（视为 DLC）。每处的外观由存档的进度决定。每次启动时关闭（由跳转模式的脚本启动时除外）；关闭后恢复原始标记。联机时以及存档目录不是跳转模式的脚本制作的复制版本时不可用。"},
     {"Travel to",
      "跳转至"},
     {"Travel",
@@ -3205,6 +3261,8 @@ constexpr Entry kChinese[] = {
      "已放弃"},
     {"Enter / Cross twice: travel      Arrows / D-pad: move      Esc / Circle: close",
      "Enter / × 键按 2 次：跳转      方向键：移动      Esc / Circle 键：关闭"},
+    {"off while playing online (turn online off in the launcher to use cheats)",
+     "联机游戏时关闭（如需使用修改器，请在启动器中关闭联机）"},
 };
 
 using Table = std::unordered_map<std::string_view, const char*>;

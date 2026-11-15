@@ -33,7 +33,7 @@ constexpr std::uint32_t kBloodVial = 1000, kQuicksilverBullets = 900;
 constexpr auto kDebounce = std::chrono::milliseconds(400);
 constexpr auto kInterval = std::chrono::milliseconds(250);
 constexpr auto kSettle = std::chrono::milliseconds(1500);
-constexpr const char* kNotVerified = "the engine's executable was not verified";
+constexpr const char* kNotVerified = kTextNotVerified;
 
 constexpr std::uint8_t kSigRow[] = {0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53,0x41,0x89,0xf4,
     0x49,0x89,0xfe,0x31,0xc9,0x45,0x85,0xe4,0x0f,0x88,0xf2,0x00,0x00,0x00};
@@ -824,7 +824,7 @@ void InstallExtras() {
         for (const Signature& s : signatures) {
             if (!Matches(s.bn, s.bytes)) {
                 Extra& e = ExtraOf(which);
-                e.unavailable.store("engine code differs from the verified 1.09 image");
+                e.unavailable.store(kTextCodeDiffers);
                 std::printf("Cheats: %s unavailable: engine code differs at 0x%llx\n", e.name,
                             static_cast<unsigned long long>(s.bn));
                 return false;
@@ -851,7 +851,7 @@ void InstallExtras() {
     check(NoDeath, {{0x1d2119f, kSigNoDeadMenu}, {0x1cc2331, kSigNoDeadUseA}, {0x1e57863, kSigNoDeadUseB}});
     check(Calm, {{0x1d212e9, kSigNoAttackMenu}});
     const bool stats = Matches(0x1cfc567, kSigInsight) && Matches(0x1cfc6a4, kSigEchoes);
-    g_echoes_unavailable.store(stats ? nullptr : "engine code differs from the verified 1.09 image");
+    g_echoes_unavailable.store(stats ? nullptr : kTextCodeDiffers);
     if (!stats) std::printf("Cheats: add echoes / insight unavailable: engine code differs\n");
 }
 }
@@ -864,7 +864,7 @@ bool Install(std::uint8_t* image, std::size_t size) {
     for (const Signature& s : kSignatures) {
         if (!Matches(s.bn, s.bytes)) {
             for (Cheat& c : g_cheats) {
-                c.unavailable.store("engine code differs from the verified 1.09 image");
+                c.unavailable.store(kTextCodeDiffers);
                 std::printf("Cheats: %s unavailable: engine code differs at 0x%llx\n", c.name,
                             static_cast<unsigned long long>(s.bn));
                 c.disabled = true;
@@ -887,7 +887,7 @@ bool Install(std::uint8_t* image, std::size_t size) {
 }
 
 const char* Unavailable(Which which) {
-    if (SharedWorld()) return "off while playing online (turn online off in the launcher to use cheats)";
+    if (SharedWorld()) return kTextOnline;
     if (which == Vials || which == Bullets) return g_cheats[which == Bullets ? 1 : 0].unavailable.load();
     if (which == Echoes) return g_echoes_unavailable.load();
     if (which >= WhichCount) return kNotVerified;

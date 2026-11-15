@@ -8,6 +8,8 @@
 #include "kept_travel.h"
 #include "world_copy.h"
 #include "bbport_platform.h"
+#include "cheats.h"
+#include "scout_rules.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3824,11 +3826,29 @@ std::string LampPlace(std::uint32_t lamp) {
 // Scout mode's travel (scout.cpp). OwnWorldRepair sets g_image offline too, so these work without
 // a party. LampMap and the lamp warp are called directly here, so both entries are checked first.
 const char* LampTravelCode() {
-    if (!g_image) return "the engine's executable was not verified";
+    if (!g_image) return Cheats::kTextNotVerified;
     if (std::memcmp(g_image + kLampWarp, kLampWarpEntry, sizeof kLampWarpEntry) != 0 ||
         std::memcmp(g_image + kWarpParamFind, kWarpParamFindEntry, sizeof kWarpParamFindEntry) != 0)
-        return "engine code differs from the verified 1.09 image";
+        return Cheats::kTextCodeDiffers;
     return nullptr;
+}
+
+// scout_rules.h holds a copy of the game's map table (kMapTable, 17 {area, block} u32 pairs in the
+// image's data). The size is tied at compile time, the rows here at run time.
+static_assert(std::size(ScoutRules::kScoutMaps) == kMapTableRows, "scout_rules.h kScoutMaps must match kMapTable");
+const char* ScoutMapsCode() {
+    if (!g_image) return Cheats::kTextNotVerified;
+    const auto* table = reinterpret_cast<const std::uint32_t*>(g_image + kMapTable);
+    for (int row = 0; row < kMapTableRows; ++row)
+        if (table[row * 2] != ScoutRules::kScoutMaps[row].area || table[row * 2 + 1] != ScoutRules::kScoutMaps[row].block)
+            return Cheats::kTextCodeDiffers;
+    return nullptr;
+}
+
+std::string LampName(std::uint32_t lamp) {
+    if (!ScoutRules::NamedPoint(lamp) || !g_image || std::memcmp(g_image + kMsgFind, kMsgFindEntry, sizeof kMsgFindEntry) != 0)
+        return {};
+    return PlaceText(KeptTravel::LampText(lamp));
 }
 
 std::uint32_t LampMapOf(std::uint32_t lamp) {

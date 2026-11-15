@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -25,28 +26,32 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using ScoutRules::Wait;
 
-// The same texts as cheats.cpp's, so the menu shows (and translates) one string for both.
-constexpr const char* kOnline = "off while playing online (turn online off in the launcher to use cheats)";
-constexpr const char* kNotVerified = "the engine's executable was not verified";
-constexpr const char* kCopyOnly = "only on a copy of your saves: start the game with the scout script";
-constexpr const char* kBuilding = "Building the lamp list";
+// One copy of each text (cheats.h, scout.h): the menu translates them by these exact keys.
+constexpr const char* kOnline = Cheats::kTextOnline;
+constexpr const char* kNotVerified = Cheats::kTextNotVerified;
+constexpr const char* kCopyOnly = kTextCopyOnly;
+constexpr const char* kBuilding = kTextBuilding;
 constexpr auto kMenuSettle = std::chrono::seconds(2);
 constexpr auto kMenuWaitLimit = std::chrono::seconds(60), kEnvWaitLimit = std::chrono::seconds(300);
 constexpr auto kLoadingLimit = std::chrono::seconds(30), kTravelLimit = std::chrono::seconds(300);
 constexpr auto kSaveWatch = std::chrono::seconds(30), kTraceEvery = std::chrono::seconds(1);
 constexpr auto kFlagsSettle = std::chrono::seconds(5);
+// A repeat request lets a travel go during a boss fight only while the boss wait shows, and only
+// from 1 s after it first showed, so the double click that asked for the travel cannot count.
+constexpr auto kBossConfirmAfter = std::chrono::seconds(1);
 constexpr std::uint32_t kFlagFirst = 2100, kFlagLast = 3699;
 constexpr std::uint32_t kWideStep = 50000;
 
 std::atomic<bool> g_installed{false}, g_on{false}, g_busy{false}, g_calm{false}, g_copy{false}, g_lamps_ready{false};
 std::atomic<std::uint32_t> g_request{0};
+std::atomic<const char*> g_scan_failed{nullptr};
 std::mutex g_mu;
 std::vector<Lamp> g_lamps;
 Status g_status;
 
 // Read once at Install, before the menu can call in; only the game thread changes them later.
 std::string g_override;
-bool g_list = false, g_trace = false, g_flags = false, g_dlc = false, g_env_pending = false;
+bool g_list = false, g_trace = false, g_flags = false, g_dlc = false, g_all_rows = false, g_env_pending = false;
 std::uint32_t g_env_warp = 0;
 Clock::duration g_wait = std::chrono::seconds(5);
 
@@ -82,7 +87,7 @@ struct Scan {
     Clock::time_point began;
     std::vector<Lamp> found;
     std::set<std::uint32_t> maps;
-    unsigned below = 0, dlc = 0;
+    unsigned other = 0, dlc = 0;
 };
 Scan g_scan;
 
@@ -92,8 +97,8 @@ void FinishScan(Clock::time_point now) {
     std::map<std::string, int> seen;
     for (Lamp& lamp : found)
         if (const int n = ++seen[lamp.name]; n > 1) lamp.name += " " + std::to_string(n);
-    Say("lamps: %zu in %zu maps (%u below point 950, %u DLC maps skipped) in %lld ms", found.size(), g_scan.maps.size(),
-        g_scan.below, g_scan.dlc,
+    Say("lamps: %zu in %zu maps (%u other warp rows %s: below point 950 or no name of their own; %u DLC maps skipped) in %lld ms",
+        found.size(), g_scan.maps.size(), g_scan.other, g_all_rows ? "listed too (BB_SCOUT_ALL_ROWS=1)" : "left out", g_scan.dlc,
         static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - g_scan.began).count()));
     if (g_list)
         for (const Lamp& lamp : found) Say("lamp %u map %u_%u %s", lamp.id, lamp.map >> 24, lamp.map >> 16 & 0xff, lamp.name.c_str());
@@ -111,8 +116,11 @@ void ScanTick(Clock::time_point now) {
     if (!g_scan.started) {
         g_scan.started = true;
         g_scan.began = now;
-        if (const char* why = OnlineFixes::LampTravelCode()) {
+        const char* why = OnlineFixes::LampTravelCode();
+        if (!why && (why = OnlineFixes::ScoutMapsCode())) Say("map table differs from scout_rules.h; no lamp list");
+        if (why) {
             Say("travel unavailable: %s", why);
+            g_scan_failed = why;
             g_scan.done = true;
             return;
         }
@@ -123,18 +131,34 @@ void ScanTick(Clock::time_point now) {
     }
     const ScoutRules::MapRow row = ScoutRules::kScoutMaps[g_scan.row++];
     if (row.area == 29) return;
-    if (ScoutRules::DlcArea(row.area) && !g_dlc) {
+    // DLC rows without BB_DLC=1 stay out of the list; BB_SCOUT_LIST=1 still logs them, to name the areas.
+    const bool dlc_skip = ScoutRules::DlcArea(row.area) && !g_dlc;
+    if (dlc_skip) {
         ++g_scan.dlc;
-        return;
+        if (!g_list) return;
     }
     const std::uint32_t first = ScoutRules::FirstId(row), expected = ScoutRules::MapOf(row.area, row.block);
     for (std::uint32_t id = first; id < first + ScoutRules::kIdsPerMap; ++id) {
         const std::uint32_t map = OnlineFixes::LampMapOf(id);
         if (!map) continue;
         if (map != expected) Say("lamp %u: warp row says map %u_%u", id, map >> 24, map >> 16 & 0xff);
-        if (id % ScoutRules::kIdsPerMap < 950) ++g_scan.below;
+        std::string name = OnlineFixes::LampName(id);
+        if (dlc_skip) {
+            Say("lamp %u map %u_%u %s (DLC, skipped)", id, map >> 24, map >> 16 & 0xff,
+                (name.empty() ? OnlineFixes::LampPlace(id) : name).c_str());
+            continue;
+        }
+        if (name.empty()) {
+            // Not a named lamp row (guess: a story or event warp). Out of the menu unless BB_SCOUT_ALL_ROWS=1;
+            // BB_SCOUT_WARP can still travel there.
+            ++g_scan.other;
+            name = OnlineFixes::LampPlace(id);
+            if (g_list) Say("other warp row %u map %u_%u %s%s", id, map >> 24, map >> 16 & 0xff, name.c_str(),
+                            g_all_rows ? "" : " (not in the menu)");
+            if (!g_all_rows) continue;
+        }
         g_scan.maps.insert(map);
-        g_scan.found.push_back({id, map, OnlineFixes::LampPlace(id)});
+        g_scan.found.push_back({id, map, std::move(name)});
     }
 }
 
@@ -143,7 +167,7 @@ struct Wide {
     bool done = false;
     std::uint32_t next = ScoutRules::kFirstLamp;
     Clock::time_point began;
-    unsigned outside = 0;
+    unsigned outside = 0, dungeon = 0;
 };
 Wide g_wide;
 
@@ -154,13 +178,18 @@ void WideTick(Clock::time_point now) {
     for (std::uint32_t id = g_wide.next; id < end; ++id) {
         const std::uint32_t map = OnlineFixes::LampMapOf(id);
         if (!map || ScoutRules::InScannedRows(id)) continue;
+        // Chalice dungeon rows are many and never scanned: counted, not one line each.
+        if (ScoutRules::Dungeon(id)) {
+            ++g_wide.dungeon;
+            continue;
+        }
         ++g_wide.outside;
         Say("list check: row %u map %u_%u outside the scanned ranges", id, map >> 24, map >> 16 & 0xff);
     }
     g_wide.next = end;
     if (end > ScoutRules::kLastLamp) {
         g_wide.done = true;
-        Say("list check done: %u rows outside, %lld ms", g_wide.outside,
+        Say("list check done: %u rows outside, %u chalice dungeon rows (area 29, never listed), %lld ms", g_wide.outside, g_wide.dungeon,
             static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - g_wide.began).count()));
     }
 }
@@ -232,31 +261,39 @@ struct Travel {
     bool env = false, boss_ok = false, first_wait = true;
     Wait last = Wait::None;
     std::string name;
-    Clock::time_point asked, called, since, watch_until;
+    Clock::time_point asked, called, since, watch_until, boss_seen;
     unsigned saves_at_call = 0, saves_seen = 0;
 };
 Travel g_travel;
 
+// Only from the list built in the world: the game's text lookup is not called before then.
 std::string NameOf(std::uint32_t lamp) {
-    {
-        std::scoped_lock lock{g_mu};
-        for (const Lamp& l : g_lamps)
-            if (l.id == lamp) return l.name;
-    }
-    return OnlineFixes::LampPlace(lamp);
+    std::scoped_lock lock{g_mu};
+    for (const Lamp& l : g_lamps)
+        if (l.id == lamp) return l.name;
+    return {};
+}
+
+std::string Label(const Travel& t) {
+    return t.name.empty() ? "lamp " + std::to_string(t.lamp) : t.name;
 }
 
 void GiveUp(const char* why) {
     Say("warp %u: gave up: %s", g_travel.lamp, why);
-    SetStatus(Step::GaveUp, g_travel.name);
+    SetStatus(Step::GaveUp, Label(g_travel));
     g_travel = {};
 }
 
 void StartTravel(std::uint32_t lamp, bool env, Clock::time_point now) {
     Travel& t = g_travel;
     if (t.phase == Phase::Wait && t.lamp == lamp && !env) {
-        if (!t.boss_ok) Say("warp %u: asked again: going even during a boss fight", lamp);
-        t.boss_ok = true;
+        if (t.boss_ok) return;
+        if (t.last == Wait::Boss && now - t.boss_seen >= kBossConfirmAfter) {
+            Say("warp %u: asked again during the boss fight wait: going anyway", lamp);
+            t.boss_ok = true;
+        } else {
+            Say("warp %u: asked again: ignored (it counts only while the boss fight wait shows, from 1 s after)", lamp);
+        }
         return;
     }
     if (t.phase == Phase::Loading || t.phase == Phase::Arriving) {
@@ -269,7 +306,7 @@ void StartTravel(std::uint32_t lamp, bool env, Clock::time_point now) {
     t.env = env;
     t.asked = now;
     t.name = NameOf(lamp);
-    SetStatus(Step::WaitSettled, t.name);
+    SetStatus(Step::WaitSettled, Label(t));
 }
 
 Step StepOf(Wait w) {
@@ -300,6 +337,8 @@ void Go(Clock::time_point now) {
     if (ScoutRules::Dungeon(t.lamp) || map >> 24 == 29) return GiveUp("chalice dungeon lamps are left out");
     if ((ScoutRules::DlcArea(t.lamp / 100000) || ScoutRules::DlcArea(map >> 24)) && !g_dlc) return GiveUp("needs the DLC");
     t.map = map;
+    // In the world now (FirstWait gave None), so the game's text lookup is safe to call.
+    if (t.name.empty()) t.name = OnlineFixes::LampPlace(t.lamp);
     Say("warp %u: travelling from block 0x%08x to map %u_%u %s", t.lamp, Block(), map >> 24, map >> 16 & 0xff, t.name.c_str());
     t.saves_at_call = OnlineFixes::SavesWritten();
     if (!OnlineFixes::TravelToLamp(t.lamp)) {
@@ -325,12 +364,15 @@ void TravelTick(Clock::time_point now) {
         if (w != t.last || t.first_wait) {
             t.first_wait = false;
             t.last = w;
+            if (w == Wait::Boss) t.boss_seen = now;
             if (w != Wait::None) {
                 Say("warp %u: waiting: %s", t.lamp, ScoutRules::WaitText(w));
-                SetStatus(StepOf(w), t.name);
+                SetStatus(StepOf(w), Label(t));
             }
         }
         if (w == Wait::None) return Go(now);
+        // An env travel is asked at the first frame; its limit counts from when a character is in the world.
+        if (t.env && w == Wait::NoPlayer) t.asked = now;
         if (now - t.asked > (t.env ? kEnvWaitLimit : kMenuWaitLimit)) GiveUp(ScoutRules::WaitText(w));
         return;
     }
@@ -387,17 +429,31 @@ void Install() {
     g_flags = flag("BB_SCOUT_FLAGS");
     g_calm = flag("BB_SCOUT_CALM");
     g_dlc = flag("BB_DLC");
+    g_all_rows = flag("BB_SCOUT_ALL_ROWS");
     if (const char* wait = std::getenv("BB_SCOUT_WAIT_S"); wait && *wait)
         g_wait = std::chrono::seconds(std::clamp(std::strtol(wait, nullptr, 10), 1L, 120L));
     if (const char* dir = std::getenv("BB_USER_DIR_OVERRIDE"); dir && *dir) g_override = dir;
-    g_copy = !g_override.empty();
+    // A copy only when bb-start applied the override (it sets BB_USER_DIR to it, start/main.cpp:775-777)
+    // and the folder holds the marker the scout script writes. The player's own folder never has it.
+    if (!g_override.empty()) {
+        const char* user = std::getenv("BB_USER_DIR");
+        std::error_code error;
+        if (!user || g_override != user) {
+            Say("saves folder override not applied by bb-start (BB_USER_DIR is %s): not a scout copy", user ? user : "not set");
+        } else if (!std::filesystem::exists(std::filesystem::path(g_override) / kCopyMarker, error)) {
+            Say("saves folder %s has no %s: not a scout copy", g_override.c_str(), kCopyMarker);
+        } else {
+            g_copy = true;
+        }
+    }
     const char* warp = std::getenv("BB_SCOUT_WARP");
     if (warp && *warp && !ScoutRules::ParseLamp(warp, &g_env_warp)) {
         Say("BB_SCOUT_WARP='%s' is not a lamp id; nothing done", warp);
         g_env_warp = 0;
     }
     g_env_pending = asked || g_env_warp;
-    if (g_env_pending || g_copy) Say("saves folder override: %s", g_copy ? g_override.c_str() : "not set");
+    if (g_env_pending || !g_override.empty())
+        Say("saves folder override: %s%s", g_override.empty() ? "not set" : g_override.c_str(), g_copy ? " (scout copy)" : "");
     g_installed = true;
     // The online gate can only go live later, so the env start waits for the first Tick.
     if (g_env_pending) g_busy = true;
@@ -433,6 +489,7 @@ const char* SetOn(bool on) {
 
 const char* TravelUnavailable() {
     if (const char* why = OnlineFixes::LampTravelCode()) return why;
+    if (const char* why = g_scan_failed.load()) return why;
     return g_lamps_ready ? nullptr : kBuilding;
 }
 
@@ -445,9 +502,14 @@ void RequestTravel(std::uint32_t lamp) {
     if (On() && lamp) g_request = lamp;
 }
 
+void PanelOpened(const char* how) {
+    Say("travel panel opened (%s)", how);
+}
+
 Status Current() {
     std::scoped_lock lock{g_mu};
-    if (g_status.step == Step::None && g_on && !g_lamps_ready && !OnlineFixes::LampTravelCode()) return {Step::Building, {}};
+    if (g_status.step == Step::None && g_on && !g_lamps_ready && !OnlineFixes::LampTravelCode() && !g_scan_failed.load())
+        return {Step::Building, {}};
     return g_status;
 }
 

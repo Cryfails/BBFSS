@@ -28,6 +28,8 @@ std::string LampPlace(std::uint32_t lamp);
 // Scout mode (scout.cpp). Game thread only, except LampTravelCode and SavesWritten.
 const char* LampTravelCode();              // null, or why lamp travel cannot be used
 std::uint32_t LampMapOf(std::uint32_t lamp);  // 0xAABB0000 from the game's warp table, 0 if none
+const char* ScoutMapsCode();               // null when the game's map table equals ScoutRules::kScoutMaps
+std::string LampName(std::uint32_t lamp);  // the lamp's own place text (points 950+), or empty
 bool TravelToLamp(std::uint32_t lamp);     // calls the game's lamp warp; false if the code check fails
 bool BossFight();
 std::int32_t LocalHp();                    // -1 with no character in the world

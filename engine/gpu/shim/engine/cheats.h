@@ -4,6 +4,12 @@
 #include <cstdint>
 
 namespace BbEngine::Cheats {
+// Refusal texts shared by the cheats, OnlineFixes::LampTravelCode and scout mode. The menu
+// translates them by these exact English keys (bbport_menu_i18n.cpp), so they live in one place.
+inline constexpr char kTextOnline[] = "off while playing online (turn online off in the launcher to use cheats)";
+inline constexpr char kTextNotVerified[] = "the engine's executable was not verified";
+inline constexpr char kTextCodeDiffers[] = "engine code differs from the verified 1.09 image";
+
 // NoDeath and Calm have no setting of their own: scout mode (scout.h) switches them.
 enum Which : int {
     Vials = 0, Bullets, Stamina, Stealth, GunRange, KeepEchoes, EchoMultiplier, NoDurability, Consumables,
