@@ -2743,7 +2743,7 @@ bool TemporalUpscaler::RedirectSampled(VideoCore::ImageId image,
     return true;
 }
 
-bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display) {
+bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display, vk::Format view_format) {
     std::scoped_lock lock{display_mutex};
     const auto it = displays.find(address);
     if (it == displays.end() || !it->second.valid) {
@@ -2765,8 +2765,11 @@ bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display) {
     if (dump_remaining > 0) {
         --dump_remaining;
         scheduler.EndRendering();
-        const bool bgra = display.format == vk::Format::eB8G8R8A8Unorm ||
-                          display.format == vk::Format::eB8G8R8A8Srgb;
+        // bbport (r75_present-dump-label): the label names the byte order the presenter reads
+        // (its view format: B8G8R8A8 for the game's A8R8G8B8 buffer), not the image's create
+        // format (R8G8B8A8, ConvertPixelFormat), which named these BGRA bytes "rgba".
+        const bool bgra = view_format == vk::Format::eB8G8R8A8Unorm ||
+                          view_format == vk::Format::eB8G8R8A8Srgb;
         DumpImages(instance, scheduler, scheduler.CommandBuffer(), dump_index++,
                    {{display.image, display.width, display.height, 4, "present",
                      bgra ? "bgra" : "rgba"}});

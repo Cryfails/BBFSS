@@ -916,7 +916,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     BbTimeline::Note(BbTimeline::PipeTask, 4, draw_scheduler.CurrentTick());
     // bbport: scaled upscaler presets: the output-size display buffer drawn by the port.
     TemporalUpscaler::Display display{};
-    const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(cpu_address, display);
+    // bbport (r75_present-dump-label): the view format names the byte order of a present dump.
+    const bool upscaled = rasterizer->GetUpscaler().DisplayOverride(
+        cpu_address, display, GetFrameViewFormat(attribute.attrib.pixel_format));
     VideoCore::ImageId image_id{};
     if (!upscaled) {
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};

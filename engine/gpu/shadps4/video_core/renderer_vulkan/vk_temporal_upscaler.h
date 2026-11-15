@@ -145,7 +145,9 @@ public:
         vk::Format format;
         u32 width, height;
     };
-    bool DisplayOverride(VAddr address, Display& display);
+    /// `view_format`: the format the presenter reads that buffer through; it names the byte
+    /// order of a BB_PRESENT_DUMP_TRIGGER dump (bbport r75_present-dump-label).
+    bool DisplayOverride(VAddr address, Display& display, vk::Format view_format);
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
     bool PresentDumpDue();
     /// Saves `image` (General layout, 4 bytes a pixel) as present_<w>x<h> in BB_DUMP_DIR.
