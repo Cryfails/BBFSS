@@ -2615,9 +2615,10 @@ void ScoutSection() {
             Scout::SetParts(parts);
         }
         Hint(BbSettings::MenuText(
-            "Sets Player No Dead and sets your health back to full when it is below full and above 0. Hits still land.",
-            "Включает Player No Dead и возвращает полное здоровье, когда оно ниже полного и выше 0. Удары "
-            "по-прежнему попадают."));
+            "Sets Player No Dead and sets your health back to full when it is below full and above 0, except in the "
+            "first 1.5 s after a load or after you enter another map block. Hits still land.",
+            "Включает Player No Dead и возвращает полное здоровье, когда оно ниже полного и выше 0, кроме первых "
+            "1,5 с после загрузки или перехода в другой блок карты. Удары по-прежнему попадают."));
         CheatUnavailable(BbEngine::Cheats::NoDeath);
         ImGui::PopID();
     }
