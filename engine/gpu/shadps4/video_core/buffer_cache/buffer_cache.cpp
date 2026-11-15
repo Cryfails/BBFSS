@@ -3715,6 +3715,16 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         };
         const auto bind_start = std::chrono::steady_clock::now();
         auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        // bbport (r79_load-crash): a failed bind (not a lost device) went unnoticed and the
+        // submission ran into unbacked pages. Retried while other games' loads pass, logged.
+        for (u32 attempt = 1; submit_result != vk::Result::eSuccess &&
+                              submit_result != vk::Result::eErrorDeviceLost && attempt <= 50;
+             ++attempt) {
+            std::printf("Guest memory: sparse bind failed: %s (attempt %u, %zu arenas)\n",
+                        vk::to_string(submit_result).c_str(), attempt, buffer_binds.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        }
         const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now() - bind_start)
                            .count();
@@ -3738,6 +3748,8 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
             Vulkan::Breadcrumbs::ReportDeviceLost("submit");
         }
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        ASSERT_MSG(submit_result == vk::Result::eSuccess, "Sparse bind failed: {}",
+                   vk::to_string(submit_result)); // bbport (r79_load-crash)
     });
     QueueCopyBacks(submitted); // bound with the next submission
     QueuePromotions(submitted);
