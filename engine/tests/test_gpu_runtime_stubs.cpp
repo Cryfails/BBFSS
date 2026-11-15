@@ -48,6 +48,10 @@ int32_t runtime_thread_spawn(void**, void* (*)(void*), void*, uint64_t, const ch
 int32_t runtime_thread_join_spawned(void*, void**) { std::abort(); }
 void runtime_memory_gpu_protect(uintptr_t, uint64_t, int, int) { std::abort(); }
 void runtime_restart() { std::abort(); }
+void runtime_blocked_report(void) {}
+[[noreturn]] void runtime_thread_exit(void*) { std::abort(); }
+int sys_pad_type(void) { return 0; }
+int sys_pad_button(uint32_t, int) { return 0; }
 uint64_t runtime_process_time_counter() { return runtime_process_time_us() * 1000; }
 int32_t* runtime_errno() { std::abort(); }
 int runtime_memory_write_backing(uintptr_t, const void*, uint64_t) { std::abort(); }
