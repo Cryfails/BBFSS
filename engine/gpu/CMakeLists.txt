@@ -224,6 +224,10 @@ add_host_shader(point_shadow_ray.comp point_shadow_ray_half_comp HALF=1)
 # two above are unchanged.
 add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_comp CENTRED=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_comp HALF=1 CENTRED=1)
+# bbport (r61_lamp-window-cost): the resolves' own builds of 2 (every dispatch a resolve, no ray
+# code); the first two builds above are unchanged.
+add_host_shader(point_shadow_ray.comp point_shadow_ray_resolve_comp CENTRED=1 RESOLVE=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_resolve_comp HALF=1 CENTRED=1 RESOLVE=1)
 add_host_shader(ssgi_gather_ray.comp ssgi_gather_ray_comp)
 add_host_shader(rt_shadow_filter.comp rt_shadow_filter_comp)
 # bbport (r25_rt-sun-trace): the engine's build (fade-0 shortcut, counters); tests keep the plain

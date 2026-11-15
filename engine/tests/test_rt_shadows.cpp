@@ -20,6 +20,9 @@
 // bbport (r60_lamp-centred-window): the BB_LAMP_SHADOW_WINDOW=2 builds
 #include "video_core/host_shaders/point_shadow_ray_centred_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_centred_comp.h"
+// bbport (r61_lamp-window-cost): the resolves' own builds of BB_LAMP_SHADOW_WINDOW=2
+#include "video_core/host_shaders/point_shadow_ray_half_resolve_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_resolve_comp.h"
 #include "video_core/host_shaders/rt_still_sig_comp.h" // bbport (r47_still-check)
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/host_shaders/ssgi_gather_ray_comp.h"
@@ -408,7 +411,7 @@ struct Vk {
             .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
         CHECK(vkAllocateCommandBuffers(device, &ai, &cmd));
         VkQueryPoolCreateInfo query{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 2};
+            .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 5}; // bbport (r61): 2 to 4, Span
         CHECK(vkCreateQueryPool(device, &query, nullptr, &stamps));
         VkSamplerCreateInfo sm{.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
             .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
@@ -421,7 +424,7 @@ struct Vk {
         CHECK(vkResetCommandBuffer(cmd, 0));
         VkCommandBufferBeginInfo begin{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         CHECK(vkBeginCommandBuffer(cmd, &begin));
-        vkCmdResetQueryPool(cmd, stamps, 0, 2);
+        vkCmdResetQueryPool(cmd, stamps, 0, 5);
     }
     void Stamp(unsigned i) { vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, stamps, i); }
     void Barrier() {
@@ -446,6 +449,14 @@ struct Vk {
         const VkResult r = vkGetQueryPoolResults(device, stamps, 0, 2, sizeof t, t.data(), sizeof(std::uint64_t),
                                                  VK_QUERY_RESULT_64_BIT);
         return r == VK_SUCCESS ? double((t[1] - t[0]) & mask) * period / 1e6 : 0.0;
+    }
+    // bbport (r61_lamp-window-cost): after End, ms from timestamp a to timestamp b (both written in
+    // that submission; 2 to 4 only by the torch lab's timing of the resolves)
+    double Span(unsigned a, unsigned b) {
+        std::array<std::uint64_t, 2> t{};
+        const VkResult ra = vkGetQueryPoolResults(device, stamps, a, 1, 8, &t[0], 8, VK_QUERY_RESULT_64_BIT);
+        const VkResult rb = vkGetQueryPoolResults(device, stamps, b, 1, 8, &t[1], 8, VK_QUERY_RESULT_64_BIT);
+        return ra == VK_SUCCESS && rb == VK_SUCCESS ? double((t[1] - t[0]) & mask) * period / 1e6 : 0.0;
     }
 };
 
@@ -1189,6 +1200,24 @@ int main(int argc, char** argv) {
                          VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
                         64, POINT_SHADOW_RAY_HALF_CENTRED_COMP, sizeof(POINT_SHADOW_RAY_HALF_CENTRED_COMP),
                         VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+        // bbport (r61_lamp-window-cost): the resolves' own builds, with the centred builds' bindings
+        vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                        64, POINT_SHADOW_RAY_RESOLVE_COMP, sizeof(POINT_SHADOW_RAY_RESOLVE_COMP),
+                        VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+        vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                        64, POINT_SHADOW_RAY_HALF_RESOLVE_COMP, sizeof(POINT_SHADOW_RAY_HALF_RESOLVE_COMP),
+                        VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
         std::puts("RT pipelines: built");
         return 0;
     }
@@ -1353,6 +1382,25 @@ int main(int argc, char** argv) {
                                                      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
                                                     64, POINT_SHADOW_RAY_HALF_CENTRED_COMP, sizeof(POINT_SHADOW_RAY_HALF_CENTRED_COMP),
                                                     VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+            // bbport (r61_lamp-window-cost): the resolves' own builds (PointShadow::Ready and HalfReady
+            // make them beside the centred ones, with the same bindings)
+            Pipeline lamp_resolve = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                                                    64, POINT_SHADOW_RAY_RESOLVE_COMP, sizeof(POINT_SHADOW_RAY_RESOLVE_COMP),
+                                                    VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
+            Pipeline half_resolve = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                                                     VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                                                    64, POINT_SHADOW_RAY_HALF_RESOLVE_COMP, sizeof(POINT_SHADOW_RAY_HALF_RESOLVE_COMP),
+                                                    VK_PIPELINE_CREATE_DISPATCH_BASE_BIT);
             Image lamp_answers = vk.MakeImage(W, H, VK_FORMAT_R32G32_UINT);
             vk.Begin();
             vk.ToGeneral(lamp_answers.image);
@@ -1406,6 +1454,13 @@ int main(int argc, char** argv) {
             // the shader's atomic adds cost fifty times the pass (the engine keeps them on the GPU
             // and counts one pass in eight).
             bool half_count = true;
+            // bbport (r61_lamp-window-cost): resolve_build: a split pass's resolves run their own build,
+            // as the engine runs them unless BB_LAMP_SHADOW_RESOLVE_BUILD=0; false: the centred build, as
+            // r60 ran them. split_stamps: a split pass also writes timestamps around its resolves, and
+            // resolve_ms is then their time in the last pass (to the end of the pass for the last one).
+            bool resolve_build = true;
+            bool split_stamps = false;
+            double resolve_ms = 0.0;
             const auto run = [&](const Views& v, const Pass& pass) {
                 auto* words = static_cast<float*>(lights.data);
                 for (int r = 0; r < 4; ++r)
@@ -1534,25 +1589,39 @@ int main(int argc, char** argv) {
                 }
                 if (pass.half) {
                     const Pipeline& p = centred ? half_centred : half; // bbport (r60)
-                    vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-                    vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, centred ? 14 : 13, writes.data());
+                    // bbport (r61_lamp-window-cost): the resolves' build (their own, or the centred one)
+                    // and what is bound
+                    const Pipeline& rp = split && resolve_build ? half_resolve : p;
+                    const Pipeline* bound = &p;
+                    const auto bind = [&](const Pipeline& q) {
+                        vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, q.pipeline);
+                        vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, q.layout, 0, centred ? 14 : 13, writes.data());
+                        bound = &q;
+                    };
+                    bind(p);
                     const unsigned count = half_count ? 8u : 0u; // MODE_HALF_COUNT
                     // bbport (r60_lamp-centred-window): split, each half's trace and resolve (the
                     // resolves count nothing), as PointShadow::Flush records them
                     const auto dispatch = [&](unsigned word, unsigned x, unsigned y) {
                         std::memcpy(&push.thickness, &word, 4);
-                        vkCmdPushConstants(vk.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                        vkCmdPushConstants(vk.cmd, bound->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
                         vkCmdDispatchBase(vk.cmd, 0, 0, 0, x, y, 1);
                     };
                     dispatch(mode | 2u | count | (split ? Trace : 0u), (W + 15) / 16, (H + 15) / 16); // MODE_HALF_FIRST
                     vk.Barrier();
                     if (split) {
+                        if (&rp != &p) bind(rp); // bbport (r61)
+                        if (split_stamps) vk.Stamp(2);
                         dispatch(mode | 2u | Resolve, (W + 15) / 16, (H + 15) / 16);
+                        if (split_stamps) vk.Stamp(3);
                         vk.Barrier();
+                        if (&rp != &p) bind(p);
                     }
                     dispatch(mode | 4u | count | (split ? Trace : 0u), (W + 7) / 8, (H + 7) / 8); // MODE_HALF_FILL
                     if (split) {
                         vk.Barrier();
+                        if (&rp != &p) bind(rp); // bbport (r61)
+                        if (split_stamps) vk.Stamp(4);
                         dispatch(mode | 4u | Resolve, (W + 7) / 8, (H + 7) / 8);
                     }
                 } else {
@@ -1565,16 +1634,26 @@ int main(int argc, char** argv) {
                     vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
                     if (split) {
                         vk.Barrier();
+                        // bbport (r61_lamp-window-cost): the resolves' build (their own, or the centred one)
+                        const Pipeline& rp = resolve_build ? lamp_resolve : p;
+                        if (&rp != &p) {
+                            vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rp.pipeline);
+                            vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, rp.layout, 0, 12, full_writes.data());
+                        }
                         word = mode | Resolve;
                         std::memcpy(&push.thickness, &word, 4);
-                        vkCmdPushConstants(vk.cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                        vkCmdPushConstants(vk.cmd, rp.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                        if (split_stamps) vk.Stamp(2);
                         vkCmdDispatchBase(vk.cmd, 0, 0, 0, (W + 7) / 8, (H + 7) / 8, 1);
                     }
                 }
                 vk.Barrier();
                 vk.Stamp(1);
                 vk.Barrier();
-                return vk.End();
+                const double ms = vk.End();
+                // bbport (r61_lamp-window-cost): the resolves' part of the pass
+                if (split && split_stamps) resolve_ms = pass.half ? vk.Span(2, 3) + vk.Span(4, 1) : vk.Span(2, 1);
+                return ms;
             };
             const auto values = [&] {
                 const auto bits = lab.Read(lamp_images[0], VK_FORMAT_R32_SFLOAT);
@@ -2185,6 +2264,53 @@ int main(int argc, char** argv) {
                                 if (checked && centred_apart_fault.empty() && (differ[0] != 0 || differ[1] != 0)) {
                                     centred_apart_fault = lc.name;
                                 }
+                                // bbport (r61_lamp-window-cost): 1 once more (with MODE_APART, as apart_1 above,
+                                // and after a run of 2, as apart_1 was): the control, 0 when the lab repeats bit
+                                // for bit (r60's two labs printed the same lines of 1). Then 2 once more (with
+                                // MODE_APART, as the run above), its resolves in their own build as above, and in
+                                // the centred build as r60 ran them, each against the run above. The first of
+                                // these is the lab's repeat noise for 2: where 1 repeats and 2 does not, value 2
+                                // has a fault of its own (a race, or state carried over between runs), which
+                                // would also explain r60's "MODE_APART changes the picture" with 2. The second is
+                                // the two builds' difference and noise, and is meant to be no larger than the
+                                // first.
+                                at_apart = true;
+                                const auto again_1 = moving(tunes[1], lc.move);
+                                std::size_t differ_control = 0;
+                                double most_control = 0.0;
+                                for (std::size_t i = 0; i < apart_1.size(); ++i) {
+                                    const double d = std::abs(double(again_1[i]) - double(apart_1[i]));
+                                    differ_control += d > 0.0 ? 1 : 0;
+                                    most_control = std::max(most_control, d);
+                                }
+                                const auto again_2 = moving(tunes[3], lc.move);
+                                resolve_build = false;
+                                const auto centred_build_2 = moving(tunes[3], lc.move);
+                                resolve_build = true;
+                                at_apart = false;
+                                std::array<std::size_t, 2> differ_61{};
+                                std::array<double, 2> most_61{};
+                                for (std::size_t i = 0; i < last[3].size(); ++i) {
+                                    const double d1 = std::abs(double(again_2[i]) - double(last[3][i]));
+                                    const double d2 = std::abs(double(centred_build_2[i]) - double(last[3][i]));
+                                    differ_61[0] += d1 > 0.0 ? 1 : 0;
+                                    differ_61[1] += d2 > 0.0 ? 1 : 0;
+                                    most_61[0] = std::max(most_61[0], d1);
+                                    most_61[1] = std::max(most_61[1], d2);
+                                }
+                                const char* const repeat_what =
+                                    differ_control != 0 ? "the control does not repeat: the lab itself is not deterministic here"
+                                    : differ_61[0] != 0 ? "2 does not repeat where 1 does: a fault of 2's own (a race or carried state)"
+                                                        : "2 repeats as 1 does";
+                                std::printf("Torch lab, r61 resolve build, %s, %.1f cm a frame, %s: control, "
+                                            "BB_LAMP_SHADOW_WINDOW=1 (MODE_APART) once more against its run above %zu pixels "
+                                            "differ (most %.5f); =2 (MODE_APART) once more against the run above, its resolves "
+                                            "in their own build again %zu pixels differ (most %.5f; the lab's repeat noise), in "
+                                            "the centred build as r60 ran them %zu pixels differ (most %.5f) (printed only; 0, 0 "
+                                            "and 0 expected, the third at most the second): %s\n",
+                                            lc.name, speed * 100.0f, half_build ? "half-resolution build" : "full resolution",
+                                            differ_control, most_control, differ_61[0], most_61[0], differ_61[1], most_61[1],
+                                            repeat_what);
                             }
                             at_half = false;
                             const std::vector<std::pair<int, unsigned>> folds =
@@ -2712,6 +2838,40 @@ int main(int argc, char** argv) {
                 std::printf("Torch lab, r60: the area lamp with its history, BB_LAMP_SHADOW_WINDOW=1 %.3f ms, =2 %.3f ms; "
                             "the half-resolution build =1 %.3f ms, =2 %.3f ms (printed only)\n",
                             window_best[0], window_best[2], window_best[1], window_best[3]);
+                // bbport (r61_lamp-window-cost): =2 with its resolves in their own build (the engine's
+                // default, as the r60 line above runs it) and in the centred build (as r60 ran them,
+                // BB_LAMP_SHADOW_RESOLVE_BUILD=0), at full and at half resolution: the pass's time, settled
+                // (frames 8 to 35, as above), and the resolves' part of it from timestamps around them (frames
+                // 40 to 63; on frames of their own, so the pass's time above carries no extra timestamp).
+                // Printed only.
+                std::array<double, 4> build_best{1e9, 1e9, 1e9, 1e9}, resolve_best{1e9, 1e9, 1e9, 1e9};
+                half_count = false;
+                at_apart = true;
+                for (int b = 0; b < 2; ++b) {
+                    resolve_build = b == 0;
+                    for (const bool h : {false, true}) {
+                        const std::size_t at = std::size_t(b * 2 + (h ? 1 : 0));
+                        restart();
+                        at_half = h;
+                        for (int i = 0; i < 64; ++i) {
+                            split_stamps = i >= 36;
+                            const double ms = frame(view, windows[1]);
+                            if (i >= 8 && i < 36) build_best[at] = std::min(build_best[at], ms);
+                            if (i >= 40) resolve_best[at] = std::min(resolve_best[at], resolve_ms);
+                        }
+                    }
+                }
+                split_stamps = false;
+                resolve_build = true;
+                at_half = false;
+                at_apart = false;
+                half_count = true;
+                std::printf("Torch lab, r61: the area lamp with its history, BB_LAMP_SHADOW_WINDOW=2 with its resolves in "
+                            "their own build %.3f ms (the resolves %.3f ms), in the centred build as r60 %.3f ms (the "
+                            "resolves %.3f ms); the half-resolution build %.3f ms (the resolves %.3f ms), %.3f ms (the "
+                            "resolves %.3f ms) (printed only)\n",
+                            build_best[0], resolve_best[0], build_best[2], resolve_best[2], build_best[1], resolve_best[1],
+                            build_best[3], resolve_best[3]);
             }
             vk.destroy_as(vk.device, tlas.handle, nullptr);
             vk.Free(tlas.instances); vk.Free(tlas.storage); vk.Free(tlas.scratch);

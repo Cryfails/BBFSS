@@ -51,6 +51,18 @@ layout(set = 0, binding = 13, rg32ui) uniform uimage2D lamp_answers;
 layout(set = 0, binding = 11, rg32ui) uniform uimage2D lamp_answers;
 #endif
 #endif
+#ifdef RESOLVE
+// bbport (r61_lamp-window-cost): the resolve's own builds (point_shadow_ray_resolve_comp and
+// point_shadow_ray_half_resolve_comp): the centred build in which every dispatch is a resolve
+// (main takes MODE_RESOLVE as set and MODE_TRACE as clear), so the rays, the tile list and the
+// trace's stores cannot be reached. The SPIR-V still holds them; the saving needs the driver to drop
+// that dead code and give the build the registers of a pass that only loads and blends. Same bindings
+// and push constants as the centred build; the host runs it for the resolves only
+// (vk_point_shadow.cpp, BB_LAMP_SHADOW_RESOLVE_BUILD).
+#ifndef CENTRED
+#error "RESOLVE is a form of the CENTRED build"
+#endif
+#endif
 #ifdef HALF
 // bbport (r32_lamp-half): BB_LAMP_SHADOW_HALF=1 only (the point_shadow_ray_half_comp build).
 // half_answers: one texel per 2x2 block, written by the first pass: (shadow ratio, view depth,
@@ -528,17 +540,38 @@ void storeAnswer(ivec2 p, float answer, float code, uint top) {
 // The resolve's tile, loaded by the whole workgroup (every invocation calls it, and a barrier
 // follows). lo: the workgroup's first pixel; apart: 1, or 2 between first-pass pixels. A place
 // outside the pass's rect or the screen has no answer: nothing traced it this frame.
-void loadTile(ivec2 lo, int apart) {
-    for (uint i = gl_LocalInvocationIndex; i < 144u; i += 64u) {
-        const ivec2 q = lo + apart * (ivec2(int(i % 12u), int(i / 12u)) - 2);
-        float a = -1.0, c = CAST_FREE;
-        if (all(greaterThanEqual(q, rect.xy)) && all(lessThan(q, rect.zw)) && all(lessThan(q, ivec2(size)))) {
-            const uvec2 t = imageLoad(lamp_answers, q).xy;
-            a = uintBitsToFloat(t.x);
-            c = unpackHalf2x16(t.y).y;
+// bbport (r61_lamp-window-cost): cell i of the tile, as r60 loaded every cell.
+void loadCell(uint i, ivec2 lo, int apart) {
+    const ivec2 q = lo + apart * (ivec2(int(i % 12u), int(i / 12u)) - 2);
+    float a = -1.0, c = CAST_FREE;
+    if (all(greaterThanEqual(q, rect.xy)) && all(lessThan(q, rect.zw)) && all(lessThan(q, ivec2(size)))) {
+        const uvec2 t = imageLoad(lamp_answers, q).xy;
+        a = uintBitsToFloat(t.x);
+        c = unpackHalf2x16(t.y).y;
+    }
+    tile_answer[i] = a;
+    tile_cast[i] = c;
+}
+
+// bbport (r61_lamp-window-cost): the centre cell of invocation lid, (lid + 2), is the place
+// lo + apart * lid, which is the invocation's own pixel; main has loaded that texel already (own,
+// under the same test: own_in), so the invocation writes it there, and only the 80 cells of the
+// ring around the workgroup are loaded (one or two loads an invocation, in place of r60's two or
+// three of all 144 cells, 64 of which every invocation had loaded once more for itself). Every cell
+// holds the same bits as r60's: the same texel, decoded the same way, or the same "no answer".
+void loadTile(ivec2 lo, int apart, bool own_in, uvec2 own) {
+    const uint centre = (gl_LocalInvocationID.y + 2u) * 12u + gl_LocalInvocationID.x + 2u;
+    tile_answer[centre] = own_in ? uintBitsToFloat(own.x) : -1.0;
+    tile_cast[centre] = own_in ? unpackHalf2x16(own.y).y : CAST_FREE;
+    for (uint j = gl_LocalInvocationIndex; j < 80u; j += 64u) {
+        // rows 0 and 1 (cells 0 to 23), rows 10 and 11 (120 to 143), then columns 0, 1, 10 and 11
+        // of rows 2 to 9
+        uint i = j < 24u ? j : j + 96u;
+        if (j >= 48u) {
+            const uint k = j - 48u;
+            i = (2u + k / 4u) * 12u + ((k & 3u) < 2u ? (k & 3u) : (k & 3u) + 8u);
         }
-        tile_answer[i] = a;
-        tile_cast[i] = c;
+        loadCell(i, lo, apart);
     }
 }
 #endif
@@ -677,7 +710,43 @@ void main() {
     // so the same workgroups return below: one without a tile does in both, as with value 1, and
     // its trace has stored "no answer" for its pixels, which the windows around it read from the
     // image), but casts no ray (tile_count below)
+#ifdef RESOLVE
+    const bool resolve_mode = true; // bbport (r61_lamp-window-cost): every dispatch of this build
+    const bool trace_mode = false;
+#else
     const bool resolve_mode = (mode & MODE_RESOLVE) != 0u;
+    const bool trace_mode = (mode & MODE_TRACE) != 0u;
+#endif
+    // bbport (r61_lamp-window-cost): the resolve lists no tile. Each invocation loads its own
+    // pixel's texel of the answers (r60 loaded it below, and once more into the tile), and the
+    // workgroup goes on only if its trace answered one of its pixels (group_count then 1, else 0).
+    // In logic the same result as r60's list (in bits not proven: this build's SPIR-V is new): a
+    // workgroup without a tile has no answer (its trace stored none),
+    // and in one with tiles but no answer r60's resolve wrote nothing (its pixels are not live, no
+    // lamp light is left in them, and the -1 block answers of the half-resolution build's first pass
+    // are what its trace stored): it now returns here, before loading the tune, the light, depth and
+    // the tile.
+    uvec2 own = uvec2(0u);   // the texel (loaded where the pixel lies in the pass's rect)
+    bool own_in = false;     // the pixel lies in the rect and on the screen (loadCell's test)
+    bool own_answer = false; // r60's `live` after its load: in the rect, not the first pass's
+                             // pixel (second pass), and the trace answered it
+    if (resolve_mode) {
+#ifdef HALF
+        const ivec2 p = ivec2(gl_GlobalInvocationID.xy) * (first ? 2 : 1);
+        const bool mine = !fill || ((p.x | p.y) & 1) != 0;
+#else
+        const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+        const bool mine = true;
+#endif
+        if (p.x >= rect.x && p.y >= rect.y && p.x < rect.z && p.y < rect.w) {
+            own = imageLoad(lamp_answers, p).xy;
+            own_in = all(lessThan(p, ivec2(size)));
+            own_answer = mine && uintBitsToFloat(own.x) >= 0.0;
+        }
+        if (own_answer) {
+            atomicOr(group_count, 1u);
+        }
+    } else
 #endif
     for (uint t = gl_LocalInvocationIndex; t < light_count; t += 64u) {
         if (inside(t, group_lo, group_hi)) {
@@ -700,7 +769,7 @@ void main() {
         }
 #endif
 #ifdef CENTRED
-        if ((mode & MODE_TRACE) != 0u) { // bbport (r60_lamp-centred-window): no answer here
+        if (trace_mode) { // bbport (r60_lamp-centred-window): no answer here
 #ifdef HALF
             const ivec2 p = ivec2(gl_GlobalInvocationID.xy) * (first ? 2 : 1);
             if (!fill || ((p.x | p.y) & 1) != 0) { // (not over the first pass's pixel)
@@ -735,11 +804,20 @@ void main() {
     // 2 and 3 (lamps, rays) are drawn by one dispatch (the host does not split them). A split the
     // shader does not take is done whole by its trace dispatch, and its resolve does nothing.
     const bool centred = t_centred && (history_flags & HISTORY_BLEND) != 0u && t_view != 2u && t_view != 3u;
-    const bool trace_only = (mode & MODE_TRACE) != 0u && centred;
+#ifdef RESOLVE
+    // bbport (r61_lamp-window-cost): as below with resolve_mode set; past the return, centred
+    if (!centred) {
+        return;
+    }
+    const bool trace_only = false;
+    const bool resolve = true;
+#else
+    const bool trace_only = trace_mode && centred;
     const bool resolve = resolve_mode && centred;
     if (resolve_mode && !centred) {
         return;
     }
+#endif
 #ifdef HALF
     const bool resolve_normal = first; // the first pass's block answer holds the normal
     // The window's places: first-pass pixels two apart in the first pass (25 answers within 4
@@ -768,10 +846,14 @@ void main() {
 #ifdef CENTRED
     // bbport (r60_lamp-centred-window): the resolve shadows the pixels the trace answered for. The
     // tests below then hold for them again: where it answered, the trace changed none of their inputs.
-    uvec2 stored = uvec2(0u);
-    if (resolve && live) {
-        stored = imageLoad(lamp_answers, px).xy;
-        live = uintBitsToFloat(stored.x) >= 0.0;
+    // bbport (r61_lamp-window-cost): the texel is the one loaded above (`stored` is read only for a
+    // pixel that stays live), and the tile's ring is loaded here, before the pixel's own loads below,
+    // so that they are in flight together (r60 loaded the whole tile after them; nothing between
+    // writes the answers or reads the tile).
+    const uvec2 stored = own;
+    if (resolve) {
+        live = live && own_answer;
+        loadTile(group_lo, resolve_apart, own_in, own);
     }
 #endif
     // s: the light without the lamps, d: the lamps' light.
@@ -780,7 +862,16 @@ void main() {
     // apart: the pixel has lamp light to move into the light targets, shadowed or not.
     bool lit = false;
     if (apart) {
+#ifdef CENTRED
+        // bbport (r61_lamp-window-cost): the resolve reads the lamp light only of a pixel its trace
+        // answered. No other pixel of a resolve that got this far has any left: its trace ran past
+        // the tile list and moved it into the light targets, zeroing snap0 and snap1 (below: lit,
+        // not live), or (the first pass's pixels, in the second pass) the first pass did. So r60's
+        // loads gave lit false there, and d0, d1, s0 and s1 stay 0 as they gave.
+        if ((!resolve || live) && px.x < int(size.x) && px.y < int(size.y)) {
+#else
         if (px.x < int(size.x) && px.y < int(size.y)) {
+#endif
             d0 = imageLoad(snap0, px).rgb;
             d1 = imageLoad(snap1, px).rgb;
             lit = any(notEqual(d0, vec3(0.0))) || any(notEqual(d1, vec3(0.0)));
@@ -848,7 +939,12 @@ void main() {
         n = surfaceNormal(uv, P);
         reach = bias_m + 0.0015 * P.z;
         origin = P + n * reach;
-        if (soft) {
+#ifdef CENTRED
+        if (soft && !resolve) // bbport (r61_lamp-window-cost): the resolve casts no ray
+#else
+        if (soft)
+#endif
+        {
             xi = samplePoint(px, t_frame);
         }
     }
@@ -954,10 +1050,23 @@ void main() {
     if (live && (due || !old_valid || old_stable < STABLE_FRAMES)) {
         atomicOr(group_trace, 1u);
     }
+#ifdef CENTRED
+    // bbport (r61_lamp-window-cost): the resolve does not wait here: it never reads group_trace
+    // before the barrier at its tile (its own branch below comes before the one that does, and
+    // HalfCount's slot is taken after that barrier). `resolve` is the same for the whole workgroup.
+    if (!resolve) {
+        barrier();
+    }
+#else
     barrier();
+#endif
 #ifdef HALF
     if (!live) {
+#ifdef CENTRED
+        if (first && !resolve) { // bbport (r61_lamp-window-cost): the trace stored this -1 already
+#else
         if (first) {
+#endif
             imageStore(half_answers, px >> 1, vec4(-1.0)); // no answer
         }
         HalfCount(first, 0u, 0u);
@@ -1175,10 +1284,9 @@ void main() {
 #endif
             return;
         }
-        if (resolve) {
-            // bbport (r60_lamp-centred-window): the 5x5 answers around every pixel of the workgroup
-            loadTile(group_lo, resolve_apart);
-        } else {
+        // bbport (r60_lamp-centred-window): the resolve's 5x5 answers around every pixel of the
+        // workgroup are in its tile (bbport r61_lamp-window-cost: loaded above, with its own loads)
+        if (!resolve) {
             group_answer[gl_LocalInvocationIndex] = live ? answer : -1.0;
             group_cast[gl_LocalInvocationIndex] = blocker;
         }

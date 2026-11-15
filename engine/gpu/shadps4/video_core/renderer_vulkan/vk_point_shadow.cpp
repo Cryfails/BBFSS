@@ -19,8 +19,12 @@
 // bbport (r60_lamp-centred-window): the builds of BB_LAMP_SHADOW_WINDOW=2
 #include "video_core/host_shaders/point_shadow_ray_centred_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_centred_comp.h"
+// bbport (r61_lamp-window-cost): the resolves' own builds of BB_LAMP_SHADOW_WINDOW=2
+#include "video_core/host_shaders/point_shadow_ray_half_resolve_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_resolve_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h" // bbport (r61_lamp-window-cost)
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
@@ -224,15 +228,23 @@ bool PointShadow::Ready() {
         std::printf("Point shadows: off - this GPU cannot run the pass\n");
         return false;
     }
+    // bbport (r61_lamp-window-cost, r73_lamp-resolve-list-check): the centred build and the
+    // resolves' own build of it must take the same bindings, as Flush pushes one set of descriptor
+    // writes to whichever of the two runs; so the list is written once, here, and both are made
+    // through this.
+    const auto make_centred = [&](vk::UniqueDescriptorSetLayout& set, vk::UniquePipelineLayout& lay,
+                                  vk::UniquePipeline& pipe, std::span<const u32> code, const char* name) {
+        return EffectPass::Create(instance, set, lay, pipe,
+                                  {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
+                                   eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
+                                   eStorageImage, eStorageImage, eStorageImage, eStorageImage},
+                                  sizeof(Push), code, name, true);
+    };
     // bbport (r60_lamp-centred-window): BB_LAMP_SHADOW_WINDOW=2: the build with the centred window
     // and binding 11, its answers image. It cannot be made: the window of 1, said in the log.
     centred = tune.window && tune.window_centred;
     if (centred && rt_shadow.Capturing() &&
-        !EffectPass::Create(instance, ray_set_layout, ray_layout, ray_pipeline,
-                            {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
-                             eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
-                             eStorageImage, eStorageImage, eStorageImage, eStorageImage},
-                            sizeof(Push), POINT_SHADOW_RAY_CENTRED_COMP, "Ray traced lamps", true)) {
+        !make_centred(ray_set_layout, ray_layout, ray_pipeline, POINT_SHADOW_RAY_CENTRED_COMP, "Ray traced lamps")) {
         std::printf("Ray traced lamps (r60): the centred window's pass could not be made: "
                     "BB_LAMP_SHADOW_WINDOW=1\n");
         centred = false;
@@ -246,6 +258,20 @@ bool PointShadow::Ready() {
                              eStorageImage, eStorageImage, eStorageImage},
                             sizeof(Push), POINT_SHADOW_RAY_COMP, "Ray traced lamps", true)) {
         std::printf("Ray traced lamps: off - the pass could not be made\n");
+    }
+    // bbport (r61_lamp-window-cost): with the centred build, the resolves' own build (the centred
+    // build in which every dispatch is a resolve: its ray code cannot be reached, so the driver may
+    // drop it and give the build fewer registers), unless BB_LAMP_SHADOW_RESOLVE_BUILD starts with
+    // 0. Same bindings (make_centred) and push constants as the centred build. Not made: the
+    // resolves run the centred build, which r60 ran them in, said in the log.
+    if (centred && ray_pipeline) {
+        const char* const resolve_env = std::getenv("BB_LAMP_SHADOW_RESOLVE_BUILD");
+        resolve_wanted = !resolve_env || resolve_env[0] != '0';
+        if (resolve_wanted && !make_centred(resolve_set_layout, resolve_layout, resolve_pipeline,
+                                            POINT_SHADOW_RAY_RESOLVE_COMP, "Ray traced lamps (resolve)")) {
+            std::printf("Ray traced lamps (r61): the resolves' own build could not be made: they run the "
+                        "centred build\n");
+        }
     }
     if (ray_pipeline) { // bbport (r41_lamp-shadows, r42_lamp-soft)
         // bbport (r48_lamp-softness): the radius graphics_lamp_shadow_softness gives now (Flush
@@ -305,6 +331,15 @@ bool PointShadow::Ready() {
                     "barrier more (two at half resolution) and one image of 8 bytes a pixel (16.6 MB at "
                     "1920x1080, 66.4 MB at 3840x2160), made only with 2\n",
                     centred ? "yes" : "no", unsigned(LampWindowDefault));
+        // bbport (r61_lamp-window-cost): what the value 2 does to save time, when it is on
+        if (centred) {
+            std::printf("Ray traced lamps (r61): the centred window's resolve stops at once in a workgroup "
+                        "its trace answered no pixel of, loads only the ring of its tile and no lamp light "
+                        "it does not use (the same as r60 in logic, not yet proven in bits); its build: %s "
+                        "(BB_LAMP_SHADOW_RESOLVE_BUILD; 0 = the centred build, which r60 ran them in)\n",
+                        resolve_pipeline ? "its own" : resolve_wanted ? "the centred one (its own could not be made)"
+                                                                      : "the centred one");
+        }
     }
     // bbport (r37_menu-options): the half-resolution build is made by HalfReady, when first wanted.
     constexpr auto Drawn = vk::FormatFeatureFlagBits::eColorAttachment |
@@ -325,22 +360,35 @@ bool PointShadow::HalfReady() {
     }
     half_tried = true;
     using enum vk::DescriptorType;
+    // bbport (r61_lamp-window-cost, r73_lamp-resolve-list-check): the half-resolution centred
+    // build and the resolves' own build of it must take the same bindings, as Ready's pair does;
+    // so the list is written once, here, and both are made through this.
+    const auto make_half_centred = [&](vk::UniqueDescriptorSetLayout& set, vk::UniquePipelineLayout& lay,
+                                       vk::UniquePipeline& pipe, std::span<const u32> code, const char* name) {
+        return EffectPass::Create(instance, set, lay, pipe,
+                                  {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
+                                   eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
+                                   eStorageImage, eStorageImage, eStorageBuffer, eStorageImage, eStorageImage,
+                                   eStorageImage},
+                                  sizeof(Push), code, name, true);
+    };
     // bbport (r60_lamp-centred-window): with the centred window (Ready), its build: binding 13
     // its answers image. If it cannot be made, the plain build (the half-resolution pass then has
     // the window of 1 and does not split; the full-resolution pass keeps 2), said in the log.
     half_centred = ray_pipeline && centred &&
-                   EffectPass::Create(instance, half_set_layout, half_layout, half_pipeline,
-                                      {eStorageBuffer, eCombinedImageSampler, eStorageImage,
-                                       eStorageImage, eStorageImage, eStorageImage,
-                                       eAccelerationStructureKHR, eStorageImage, eStorageImage,
-                                       eStorageImage, eStorageBuffer, eStorageImage, eStorageImage,
-                                       eStorageImage},
-                                      sizeof(Push), POINT_SHADOW_RAY_HALF_CENTRED_COMP,
-                                      "Ray traced lamps (half resolution)", true);
+                   make_half_centred(half_set_layout, half_layout, half_pipeline, POINT_SHADOW_RAY_HALF_CENTRED_COMP,
+                                     "Ray traced lamps (half resolution)");
     if (ray_pipeline && centred && !half_centred) {
         std::printf("Ray traced lamps (r60): the centred window's half-resolution pass could not be made: "
                     "the half-resolution pass has the window of 1 (BB_LAMP_SHADOW_WINDOW=1), the "
                     "full-resolution pass keeps 2\n");
+    }
+    // bbport (r61_lamp-window-cost): and the resolves' own build of it, as Ready makes the full one
+    if (half_centred && resolve_wanted &&
+        !make_half_centred(half_resolve_set_layout, half_resolve_layout, half_resolve_pipeline,
+                           POINT_SHADOW_RAY_HALF_RESOLVE_COMP, "Ray traced lamps (half resolution, resolve)")) {
+        std::printf("Ray traced lamps (r61): the half-resolution resolves' own build could not be made: "
+                    "they run the centred build\n");
     }
     const bool made =
         ray_pipeline &&
@@ -1606,9 +1654,20 @@ void PointShadow::Flush(bool animate_noise) {
         ++apart_passes;
         lost.armed = false;
     }
-    scheduler.RecordCrumb(
-        {.name = "Point shadows"},
-        [push, target_views, depth_view, sampler = *sampler, snap0 = *before[0].view,
+    // bbport (r61_lamp-window-cost): the resolves of a split pass run their own build (made beside
+    // the centred builds by Ready and HalfReady; null: the centred build, which r60 ran them in). With
+    // BB_GPU_PROFILE=1 a split pass is recorded in parts with a mark between them, so that the
+    // resolves have a row of their own ("Lighting: point shadows: resolve"): the trace and the
+    // resolve at full resolution; the first half's trace, its resolve, the second half's trace and
+    // its resolve at half resolution. Without the profiler, or a split, it is one part, as before.
+    const bool own_resolve = split && (use_half ? bool(half_resolve_pipeline) : bool(resolve_pipeline));
+    const int parts = split && GpuProfiler::Get() ? (use_half ? 4 : 2) : 0;
+    auto record =
+        [push, base_word = std::bit_cast<u32>(push.thickness_m), last_part = parts - 1, // bbport (r61)
+         resolve_pipe = own_resolve ? (use_half ? *half_resolve_pipeline : *resolve_pipeline) : vk::Pipeline{},
+         resolve_pipe_layout = own_resolve ? (use_half ? *half_resolve_layout : *resolve_layout)
+                                           : vk::PipelineLayout{},
+         target_views, depth_view, sampler = *sampler, snap0 = *before[0].view,
          snap1 = *before[1].view, batch = std::move(batch), words = std::move(data),
          buffer = light_data->Handle(), pipeline = use_rays ? *ray_pipeline : *pipeline,
          layout = use_rays ? *ray_layout : *layout, use_rays, scene = rt_shadow.Scene(), covered,
@@ -1624,91 +1683,96 @@ void PointShadow::Flush(bool animate_noise) {
          half_image = use_half ? vk::Image(half_answers.image) : vk::Image{},
          half_count_buffer = use_half ? half_counts->Handle() : vk::Buffer{},
          half_read_buffer = use_half ? half_readback->Handle() : vk::Buffer{}, half_lay_out,
-         half_count, half_clear](vk::CommandBuffer cmdbuf) mutable {
-            for (int i = 0; i < 2; ++i) {
-                if (!lay_out[i]) {
-                    continue;
+         half_count, half_clear](vk::CommandBuffer cmdbuf, int part) mutable {
+            // bbport (r61_lamp-window-cost): part: -1 the whole pass; else one part of the split pass
+            // (above). The first part lays out, clears and fills what the pass uses, as the whole pass
+            // does; every part binds its own pipeline, descriptors and constants.
+            if (part <= 0) {
+                for (int i = 0; i < 2; ++i) {
+                    if (!lay_out[i]) {
+                        continue;
+                    }
+                    const vk::ImageMemoryBarrier2 to_general{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                        .oldLayout = vk::ImageLayout::eUndefined,
+                        .newLayout = vk::ImageLayout::eGeneral,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = history_images[i],
+                        .subresourceRange = ColorRange,
+                    };
+                    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
                 }
-                const vk::ImageMemoryBarrier2 to_general{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                    .oldLayout = vk::ImageLayout::eUndefined,
-                    .newLayout = vk::ImageLayout::eGeneral,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = history_images[i],
-                    .subresourceRange = ColorRange,
-                };
-                cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
-            }
-            // bbport (r52_follow-soft): the follow images on their first use, as the history's
-            // (and zeroed below: nothing reads a texel the pass has not written, this keeps them
-            // defined all the same)
-            for (int i = 0; i < 2; ++i) {
-                if (!follow_lay_out[i]) {
-                    continue;
+                // bbport (r52_follow-soft): the follow images on their first use, as the history's
+                // (and zeroed below: nothing reads a texel the pass has not written, this keeps them
+                // defined all the same)
+                for (int i = 0; i < 2; ++i) {
+                    if (!follow_lay_out[i]) {
+                        continue;
+                    }
+                    const vk::ImageMemoryBarrier2 to_general{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                        .oldLayout = vk::ImageLayout::eUndefined,
+                        .newLayout = vk::ImageLayout::eGeneral,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = follow_images[i],
+                        .subresourceRange = ColorRange,
+                    };
+                    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
                 }
-                const vk::ImageMemoryBarrier2 to_general{
+                if (answers_lay_out) { // bbport (r60_lamp-centred-window): on its first use
+                    const vk::ImageMemoryBarrier2 to_general{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstStageMask = Compute,
+                        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                        .oldLayout = vk::ImageLayout::eUndefined,
+                        .newLayout = vk::ImageLayout::eGeneral,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .image = answers_image,
+                        .subresourceRange = ColorRange,
+                    };
+                    cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
+                }
+                const vk::MemoryBarrier2 to_transfer{
                     .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-                    .oldLayout = vk::ImageLayout::eUndefined,
-                    .newLayout = vk::ImageLayout::eGeneral,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = follow_images[i],
-                    .subresourceRange = ColorRange,
-                };
-                cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
-            }
-            if (answers_lay_out) { // bbport (r60_lamp-centred-window): on its first use
-                const vk::ImageMemoryBarrier2 to_general{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .dstStageMask = Compute,
-                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                    .oldLayout = vk::ImageLayout::eUndefined,
-                    .newLayout = vk::ImageLayout::eGeneral,
-                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = answers_image,
-                    .subresourceRange = ColorRange,
-                };
-                cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
-            }
-            const vk::MemoryBarrier2 to_transfer{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
-                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
-            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_transfer});
-            if (clear_history) {
-                const vk::MemoryBarrier2 history_free{
-                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                    .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryRead,
                     .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
                     .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
-                cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &history_free});
-                const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
-                cmdbuf.clearColorImage(history_cur_image, vk::ImageLayout::eGeneral, zero, ColorRange);
-            }
-            for (int i = 0; i < 2; ++i) { // bbport (r52_follow-soft)
-                if (follow_lay_out[i]) {
+                cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_transfer});
+                if (clear_history) {
+                    const vk::MemoryBarrier2 history_free{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite};
+                    cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &history_free});
                     const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
-                    cmdbuf.clearColorImage(follow_images[i], vk::ImageLayout::eGeneral, zero, ColorRange);
+                    cmdbuf.clearColorImage(history_cur_image, vk::ImageLayout::eGeneral, zero, ColorRange);
                 }
+                for (int i = 0; i < 2; ++i) { // bbport (r52_follow-soft)
+                    if (follow_lay_out[i]) {
+                        const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+                        cmdbuf.clearColorImage(follow_images[i], vk::ImageLayout::eGeneral, zero, ColorRange);
+                    }
+                }
+                for (u32 at = 0; at < words.size(); at += UpdateWords) {
+                    const u32 count = std::min<u32>(UpdateWords, u32(words.size()) - at);
+                    cmdbuf.updateBuffer(buffer, at * sizeof(u32), count * sizeof(u32), words.data() + at);
+                }
+                const vk::MemoryBarrier2 before{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = Compute,
+                    .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+                                     vk::AccessFlagBits2::eShaderWrite};
+                cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
             }
-            for (u32 at = 0; at < words.size(); at += UpdateWords) {
-                const u32 count = std::min<u32>(UpdateWords, u32(words.size()) - at);
-                cmdbuf.updateBuffer(buffer, at * sizeof(u32), count * sizeof(u32), words.data() + at);
-            }
-            const vk::MemoryBarrier2 before{
-                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-                .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
-                .dstStageMask = Compute,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderRead |
-                                 vk::AccessFlagBits2::eShaderWrite};
-            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
             const vk::DescriptorBufferInfo lights{buffer, 0, words.size() * sizeof(u32)};
             const vk::DescriptorImageInfo depth_info{sampler, depth_view,
                                                      vk::ImageLayout::eGeneral};
@@ -1771,7 +1835,7 @@ void PointShadow::Flush(bool animate_noise) {
             // (16x16 pixels a workgroup), then the other three, each taking its block's answer
             // or tracing; then what the full-resolution pass does after its dispatch.
             if (half_pipe) {
-                if (half_lay_out) {
+                if (half_lay_out && part <= 0) {
                     const vk::ImageMemoryBarrier2 to_general{
                         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
                         .dstStageMask = Compute,
@@ -1787,7 +1851,7 @@ void PointShadow::Flush(bool animate_noise) {
                     cmdbuf.pipelineBarrier2(
                         {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
                 }
-                if (half_clear) { // the counters start at zero
+                if (half_clear && part <= 0) { // the counters start at zero
                     cmdbuf.fillBuffer(half_count_buffer, 0, VK_WHOLE_SIZE, 0);
                     EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eTransfer,
                                               vk::AccessFlagBits2::eTransferWrite, Compute,
@@ -1816,50 +1880,73 @@ void PointShadow::Flush(bool animate_noise) {
                     vk::WriteDescriptorSet{.dstBinding = 13, .descriptorCount = 1,
                                            .descriptorType = vk::DescriptorType::eStorageImage,
                                            .pImageInfo = &answers_info}};
-                cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, half_pipe);
-                cmdbuf.pushDescriptorSetKHR(
-                    vk::PipelineBindPoint::eCompute, half_pipe_layout, 0,
-                    vk::ArrayProxy<const vk::WriteDescriptorSet>(half_with_answers ? 14u : 13u, half_writes.data()));
+                // bbport (r61_lamp-window-cost): a build and its bindings (the resolves' own build
+                // or the pass's)
+                const auto bind = [&](vk::Pipeline pipe, vk::PipelineLayout pipe_layout) {
+                    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipe);
+                    cmdbuf.pushDescriptorSetKHR(
+                        vk::PipelineBindPoint::eCompute, pipe_layout, 0,
+                        vk::ArrayProxy<const vk::WriteDescriptorSet>(half_with_answers ? 14u : 13u, half_writes.data()));
+                };
+                bind(half_pipe, half_pipe_layout);
+                const vk::PipelineLayout resolve_push_layout = resolve_pipe ? resolve_pipe_layout : half_pipe_layout;
                 push.first_light = table;
                 push.light_count = tile_count;
                 push.rect = covered;
-                const u32 mode = std::bit_cast<u32>(push.thickness_m) |
-                                 (half_count ? ModeHalfCount : 0u);
+                const u32 mode = base_word | (half_count ? ModeHalfCount : 0u); // bbport (r61): as before
                 // bbport (r60_lamp-centred-window): split, each half as a trace and a resolve; the
                 // second half's trace reads the block answers and the history the first half's
                 // resolve wrote (HalfAnswer, a taken block's copy), so four dispatches. The
                 // resolves count nothing (each pixel is counted once, by its trace).
                 const u32 trace = split ? ModeTrace : 0u;
                 const u32 resolve = (mode & ~ModeHalfCount) | ModeResolve;
-                push.thickness_m = std::bit_cast<float>(mode | ModeHalfFirst | trace);
-                cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                                     sizeof(Push), &push);
                 const u32 hx0 = u32(covered[0]) / 16, hy0 = u32(covered[1]) / 16;
                 const u32 hx1 = (u32(covered[2]) + 15) / 16, hy1 = (u32(covered[3]) + 15) / 16;
-                cmdbuf.dispatchBase(hx0, hy0, 0, hx1 - hx0, hy1 - hy0, 1);
-                EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite,
-                                          Compute,
-                                          vk::AccessFlagBits2::eShaderRead |
-                                              vk::AccessFlagBits2::eShaderWrite);
-                if (split) {
-                    push.thickness_m = std::bit_cast<float>(resolve | ModeHalfFirst);
+                if (part <= 0) {
+                    push.thickness_m = std::bit_cast<float>(mode | ModeHalfFirst | trace);
                     cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(Push), &push);
+                    cmdbuf.dispatchBase(hx0, hy0, 0, hx1 - hx0, hy1 - hy0, 1);
+                    EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite,
+                                              Compute,
+                                              vk::AccessFlagBits2::eShaderRead |
+                                                  vk::AccessFlagBits2::eShaderWrite);
+                }
+                if (split && (part < 0 || part == 1)) {
+                    if (resolve_pipe) { // bbport (r61_lamp-window-cost)
+                        bind(resolve_pipe, resolve_pipe_layout);
+                    }
+                    push.thickness_m = std::bit_cast<float>(resolve | ModeHalfFirst);
+                    cmdbuf.pushConstants(resolve_push_layout, vk::ShaderStageFlagBits::eCompute, 0,
                                          sizeof(Push), &push);
                     cmdbuf.dispatchBase(hx0, hy0, 0, hx1 - hx0, hy1 - hy0, 1);
                     between();
                 }
-                push.thickness_m = std::bit_cast<float>(mode | ModeHalfFill | trace);
-                cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
-                                     sizeof(Push), &push);
                 const u32 gx0 = u32(covered[0]) / 8, gy0 = u32(covered[1]) / 8;
                 const u32 gx1 = (u32(covered[2]) + 7) / 8, gy1 = (u32(covered[3]) + 7) / 8;
-                cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
-                if (split) {
-                    between();
-                    push.thickness_m = std::bit_cast<float>(resolve | ModeHalfFill);
+                if (part < 0 || part == 2) {
+                    if (resolve_pipe && part < 0) { // bbport (r61_lamp-window-cost): the trace's build again
+                        bind(half_pipe, half_pipe_layout);
+                    }
+                    push.thickness_m = std::bit_cast<float>(mode | ModeHalfFill | trace);
                     cmdbuf.pushConstants(half_pipe_layout, vk::ShaderStageFlagBits::eCompute, 0,
                                          sizeof(Push), &push);
                     cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                    if (split) {
+                        between();
+                    }
+                }
+                if (split && (part < 0 || part == 3)) {
+                    if (resolve_pipe) { // bbport (r61_lamp-window-cost)
+                        bind(resolve_pipe, resolve_pipe_layout);
+                    }
+                    push.thickness_m = std::bit_cast<float>(resolve | ModeHalfFill);
+                    cmdbuf.pushConstants(resolve_push_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(Push), &push);
+                    cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                }
+                if (part >= 0 && part != last_part) {
+                    return; // bbport (r61_lamp-window-cost): what follows ends the last part
                 }
                 const vk::MemoryBarrier2 half_after{
                     .srcStageMask = Compute,
@@ -1892,20 +1979,36 @@ void PointShadow::Flush(bool animate_noise) {
                 push.first_light = table;
                 push.light_count = tile_count;
                 push.rect = covered;
-                cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
                 const u32 gx0 = u32(covered[0]) / 8, gy0 = u32(covered[1]) / 8;
                 const u32 gx1 = (u32(covered[2]) + 7) / 8, gy1 = (u32(covered[3]) + 7) / 8;
                 if (split) { // bbport (r60_lamp-centred-window): the trace, then the resolve
-                    const u32 mode = std::bit_cast<u32>(push.thickness_m);
-                    push.thickness_m = std::bit_cast<float>(mode | ModeTrace);
+                    if (part <= 0) {
+                        push.thickness_m = std::bit_cast<float>(base_word | ModeTrace);
+                        cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
+                        cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                        between();
+                    }
+                    if (part < 0 || part == 1) {
+                        // bbport (r61_lamp-window-cost): the resolves' own build, when there is one
+                        if (resolve_pipe) {
+                            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, resolve_pipe);
+                            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, resolve_pipe_layout, 0,
+                                                        vk::ArrayProxy<const vk::WriteDescriptorSet>(
+                                                            ray_count, ray_writes.data()));
+                        }
+                        push.thickness_m = std::bit_cast<float>(base_word | ModeResolve);
+                        cmdbuf.pushConstants(resolve_pipe ? resolve_pipe_layout : layout,
+                                             vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
+                        cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
+                    }
+                } else {
                     cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
                     cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
-                    between();
-                    push.thickness_m = std::bit_cast<float>(mode | ModeResolve);
-                    cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push), &push);
                 }
-                cmdbuf.dispatchBase(gx0, gy0, 0, gx1 - gx0, gy1 - gy0, 1);
                 batch.clear();
+            }
+            if (part >= 0 && part != last_part) {
+                return; // bbport (r61_lamp-window-cost): what follows ends the last part
             }
             for (const Tile& tile : batch) {
                 push.first_light = tile.first_light;
@@ -1924,7 +2027,22 @@ void PointShadow::Flush(bool animate_noise) {
                 .dstAccessMask = vk::AccessFlagBits2::eMemoryRead |
                                  vk::AccessFlagBits2::eMemoryWrite};
             cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
-        });
+        };
+    if (parts == 0) {
+        scheduler.RecordCrumb({.name = "Point shadows"},
+                              [record = std::move(record)](vk::CommandBuffer cmdbuf) mutable { record(cmdbuf, -1); });
+        return;
+    }
+    // bbport (r61_lamp-window-cost): the parts in order, one closure shared by them (it holds the
+    // pass's words and tiles once); the marks are written where each part starts
+    const auto shared = std::make_shared<decltype(record)>(std::move(record));
+    for (int part = 0; part < parts; ++part) {
+        if (part > 0) {
+            EffectPass::Mark(part % 2 != 0 ? 61 : 6, part % 2 != 0 ? "point shadows: resolve" : "point shadows");
+        }
+        scheduler.RecordCrumb({.name = "Point shadows"},
+                              [shared, part](vk::CommandBuffer cmdbuf) { (*shared)(cmdbuf, part); });
+    }
 }
 
 }

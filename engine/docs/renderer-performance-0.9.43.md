@@ -95,6 +95,64 @@ switch on is not a run of the pre-PR engine.
   without frame capture, and one lab line where 2 changes 663 pixels of the half-resolution
   lamps-apart case. No
   experiment bit gates it, so the switch does not change it.
+- **Cheaper centred lamp window (r61).** Only `BB_LAMP_SHADOW_WINDOW=2` changes; 0 and 1 are as before
+  (their two shader builds are byte for byte the same, and the pass records the same commands for them).
+  In `point_shadow_ray.comp`, under `CENTRED`, the resolve (`MODE_RESOLVE`) no longer lists the lamp
+  tiles: each invocation loads its own pixel's texel of the answers image, and a workgroup whose trace
+  answered none of its pixels returns at once (before the tuning words, the light targets, depth and the
+  tile); it loads only the 80 texels of the ring around the workgroup into its 12x12 tile, the centre
+  coming from the texels it already holds; with `MODE_APART` it reads the lamp light only of answered
+  pixels; it skips the barrier after the trace flag, the disc's sample point and the half-resolution
+  block answers its trace had already stored as "none". In logic each of these leaves every value the
+  pass writes as r60 wrote it (the reasons are in the shader's comments); in bits that is not proven,
+  as the centred build's SPIR-V changes too (85972 to 89716 bytes) and a driver may round it
+  differently. Checked in two lab runs of this build against two lab runs of r60 alone: the torch
+  lab's r60 lattice lines (six cases, each at full and half resolution: the window phases and, for
+  the last frame with 2 against 1, the mean difference and the pixels apart by more than 0.01) agree
+  to the printed digits in the phases and within 0.00001 in the mean differences; the pixel counts
+  (28000 to 93000) differ by at most 15, where two runs of one build differ by up to 8.
+  New builds `point_shadow_ray_resolve_comp`
+  and `point_shadow_ray_half_resolve_comp` (`CENTRED=1 RESOLVE=1`, `gpu/CMakeLists.txt`): the centred
+  build with every dispatch a resolve, so its ray code cannot be reached (the SPIR-V still holds it; the
+  saving needs the driver to drop it) and the driver may give it fewer registers. `PointShadow::Ready`
+  makes the full-resolution one when it runs (at start with r65, else at the first lamp draw);
+  `HalfReady` makes the half-resolution one beside the half
+  centred build, at start with r65, and without r65 at the first half-resolution pass, beside r60's own
+  centred build, so that stall gets a second compile. The split pass runs its resolves with them;
+  `BB_LAMP_SHADOW_RESOLVE_BUILD` with a value starting with `0`, read once by `Ready`, or a build that cannot be made, runs them in
+  the centred build, which r60 ran them in. Their logic is the same text, but a different build may
+  round a few floating-point operations differently (the driver's choice of fused multiply-adds), so
+  they are not proven to give the same bits. Where they differ it is usually at most one storage step
+  of a value (the 16-bit history, the 11-bit light); rarely a 1-ulp difference flips a threshold of the
+  resolve (`got > 0.01`, the `fa > 0.01` test that clears the follow weight, `frames > 1.5`), which
+  gives one pixel a larger difference for one frame that then decays with the history. The pass or
+  fail test is the torch lab's "r61 resolve build" line: the centred build's count at most the
+  repeat's. It passed in both lab runs: at full resolution 0 against 0 and 788 against 788 pixels,
+  at half resolution 0 against 1547 and 822 against 822 (the centred build's count first).
+  With `BB_GPU_PROFILE=1` a split pass is recorded in parts with a profiler mark between them, so the
+  resolves get a row of their own, "Lighting: point shadows: resolve" (the traces stay in "Lighting: point
+  shadows"; without the profiler the pass is one part, as before). Measured on an RTX 4090, Ryzen 9
+  7900X3D, 4K output with DLSS Performance (1080p internal), in a build that also held other changes
+  not in this branch (one of them on by default), the same on both sides of every pair. Torch lab,
+  `BB_LAMP_SHADOW_WINDOW=2`, one build, `BB_LAMP_SHADOW_RESOLVE_BUILD=1` (the resolves in their own
+  build) against `0` (the resolves in the centred build, as r60 ran them), the whole lamp pass, two
+  runs: 0.238 ms to 0.199 ms and 0.238 ms to 0.200 ms at full resolution, 0.309 ms to 0.276 ms and
+  0.350 ms to 0.311 ms at half resolution. Separate lab runs of r60 alone gave 0.243 and 0.247 ms at
+  full resolution and 0.316 and 0.317 ms at half resolution for 2. In the game, standing for 20 s,
+  three pairs of runs of one build, `BB_LAMP_SHADOW_WINDOW=2` minus `BB_LAMP_SHADOW_WINDOW=1`, the lamp
+  pass's profiler rows with the resolve row included: a median of +0.007 ms (pairs +0.005 to
+  +0.047 ms) at full resolution and +0.081 ms (+0.061 to +0.138 ms) at half resolution
+  (`graphics_lamp_shadow_half=1`); the GPU profile's busy time per frame rose by a median of 0.10 ms
+  (pairs +0.02 to +0.14 ms) and 0.27 ms (-0.12 to +0.27 ms), within that total's spread between
+  repeats of one case (up to 0.31 ms). The wake pictures show smooth edges with 2 and 8 px steps
+  with 1. Open: 2 run twice in one lab run does not give the same result everywhere (two lab runs:
+  0 and 788 pixels at full resolution, 1547 and 822 at half resolution, at most 0.0156 of a value)
+  while the control, 1, repeats exactly (0); this change did not create it (r60 already has the 663
+  pixel line) and it is left as invisible. Memory and bindings as r60. The binding lists of each
+  resolve build and its centred build are written once, in one helper in `PointShadow::Ready` and
+  one in `PointShadow::HalfReady`, as the pass pushes the same descriptor writes to either. The
+  default stays
+  `LampWindowDefault` = 1. No experiment bit gates it, so the switch does not change it.
 - **Startup-only items.** The motion store size and thread pinning are read once at start.
 
 ## Effect on the claimed numbers

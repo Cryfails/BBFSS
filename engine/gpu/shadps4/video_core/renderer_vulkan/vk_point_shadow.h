@@ -236,6 +236,16 @@ private:
     OwnImage answers;
     bool answers_laid_out = false;
     bool answers_short = false;
+    // bbport (r61_lamp-window-cost): the resolves' own builds (point_shadow_ray_resolve_comp, made by
+    // Ready, and point_shadow_ray_half_resolve_comp, made by HalfReady, beside the centred builds,
+    // with the same bindings): the centred build in which every dispatch is a resolve, so its ray
+    // code cannot be reached. resolve_wanted: BB_LAMP_SHADOW_RESOLVE_BUILD is not 0 (read once, by
+    // Ready). A build that is null (not wanted or not made): its resolves run the centred build, which
+    // r60 ran them in.
+    bool resolve_wanted = false;
+    vk::UniqueDescriptorSetLayout resolve_set_layout, half_resolve_set_layout;
+    vk::UniquePipelineLayout resolve_layout, half_resolve_layout;
+    vk::UniquePipeline resolve_pipeline, half_resolve_pipeline;
     std::array<float, 12> last_view{}, pending_view{};
     std::array<float, 16> last_proj{}, pending_proj{};
     bool last_valid = false, pending_valid = false;
