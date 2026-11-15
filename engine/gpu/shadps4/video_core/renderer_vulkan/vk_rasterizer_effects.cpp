@@ -337,7 +337,9 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
     if (fetch) {
         for (const auto& attribute : fetch->attributes) {
             if (attribute.semantic == 0) {
-                draw.positions = attribute.GetSharp(vs).base_address;
+                const auto stream = attribute.GetSharp(vs);
+                draw.positions = stream.base_address;
+                draw.positions_size = stream.GetSize(); // bbport (r47c_review-fixes)
                 break;
             }
         }
@@ -351,6 +353,11 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
     const bool r19_reuse = r19 && r19_motion.valid;
     const bool r19_palette = r19_reuse && r19_motion.palette_complete;
     draw.r19_wanted = r19; // Wanted() was true above
+    // bbport (r47b_casters): a small bone palette in memory the GPU wrote is known by where it
+    // lies, not by its bytes (see RtShadow::Draw::palette_placed). Experiment StillCheckOldBit
+    // set: by its bytes in guest memory, as before.
+    // bbport (r47c_review-fixes): nor with BB_RT_PALETTE_PLACE=0 (RtShadow::PalettePlace).
+    const bool r47b_placed = !BbToggle::Experiment(StillCheckOldBit) && RtShadow::PalettePlace();
     if (is_indexed) {
         const VAddr address = regs.index_base_address.Address<VAddr>() + u64(index_offset) * index_size;
         const u64 bytes = u64(regs.num_indices) * index_size;
@@ -378,8 +385,24 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
             if (role == Motion::BufferRole::Skeleton) {
                 draw.skinned = true;
             } else if (role == Motion::BufferRole::SmallSkeleton && !r19_palette) {
-                draw.palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(buffer.base_address),
-                                                    size, draw.palette);
+                // (r19_palette: the Motion block hashed every palette of this draw, none of
+                // them GPU-written)
+                // bbport (r47c_review-fixes): not while the range is bound to the game's own
+                // memory in place (BB_GUEST_IN_PLACE). There IsRegionGpuModified only says that
+                // a write of the command stream is not done yet: the bytes in guest memory are
+                // the palette's, and the answer changes with the GPU's progress (one prop would
+                // be known by its address on one draw and by its bytes on the next). What the
+                // GPU wrote for good is kept in VRAM, not in place.
+                if (r47b_placed &&
+                    buffer_cache.IsRegionGpuModified(buffer.base_address, size) &&
+                    !buffer_cache.IsInPlace(buffer.base_address, size)) {
+                    const std::array<u64, 2> place{buffer.base_address, size};
+                    draw.palette = XXH3_64bits_withSeed(place.data(), sizeof(place), draw.palette);
+                    draw.palette_placed = true;
+                } else {
+                    draw.palette = XXH3_64bits_withSeed(
+                        reinterpret_cast<const void*>(buffer.base_address), size, draw.palette);
+                }
             }
         }
     }

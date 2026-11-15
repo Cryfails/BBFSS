@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r47_still-check): the world bounds of one captured mesh (RtShadow::RecordBuilds, before
+// rt_unproject.comp brings its vertices to world space), into its signature: eight words that
+// renderer_vulkan/rt_still_check.h reads (DecodeStillSig; StillPoint and StillSigAdd are this
+// shader's sum on the CPU). One invocation an index of the mesh's triangle list: only the
+// vertices its triangles use were written by the capture. The rest of its vertex range holds
+// whatever an earlier frame left there, so the bounds cannot be gathered over the range (as
+// rt_unproject.comp walks it). The slots are zeroed before the dispatch: every word only grows
+// (the least value is kept as the greatest inverted key).
+// The vertices are read as the capture stored them, in clip space, and brought to world space
+// here in two parts: to their place about the capture's camera, then the camera's place is
+// added. rt_unproject.comp's one matrix would round a far vertex by millimetres, differently for
+// every pose of the camera (StillClipToWorld in rt_still_check.h says why), and a wall far away
+// would seem to move whenever the camera does.
+
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Indices { uint i[]; };
+
+layout(std430, set = 0, binding = 0) readonly buffer Positions { vec4 p[]; } positions;
+layout(std430, set = 0, binding = 1) buffer Signatures { uint s[]; } signatures;
+
+layout(push_constant) uniform Constants {
+    vec4 row0;       // clip space to world space about the capture's camera (StillClipToWorld)
+    vec4 row1;
+    vec4 row2;
+    vec3 origin;     // that camera's place in the world
+    uint first;      // the mesh's first vertex in `positions`
+    Indices indices; // its triangle list, relative to `first`
+    uint count;      // indices
+    uint slot;       // its signature
+};
+
+// A float as an unsigned number of the same order (StillKey).
+uvec3 Key(vec3 v) {
+    const uvec3 bits = floatBitsToUint(v);
+    return mix(bits | uvec3(0x80000000u), ~bits, notEqual(bits & uvec3(0x80000000u), uvec3(0u)));
+}
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    if (id >= count) {
+        return;
+    }
+    const vec4 clip = positions.p[first + indices.i[id]];
+    const vec3 p = vec3(dot(row0, clip), dot(row1, clip), dot(row2, clip)) + origin;
+    // Not a finite number (all exponent bits set): counted and left out. 0 is below every key
+    // and every inverted key of a finite number, so it leaves the greatest as it is.
+    const bool finite = !any(equal(floatBitsToUint(p) & uvec3(0x7f800000u), uvec3(0x7f800000u)));
+    const uvec3 key = Key(p);
+    // One thread of each subgroup writes for all of it: the words are shared by the whole
+    // dispatch, and seven atomics a vertex on the same seven words would queue up.
+    const uvec3 least = subgroupMax(finite ? ~key : uvec3(0u));
+    const uvec3 greatest = subgroupMax(finite ? key : uvec3(0u));
+    const uint taken = subgroupAdd(finite ? 1u : 0u);
+    const uint left = subgroupAdd(finite ? 0u : 1u);
+    if (!subgroupElect()) {
+        return;
+    }
+    const uint at = slot * 8u;
+    for (uint k = 0u; k < 3u; ++k) {
+        atomicMax(signatures.s[at + k], least[k]);
+        atomicMax(signatures.s[at + 3u + k], greatest[k]);
+    }
+    atomicAdd(signatures.s[at + 6u], taken);
+    atomicAdd(signatures.s[at + 7u], left);
+}

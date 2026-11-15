@@ -207,6 +207,8 @@ add_host_shader(paint_lock.comp paint_lock_comp)
 add_host_shader(rt_shadow.comp rt_shadow_comp)
 add_host_shader(rt_shadow.comp rt_shadow_coverage_comp COVERAGE_SKIP=1)
 add_host_shader(rt_unproject.comp rt_unproject_comp)
+# bbport (r47_still-check): the bounds of a captured mesh, for the looks at casters held for still
+add_host_shader(rt_still_sig.comp rt_still_sig_comp)
 add_host_shader(sun_vsm.comp sun_vsm_comp)
 add_host_shader(sun_vsm_draw.vert sun_vsm_draw_vert)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_comp)
@@ -463,6 +465,14 @@ add_dependencies(drawn-look-test host_shaders)
 add_executable(rt-copy-turns-test EXCLUDE_FROM_ALL ../tests/test_rt_copy_turns.cpp)
 target_compile_options(rt-copy-turns-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(rt-copy-turns-test PRIVATE ..)
+# bbport (r46_lamp-cards): which cut-out cards lamp rays leave out (rt_lamp_cards.h)
+add_executable(rt-lamp-cards-test EXCLUDE_FROM_ALL ../tests/test_rt_lamp_cards.cpp)
+target_compile_options(rt-lamp-cards-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(rt-lamp-cards-test PRIVATE ..)
+# bbport (r47_still-check): whether a caster held for still has moved (rt_still_check.h)
+add_executable(rt-still-check-test EXCLUDE_FROM_ALL ../tests/test_rt_still_check.cpp)
+target_compile_options(rt-still-check-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(rt-still-check-test PRIVATE ..)
 foreach(effect_test
         "motion-blur-shader-test;test_motion_blur.cpp"
         "directional-shadow-test;test_directional_shadows.cpp"

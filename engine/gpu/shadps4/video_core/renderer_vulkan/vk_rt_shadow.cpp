@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef> // bbport (r47_still-check): offsetof
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,8 +21,10 @@
 #include "video_core/host_shaders/rt_shadow_coverage_comp.h"
 #include "video_core/host_shaders/rt_shadow_filter_r25_comp.h" // bbport (r25_rt-sun-trace)
 #include "video_core/host_shaders/rt_shadow_half_comp.h"       // bbport (r25_rt-sun-trace)
+#include "video_core/host_shaders/rt_still_sig_comp.h"         // bbport (r47_still-check)
 #include "video_core/host_shaders/rt_unproject_comp.h"
 #include "video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r42_lamp-soft)
+#include "video_core/renderer_vulkan/rt_lamp_cards.h"    // bbport (r46_lamp-cards)
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -69,9 +72,102 @@ constexpr VkBufferUsageFlags InputUsage = VK_BUFFER_USAGE_ACCELERATION_STRUCTURE
 constexpr u8 ShadowMask = 1, CameraMask = 2;
 // bbport: what lamp rays hit (point_shadow_ray.comp). A ray cannot test a texture, so a cut-out
 // card (a leaf on a vine) shadows as its whole polygon: rectangles of shadow on the ground. The
-// cards the shadow pass draws (Entry::shadow_card) stay out and cast no lamp shadow, as in the
-// game; skinned meshes keep theirs (cloth).
+// cards stay out and cast no lamp shadow, as in the game; skinned meshes keep theirs (cloth).
+// bbport (r46_lamp-cards): a card is known by any draw of it that ever showed a cut-out: a sun
+// shadow pass draw with a texture, or a camera pass draw with a discarding pixel shader, its
+// own or another draw of the same mesh (Entry::card_shadow, card_camera, card_mesh; LampCard in
+// rt_lamp_cards.h). Before, only by the texture of a sun shadow pass draw that was the entry's
+// first of a frame, and only while the entry did not count as moving (Entry::shadow_card): the
+// plants kept their lamp bit. That rule is still the one with experiment LampCardsOldBit set or
+// BB_RT_LAMP_CARDS=0.
 constexpr u8 LampMask = 4;
+// bbport (r46_lamp-cards, r46b_plant-rule): BB_RT_LAMP_CARDS, read once (default
+// LampCardLevelDefault, 3; at most LampCardLevelMost, 3). 0: the rule of before. 1: cut-outs
+// without a skeleton stay out of lamp rays. 2: every cut-out stays out, skinned ones too (hair
+// and cloth then cast no lamp shadow). 3: as 1, and of the skinned cut-outs those whose vertices
+// no sun shadow pass draws (Entry::lone): the plants that threw the rectangles are drawn with a
+// skeleton, and the game gives them no sun shadow, while it gives one to every character.
+// bbport (r46b_plant-rule): position streams known at most (lone_streams), and the frames a
+// stream that is not lone stays known undrawn once the map is full.
+constexpr std::size_t LoneStreamsMost = 16384;
+constexpr u64 LoneStreamKeep = 600;
+u32 LampCardLevel() {
+    static const u32 level = ReadCopyTurnKnob(std::getenv("BB_RT_LAMP_CARDS"),
+                                              LampCardLevelDefault, LampCardLevelMost);
+    return level;
+}
+// bbport (r47_still-check): the knobs of the looks at casters held for still (rt_still_check.h),
+// each read once. BB_RT_STILL: on (the default), count (the looks and the 600-frame line, but
+// nothing is counted as moving: the picture and every structure as before, with the proof in the
+// log) or off. BB_RT_STILL_BUDGET: triangles a frame looked at again in turn (default
+// StillBudget, 60,000; at most StillBudgetMost; 0: none). BB_RT_STILL_EARLY: the same for the
+// first look after a build, and once more for the other early looks (the first StillEarlyChecks;
+// default StillEarly, 100,000). A caster whose turn finds its budget used up waits for the next
+// frame. So that those drawn first do not take the budget again at every period while those
+// drawn last wait for good, a look in turn does not come again before every caster looked at in
+// turn could have had its own at the budget (StillCrowd of still_pool_last): where a scene
+// holds more casters than the budget lets through at the usual pace, all of them are looked
+// at, more rarely. (bbport (r47c_review-fixes): at first only the casters DUE on the frame
+// before were counted, a few frames' worth, which put nothing off.) And a look in turn that
+// has waited BB_RT_STILL_OVERDUE frames (StillOverdueFrames below) is served from a second
+// budget of the same size: a caster that only every 8th frame draws (a far sun cascade's)
+// found the first one used up by those drawn before it every time, and in the game such looks
+// waited without end. The caster that
+// crosses a budget is still looked at. BB_RT_STILL_TOLERANCE: metres its bounds may differ by
+// (default StillTolerance, 0.004; StillToleranceLeast to StillToleranceMost).
+// BB_RT_STILL_MOVERS: the most triangles of living casters the looks count as moving, which are
+// refit at every draw (default StillMovers, 400,000; at most StillMoversMost; 0: none is taken).
+u32 StillMode() {
+    static const u32 mode = ReadStillMode(std::getenv("BB_RT_STILL"));
+    return mode;
+}
+u32 StillLane(bool early) {
+    static const u32 turn =
+        ReadCopyTurnKnob(std::getenv("BB_RT_STILL_BUDGET"), StillBudget, StillBudgetMost);
+    static const u32 first =
+        ReadCopyTurnKnob(std::getenv("BB_RT_STILL_EARLY"), StillEarly, StillBudgetMost);
+    return early ? first : turn;
+}
+float StillLimit() {
+    static const float limit = ReadStillTolerance(std::getenv("BB_RT_STILL_TOLERANCE"));
+    return limit;
+}
+u32 StillMoverCap() {
+    static const u32 cap =
+        ReadCopyTurnKnob(std::getenv("BB_RT_STILL_MOVERS"), StillMovers, StillMoversMost);
+    return cap;
+}
+// bbport (r47b_casters): BB_RT_STILL_LIST=<n>, read once (default 0: no list; at most 1024): a
+// diagnostic. Under the still check's 600-frame line, one line "still mover:" for every caster a
+// look found moving since the last line (up to n, each caster once with its farthest move):
+// mesh, key, triangles, how far, on how many looks, both boxes and their sizes, its class
+// (an instance's own entry or known by draw order; palette none, by its bytes or by its address;
+// skinned or not), the pass of the capture, taken as moving or not. Needs BB_RT_STILL=count or
+// on. A far move with an unchanged box size is one caster captured at two instances' places.
+// bbport (r47c_review-fixes): BB_RT_STILL_OVERDUE=<frames>, read once (default StillOverdue, 64;
+// at most StillOverdueMost; 0: no second budget, as before): a look in turn that has waited this
+// long for a budget that is used up when its draw comes is served from a second budget of the
+// same size (rt_still_check.h, StillLaneOf).
+u32 StillOverdueFrames() {
+    static const u32 frames =
+        ReadCopyTurnKnob(std::getenv("BB_RT_STILL_OVERDUE"), StillOverdue, StillOverdueMost);
+    return frames;
+}
+constexpr u32 StillListCap = 1024;
+u32 StillListMost() {
+    static const u32 most = ReadCopyTurnKnob(std::getenv("BB_RT_STILL_LIST"), 0, StillListCap);
+    return most;
+}
+// BB_RT_LAMP_LEAVE, read once (default 0: nothing; at most StillLeaveMost): a diagnostic that
+// tells which kind of caster throws a lamp shadow. Lamp rays leave out the instances of the
+// classes it names (StillLeaveClasses: 1 not drawn by the camera pass, 2 held for a sun cascade,
+// 4 shared copies, 8 instances' own entries, 16 held for still by draw order, 32 moving and not
+// shared, 64 r46's cut-out cards). It acts whatever BB_RT_STILL and the experiment bits say.
+u32 LampLeave() {
+    static const u32 classes =
+        ReadCopyTurnKnob(std::getenv("BB_RT_LAMP_LEAVE"), 0, StillLeaveMost);
+    return classes;
+}
 // bbport (r41_lamp-shadows): a moving copy of a mesh drawn more than once in a pass (a "shared"
 // entry, see PrepareDraw) is never refit, only rebuilt, within RebuiltTrianglesPerFrame and in
 // draw order. Where a frame's copies hold more triangles than that, the same ones go without
@@ -264,6 +360,25 @@ struct UnprojectPush {
 };
 static_assert(sizeof(UnprojectPush) == 56);
 
+// bbport (r47_still-check): rt_still_sig.comp's push constants: what takes a capture's clip
+// space positions to world space (StillClipToWorld), the mesh's first vertex in `positions`,
+// the address of its triangle list, its indices, its signature's place.
+struct StillPush {
+    std::array<float, 12> rows;
+    std::array<float, 3> origin;
+    u32 first;
+    u64 indices;
+    u32 count;
+    u32 slot;
+};
+static_assert(sizeof(StillPush) == 80 && offsetof(StillPush, first) == 60 &&
+              offsetof(StillPush, indices) == 64 && offsetof(StillPush, slot) == 76);
+
+// The key of an instance's own entry (see PrepareDraw): its mesh key and its bone palette.
+u64 InstanceKey(u64 key, u64 palette) {
+    return XXH3_64bits_withSeed(&palette, sizeof(palette), key ^ 0xa24baed4963ee407ull);
+}
+
 constexpr auto Compute = vk::PipelineStageFlagBits2::eComputeShader;
 constexpr auto AsBuild = vk::PipelineStageFlagBits2::eAccelerationStructureBuildKHR;
 
@@ -407,6 +522,8 @@ RtShadow::~RtShadow() {
     }
     Free(r25_counts); // bbport (r25_rt-sun-trace)
     Free(r25_readback);
+    Free(still_sigs); // bbport (r47_still-check)
+    Free(still_readback);
     if (raw_view) {
         device.destroyImageView(raw_view);
     }
@@ -457,6 +574,18 @@ void RtShadow::Destroy(Entry& entry) {
     blas_bytes -= std::min(blas_bytes, entry.scene_bytes);
     entry.bytes = 0;
     entry.scene_bytes = 0;
+    // bbport (r47_still-check): its signatures still on their way back are not read (the lists
+    // point at the entry), and it no longer counts against the cap of the casters found moving.
+    if (entry.still_wait != 0) {
+        for (auto& list : still_pending) {
+            std::erase_if(list, [&](const StillPending& item) { return item.entry == &entry; });
+        }
+        entry.still_wait = 0;
+    }
+    if (entry.still_moved) {
+        still_mover_triangles -= std::min<u64>(still_mover_triangles, entry.triangles);
+        entry.still_moved = false;
+    }
     const auto device = instance.GetDevice();
     const auto allocator = instance.GetAllocator();
     // bbport (r35_pending-ops): a pure free (the entry is gone from the scene): may be carried.
@@ -562,6 +691,53 @@ bool RtShadow::Setup(const ObjectMotion& object_motion) {
         return false;
     }
     std::memset(r25_readback.mapped, 0, R25Slots * sizeof(u32));
+    // bbport (r47_still-check): the signature pass and its buffers, unless BB_RT_STILL=off.
+    // Without them there are no looks; ray tracing is as before. The copies the host reads lie
+    // in memory it reads fast (Make's host buffers are for writing, as the sun VSM's Make notes
+    // for its own readback).
+    if (StillMode() != StillOff) {
+        const vk::DeviceSize sig_bytes = vk::DeviceSize(StillSigsPerFrame) * StillSigWords * 4;
+        const VkBufferCreateInfo readback_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = 4 * sig_bytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        };
+        VmaAllocationCreateInfo readback_alloc{.usage = VMA_MEMORY_USAGE_AUTO};
+        readback_alloc.requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        readback_alloc.flags =
+            VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+        VkBuffer readback{};
+        VmaAllocationInfo readback_info{};
+        // rt_still_sig.comp gathers a subgroup's bounds before one of its threads writes them:
+        // the arithmetic subgroup operations in a compute shader, which a device need not have.
+        const auto subgroup =
+            instance.GetPhysicalDevice()
+                .getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceSubgroupProperties>()
+                .get<vk::PhysicalDeviceSubgroupProperties>();
+        const bool subgroups =
+            (subgroup.supportedStages & vk::ShaderStageFlagBits::eCompute) &&
+            (subgroup.supportedOperations & vk::SubgroupFeatureFlagBits::eArithmetic);
+        still_ready =
+            subgroups &&
+            EffectPass::Create(instance, still_set, still_layout, still_pipeline,
+                               {eStorageBuffer, eStorageBuffer}, sizeof(StillPush),
+                               RT_STILL_SIG_COMP, "Ray tracing still check") &&
+            Make(still_sigs, sig_bytes, false,
+                 VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                     VK_BUFFER_USAGE_TRANSFER_DST_BIT) &&
+            vmaCreateBuffer(instance.GetAllocator(), &readback_ci, &readback_alloc, &readback,
+                            &still_readback.allocation, &readback_info) == VK_SUCCESS;
+        still_readback.buffer = readback;
+        still_readback.mapped = readback_info.pMappedData;
+        still_ready = still_ready && still_readback.mapped;
+        if (still_ready) {
+            std::memset(still_readback.mapped, 0, std::size_t(4 * sig_bytes));
+        } else {
+            std::printf("Ray tracing still check (r47): off - %s\n",
+                        subgroups ? "no signature pipeline or buffer"
+                                  : "this GPU has no subgroup arithmetic in compute shaders");
+        }
+    }
     // bbport (r37_menu-options): the half-resolution trace is made by R25HalfWanted, when first wanted.
     const std::array<u64, 2> capture_table{params.address, positions.address};
     std::memcpy(capture_addresses.mapped, capture_table.data(), sizeof(capture_table));
@@ -833,6 +1009,7 @@ std::unique_ptr<RtShadow::Entry> RtShadow::MakeEntry(const Draw& draw, u8 mask) 
     entry->first_instance = draw.first_instance;
     entry->triangles = u32(list.size() / 3);
     entry->palette = draw.palette;
+    entry->palette_placed = draw.palette_placed; // bbport (r47b_casters)
     entry->dynamic = draw.skinned;
     entry->mask = mask;
     entry->shadow = mask == ShadowMask;
@@ -1083,11 +1260,75 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         return XXH3_64bits(mesh_parts.data(), sizeof(mesh_parts));
     };
     const u64 mesh = r19 ? 0 : mesh_of();
+    // bbport (r46_lamp-cards): the key of a draw with a position stream (the entries are known
+    // by it, below): it depends neither on the pass nor on the shader.
+    const auto position_key = [&] {
+        const std::array<u64, 4> parts{draw.positions, draw.indices,
+                                       (u64(draw.index_count) << 32) | draw.first_vertex,
+                                       draw.instances};
+        return XXH3_64bits(parts.data(), sizeof(parts));
+    };
     if (draw.camera_pass && draw.alpha) {
+        // bbport (r46_lamp-cards): cutout_gen tells the entries that a set changed (PrepareScene)
         if (cutout_meshes.size() >= 65536) {
             cutout_meshes.clear();
+            ++cutout_gen;
         }
-        cutout_meshes.insert(r19 ? mesh_of() : mesh);
+        if (cutout_meshes.insert(r19 ? mesh_of() : mesh).second) {
+            ++cutout_gen;
+        }
+        // The same draw by the key as well, which the sun shadow pass's entries of the mesh
+        // have too where `mesh` differs between the passes (see cutout_keys). Here, before the
+        // filters below: a cut-out without skeleton or palette is dropped there and gets no
+        // entry from the camera pass, so its sun shadow pass entry knows itself as a card
+        // through these sets alone.
+        if (draw.positions && draw.indices) {
+            if (cutout_keys.size() >= 65536) {
+                cutout_keys.clear();
+                ++cutout_gen;
+            }
+            if (cutout_keys.insert(position_key()).second) {
+                ++cutout_gen;
+            }
+        }
+    }
+
+    // bbport (r46b_plant-rule): the position streams drawn with a skeleton, by a sun shadow
+    // pass (the game gives the mesh a shadow: a character's, for good) or by the camera pass with
+    // a discarding pixel shader (LampLoneCameraDraw counts the frames on which the sun shadow
+    // pass draws skeletons but not this one). By the stream's address and not by the key: a pass
+    // may draw another index list of the same vertices (a coarser level of detail). Here,
+    // before the filters below, so a sun shadow pass draw counts whatever becomes of it. A map
+    // at its cap first forgets the streams not drawn for LoneStreamKeep frames that are not
+    // lone (vertices written to a new address on every frame would fill it), then everything.
+    if (draw.skinned && draw.positions != 0 && (draw.shadow_pass || draw.alpha)) {
+        ++lone_draws;
+        if (lone_streams.size() >= LoneStreamsMost) {
+            std::erase_if(lone_streams, [&](const auto& item) {
+                return LampLoneOf(item.second) != LampLoneState::Lone &&
+                       item.second.seen + LoneStreamKeep < frame;
+            });
+            if (lone_streams.size() >= LoneStreamsMost) {
+                lone_streams.clear();
+            }
+            ++lone_gen;
+        }
+        const auto [known, fresh] = lone_streams.try_emplace(draw.positions);
+        bool changed = fresh;
+        // bbport (r47c_review-fixes): another size of vertices bound at the address: the game
+        // gave the memory to another mesh, what was known of the stream is forgotten
+        const u32 sized = known->second.size;
+        changed |= LampLoneSized(known->second, draw.positions_size);
+        lone_resized += sized != 0 && sized != known->second.size ? 1 : 0;
+        if (draw.shadow_pass) {
+            sun_skinned_frame = frame;
+            sun_skinned_any = true;
+            changed |= LampLoneSunDraw(known->second, frame);
+        } else {
+            changed |= LampLoneCameraDraw(known->second, frame, sun_skinned_any,
+                                          sun_skinned_frame);
+        }
+        lone_gen += changed ? 1 : 0;
     }
 
     // Camera pass casters only serve the ray traced scene (lamp shadows, bounced light).
@@ -1129,10 +1370,7 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     const u8 mask = draw.camera_pass ? CameraMask : ShadowMask;
     u64 key;
     if (draw.positions) {
-        const std::array<u64, 4> mesh{draw.positions, draw.indices,
-                                      (u64(draw.index_count) << 32) | draw.first_vertex,
-                                      draw.instances};
-        key = XXH3_64bits(mesh.data(), sizeof(mesh));
+        key = position_key(); // bbport (r46_lamp-cards): as the camera pass's cut-outs above
     } else {
         key = draw.geometry ^ (draw.shader * 0x9e3779b97f4a7c15ull);
         key = XXH3_64bits_withSeed(&draw.indices, sizeof(draw.indices), key);
@@ -1174,7 +1412,7 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     bool instance_entry = false;
     bool promote = false;
     if (palette_draw) {
-        instance_key = XXH3_64bits_withSeed(&draw.palette, sizeof(draw.palette), key ^ 0xa24baed4963ee407ull);
+        instance_key = InstanceKey(key, draw.palette);
         instance_entry = entries.contains(instance_key);
         if (!instance_entry) {
             if (candidates.size() >= MaxCandidates) {
@@ -1228,6 +1466,7 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
                 ++r19_entries_gen; // bbport (r19_draw-cost)
                 adopted->rebuilt = false;
                 adopted->instance = true;
+                StillAdmit(*adopted, instance_key); // bbport (r47_still-check)
                 entries[instance_key] = std::move(adopted);
                 ++stats.promoted;
             }
@@ -1279,6 +1518,9 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             slot->instance = instance_entry;
             slot->rebuild_every = RebuildEveryFrames + u32(entry_key % RebuildSpread);
             stats.promoted += promote ? 1 : 0;
+            // bbport (r47_still-check): a caster a look found moving before it was evicted
+            // counts as moving from its first draw
+            StillAdmit(*slot, entry_key);
         }
         r19_entry = slot.get();
         if (r19_memo && !shared) { // entry_key == key here
@@ -1287,6 +1529,10 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
     }
     Entry& entry = *r19_entry;
+    if (palette_draw) { // bbport (r47b_casters): for the 600-frame line
+        ++still_stats.palette_draws;
+        still_stats.placed_draws += draw.palette_placed ? 1 : 0;
+    }
     if (hold_frames && draw.shadow_pass) { // bbport (r14_cascade_rt): see Holds
         if (entry.shadow_frame != frame) {
             entry.shadow_frame = frame;
@@ -1315,10 +1561,29 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     }
     const bool r17_far_draw =
         r19_far_book && draw.shadow_pass && (r17_cascade == 2 || r17_cascade == 3);
-    const bool r17_far =
-        r17_far_draw && entry.seen_frame != frame && entry.r17_near_frame + 1 < frame;
+    // bbport (r47c_review-fixes): a moving prop known by its palette's address may be two
+    // entries, each drawn every other frame (Draw::palette_placed): its near draw of two frames
+    // ago is its last one. Counted as "no near draw last frame", such an entry was far only
+    // whenever c2/c3 drew it first on a frame, although the camera pass draws it, and its refit
+    // was left out (RefitEvery) with the lamp bit kept.
+    const u64 r17_near_gap = entry.instance && entry.palette_placed ? 2 : 1;
+    const bool r17_far = r17_far_draw && entry.seen_frame != frame &&
+                         entry.r17_near_frame + r17_near_gap < frame;
     if (!r17_far_draw && r19_far_book) {
         entry.r17_near_frame = frame;
+    }
+    // bbport (r46_lamp-cards): what this draw shows of a cut-out card, at every draw of the
+    // entry (a second draw of the frame returns just below) and for good: whichever pass comes
+    // first, and whether or not the entry counts as moving, lamp rays leave a card out
+    // (PrepareScene). Entry::shadow_card below is the rule of before, kept as it was.
+    entry.skinned = entry.skinned || draw.skinned;
+    entry.card_shadow = entry.card_shadow || (draw.shadow_pass && draw.textured);
+    entry.card_camera = entry.card_camera || (draw.camera_pass && draw.alpha);
+    entry.stream = draw.positions; // bbport (r46b_plant-rule): the same at every draw of the key
+    // bbport (r47_still-check): the last camera pass draw of it, also when a sun cascade drew
+    // it first on the frame (a caster the camera pass draws is looked at more often)
+    if (draw.camera_pass) {
+        entry.still_camera_frame = frame;
     }
     if (entry.seen_frame == frame) {
         if ((entry.mask & mask) == 0) {
@@ -1352,14 +1617,124 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             turn_drawn.push_back(&entry);
         }
     }
+    // bbport (r47_still-check): what is done about casters held for still on this draw. With
+    // the experiment bit set while the game runs, a caster the looks found moving is held for
+    // still again, as before: its BLAS keeps the pose of its last refit. No bounds were taken
+    // of that pose (a moving caster's captures are not measured), so what the looks knew of the
+    // caster no longer holds: with the bit clear again it is refit once and looked at anew.
+    const u32 still = StillNow();
+    if (entry.still_moved && still != StillOn) {
+        entry.dynamic = false;
+        entry.still_moved = false;
+        entry.still_has_ref = {};
+        entry.still_doubt = false;
+        entry.still_checks = 0;
+        entry.still_next = frame;
+        still_mover_triangles -= std::min<u64>(still_mover_triangles, entry.triangles);
+        ++still_stats.taken_back;
+    }
     if (entry.palette != draw.palette) {
         entry.palette = draw.palette;
+        entry.palette_placed = draw.palette_placed; // bbport (r47b_casters)
         entry.dynamic = true;
+        // bbport (r47_still-check): moving by its palette from now on, whatever the looks found
+        // (nothing to take back, and not counted under their cap)
+        if (entry.still_moved) {
+            entry.still_moved = false;
+            still_mover_triangles -= std::min<u64>(still_mover_triangles, entry.triangles);
+        }
     }
-    const bool needs_data = !entry.built || entry.dynamic || entry.rebuilt ||
-                            (need_scene && !entry.blas) ||
-                            (entry.shadow && entry.world.buffer && !entry.copied &&
-                             WorldCopies());
+    bool needs_data = !entry.built || entry.dynamic || entry.rebuilt ||
+                      (need_scene && !entry.blas) ||
+                      (entry.shadow && entry.world.buffer && !entry.copied && WorldCopies());
+    // bbport (r47_still-check): a caster held for still (built, not moving, not a shared copy,
+    // nothing else to capture it for) whose look is due is captured once more as a probe: its
+    // vertices go to the positions like any capture's and RecordBuilds measures their bounds
+    // (rt_still_sig.comp), but nothing is built or copied from them: the BLAS, the world copy
+    // and the entry stay as they are, so the scene and the picture are those of a frame without
+    // the look. A probe takes a capture param and room in the positions, never scratch or a
+    // budget of builds; where its own budget (StillLane) or that room is used up it waits for
+    // the next frame with its turn kept. Not while BB_RT_UPKEEP_FREEZE measures (r26).
+    // still_refit: nothing is known of the capture its BLAS holds (it was built while the
+    // experiment bit was set, as a shared copy before an instance's entry took it over, or its
+    // signature was lost), so a look would have nothing to compare with. With BB_RT_STILL=on it
+    // is refit once instead, as a moving caster is at every draw: the BLAS then holds the pose
+    // of this frame and that capture's bounds are its reference. (With count it stays a probe,
+    // whose bounds become the reference: no structure changes.)
+    // Two kinds of capture are never measured, neither for a look nor for a reference: a mesh
+    // of more indices than one dispatch of rt_still_sig.comp takes (still_fits), and a draw that
+    // starts at another instance than the entry was made with (Param tells the vertex shader to
+    // store the entry's instances: such a draw stores nothing, its range of the positions would
+    // hold an earlier frame's and read as a move).
+    bool still_refit = false;
+    const bool still_fits = u64(entry.triangles) * 3 <= StillSigIndicesMost;
+    const bool still_stored = draw.first_instance == entry.first_instance;
+    // bbport (r47c_review-fixes): the casters looked at in turn that this frame draws, due or
+    // not: the pace of their looks is set by all of them (StillCrowd in StillNext below).
+    if (still != StillOff && still_fits && !needs_data && need_scene && !entry.still_blind &&
+        r26_freeze == 0 && entry.still_checks >= StillEarlyChecks) {
+        still_pool += StillPoolShare(
+            entry.triangles,
+            entry.palette != 0 || entry.still_camera_frame + StillNearFrames >= frame);
+    }
+    if (still != StillOff && still_fits && !needs_data && need_scene && entry.still_wait == 0 &&
+        !entry.still_blind && frame >= entry.still_next && r26_freeze == 0) {
+        // The lane: the first look after a build, the other early looks, the looks in turn.
+        // bbport (r47c_review-fixes): and lane 3, a second budget of the looks in turn's size
+        // for a look in turn that has waited StillOverdueFrames() frames or more and finds the
+        // budget used up once again (StillLaneOf): the budgets go in draw order, and a caster
+        // that only every 8th frame draws, after the others, found it used up every time.
+        const u32 lane = StillLaneOf(entry.still_checks, still_used[2] >= StillLane(false),
+                                     frame - entry.still_next, StillOverdueFrames());
+        u32& used = still_used[lane];
+        const u64 stored = u64(entry.vertices) * entry.instances;
+        // What the looks in turn would need on this frame, looked at or not (StillCrowd).
+        still_due += lane >= 2 ? entry.triangles : 0;
+        Build probe{&entry, positions_used, true, to_world};
+        probe.probe = true;
+        if (used >= StillLane(lane < 2)) {
+            ++still_stats.waited;
+            // bbport (r47c_review-fixes): for the line: the longest wait, served or not, and
+            // whose it is (seen_frame is still its draw before)
+            if (frame - entry.still_next >= still_stats.oldest_waiting) {
+                still_stats.oldest_waiting = frame - entry.still_next;
+                still_stats.oldest_triangles = entry.triangles;
+                still_stats.oldest_gap = frame - entry.seen_frame;
+                still_stats.oldest_near =
+                    entry.palette != 0 || entry.still_camera_frame + StillNearFrames >= frame;
+            }
+        } else if (!still_stored) {
+            ++still_stats.other_draw;
+        } else if (still_sig_used >= StillSigsPerFrame || params_used >= MaxParams ||
+                   positions_used + stored > MaxPositions ||
+                   !StillWorld(draw.constants, probe)) {
+            ++still_stats.no_room;
+        } else if (still == StillOn && !entry.still_has_ref[0] && !entry.still_has_ref[1]) {
+            used += entry.triangles;
+            still_refit = true;
+            needs_data = true;
+        } else {
+            used += entry.triangles;
+            still_stats.longest_wait =
+                std::max(still_stats.longest_wait, frame - entry.still_next);
+            probe.param = Param(positions_used, entry);
+            probe.sig = TakeStillSig(entry);
+            probe.still_camera = draw.camera_pass;
+            builds.push_back(probe);
+            positions_used += u32(stored);
+            const bool nearby =
+                entry.palette != 0 || entry.still_camera_frame + StillNearFrames >= frame;
+            entry.still_checks += entry.still_checks != 0xff ? 1 : 0;
+            entry.still_next =
+                frame + StillNext(entry.still_checks, entry.base, nearby,
+                                  StillCrowd(still_pool_last, StillLane(false)));
+            ++still_stats.probes[lane];
+            still_stats.probe_triangles += entry.triangles;
+            entry.seen_frame = frame;
+            frame_entries.push_back(&entry);
+            return probe.param;
+        }
+    }
     // Over budget, a caster built before keeps last frame's BLAS and world copy (exact for static
     // props drawn several times, a frame late for moving ones) rather than vanishing.
     const auto skip = [&] {
@@ -1401,8 +1776,9 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     };
     u32 param = 0;
     if (needs_data) {
+        // bbport (r47_still-check): still_refit: a refit whatever the age of the build
         const bool update = need_scene && entry.blas && entry.built && !entry.rebuilt &&
-                            frame - entry.built_frame < entry.rebuild_every &&
+                            (still_refit || frame - entry.built_frame < entry.rebuild_every) &&
                             entry.r17_updatable; // bbport (r17_rt-upkeep): not fast-built
         // bbport (r17_rt-upkeep): opt-in refit skips of moving casters, keeping the BLAS (as the
         // over-budget skip does). BB_RT_UNCHANGED=skip: what the vertex shader reads hashes the
@@ -1494,10 +1870,28 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             return skip();
         }
         builds.push_back({&entry, positions_used, update, to_world});
+        builds.back().param = param; // bbport (r47_still-check): see CaptureLeftOut
         stats.refit_triangles += update ? entry.triangles : 0;
         // bbport (r17_rt-upkeep): a shared copy's refresh (never refit) is built for speed
         builds.back().fast = UpkeepOn() && refresh;
         builds.back().inputs = draw.inputs;
+        // bbport (r47_still-check): the BLAS of a caster held for still is built from this
+        // capture: its bounds are what the looks compare with (they arrive with the signature;
+        // those of the capture before no longer hold), and its looks start again. Where the
+        // capture cannot be measured (still_fits, still_stored above) nothing is known of it.
+        if (still != StillOff && need_scene && !entry.dynamic && !entry.rebuilt) {
+            if (still_fits && still_stored && StillWorld(draw.constants, builds.back())) {
+                builds.back().sig = TakeStillSig(entry);
+                builds.back().still_camera = draw.camera_pass;
+                builds.back().still_first = true;
+            }
+            entry.still_has_ref = {};
+            entry.still_blind = false;
+            entry.still_doubt = false;
+            entry.still_checks = 0;
+            still_stats.refits += still_refit ? 1 : 0;
+            entry.still_next = frame + StillNext(0, entry.base, true);
+        }
         positions_used += u32(stored);
         scratch_used += needed;
         if (!update) {
@@ -1539,7 +1933,11 @@ void RtShadow::RecordBuilds() {
     }
     BB_SECTION(RtBuilds);
     const bool world_copies = WorldCopies();
-    if (need_scene) {
+    // bbport (r47_still-check): a probe builds nothing; a call that holds probes alone leaves
+    // the scene as it is (no build to wait for, the instance records as written).
+    const bool built_any = std::ranges::any_of(
+        builds, [](const Build& b) { return !b.probe && !b.left_out; });
+    if (need_scene && built_any) {
         r17_blas_dirty = true; // bbport (r17_rt-upkeep): the TLAS cannot be skipped
     }
     struct Job {
@@ -1549,6 +1947,10 @@ void RtShadow::RecordBuilds() {
         std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> pointers;
         std::vector<UnprojectPush> unproject;
         std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
+        // bbport (r47_still-check): the captures whose bounds are measured, and their
+        // signatures' bytes in still_sigs (source) and in the frame's part of still_readback
+        std::vector<StillPush> still;
+        vk::BufferCopy still_copy;
     };
     auto job = std::make_shared<Job>();
     job->geometries.reserve(builds.size());
@@ -1556,8 +1958,36 @@ void RtShadow::RecordBuilds() {
     job->unproject.reserve(builds.size());
     u64 scratch_at = 0;
     const auto align = [&](u64 v) { return (v + scratch_align - 1) / scratch_align * scratch_align; };
+    const u32 still_slot = u32(frame % 4);
+    u32 sig_first = UINT32_MAX, sig_last = 0;
     for (const Build& build : builds) {
         Entry& e = *build.entry;
+        // bbport (r47_still-check): the draw of this capture was left out (CaptureLeftOut): its
+        // range of the positions was not written. Nothing is measured, built or copied from it;
+        // like a build that was never recorded (OnFrameEnd), the entry is built at its next
+        // draw.
+        if (build.left_out) {
+            if (!build.probe) {
+                e.built = e.built && build.update;
+                e.r17_inputs = 0;
+            }
+            continue;
+        }
+        // bbport (r47_still-check): the bounds of this capture are measured over the vertices
+        // its triangles use, as it was stored (clip space, before the pass below brings it to
+        // world space); the host reads them at a frame's end (ReadStillSigs). A probe is done
+        // with that: its positions are read by nothing else.
+        if (build.sig != 0) {
+            job->still.push_back({build.still_rows, build.still_origin, build.store,
+                                  e.indices.address, e.triangles * 3, build.sig - 1});
+            still_pending[still_slot].push_back(
+                {&e, frame, build.sig, build.still_camera, build.still_first});
+            sig_first = std::min(sig_first, build.sig);
+            sig_last = std::max(sig_last, build.sig);
+        }
+        if (build.probe) {
+            continue;
+        }
         job->unproject.push_back({build.to_world, build.store, e.vertices * e.instances});
         e.built = true;
         e.blas = need_scene;
@@ -1654,14 +2084,73 @@ void RtShadow::RecordBuilds() {
     }
     // bbport: its own row in the GPU profile (BB_GPU_PROFILE=1); before, its time went to the
     // pass recorded before it (with the ray traced sun: the game's shadow blur, ps 11ffdfb5).
+    // bbport (r47_still-check): this call's signatures (taken one after the other, so one run
+    // of slots) and the tick the host waits for before it reads them
+    if (!job->still.empty()) {
+        const vk::DeviceSize sig_bytes = StillSigWords * 4;
+        job->still_copy = vk::BufferCopy{
+            (sig_first - 1) * sig_bytes,
+            (vk::DeviceSize(still_slot) * StillSigsPerFrame + sig_first - 1) * sig_bytes,
+            (sig_last - sig_first + 1) * sig_bytes};
+        still_ticks[still_slot] = scheduler.CurrentTick();
+    }
     EffectPass::Mark(16, "ray tracing geometry");
     scheduler.RecordCrumb(
         {.name = "Ray tracing geometry"},
         [job, positions = positions.buffer, unproject_pipeline = *unproject_pipeline,
-         unproject_layout = *unproject_layout](vk::CommandBuffer cmdbuf) {
+         unproject_layout = *unproject_layout, still_sigs = still_sigs.buffer,
+         still_readback = still_readback.buffer, still_pipeline = *still_pipeline,
+         still_layout = *still_layout](vk::CommandBuffer cmdbuf) {
             EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryWrite, Compute,
                    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
             const vk::DescriptorBufferInfo position_info{positions, 0, VK_WHOLE_SIZE};
+            // bbport (r47_still-check): the signatures: their slots zeroed, the bounds of each
+            // capture gathered from its vertices as they were stored (before the pass below
+            // overwrites them with their world space places), and the slots copied to where the
+            // host reads them. Nothing here writes the positions.
+            if (!job->still.empty()) {
+                constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+                cmdbuf.fillBuffer(still_sigs, job->still_copy.srcOffset, job->still_copy.size, 0);
+                EffectPass::MemoryBarrier(cmdbuf, Compute | Transfer,
+                                          vk::AccessFlagBits2::eShaderWrite |
+                                              vk::AccessFlagBits2::eTransferWrite,
+                                          Compute,
+                                          vk::AccessFlagBits2::eShaderRead |
+                                              vk::AccessFlagBits2::eShaderWrite);
+                const vk::DescriptorBufferInfo sig_info{still_sigs, 0, VK_WHOLE_SIZE};
+                const std::array<vk::WriteDescriptorSet, 2> still_writes{{
+                    {.dstBinding = 0, .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer,
+                     .pBufferInfo = &position_info},
+                    {.dstBinding = 1, .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer,
+                     .pBufferInfo = &sig_info},
+                }};
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, still_pipeline);
+                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, still_layout, 0,
+                                            still_writes);
+                for (const StillPush& push : job->still) {
+                    cmdbuf.pushConstants(still_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                         sizeof(push), &push);
+                    cmdbuf.dispatch((push.count + 63) / 64, 1, 1);
+                }
+                // The slots are written (for the copy), and the positions were read: the pass
+                // below writes them only after these dispatches.
+                EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite,
+                                          Compute | Transfer,
+                                          vk::AccessFlagBits2::eShaderRead |
+                                              vk::AccessFlagBits2::eShaderWrite |
+                                              vk::AccessFlagBits2::eTransferRead);
+                cmdbuf.copyBuffer(still_sigs, still_readback, job->still_copy);
+                // The host reads the copy after the submission's tick; the next call's fill
+                // comes after this copy.
+                EffectPass::MemoryBarrier(cmdbuf, Transfer,
+                                          vk::AccessFlagBits2::eTransferRead |
+                                              vk::AccessFlagBits2::eTransferWrite,
+                                          vk::PipelineStageFlagBits2::eHost | Transfer,
+                                          vk::AccessFlagBits2::eHostRead |
+                                              vk::AccessFlagBits2::eTransferWrite);
+            }
             const vk::WriteDescriptorSet write{.dstBinding = 0,
                                                .descriptorCount = 1,
                                                .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -1693,7 +2182,9 @@ void RtShadow::RecordBuilds() {
                    vk::AccessFlagBits2::eAccelerationStructureReadKHR |
                        vk::AccessFlagBits2::eAccelerationStructureWriteKHR);
         });
-    tlas_count = 0;
+    if (built_any) { // bbport (r47_still-check): probes alone change nothing the scene holds
+        tlas_count = 0;
+    }
 }
 
 bool RtShadow::SceneWanted() const {
@@ -1752,6 +2243,17 @@ bool RtShadow::PrepareScene() {
     if (r26_freeze == 1u) {
         r17_blas_dirty = true;
     }
+    // bbport (r46_lamp-cards): the rule for cut-out cards, read at every scene build: with
+    // experiment LampCardsOldBit set, or BB_RT_LAMP_CARDS=0, the rule of before. When it is not
+    // the one the instance records were written with (the bit changed while the game runs), they
+    // are written again, as for a changed mask in PrepareDraw: old and new can be compared in
+    // one run.
+    const bool cards_old = BbToggle::Experiment(LampCardsOldBit);
+    const u32 card_level = LampCardLevel();
+    if (const u32 rule = cards_old ? 0u : card_level; rule != card_rule) {
+        card_rule = rule;
+        tlas_count = 0;
+    }
     if (count == tlas_count && (!hold_frames || (tlas_drawn == frame_entries.size() &&
                                                  tlas_cascades == frame_cascades))) {
         return true;
@@ -1774,27 +2276,152 @@ bool RtShadow::PrepareScene() {
     u64 triangles = 0;
     // Entries kept stale over budget since the scene was last skipped have no BLAS yet.
     u32 built = 0;
+    u32 placed_old_pose = 0; // bbport (r47b_casters)
+    // bbport (r47c_review-fixes): held moving props known by an address that keep the lamp bit,
+    // and whether a moving prop of a mesh known by an address is drawn this frame (their mesh
+    // keys are listed when the first held one asks; most frames none does).
+    u32 placed_held = 0;
+    bool placed_listed = false;
+    const auto placed_twin = [&](u64 base) {
+        if (!placed_listed) {
+            placed_listed = true;
+            placed_drawn.clear();
+            for (const Entry* e : frame_entries) {
+                if (e->instance && e->palette_placed && e->dynamic) {
+                    placed_drawn.push_back(e->base);
+                }
+            }
+            std::ranges::sort(placed_drawn);
+        }
+        return std::ranges::binary_search(placed_drawn, base);
+    };
     // bbport (r41_lamp-shadows, r42_lamp-soft): with BB_LAMP_SHADOW_STALE=1 only
     const bool lamp_repair = LampStaleOut() && !BbToggle::Experiment(LampRepairOffBit);
+    card_stats = {}; // bbport (r46_lamp-cards): of the records written now
+    const u32 lamp_leave = LampLeave(); // bbport (r47_still-check)
+    still_leave_count = 0;
     for (u32 i = 0; i < count; ++i) {
         // bbport (r14_cascade_rt): a held entry, or a held one drawn only by the camera pass while
         // its cascades are not drawn, keeps casting the sun's shadow (rt_shadow.comp's ray mask 1).
         // Not held (dropped: its cascade drew without it): the camera pass's mask only, as before.
         const bool kept = i >= frame_entries.size();
-        const Entry* entry = kept ? held_now[i - frame_entries.size()] : frame_entries[i];
+        Entry* entry = kept ? held_now[i - frame_entries.size()] : frame_entries[i];
         if (!entry->blas) {
             continue;
         }
-        const bool card = entry->shadow_card && !entry->dynamic;
+        // bbport (r46_lamp-cards): an entry no camera pass draw of its own showed as a cut-out
+        // (a sun cascade's copy, a prop drawn there under another bone palette, a card whose
+        // camera pass draw is not in the scene) is one when the camera pass draws its mesh with
+        // a discarding shader. Looked up here and not at its draw: a sun cascade draws its copy
+        // before the camera pass makes the mesh known, and the copy would cast its whole-polygon
+        // shadow for a frame. One lookup an entry each time a cut-out new to the sets was drawn.
+        if (!entry->card_camera && !entry->card_mesh && entry->card_gen != cutout_gen) {
+            entry->card_gen = cutout_gen;
+            entry->card_mesh =
+                cutout_meshes.contains(entry->mesh) || cutout_keys.contains(entry->base);
+            ++card_lookups;
+        }
+        // bbport (r46_lamp-cards): a cut-out card by any draw of it, whatever the order of the
+        // passes and whether or not it counts as moving (rt_lamp_cards.h). cards_old: the rule
+        // of before, shadow_card && !dynamic.
+        const bool cutout = entry->card_camera || entry->card_mesh;
+        // bbport (r46b_plant-rule): what a skinned cut-out's vertices are taken for (a plant
+        // when no sun shadow pass draws them: lone), looked up when the map's verdicts changed
+        if (entry->skinned && entry->lone_gen != lone_gen && (cutout || entry->card_shadow)) {
+            entry->lone_gen = lone_gen;
+            const auto known = lone_streams.find(entry->stream);
+            entry->lone = entry->stream != 0 && known != lone_streams.end()
+                              ? LampLoneOf(known->second)
+                              : LampLoneState::None;
+        }
+        const bool lone = entry->lone == LampLoneState::Lone;
+        const bool card = LampCard(cards_old, card_level, entry->shadow_card, entry->dynamic,
+                                   entry->card_shadow, cutout, entry->skinned, lone);
         const u8 mask =
             kept ? ShadowMask
                  : u8(entry->mask | (entry->held && Holds(*entry) ? ShadowMask : 0));
+        // For the 600-frame line: what is left out and by which sign, and what each rule would
+        // leave out of these same instances (the route by which a card kept its lamp bit).
+        if (card) {
+            ++card_stats.out;
+            card_stats.by_shadow += entry->card_shadow ? 1 : 0;
+            card_stats.by_camera += entry->card_camera ? 1 : 0;
+            card_stats.by_mesh += entry->card_mesh && !entry->card_camera ? 1 : 0;
+            card_stats.with_palette += entry->palette != 0 ? 1 : 0;
+            card_stats.camera_only += (mask & ShadowMask) == 0 ? 1 : 0;
+            card_stats.moving += entry->dynamic ? 1 : 0;
+            card_stats.skinned_out += entry->skinned ? 1 : 0;
+            // The four with the most triangles, each mesh once: a caster that is no plant (a
+            // weapon, a fence, a prop whose shader discards for a fade) is named in the line.
+            if (std::ranges::none_of(card_stats.largest, [&](const CardFound& c) {
+                    return c.triangles != 0 && c.key == entry->base;
+                })) {
+                CardFound found{entry->mesh,
+                                entry->base,
+                                entry->triangles,
+                                entry->card_shadow,
+                                entry->card_camera,
+                                entry->card_mesh,
+                                entry->palette != 0,
+                                entry->instance,
+                                entry->dynamic,
+                                (mask & ShadowMask) == 0,
+                                entry->skinned,
+                                entry->lone};
+                for (CardFound& slot : card_stats.largest) {
+                    if (found.triangles > slot.triangles) {
+                        std::swap(slot, found);
+                    }
+                }
+            }
+        } else if ((entry->card_shadow || cutout) && entry->skinned) {
+            ++card_stats.skinned_kept;
+            card_stats.sun_drawn += entry->lone == LampLoneState::Sun ? 1 : 0;
+            card_stats.lone_waiting += entry->lone == LampLoneState::Waiting ? 1 : 0;
+        }
+        for (u32 level = 0; level < card_stats.rule_out.size(); ++level) {
+            card_stats.rule_out[level] +=
+                LampCard(false, level, entry->shadow_card, entry->dynamic, entry->card_shadow,
+                         cutout, entry->skinned, lone)
+                    ? 1
+                    : 0;
+        }
         // bbport (r41_lamp-shadows): a moving shared copy in an old pose casts no lamp shadow
         // (Entry::lamp_out, kept by PrepareDraw; a changed mask makes the TLAS a full build,
         // not a refit).
         const bool stale = lamp_repair && entry->lamp_out && entry->rebuilt && entry->dynamic;
+        // bbport (r47b_casters): a moving prop known by its palette's address, not drawn this
+        // frame and held for a sun cascade that was not drawn (r14): its pose is an earlier
+        // frame's. Where the game keeps a moving object's palette at two addresses in turn (the
+        // carried torch) this is the object's other entry one frame after a far cascade drew it,
+        // beside the entry drawn now: it keeps the sun's ray mask as every held caster does, and
+        // casts no lamp shadow (the lamp sits at the torch's tip, a copy of the torch a step
+        // behind would shade it). Such entries only exist with experiment StillCheckOldBit
+        // clear.
+        // bbport (r47c_review-fixes): only while another moving prop of its mesh known by an
+        // address IS drawn this frame (the object's other entry, in today's pose). A mover with
+        // one address that only a far cascade draws (out of the camera's view: held 7 frames of
+        // 8 with graphics_sun_far_shadows=rare) keeps the lamp bit as before r47b; without it
+        // its lamp shadow would show one frame in 8.
+        const bool held_pose = kept && entry->instance && entry->palette_placed && entry->dynamic;
+        const bool old_pose = held_pose && placed_twin(entry->base);
+        placed_old_pose += old_pose ? 1 : 0;
+        placed_held += held_pose && !old_pose ? 1 : 0;
+        // bbport (r47_still-check): BB_RT_LAMP_LEAVE (a diagnostic, off unless set): lamp rays
+        // leave out the instances of the classes it names
+        const bool leave =
+            lamp_leave != 0 &&
+            (lamp_leave &
+             StillLeaveClasses((mask & CameraMask) != 0, kept, entry->rebuilt, entry->instance,
+                               entry->dynamic,
+                               LampCard(false, LampCardLevelDefault, entry->shadow_card,
+                                        entry->dynamic, entry->card_shadow, cutout,
+                                        entry->skinned, lone))) != 0;
+        // Counted where the knob alone withholds the lamp bit (not a card or a starved copy
+        // that is left out anyway).
+        still_leave_count += leave && !card && !stale ? 1 : 0;
         vk::AccelerationStructureInstanceKHR record{
-            .mask = u8(mask | (card || stale ? 0 : LampMask)),
+            .mask = u8(mask | (card || stale || leave || old_pose ? 0 : LampMask)),
             .accelerationStructureReference = entry->address,
         };
         std::memcpy(&record.transform, camera.view.data(), sizeof(camera.view));
@@ -1802,6 +2429,8 @@ bool RtShadow::PrepareScene() {
         triangles += entry->triangles;
     }
     if (tlas_count == 0) {
+        still_stats.placed_old_pose += placed_old_pose; // bbport (r47b_casters)
+        still_stats.placed_held += placed_held;         // bbport (r47c_review-fixes)
         stats.instances += count;
         stats.triangles += triangles;
         ++stats.frames;
@@ -2362,6 +2991,239 @@ void RtShadow::PlanCopyTurns() {
     turn_stats.past_triangles += plan.past_triangles;
 }
 
+// bbport (r47_still-check): what is done about the casters held for still right now. The
+// experiment bit is read at each use, so old and new can be compared in one run.
+u32 RtShadow::StillNow() const {
+    return still_ready && !BbToggle::Experiment(StillCheckOldBit) ? StillMode() : u32(StillOff);
+}
+
+// bbport (r47_still-check): a signature of this frame for a capture of `entry` (1 to
+// StillSigsPerFrame), or 0 when the frame's are used up. Until it is read or dropped the entry
+// counts it (Entry::still_wait).
+u32 RtShadow::TakeStillSig(Entry& entry) {
+    if (still_sig_used >= StillSigsPerFrame) {
+        return 0;
+    }
+    ++entry.still_wait;
+    return ++still_sig_used;
+}
+
+// bbport (r47_still-check): for the signature of a capture drawn with `constants` (the
+// projection at word 52, view to world at word 180, as ToWorld reads them): what takes its clip
+// space positions to world space in rt_still_sig.comp (StillClipToWorld). False without an
+// inverse of the projection.
+bool RtShadow::StillWorld(const float* constants, Build& build) const {
+    bool ok = false;
+    const auto inverse = Invert(constants + 52, ok);
+    if (!ok) {
+        return false;
+    }
+    StillClipToWorld(inverse.data(), constants + 180, build.still_rows, build.still_origin);
+    const auto finite = [](float v) { return std::isfinite(v); };
+    return std::ranges::all_of(build.still_rows, finite) &&
+           std::ranges::all_of(build.still_origin, finite);
+}
+
+// bbport (r47_still-check): the rasterizer left out the draw PrepareDraw last set a capture up
+// for (its pipeline is still compiling: vk_rasterizer.cpp, SkipUncompiledDraw). No vertex shader
+// ran, so nothing stored the draw's positions: their range holds what an earlier frame left
+// there. A look would read that as a move, a reference taken from it would make every later
+// look one, and a BLAS built from it holds no caster. So the capture's signature is given back;
+// a probe is dropped and its look taken again at the caster's next draw; and with BB_RT_STILL=on
+// the build is dropped too (RecordBuilds), so the entry is built from its next draw that runs.
+// With count the build stays as it always was, only unmeasured. Nothing with the experiment bit
+// set. `motion_param`, `mode`: the draw's push constant and its pipeline's motion mode, as
+// EffectsCaptureDraw left them.
+void RtShadow::CaptureLeftOut(u32 motion_param, u32 mode) {
+    const u32 param =
+        mode == Shader::MotionVectors::VertexBoth ? motion_param >> 16 : motion_param;
+    const u32 still = StillNow();
+    if (param == 0 || still == StillOff || builds.empty() || builds.back().param != param) {
+        return;
+    }
+    Build& build = builds.back();
+    Entry& entry = *build.entry;
+    if (build.sig != 0) {
+        build.sig = 0;
+        entry.still_wait -= entry.still_wait != 0 ? 1 : 0;
+    }
+    ++still_stats.left_out;
+    if (build.probe) {
+        entry.still_checks -= entry.still_checks != 0 && entry.still_checks != 0xff ? 1 : 0;
+        entry.still_next = frame;
+        build.left_out = true;
+    } else if (still == StillOn) {
+        build.left_out = true;
+    }
+}
+
+// bbport (r47c_review-fixes): BB_RT_PALETTE_PLACE, read once (default 1). 0, a diagnostic for a
+// whole run: a small bone palette in memory the GPU wrote is known by its bytes in guest memory
+// again, as before r47b, while r47's looks stay on (the two share experiment StillCheckOldBit):
+// what the looks do without r47b. Every instance of such a prop's mesh is then one entry, which
+// the looks find "moving" between the instances' places and refit to the one drawn last.
+bool RtShadow::PalettePlace() {
+    static const bool place = ReadCopyTurnKnob(std::getenv("BB_RT_PALETTE_PLACE"), 1, 1) != 0;
+    return place;
+}
+
+// bbport (r47_still-check): an entry that is new under the key `id`: when a look found the
+// caster of that key moving before (still_movers) it counts as moving from the start, within
+// the cap. (A shared copy's key is never in the list: copies are rebuilt in turn, not looked at.)
+void RtShadow::StillAdmit(Entry& entry, u64 id) {
+    if (StillNow() != StillOn || entry.dynamic || !still_movers.contains(id) ||
+        still_mover_triangles + entry.triangles > StillMoverCap()) {
+        return;
+    }
+    entry.dynamic = true;
+    entry.still_moved = true;
+    still_mover_triangles += entry.triangles;
+    ++still_stats.known;
+}
+
+// bbport (r47_still-check): the signatures of one frame of the ring, once the GPU has written
+// them. A capture the BLAS was built from gives the reference: the caster's bounds in that
+// pose. A look's bounds are compared with it: past the tolerance the caster has moved since its
+// BLAS was built, and (BB_RT_STILL=on, on the second look in a row that finds so, within the
+// cap) counts as moving from now on, like a skinned one: PrepareDraw refits it at every draw.
+// The two passes may place one mesh a little
+// differently (a sun shadow pass's vertex shader may add a bias), so each pass has its own
+// reference; a look by the pass that has none yet is compared with the other pass's under the
+// wide tolerance (a caster built in a passing pose is off by far more) and, within it, becomes
+// that pass's reference.
+void RtShadow::ReadStillSigs(u32 slot) {
+    const auto* words = static_cast<const u32*>(still_readback.mapped) +
+                        std::size_t(slot) * StillSigsPerFrame * StillSigWords;
+    const u32 still = StillNow();
+    for (const StillPending& item : still_pending[slot]) {
+        Entry& entry = *item.entry;
+        entry.still_wait -= entry.still_wait != 0 ? 1 : 0;
+        std::array<u32, StillSigWords> sig;
+        std::memcpy(sig.data(), words + std::size_t(item.sig - 1) * StillSigWords, sizeof(sig));
+        StillBox box;
+        if (!DecodeStillSig(sig.data(), box)) {
+            // A mesh with a vertex that is not a number: its bounds cannot be compared, so it
+            // is not looked at again until its BLAS is built anew.
+            entry.still_blind = true;
+            ++still_stats.unread;
+            continue;
+        }
+        const u32 pass = item.camera ? 0u : 1u;
+        if (item.first) {
+            entry.still_has_ref = {};
+            entry.still_ref[pass] = box;
+            entry.still_has_ref[pass] = true;
+            entry.still_ref_frame = item.frame;
+            ++still_stats.firsts;
+            continue;
+        }
+        const bool cross = !entry.still_has_ref[pass];
+        if (cross && !entry.still_has_ref[pass ^ 1u]) {
+            // No reference at all (BB_RT_STILL=count, and built before the looks began or its
+            // signature lost): this look is the first that can be compared with.
+            entry.still_ref[pass] = box;
+            entry.still_has_ref[pass] = true;
+            entry.still_ref_frame = item.frame;
+            continue;
+        }
+        const StillBox& then = entry.still_ref[cross ? pass ^ 1u : pass];
+        const float moved = StillMoved(then, box);
+        const float limit = cross ? std::max(StillLimit(), StillCrossTolerance) : StillLimit();
+        if (!(moved > limit)) {
+            entry.still_doubt = false;
+            if (cross) {
+                entry.still_ref[pass] = box;
+                entry.still_has_ref[pass] = true;
+            }
+            continue;
+        }
+        ++still_stats.found;
+        still_stats.found_new += entry.still_seen ? 0 : 1;
+        still_stats.found_instance += entry.instance ? 1 : 0;
+        still_stats.found_camera += item.camera ? 1 : 0;
+        still_stats.found_cross += cross ? 1 : 0;
+        entry.still_seen = true;
+        const u64 id = entry.instance ? InstanceKey(entry.base, entry.palette) : entry.base;
+        // bbport (r47c_review-fixes): a prop known by its palette's address found far from where
+        // its BLAS was built, with a box of the same size: carried whole, or its palette's
+        // address was given to another prop of the mesh (it then counts as moving for good once
+        // taken, and is refit at every draw). Counted for the line; no run has shown one.
+        still_stats.placed_carried += entry.instance && entry.palette_placed &&
+                                              moved > StillCarried &&
+                                              StillSameSize(then, box, 2.0f * StillLimit())
+                                          ? 1
+                                          : 0;
+        bool taken = false;
+        if (still == StillOn && !entry.dynamic) {
+            if (!entry.still_doubt) {
+                // One look decides nothing that lasts for the life of the entry: one capture
+                // that went wrong must not make a wall a moving caster. A second look is asked
+                // for at once, and a caster is taken when that one finds it moved as well.
+                entry.still_doubt = true;
+                entry.still_next = frame;
+                ++still_stats.doubted;
+            } else if (still_mover_triangles + entry.triangles > StillMoverCap()) {
+                ++still_stats.not_taken;
+            } else {
+                entry.still_doubt = false;
+                entry.dynamic = true;
+                entry.still_moved = true;
+                still_mover_triangles += entry.triangles;
+                if (still_movers.size() >= 65536) {
+                    still_movers.clear();
+                }
+                still_movers.insert(id);
+                ++still_stats.taken;
+                taken = true;
+            }
+        }
+        // For the line: the four that moved farthest, each caster once.
+        const StillFound found{id, entry.base, entry.mesh, item.frame - entry.still_ref_frame,
+                               entry.triangles, entry.still_checks, moved, then, box,
+                               entry.instance, item.camera, cross, taken, entry.palette != 0,
+                               entry.palette_placed, entry.skinned};
+        // bbport (r47b_casters): BB_RT_STILL_LIST: every one of them, each caster once
+        if (StillListMost() != 0) {
+            auto listed = still_list.find(id);
+            if (listed == still_list.end() && still_list.size() < StillListMost()) {
+                listed = still_list.emplace(id, found).first;
+            }
+            if (listed != still_list.end()) {
+                const u32 finds = listed->second.finds + 1;
+                const bool was_taken = listed->second.taken;
+                if (moved >= listed->second.moved) {
+                    listed->second = found;
+                }
+                listed->second.finds = finds;
+                listed->second.taken = was_taken || taken;
+            }
+        }
+        // Its place: the one it has, else the first empty one, else the smallest move's.
+        StillFound* place = nullptr;
+        for (StillFound& kept : still_stats.largest) {
+            if (kept.triangles != 0 && kept.id == id) {
+                place = &kept;
+                break;
+            }
+            if (!place || (place->triangles != 0 &&
+                           (kept.triangles == 0 || kept.moved < place->moved))) {
+                place = &kept;
+            }
+        }
+        if (place->triangles != 0 && place->id == id) {
+            const bool was_taken = place->taken;
+            if (moved > place->moved) {
+                *place = found;
+            }
+            place->taken = was_taken || taken;
+        } else if (place->triangles == 0 || moved > place->moved) {
+            *place = found;
+        }
+    }
+    still_pending[slot].clear();
+    still_ticks[slot] = 0;
+}
+
 void RtShadow::OnFrameEnd() {
     if (!capturing) {
         return;
@@ -2374,6 +3236,14 @@ void RtShadow::OnFrameEnd() {
     stats.missed += missed;
     stats.incomplete += !frame_entries.empty() && missed * 4 > u32(frame_entries.size()) ? 1 : 0;
     for (const Build& build : builds) {
+        // bbport (r47_still-check): its signature was never recorded; a probe left the entry
+        // and its BLAS as they were
+        if (build.sig != 0) {
+            build.entry->still_wait -= build.entry->still_wait != 0 ? 1 : 0;
+        }
+        if (build.probe) {
+            continue;
+        }
         build.entry->built = build.entry->built && build.update;
         build.entry->r17_inputs = 0; // bbport (r17_rt-upkeep): its BLAS did not get this capture
     }
@@ -2509,6 +3379,209 @@ void RtShadow::OnFrameEnd() {
                         static_cast<unsigned long long>(frame - e->built_frame));
         }
         std::printf("\n");
+        // bbport (r46_lamp-cards): the cut-out cards among the instances of the scene last
+        // built, and what each rule would leave out of them
+        const bool cards_old = BbToggle::Experiment(LampCardsOldBit);
+        static constexpr const char* card_rules[] = {
+            "old (the sun pass's texture on a first draw, not while moving)",
+            "1 (cut-outs without a skeleton)", "2 (every cut-out)",
+            "3 (cut-outs without a skeleton, and those with one that no sun shadow pass draws)"};
+        // bbport (r46b_plant-rule): the skinned cut-outs by what their vertices are taken for,
+        // rule 3's count, and the map of position streams
+        std::printf("Ray tracing cut-out cards (r46): rule %s (experiment 9223372036854775808 "
+                    "%s, BB_RT_LAMP_CARDS=%u); on the last scene %u instances left out of lamp "
+                    "rays as cut-out cards (%u known from the sun pass's texture, %u from their "
+                    "own camera pass draw's discard, %u only from a camera pass draw of their "
+                    "mesh that is not their own; %u with a bone palette, %u drawn by the camera "
+                    "pass only, %u counted as moving, %u with a skeleton), %u skinned cut-outs "
+                    "kept in lamp rays (%u whose vertices a sun shadow pass draws, %u not yet "
+                    "%u frames without one); the old rule would leave out %u, rule 1 %u, rule 2 "
+                    "%u, rule 3 %u; %zu cut-out meshes known, %zu by their key, %.2f entries a "
+                    "frame looked themselves up among them; %zu position streams drawn with a "
+                    "skeleton known, %.1f draws a frame went through them, a sun shadow pass "
+                    "last drew a skeleton %lld frames ago (-1: never)%s",
+                    card_rules[cards_old ? 0u : LampCardLevel()], cards_old ? "set" : "clear",
+                    LampCardLevel(), card_stats.out, card_stats.by_shadow, card_stats.by_camera,
+                    card_stats.by_mesh, card_stats.with_palette, card_stats.camera_only,
+                    card_stats.moving, card_stats.skinned_out, card_stats.skinned_kept,
+                    card_stats.sun_drawn, card_stats.lone_waiting, LampLoneFrames,
+                    card_stats.rule_out[0], card_stats.rule_out[1], card_stats.rule_out[2],
+                    card_stats.rule_out[3], cutout_meshes.size(), cutout_keys.size(),
+                    double(card_lookups) / f, lone_streams.size(), double(lone_draws) / f,
+                    sun_skinned_any ? static_cast<long long>(frame - sun_skinned_frame) : -1ll,
+                    card_stats.largest[0].triangles != 0 ? "; the largest left out:" : "");
+        lone_draws = 0;
+        for (const CardFound& c : card_stats.largest) {
+            if (c.triangles == 0) {
+                break;
+            }
+            std::printf(" mesh %016llx (key %016llx), %u triangles, known from%s%s%s%s%s%s%s%s;",
+                        static_cast<unsigned long long>(c.mesh),
+                        static_cast<unsigned long long>(c.key), c.triangles,
+                        c.by_shadow ? " [the sun pass's texture]" : "",
+                        c.by_camera ? " [its camera pass draw]" : "",
+                        c.by_mesh ? " [a camera pass draw of its mesh]" : "",
+                        c.palette ? ", with a bone palette" : "",
+                        c.instance ? ", an instance's own entry" : "",
+                        c.moving ? ", counted as moving" : "",
+                        c.camera_only ? ", drawn by the camera pass only" : "",
+                        !c.skinned                        ? ""
+                        : c.lone == LampLoneState::Lone   ? ", with a skeleton, its vertices in "
+                                                            "no sun shadow pass"
+                        : c.lone == LampLoneState::Sun    ? ", with a skeleton, its vertices in "
+                                                            "a sun shadow pass"
+                                                          : ", with a skeleton");
+        }
+        std::printf("\n");
+        card_lookups = 0;
+        // bbport (r47_still-check): the looks at the casters held for still since the last
+        // line, and the casters that moved farthest between the capture their BLAS was built
+        // from and a look: a caster built in a passing pose shows as one moved far at look 1,
+        // two frames after that capture, with its bounds then and now.
+        {
+            const auto u = [](u64 v) { return static_cast<unsigned long long>(v); };
+            static constexpr const char* still_modes[] = {"off", "count", "on"};
+            const StillStats& s = still_stats;
+            std::printf("Ray tracing still check (r47): BB_RT_STILL=%s (experiment "
+                        "4611686018427387904 %s%s); a frame %.1f casters held for still captured "
+                        "again (%.0f triangles; %.1f first looks after a build, %.1f other early "
+                        "looks, %.1f in turn; budgets %u, %u and %u triangles), %.1f waited for "
+                        "a budget (the longest wait of a look %llu frames; the casters due in "
+                        "turn on the last frame need %u frames at the budget), %.2f found no "
+                        "room, %.2f were drawn from another first instance; since the last line "
+                        "%llu captures left out with their draw, %llu refit once because "
+                        "nothing was known of the capture their BLAS held, %llu builds measured, "
+                        "%llu signatures not usable, %llu looks found "
+                        "a caster moving (%llu for the first time, %llu instance entries, %llu in "
+                        "the camera pass, %llu against the other pass's capture), %llu of them "
+                        "asked for a second look, %llu taken as moving from now on (found so "
+                        "twice in a row), %llu not taken past the cap of %u triangles (%llu "
+                        "held by living casters), %llu known from before and taken at their "
+                        "first draw, %llu held for still again; %zu casters known to move; "
+                        "tolerance %.4f m (%.2f m between the passes); lamp bit withheld by class "
+                        "alone (BB_RT_LAMP_LEAVE=%u): %u instances on the last scene%s",
+                        still_modes[StillMode()],
+                        BbToggle::Experiment(StillCheckOldBit) ? "set" : "clear",
+                        still_ready || StillMode() == StillOff ? "" : ", not ready",
+                        // bbport (r47c_review-fixes): with the overdue looks in turn (lane 3)
+                        double(s.probes[0] + s.probes[1] + s.probes[2] + s.probes[3]) / f,
+                        double(s.probe_triangles) / f, double(s.probes[0]) / f,
+                        double(s.probes[1]) / f, double(s.probes[2] + s.probes[3]) / f,
+                        StillLane(true),
+                        StillLane(true), StillLane(false), double(s.waited) / f,
+                        u(s.longest_wait), StillCrowd(still_due_last, StillLane(false)),
+                        double(s.no_room) / f, double(s.other_draw) / f, u(s.left_out),
+                        u(s.refits), u(s.firsts), u(s.unread), u(s.found), u(s.found_new),
+                        u(s.found_instance), u(s.found_camera), u(s.found_cross), u(s.doubted),
+                        u(s.taken), u(s.not_taken), StillMoverCap(), u(still_mover_triangles),
+                        u(s.known), u(s.taken_back), still_movers.size(), double(StillLimit()),
+                        double(std::max(StillLimit(), StillCrossTolerance)), LampLeave(),
+                        still_leave_count, s.largest[0].triangles != 0 ? "; moved farthest:" : "");
+            std::array<StillFound, 4> largest = s.largest;
+            std::ranges::sort(largest, [](const StillFound& a, const StillFound& b) {
+                return a.moved > b.moved;
+            });
+            for (const StillFound& m : largest) {
+                if (m.triangles == 0) {
+                    break;
+                }
+                std::printf(" mesh %016llx (key %016llx), %u triangles, moved %.3f m at look %u, "
+                            "%llu frames after the capture its BLAS was built from, box then "
+                            "(%.3f %.3f %.3f)-(%.3f %.3f %.3f), now (%.3f %.3f %.3f)-(%.3f %.3f "
+                            "%.3f), %s, by %s%s%s;",
+                            u(m.mesh), u(m.key), m.triangles, double(m.moved), m.checks,
+                            u(m.after), double(m.then[0]), double(m.then[1]), double(m.then[2]),
+                            double(m.then[3]), double(m.then[4]), double(m.then[5]),
+                            double(m.now[0]), double(m.now[1]), double(m.now[2]),
+                            double(m.now[3]), double(m.now[4]), double(m.now[5]),
+                            m.instance ? "an instance's own entry" : "known by draw order",
+                            m.camera ? "a camera pass draw" : "a sun shadow pass draw",
+                            m.cross ? " against the other pass's capture" : "",
+                            m.taken ? ", taken as moving" : "");
+            }
+            std::printf("\n");
+            // bbport (r47b_casters): how the props with a small bone palette are known, and
+            // (BB_RT_STILL_LIST) every caster the looks found moving since the last line
+            u64 instances = 0, placed = 0, placed_triangles = 0;
+            for (const Entry* e : frame_entries) {
+                instances += e->instance ? 1 : 0;
+                if (e->instance && e->palette_placed) {
+                    ++placed;
+                    placed_triangles += e->triangles;
+                }
+            }
+            std::printf("Ray tracing prop palettes (r47b): a frame %.1f draws with a small bone "
+                        "palette, %.1f of them known by the palette's address (memory the GPU "
+                        "wrote; experiment 4611686018427387904 set: all by their bytes); on the "
+                        "last frame %llu instance entries drawn, %llu of them known by an "
+                        "address (%llu triangles); %.2f instances a frame held in an earlier "
+                        "frame's pose and left without the lamp bit\n",
+                        double(s.palette_draws) / f, double(s.placed_draws) / f, u(instances),
+                        u(placed), u(placed_triangles), double(s.placed_old_pose) / f);
+            // bbport (r47c_review-fixes): the pace of the looks in turn, the held movers the
+            // lamp bit was left to, the signs of an address the game uses again
+            std::printf("Ray tracing review counters (r47c): the casters looked at in turn count "
+                        "for %llu triangles (the most a frame drew of late; one the camera pass "
+                        "does not draw for a quarter), at %u a frame a look of each every %u "
+                        "frames at the least (64 where that is less); the look that waited "
+                        "longest for a budget waited %llu frames (a caster of %llu triangles, "
+                        "%s, drawn %llu frames after its draw before), %.2f looks a frame that "
+                        "had waited %u frames or more were served from the second budget "
+                        "(BB_RT_STILL_OVERDUE); %.2f held moving props known by an address a "
+                        "frame kept the lamp bit (no other prop of their mesh drawn that frame); "
+                        "%llu looks found a prop known by an address more than %.1f m from where "
+                        "it was built with a box of the same size (its palette's address given "
+                        "to another prop, or a prop carried whole); small palettes in memory the "
+                        "GPU wrote are known by their %s (BB_RT_PALETTE_PLACE=%u); %llu position "
+                        "streams drawn with a skeleton were bound with another size than before "
+                        "(another mesh at the address: taken for new)\n",
+                        u(still_pool_last), StillLane(false),
+                        StillCrowd(still_pool_last, StillLane(false)), u(s.oldest_waiting),
+                        u(s.oldest_triangles), s.oldest_near ? "near" : "not near",
+                        u(s.oldest_gap), double(s.probes[3]) / f, StillOverdueFrames(),
+                        double(s.placed_held) / f, u(s.placed_carried), double(StillCarried),
+                        PalettePlace() && !BbToggle::Experiment(StillCheckOldBit) ? "address"
+                                                                                  : "bytes",
+                        PalettePlace() ? 1u : 0u, u(lone_resized));
+            lone_resized = 0;
+            if (StillListMost() != 0) {
+                std::vector<const StillFound*> order;
+                order.reserve(still_list.size());
+                for (const auto& item : still_list) {
+                    order.push_back(&item.second);
+                }
+                std::ranges::sort(order, [](const StillFound* a, const StillFound* b) {
+                    return a->moved != b->moved ? a->moved > b->moved : a->id < b->id;
+                });
+                std::printf("Ray tracing still list (r47b): %zu casters found moving since the "
+                            "last line (BB_RT_STILL_LIST=%u)\n",
+                            order.size(), StillListMost());
+                for (const StillFound* m : order) {
+                    std::printf("still mover: mesh %016llx key %016llx tri %u moved %.3f m on "
+                                "%u looks (look %u, %llu frames after the capture of its BLAS) "
+                                "then (%.3f %.3f %.3f)-(%.3f %.3f %.3f) now (%.3f %.3f %.3f)-"
+                                "(%.3f %.3f %.3f) size then (%.3f %.3f %.3f) now (%.3f %.3f "
+                                "%.3f) %s, palette %s, %s, %s pass%s%s\n",
+                                u(m->mesh), u(m->key), m->triangles, double(m->moved), m->finds,
+                                m->checks, u(m->after), double(m->then[0]), double(m->then[1]),
+                                double(m->then[2]), double(m->then[3]), double(m->then[4]),
+                                double(m->then[5]), double(m->now[0]), double(m->now[1]),
+                                double(m->now[2]), double(m->now[3]), double(m->now[4]),
+                                double(m->now[5]), double(m->then[3] - m->then[0]),
+                                double(m->then[4] - m->then[1]), double(m->then[5] - m->then[2]),
+                                double(m->now[3] - m->now[0]), double(m->now[4] - m->now[1]),
+                                double(m->now[5] - m->now[2]),
+                                m->instance ? "instance entry" : "draw order",
+                                !m->palette ? "none" : m->placed ? "by address" : "by bytes",
+                                m->skinned ? "skinned" : "not skinned",
+                                m->camera ? "camera" : "sun",
+                                m->cross ? ", against the other pass's capture" : "",
+                                m->taken ? ", taken as moving" : "");
+                }
+                still_list.clear();
+            }
+            still_stats = {};
+        }
         stats = {};
         turn_stats = {}; // bbport (r43_copy-turns)
     }
@@ -2635,6 +3708,38 @@ void RtShadow::OnFrameEnd() {
         scheduler.Wait(slot_ticks[slot]);
         slot_ticks[slot] = 0;
     }
+    // bbport (r47_still-check): the signatures the GPU is done with are read, the oldest frame's
+    // first: those of the ring slot the coming frame writes again (recorded four frames ago:
+    // waited for like the capture params just above, which the GPU has long passed), and those
+    // of the frames since whose tick the GPU has passed. No wait for these: the driver is asked
+    // once how far the GPU is (the tick the scheduler knows is only as new as the last wait
+    // anywhere), and only on a frame that has signatures to read; that answer serves the other
+    // slots. An entry is not looked at again before its signature is read, so a late read
+    // would put its first look off.
+    bool asked = false;
+    for (u32 age = 0; age < 4; ++age) {
+        const u32 s = (slot + age) % 4;
+        if (still_ticks[s] == 0) {
+            continue;
+        }
+        if (age == 0) {
+            scheduler.Wait(still_ticks[s]);
+        } else {
+            const bool passed = asked ? scheduler.GetWorkSemaphore()->IsFree(still_ticks[s])
+                                      : scheduler.IsFree(still_ticks[s]);
+            asked = true;
+            if (!passed) {
+                break;
+            }
+        }
+        ReadStillSigs(s);
+    }
+    still_sig_used = 0;
+    still_used = {};
+    still_due_last = still_due;
+    still_due = 0;
+    still_pool_last = still_pool_peak.End(still_pool, frame); // bbport (r47c_review-fixes)
+    still_pool = 0;
     params_used = 0;
     positions_used = 0;
     scratch_used = 0;
