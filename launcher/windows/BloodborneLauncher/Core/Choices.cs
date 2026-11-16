@@ -127,7 +127,7 @@ namespace BloodborneLauncher.Core
             new("effect_ssr", L.T("Screen-space reflections"), true, L.T("Not in the original game")),
             new("effect_modern_ssr", L.T("Improved reflections"), true, L.T("Needs Screen-space reflections on")),
             new("effect_pom_cavity", L.T("Deeper parallax surfaces"), true),
-            new("effect_contact_shadows", L.T("Contact shadows"), false),
+            new("effect_contact_shadows", L.T("Bend Studio Screenspace Shadows"), false),
             new("effect_pcss", L.T("Soft sun shadows (PCSS)"), false),
             new("effect_volumetric_light", L.T("Volumetric sunlight"), true, L.T("Heavy")),
             new("effect_point_fog", L.T("Fog around lamps"), true, L.T("Heavy")),

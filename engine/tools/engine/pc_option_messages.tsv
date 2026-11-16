@@ -78,7 +78,7 @@
 126020	PC Lighting		PC 光照		Освещение (ПК)
 127020	PC Lighting Detail		PC 光照细节		Детали освещения (ПК)
 126000	Better AO (Experimental)	GTAO in place of the game's shader; Ambient Occlusion must be on. Requires a restart.	增强环境光遮蔽（实验性）	用 GTAO 替换游戏着色器；需开启环境光遮蔽。需要重启。	Улучшенное затенение (эксп.)	GTAO вместо шейдера игры; затенение должно быть включено. Нужен перезапуск.
-126001	Contact Shadows	Fine shadows where objects meet surfaces.	接触阴影	物体与表面接触处的细腻阴影。	Контактные тени	Тонкие тени там, где предметы касаются поверхностей.
+126001	Bend Studio Screenspace Shadows	Fine shadows where objects meet surfaces.	Bend Studio 屏幕空间阴影	物体与表面接触处的细腻阴影。	Экранные тени Bend Studio	Тонкие тени там, где предметы касаются поверхностей.
 126002	Soft Sun Shadows	PCSS: shadows soften the farther they fall from what casts them.	柔和太阳阴影	PCSS：阴影离投射物越远越柔和。	Мягкие тени от солнца	PCSS: чем дальше от предмета, тем мягче тень.
 126003	Indirect Lighting	One bounce of light from nearby surfaces. Heavy.	间接光照	来自附近表面的一次反弹光。开销大。	Непрямое освещение	Один отскок света от ближних поверхностей. Тяжёлый эффект.
 126004	Indirect Light Strength	5 is the default.	间接光强度	5 为默认值。	Сила непрямого света	5 по умолчанию.

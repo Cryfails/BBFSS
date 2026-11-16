@@ -59,7 +59,7 @@ inline constexpr Effect Effects[] = {
     {"effect_gtao", "Ground-truth ambient occlusion (GTAO, experimental)", "Затенение GTAO (эксперимент)", true},
     {"effect_modern_ssr", "Improved reflections", "Улучшенные отражения", true},
     {"effect_pom_cavity", "Deeper parallax surfaces", "Глубокие параллакс-поверхности", true},
-    {"effect_contact_shadows", "Contact shadows", "Контактные тени", false},
+    {"effect_contact_shadows", "Bend Studio Screenspace Shadows", "Экранные тени Bend Studio", false},
     {"effect_pcss", "Soft sun shadows (PCSS)", "Мягкие тени солнца (PCSS)", false},
     {"effect_gi", "Indirect lighting (GI)", "Непрямое освещение (GI)", true},
     {"effect_volumetric_light", "Volumetric sunlight", "Объёмный солнечный свет", true},
