@@ -592,9 +592,16 @@ void Rasterizer::EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipel
         if (cb_descs[0].first && !dc.buffer_infos.empty() && dc.buffer_infos[0].buffer) {
             const bool has_ubo = dc.buffer_infos.size() > 1 && dc.buffer_infos[1].buffer;
             const bool has_map = dc.image_infos.size() > 1 && dc.image_infos[1].imageView;
-            contact_shadow->OnShadowDraw(
-                cb_descs[0].first,
-                {.constants = dc.buffer_infos[0].buffer,
+            const auto& ps = pipeline->GetStage(Shader::SwStage::Fragment);
+            // The shader's constant word 0 is the sharp's base address (buf_offsets[0] is only
+            // the alignment remainder the shader adds to the aligned binding). Copy the floats
+            // Bend's CPU dispatch layout needs now: Flush runs after the blur draw, by which
+            // time the game may have reused this memory.
+            const VAddr constants = !ps.buffers.empty() && !ps.buffers[0].IsSpecial()
+                                        ? ps.buffers[0].GetSharp(ps).base_address
+                                        : 0;
+            ContactShadow::Inputs inputs{
+                 .constants = dc.buffer_infos[0].buffer,
                  .constants_offset = dc.buffer_infos[0].offset,
                  .constants_range = dc.buffer_infos[0].range,
                  .uniforms = has_ubo ? dc.buffer_infos[1].buffer : vk::Buffer{},
@@ -603,7 +610,15 @@ void Rasterizer::EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipel
                  .shadow_map = has_map ? dc.image_infos[1].imageView : vk::ImageView{},
                  .shadow_layout = has_map ? dc.image_infos[1].imageLayout : vk::ImageLayout::eUndefined,
                  .constants_offset_word = PackedOffsets(dc.push_data),
-                 .frame_index = shadow_frame++});
+                 .frame_index = shadow_frame++};
+            constexpr u64 bytes = sizeof(inputs.constants_cpu);
+            if (constants && memory->IsValidGpuMapping(constants, bytes) &&
+                memory->ClampRangeSize(constants, bytes) == bytes) {
+                std::memcpy(inputs.constants_cpu.data(), reinterpret_cast<const void*>(constants),
+                            bytes);
+                inputs.has_constants_cpu = true;
+            }
+            contact_shadow->OnShadowDraw(cb_descs[0].first, inputs);
         }
     } else if (tile_lights != 0) {
         const auto& ps = pipeline->GetStage(Shader::SwStage::Fragment);

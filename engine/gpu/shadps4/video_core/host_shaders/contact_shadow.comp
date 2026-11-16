@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Bend Studio screen-space shadow traversal:
+// Copyright 2023 Sony Interactive Entertainment. SPDX-License-Identifier: Apache-2.0.
 
 #version 450
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
 
-layout(local_size_x = 8, local_size_y = 8) in;
+layout(local_size_x = 64) in;
 
 layout(scalar, set = 0, binding = 0) readonly buffer Cb { uint d[]; } cbuf;
 layout(set = 0, binding = 1) uniform sampler2D depth_tex;
@@ -15,10 +19,12 @@ layout(push_constant) uniform Constants {
     uint buf_off;
     uint frame_index;
     vec2 size;
-    float length_m;
-    float thickness_m;
+    vec4 light_coordinate;
+    ivec2 wave_offset;
+    float surface_thickness;
+    float bilinear_threshold;
     float strength;
-    float flip;
+    float shadow_contrast;
     uint debug;
     uint contact_on;
     uint pcss_on;
@@ -28,6 +34,7 @@ layout(push_constant) uniform Constants {
     float bias_m;
     uint filter_on;
     float cascade_blend;
+    float bend_distance_scale; // 0: no fade (uniforms not bound)
 };
 
 #ifndef BLOCKER_TAPS
@@ -43,7 +50,13 @@ layout(push_constant) uniform Constants {
 #define FILTER_FAR 32
 #endif
 
-const int STEPS = 20;
+const int WAVE_SIZE = 64;
+const int SAMPLE_COUNT = 60;
+const int HARD_SHADOW_SAMPLES = 4;
+const int FADE_OUT_SAMPLES = 8;
+const int READ_COUNT = SAMPLE_COUNT / WAVE_SIZE + 2;
+shared float depth_data[READ_COUNT * WAVE_SIZE];
+shared bool lds_early_out;
 
 uint base;
 float cb(int i) { return uintBitsToFloat(cbuf.d[base + uint(i)]); }
@@ -54,17 +67,11 @@ float sceneDepth(vec2 uv) { return textureLod(depth_tex, uv, 0.0).x; }
 bool fullyFaded;
 mat4 invMat;
 mat4 projMat;
-vec4 invZ, invW;
 
 vec3 viewPosAt(vec2 uv, float depth) {
     vec4 c = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
     vec4 v = invMat * c;
     return v.xyz / v.w;
-}
-
-float viewZAt(vec2 uv, float depth) {
-    vec4 c = vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    return dot(invZ, c) / dot(invW, c);
 }
 
 float hash(vec2 p) {
@@ -110,57 +117,132 @@ bool setup(vec2 uv0) {
     return setupCascade(index);
 }
 
-float contact(vec2 uv0) {
-    vec3 dir = cross(rA.xyz - lu * rW.xyz, rB.xyz - lv * rW.xyz);
-    float dl = length(dir);
-    if (!(dl > 1e-12)) {
-        return 1.0;
-    }
-    dir /= dl;
+void wavefrontExtents(out vec2 delta_xy, out vec2 pixel_xy, out float pixel_distance,
+                      out bool major_axis_x, out bool center_wave, out bool center_thread) {
+    ivec2 xy = ivec2(gl_WorkGroupID.yz) * WAVE_SIZE + wave_offset;
+    vec2 light_xy = floor(light_coordinate.xy) + 0.5;
+    vec2 light_fraction = light_coordinate.xy - light_xy;
+    bool reverse_direction = light_coordinate.w > 0.0;
 
-    if (dot(rZ.xyz - lz * rW.xyz, dir) > 0.0) {
-        dir = -dir;
-    }
-    dir *= flip;
+    ivec2 sign_xy = sign(xy);
+    bool horizontal = abs(xy.x + sign_xy.y) < abs(xy.y - sign_xy.x);
+    ivec2 axis = horizontal ? ivec2(sign_xy.y, 0) : ivec2(0, -sign_xy.x);
+    xy += axis * int(gl_WorkGroupID.x);
+    vec2 xy_f = vec2(xy);
 
-    int steps = STEPS;
-    vec4 tip = projMat * vec4(P0 + dir * length_m, 1.0);
-    if (tip.w > 0.0) {
-        vec2 tipUv = tip.xy / tip.w * vec2(0.5, -0.5) + 0.5;
-        float span = length((tipUv - uv0) * size);
-        if (span < 1.0) {
+    major_axis_x = abs(xy_f.x) > abs(xy_f.y);
+    float major_axis = major_axis_x ? xy_f.x : xy_f.y;
+    float major_axis_start = abs(major_axis);
+    float major_axis_end = abs(major_axis) - float(WAVE_SIZE);
+    float light_fraction_major = major_axis_x ? light_fraction.x : light_fraction.y;
+    light_fraction_major = major_axis > 0.0 ? -light_fraction_major : light_fraction_major;
+
+    vec2 start_xy = xy_f + light_xy;
+    vec2 end_xy = mix(light_coordinate.xy, start_xy,
+                      (major_axis_end + light_fraction_major) /
+                          (major_axis_start + light_fraction_major));
+    delta_xy = start_xy - end_xy;
+
+    int lane = int(gl_LocalInvocationIndex);
+    float thread_step = float(lane ^ (reverse_direction ? 0 : WAVE_SIZE - 1));
+    center_wave = gl_NumWorkGroups.x == 1;
+    center_thread = center_wave && gl_LocalInvocationIndex == 0;
+    if (center_wave) {
+        delta_xy = vec2(0.0);
+        pixel_xy = light_coordinate.xy;
+        pixel_distance = 1.0;
+    } else {
+        pixel_xy = mix(start_xy, end_xy, thread_step / float(WAVE_SIZE));
+        pixel_distance = major_axis_start - thread_step + light_fraction_major;
+    }
+}
+
+float bendContact(vec2 pixel_xy, vec2 delta_xy, float pixel_distance, bool major_axis_x,
+                  float start, float native_alpha) {
+    float shadowing_depth[READ_COUNT];
+    float depth_thickness_scale[READ_COUNT];
+    float sample_distance[READ_COUNT];
+    const float direction = -light_coordinate.w;
+    const float z_sign = 1.0;
+    bool skip_trace = !(start < 1.0) || !(start > 0.0) ||
+                      (debug == 0u && filter_on == 0u && native_alpha <= 1.0 - strength);
+
+    for (int i = 0; i < READ_COUNT; ++i) {
+        vec2 read_xy = floor(pixel_xy);
+        float minor_axis = major_axis_x ? pixel_xy.y : pixel_xy.x;
+        float bilinear = fract(minor_axis) - 0.5;
+        float bias = bilinear > 0.0 ? 1.0 : -1.0;
+        vec2 offset_xy = major_axis_x ? vec2(0.0, bias) : vec2(bias, 0.0);
+        vec2 depths;
+        depths.x = i == 0 ? start : textureLod(depth_tex, (read_xy + 0.5) / size, 0.0).x;
+        depths.y = textureLod(depth_tex, (read_xy + 0.5 + offset_xy) / size, 0.0).x;
+
+        depth_thickness_scale[i] = abs(1.0 - depths.x);
+        bool use_point_filter =
+            abs(depths.x - depths.y) > depth_thickness_scale[i] * bilinear_threshold;
+        float shadow_depth = depths.x + abs(depths.x - depths.y) * z_sign;
+        shadowing_depth[i] = use_point_filter ? depths.x : shadow_depth;
+        sample_distance[i] = pixel_distance + float(WAVE_SIZE * i) * direction;
+        pixel_xy += delta_xy * direction;
+    }
+
+    bool any_active = subgroupAny(!skip_trace);
+    if (gl_SubgroupSize == WAVE_SIZE) {
+        if (!any_active) {
             return 1.0;
         }
-        steps = clamp(int(span / 1.5), 4, STEPS);
+    } else {
+        if (gl_LocalInvocationIndex == 0u) {
+            lds_early_out = true;
+        }
+        barrier();
+        if (any_active) {
+            lds_early_out = false;
+        }
+        barrier();
+        if (lds_early_out) {
+            return 1.0;
+        }
     }
 
-    float jitter = hash(uv0 * size);
-    for (int i = 0; i < steps; ++i) {
-        float t = (float(i) + 0.5 + jitter) / float(steps);
-        vec3 P = P0 + dir * (t * length_m);
-        if (!(P.z > 0.0)) {
-            break;
+    for (int i = 0; i < READ_COUNT; ++i) {
+        float stored_depth = (shadowing_depth[i] - light_coordinate.z) / sample_distance[i];
+        if (i != 0 && sample_distance[i] <= 0.0) {
+            stored_depth = 1e10;
         }
-        vec4 n4 = projMat * vec4(P, 1.0);
-        if (!(n4.w != 0.0)) {
-            break;
-        }
-        vec3 ndc = n4.xyz / n4.w;
-        vec2 uv = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-            break;
-        }
-        float sd = sceneDepth(uv);
-        if (!(sd < 1.0) || !(sd > 0.0)) {
-            continue;
-        }
-        float diff = P.z - viewZAt(uv, sd);
-        float bias = 0.03 + 0.004 * P0.z + 0.04 * t * length_m;
-        if (diff > bias && diff < thickness_m) {
-            return 1.0 - strength * (1.0 - 0.5 * t);
-        }
+        depth_data[i * WAVE_SIZE + int(gl_LocalInvocationIndex)] = stored_depth;
     }
-    return 1.0;
+    barrier();
+    if (skip_trace) {
+        return 1.0;
+    }
+
+    float start_depth = (start - light_coordinate.z) / sample_distance[0];
+    int sample_index = int(gl_LocalInvocationIndex) + 1;
+    vec4 shadow_value = vec4(1.0);
+    float hard_shadow = 1.0;
+    float depth_scale = min(sample_distance[0] + direction, 1.0 / surface_thickness) *
+                        sample_distance[0] / depth_thickness_scale[0];
+    start_depth = start_depth * depth_scale - z_sign;
+
+    for (int i = 0; i < HARD_SHADOW_SAMPLES; ++i) {
+        float depth_delta = abs(start_depth - depth_data[sample_index + i] * depth_scale);
+        hard_shadow = min(hard_shadow, depth_delta);
+    }
+    for (int i = HARD_SHADOW_SAMPLES; i < SAMPLE_COUNT - FADE_OUT_SAMPLES; ++i) {
+        float depth_delta = abs(start_depth - depth_data[sample_index + i] * depth_scale);
+        shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta);
+    }
+    for (int i = SAMPLE_COUNT - FADE_OUT_SAMPLES; i < SAMPLE_COUNT; ++i) {
+        float depth_delta = abs(start_depth - depth_data[sample_index + i] * depth_scale);
+        float fade = float(i + 1 - (SAMPLE_COUNT - FADE_OUT_SAMPLES)) /
+                     float(FADE_OUT_SAMPLES + 1) * 0.75;
+        shadow_value[i & 3] = min(shadow_value[i & 3], depth_delta + fade);
+    }
+
+    shadow_value = clamp(shadow_value * shadow_contrast + (1.0 - shadow_contrast), 0.0, 1.0);
+    hard_shadow = clamp(hard_shadow * shadow_contrast + (1.0 - shadow_contrast), 0.0, 1.0);
+    return min(hard_shadow, dot(shadow_value, vec4(0.25)));
 }
 
 bool lightCoords(vec2 uv, out vec3 l, out float viewZ) {
@@ -289,26 +371,62 @@ float pcss(vec2 uv0) {
 void main() {
     base = (buf_off & 0xffu) >> 2;
 
-    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(pixel, ivec2(size)))) {
-        return;
+    vec2 delta_xy, pixel_xy;
+    float pixel_distance;
+    bool major_axis_x;
+    ivec2 pixel;
+    bool valid_pixel;
+    if (contact_on != 0u) {
+        // Bend's wavefront layout: each workgroup walks one projected light ray.
+        bool center_wave, center_thread;
+        wavefrontExtents(delta_xy, pixel_xy, pixel_distance, major_axis_x, center_wave,
+                         center_thread);
+        pixel = ivec2(floor(pixel_xy));
+        valid_pixel = all(greaterThanEqual(pixel, ivec2(0))) &&
+                      all(lessThan(pixel, ivec2(size))) && (!center_wave || center_thread);
+    } else {
+        // Shadow-map filter only: one thread per pixel, in rows of 64.
+        pixel = ivec2(gl_WorkGroupID.x * uint(WAVE_SIZE) + gl_LocalInvocationIndex,
+                      gl_WorkGroupID.y);
+        valid_pixel = all(lessThan(pixel, ivec2(size)));
     }
-    const vec2 uv = (vec2(pixel) + 0.5) / size;
-    d0 = sceneDepth(uv);
-    if (!(d0 < 1.0) || !(d0 > 0.0)) return;
-    extent = vec2(textureSize(shadow_map, 0));
-    invMat = transpose(mat4(row(0), row(4), row(8), row(12)));
-    projMat = inverse(invMat);
-    invZ = vec4(invMat[0][2], invMat[1][2], invMat[2][2], invMat[3][2]);
-    invW = vec4(invMat[0][3], invMat[1][3], invMat[2][3], invMat[3][3]);
-    vec4 c = imageLoad(shadow_img, pixel);
-    if (!setup(uv)) {
-        return;
-    }
-    float alpha = c.a;
+    vec2 uv = (vec2(pixel) + 0.5) / size;
+    d0 = valid_pixel ? sceneDepth(uv) : 1.0;
+    vec4 c = valid_pixel ? imageLoad(shadow_img, pixel) : vec4(1.0);
 
+    // Every thread of a Bend wavefront takes part (shared depth samples and barriers), even
+    // off-screen or sky ones.
+    float contact = 1.0;
+    if (contact_on != 0u) {
+        contact = bendContact(pixel_xy, delta_xy, pixel_distance, major_axis_x, d0, c.a);
+    }
+    if (!valid_pixel || !(d0 < 1.0) || !(d0 > 0.0)) {
+        return;
+    }
+
+    invMat = transpose(mat4(row(0), row(4), row(8), row(12)));
+    const uint ub = ((buf_off >> 8) & 0xffu) >> 2;
+    if (contact_on != 0u && debug == 0u) {
+        // Fade the Bend shadows out with the game's sun-shadow distance fade, stretched
+        // bend_distance_scale times further, so they don't run on past the shadow map
+        // (unfaded, distant foliage flickered in the Elden Ring port).
+        float fade = 1.0;
+        if (bend_distance_scale > 0.0) {
+            float dist = length(viewPosAt(uv, d0));
+            fade = clamp(uintBitsToFloat(ubuf.d[ub + 73u]) *
+                             (uintBitsToFloat(ubuf.d[ub + 72u]) - dist / bend_distance_scale),
+                         0.0, 1.0);
+        }
+        contact = 1.0 - strength * fade * (1.0 - contact);
+    }
+
+    float alpha = c.a;
     if (filter_on != 0u) {
-        const uint ub = ((buf_off >> 8) & 0xffu) >> 2;
+        extent = vec2(textureSize(shadow_map, 0));
+        projMat = inverse(invMat);
+        if (!setup(uv)) {
+            return;
+        }
         float fade = clamp(uintBitsToFloat(ubuf.d[ub + 73u]) *
                                (uintBitsToFloat(ubuf.d[ub + 72u]) - length(P0)),
                            0.0, 1.0);
@@ -325,16 +443,13 @@ void main() {
                 if (next >= 0.0)
                     vis = mix(vis, next, smoothstep(split - band, split, P0.z));
             }
-            if (contact_on != 0u)
-                setupCascade(primary);
         }
         if (vis >= 0.0) {
             alpha = 1.0 - fade * (1.0 - vis);
         }
     }
-    if (contact_on != 0u && (debug != 0u || alpha > 1.0 - strength)) {
-        float k = contact(uv);
-        alpha = debug != 0u ? k : min(alpha, k);
+    if (contact_on != 0u) {
+        alpha = debug != 0u ? contact : min(alpha, contact);
     }
     c.a = alpha;
     imageStore(shadow_img, pixel, c);

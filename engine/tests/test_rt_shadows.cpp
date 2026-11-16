@@ -2,6 +2,7 @@
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -668,13 +669,17 @@ void WritePgm(const char* path, const std::vector<float>& image) {
 
 struct PcssPush {
     unsigned offsets = 0, frame = 0;
-    float width = W, height = H, length = 0.6f, thickness = 0.35f, strength = 0.75f, flip = 1;
+    float width = W, height = H;
+    std::array<float, 4> light_coordinate{};
+    std::array<int, 2> wave_offset{};
+    float surface = 0.005f, bilinear = 0.02f, strength = 0.75f, contrast = 4;
     unsigned debug = 0, contact = 0, pcss = 1;
     float light = 0.02f, maximum = 0.3f, minimum = 0.0f, bias = 0.04f;
     unsigned filter = 1;
     float blend = 0.1f;
+    float bend_scale = 0;
 };
-static_assert(sizeof(PcssPush) == 68);
+static_assert(sizeof(PcssPush) == 96);
 struct RtPush {
     unsigned offsets = 0, frame = 0;
     float width = W, height = H;
@@ -802,8 +807,9 @@ struct Lab {
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 4, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &u}}};
         vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pcss.pipeline);
         vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pcss.layout, 0, 5, writes.data());
+        // PCSS only (contact = 0): one thread per pixel, in rows of 64.
         vkCmdPushConstants(vk.cmd, pcss.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
-        vkCmdDispatch(vk.cmd, (W + 7) / 8, (H + 7) / 8, 1);
+        vkCmdDispatch(vk.cmd, (W + 63) / 64, H, 1);
     }
     std::vector<float> Read(Image& image, VkFormat format) {
         vk.Begin();

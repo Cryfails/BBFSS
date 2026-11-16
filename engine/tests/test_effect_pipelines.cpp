@@ -138,7 +138,7 @@ int main() {
          CONTACT_SHADOW_COMP,
          {eStorageBuffer, eCombinedImageSampler, eStorageImage, eCombinedImageSampler,
           eStorageBuffer},
-         68},
+         96},
         {"point shadows",
          POINT_SHADOW_COMP,
          {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage,

@@ -18,7 +18,9 @@ bool Create(const Instance& instance, vk::UniqueDescriptorSetLayout& set_layout,
             std::initializer_list<vk::DescriptorType> types, u32 push_size,
             std::span<const u32> code, const char* name, bool dispatch_base = false);
 
-bool CreateSampler(const Instance& instance, vk::UniqueSampler& sampler, vk::Filter filter);
+bool CreateSampler(const Instance& instance, vk::UniqueSampler& sampler, vk::Filter filter,
+                   vk::SamplerAddressMode address = vk::SamplerAddressMode::eClampToEdge,
+                   vk::BorderColor border = vk::BorderColor::eFloatOpaqueBlack);
 
 bool StorageFormat(const Instance& instance, vk::Format format);
 

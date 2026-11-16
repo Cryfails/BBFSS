@@ -65,6 +65,7 @@ Seamless co-op runs on a server in Frankfurt, sponsored by [1337 Hosting](https:
 | Online backend for The Hunter's Dream | [droogie/bbhost](https://github.com/droogie/bbhost) |
 | FSR (FSR 4.1.2 and FSR 3.1.6) | [AMD FSR SDK 2.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK), AMD's signed Vulkan binaries |
 | Seamless co-op server | [1337 Hosting](https://1337hosting.com) |
+| Compute screen-space shadows | [Bend Studio's Screen Space Shadows](https://github.com/BendStudio/ScreenSpaceShadows) |
 | FSR 3.1 and FSR 4 on Vulkan | [FireBurn/FSR-Vulkan](https://github.com/FireBurn/FSR-Vulkan) and the AMD FidelityFX SDK |
 | FSR 4.1.1 | [fsr4vk](https://github.com/dvj5411/fsr4vk), with the AMD driver fix from [0xCydral](https://github.com/0xCydral/bloodborne_pc) |
 | DLSS | NVIDIA DLSS SDK |

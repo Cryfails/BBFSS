@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
@@ -36,6 +38,10 @@ public:
         vk::ImageLayout shadow_layout = vk::ImageLayout::eUndefined;
         u32 constants_offset_word = 0;
         u32 frame_index = 0;
+        /// Copy of the resolve's first 28 constant floats (inverse projection, cascade 0), taken
+        /// at draw time; Bend's dispatch layout is built from them on the CPU.
+        std::array<float, 28> constants_cpu{};
+        bool has_constants_cpu = false;
     };
 
     void OnShadowDraw(VideoCore::ImageId target, const Inputs& inputs);
@@ -73,9 +79,13 @@ private:
     bool use_filter = false;
     bool use_rt = false;
     bool sun_replaced = false;
-    float length_m = 0.6f;
-    float thickness_m = 0.35f;
+    float surface_thickness = 0.005f;
+    float bilinear_threshold = 0.02f;
     float strength = 0.75f;
+    float shadow_contrast = 2.0f;
+    // Bend shadows fade out with the game's sun-shadow distance fade, stretched this many times
+    // further than the shadow map (1.5 was the accepted Elden Ring setting).
+    float bend_distance_scale = 1.5f;
     float flip = 1.0f;
     u32 debug = 0;
     float light_tan = 0.02f;
