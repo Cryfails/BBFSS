@@ -1,4 +1,4 @@
-# LRT: lamp ray tracing (status at hand-over, 2026-11-16)
+# LRT: lamp ray tracing (status at pause, 2026-11-16 about 17:00)
 
 Completion is about 22% against the owner's goals (9 tasks).
 
@@ -36,6 +36,9 @@ Unless a line says otherwise, the patch is off by default.
 - r130c_glass-lamp-light (reviewed fixed version): knob BB_GLASS_LIGHT. b80: runs, not shown.
 - r130e_sewer-water-moves (reviewed fixed version): uses the water motion strength from r130b. b81: works. The sewer water moves clearly when looking down.
 - r130g_glass-light-forward (reviewed fixed version): knobs BB_GLASS_LIGHT and BB_RT_GLASS. b82: first visible tinted light, but through ivy leaves (a wrong key), not lamp glass.
+- r131b_lrt-settings: lantern ini graphics_rt_foliage_shadows (0 off, 1 lamps, 2 lamps and sun; needs a restart) and graphics_blood_sheen_tint (0, 1, 2; default 1; live), plus menu and launcher rows for water motion and the sheen tint. b83: PASS.
+- r131c_cabinet-glass-clear (reviewed fixed version): knobs BB_GLASS_CLEAR=1 and BB_GLASS_CLEAR_FILM (0 to 0.5, default 0.12). The dream-house cabinet's panes show what is behind them through a thin film. Works (about 24k pane pixels a frame, no holes; do-nothing place unchanged). Cost on about 0.05 to 0.1 ms and 60 to 95 MB at 1080p. Needs BB_GLASS_LIGHT=1, so it waits for the blob fix (r131d).
+- r131a_foliage-translucency (reviewed fixed version): knobs BB_FOLIAGE_TRANSLUCENCY=1 (master, needs BB_RT_CARD_ALPHA=2), BB_FOLIAGE_LIGHT_THROUGH, BB_FOLIAGE_GLOW (needs BB_RT_CARD_LAMPS=1). b84: light through leaves works but is faint; the glow is not visible yet and costs 10 to 12 ms a frame, because every non-sky pixel casts a camera ray to ask whether it is a leaf. HELD BACK until fixed.
 
 ## Knobs
 
@@ -57,6 +60,10 @@ Defaults marked "not recorded" were not stated in the hand-over notes. Check the
 | BB_GLASS_LIGHT | Lets lamp light pass through registered glass with a tint (r130c, r130g) | off |
 | BB_RT_GLASS | Puts window pane draws into the ray traced scene as glass records (r83; r130g adds forward panes) | off |
 
+## The white blob (found 2026-11-16)
+
+A large white glow that comes and goes over the hunter. It is not the glass. The coloured lamp shadow path (r92, BB_LAMP_SHADOW_COLOUR=1, which BB_GLASS_LIGHT=1 and r131a also switch on) makes a few bad pixels on the hunter's hair in some frames, and bloom spreads them into the glow. With the coloured path alone it shows in 5 of 10 pictures; with bloom off there is no glow, only the white hair pixels. The fix, r131d_lamp-colour-blob, is being drafted, with an off-by-default counter of bad values to prove the exact line first.
+
 ## Findings at hand-over
 
 (a) The draw pair c6cdba2b:6720ae0d that older notes called street-lamp glass is an ivy leaf shader. The glass view paints ivy leaves at the lamp-test-spot. The b82 blue shadow was a leaf shadow.
@@ -67,6 +74,7 @@ Defaults marked "not recorded" were not stated in the hand-over notes. Check the
 
 ## Next steps
 
+0. At the pause: r131d (blob fix) is being drafted. Then implement, review, build, and rerun the blob test (expect 0 of 10). Then show the cabinet glass with glass light on. Then fix the r131a glow cost (a leaf mask instead of a camera ray per pixel) and make the effect visible.
 1. Find a place with sun or a lamp shining through a real window. Ask the owner, with a picture.
 2. Build a triangle-level glass pick for the lantern and street-lamp panes.
 3. Get owner 4K clips of: r128a (moving edge), BB_BLOOD_SHEEN_TINT 2, water motion strength 2 to 4, and r128c in a brighter place.
