@@ -8,6 +8,7 @@
 #include <cstdio>
 
 #include "bbport_settings.h"
+#include "shader_recompiler/native/froyok_composite.h"
 #include "video_core/host_shaders/gtao_frag.h"
 #include "video_core/host_shaders/gtao_hq_frag.h"
 #include "video_core/host_shaders/bloom_downsample_frag.h"
@@ -255,6 +256,11 @@ std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<cons
 bool KeepRecompiled(const Shader::Info& info) {
     if (info.hw_stage != Shader::HwStage::Fragment) {
         return false;
+    }
+    // The Froyok composite's blend exists only in the recompiler's IR (native/froyok_composite.h);
+    // the lifter would emit the game's original bloom addition for the same shader.
+    if (info.pgm_hash == Shader::Native::FroyokCompositeHash && info.uses_froyok_bloom) {
+        return true;
     }
     return ((info.pgm_hash == SsrCompositeHash || info.pgm_hash == WaterHash) &&
             Wanted(BbSettings::EffectModernSsr)) ||

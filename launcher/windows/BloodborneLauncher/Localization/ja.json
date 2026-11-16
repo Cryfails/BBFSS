@@ -755,6 +755,7 @@
   "Ambient occlusion strength": "アンビエントオクルージョンの強さ",
   "Shadow distance": "影の描画距離",
   "Bloom": "ブルーム",
+  "Bloom quality": "ブルームの品質",
   "Saturation": "彩度",
   "Brightness": "明るさ",
   "Contrast": "コントラスト",

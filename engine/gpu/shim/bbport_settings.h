@@ -47,7 +47,8 @@ struct Effect {
 };
 inline constexpr Effect Effects[] = {
     {"effect_chromatic_aberration", "Chromatic aberration", "Хроматическая аберрация", false},
-    {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", false},
+    // On by default: Froyok bloom builds its pyramid at DoF's recombination (vk_froyok_bloom.h).
+    {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", true},
     {"effect_motion_blur", "Motion blur", "Размытие в движении", false},
     {"effect_ssao", "Ambient occlusion (SSAO)", "Затенение SSAO", true},
     {"effect_game_aa", "Game's own anti-aliasing", "Собственное сглаживание игры", false},

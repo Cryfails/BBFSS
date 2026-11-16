@@ -160,6 +160,8 @@ namespace BloodborneLauncher.Views
                 L.T("Off adds no indirect lighting. Medium is screen-space indirect light with a single bounce. High uses screen-space radiance probes for the diffuse bounce and rough specular reflections and costs more. Ultra traces indirect light against the scene, needs a GPU with ray tracing and is the most expensive. Takes effect on the next game start."),
                 Choices.GiQualities, () => Choices.GiMode(Ini), v => Choices.SetGiMode(Ini, v), changed: UpdatePerformance);
             IniCombo(SymbolRegular.Lightbulb24, L.T("Motion blur quality"), L.T("Applied when the game starts"), Choices.MotionBlurQuality, "graphics_motion_blur_quality");
+            ComboRow(SymbolRegular.Lightbulb24, L.T("Bloom quality"), L.T("Applied when the game starts"), Choices.BloomQuality,
+                () => Ini.Get(Choices.BloomQualityKey, Choices.BloomQualityFallback), v => Ini.Set(Choices.BloomQualityKey, v));
             IniSlider(SymbolRegular.Lightbulb24, L.T("Indirect lighting strength"), 0, 12, "graphics_gi_strength", fallback: 1.5);
             IniSlider(SymbolRegular.Lightbulb24, L.T("Reflection strength"), 0, 3, "graphics_ssr_intensity");
             IniSlider(SymbolRegular.Lightbulb24, L.T("Volumetric sunlight strength"), 0, 3, "graphics_volumetric_intensity");

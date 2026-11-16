@@ -120,7 +120,7 @@ namespace BloodborneLauncher.Core
         public static readonly Effect[] Effects =
         {
             new("effect_chromatic_aberration", L.T("Chromatic aberration"), false),
-            new("effect_dof", L.T("Depth of field"), false),
+            new("effect_dof", L.T("Depth of field"), true), // Froyok bloom needs it (engine default too)
             new("effect_motion_blur", L.T("Motion blur"), false),
             new("effect_game_aa", L.T("Game's own anti-aliasing"), false),
             new("effect_dynamic_shadows", L.T("Shadows from dynamic lights"), true),
@@ -156,6 +156,15 @@ namespace BloodborneLauncher.Core
         {
             new(L.T("Game's own"), "0"),
             new(L.T("High"), "1"),
+        };
+
+        /// <summary>graphics_bloom_quality. Without the key the engine uses the game's own bloom, so
+        /// the launcher shows that too (BloomQualityKey, BloomQualityFallback).</summary>
+        public const string BloomQualityKey = "graphics_bloom_quality", BloomQualityFallback = "original";
+        public static readonly Choice[] BloomQuality =
+        {
+            new(L.T("Game's own"), "original"),
+            new("Froyok Bloom", "froyok"),
         };
 
         /// <summary>The ambient occlusion choice: effect_ssao, effect_gtao and graphics_ao_quality together

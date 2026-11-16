@@ -84,7 +84,8 @@ const std::vector<std::tuple<std::string, const char*, const char*>>& Effects() 
 }
 const std::map<std::string, std::string> kModelLod{
     {"-2", "Model LOD -2 (Highest)"}, {"1", "Model LOD 1 (Lower)"}, {"2", "Model LOD 2 (Lowest)"}};
-const std::set<std::string> kDefaultOff{"effect_chromatic_aberration", "effect_dof", "effect_motion_blur", "effect_game_aa"};
+// effect_dof is on without a key (bbport_settings.h): Froyok bloom builds at DoF's recombination.
+const std::set<std::string> kDefaultOff{"effect_chromatic_aberration", "effect_motion_blur", "effect_game_aa"};
 const std::set<std::string> kBloodborneIds{"CUSA00207", "CUSA00208", "CUSA00299", "CUSA00900", "CUSA01363",
                                            "CUSA03014", "CUSA03023", "CUSA03173", "CUSA03179"};
 

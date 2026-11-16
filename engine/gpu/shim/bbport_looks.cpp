@@ -33,7 +33,7 @@ constexpr Knob kKnobs[] = {
     {"graphics_ao_strength", "1"},
     {"graphics_shadow_scale", "1"},
     {"effect_chromatic_aberration", "0"},
-    {"effect_dof", "0"},
+    {"effect_dof", "1"},
     {"effect_motion_blur", "0"},
     {"effect_ssao", "1"},
     {"effect_game_aa", "0"},

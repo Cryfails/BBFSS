@@ -67,6 +67,8 @@
 120020	PC Effects		PC 特效		Эффекты (ПК)
 120000	Bloom	The glow around bright light. 10 is the game's own.	泛光	明亮光源周围的光晕。10 为游戏原始值。	Свечение	Сияние вокруг яркого света. 10 — как в оригинале
 120001	Vignette	The darkened frame edges some areas use.	暗角	部分区域使用的画面边缘变暗效果。	Виньетка	Затемнение краёв кадра, которое используется в некоторых местах
+120002	Bloom Quality	Froyok Bloom uses its own HDR filters and final blend. Requires a restart.	泛光质量	Froyok Bloom 使用自己的 HDR 滤镜和最终混合。需要重启。	Качество свечения	Froyok Bloom использует собственные HDR-фильтры и финальное смешивание. Нужен перезапуск.
+120010	Froyok Bloom		Froyok Bloom		Froyok Bloom
 125020	PC Colour		PC 色彩		Цвет (ПК)
 125004	Picture Tuning	Applies PC Graphics, PC Effects and PC Colour live. Off: the game's own picture. Moving one of their settings turns it on.	画面调校	实时应用 PC 画质、PC 特效和 PC 色彩设置。关闭后使用游戏原始画面。调整这些设置中的任一项会将其开启。	Настройка картинки	Параметры Графики/Эффектов/Цвета (ПК) применяются моментально при изменении. Выкл. или 5 — картинка как в оригинале
 125000	Brightness	How bright the picture is. 5 is the game's own.	亮度	画面的明暗程度。5 为游戏原始值。	Яркость	Яркость картинки. 5 — как в оригинале

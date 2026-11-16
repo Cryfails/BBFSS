@@ -28,7 +28,7 @@ These `graphics_*` keys in `lantern.ini` have no control in the Windows launcher
 |---|---|---|
 | `graphics_tonemapper` | Tonemapper: `original`, `gt7` or `aces` | `original` |
 | `graphics_gt7_exposure` | Exposure for the GT7 tonemapper | `1.0` |
-| `graphics_bloom_quality` | Bloom: `original` or `froyok` | `original` |
+| `graphics_bloom_quality` | Bloom: `original` or `froyok`, applied at the next start. Also on the launcher's Graphics page and the game's System > PC Effects page; BBFSS packages ship `froyok` | `original` |
 | `graphics_froyok_bloom_blend` | Froyok bloom blend | `0.1` |
 | `graphics_froyok_bloom_spread` | Froyok bloom spread | `0.85` |
 | `graphics_rt_point_shadows` | Ray-traced point-light shadows; ray tracing (`effect_ray_tracing`) is switched on automatically when this, High or Ultra shadows or Ultra GI is selected (needs a ray tracing GPU and a restart the first time) | off |

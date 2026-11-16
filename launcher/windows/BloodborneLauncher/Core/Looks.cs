@@ -41,7 +41,7 @@ namespace BloodborneLauncher.Core
             Amount("graphics_ao_strength", 0, 5, 1),
             Amount("graphics_shadow_scale", 0.25, 8, 1),
             Toggle("effect_chromatic_aberration", false),
-            Toggle("effect_dof", false),
+            Toggle("effect_dof", true),
             Toggle("effect_motion_blur", false),
             Toggle("effect_ssao", true),
             Toggle("effect_game_aa", false),

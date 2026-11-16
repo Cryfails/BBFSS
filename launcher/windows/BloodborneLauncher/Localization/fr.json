@@ -755,6 +755,7 @@
   "Ambient occlusion strength": "Intensité de l'occlusion ambiante",
   "Shadow distance": "Distance des ombres",
   "Bloom": "Bloom",
+  "Bloom quality": "Qualité du bloom",
   "Saturation": "Saturation",
   "Brightness": "Luminosité",
   "Contrast": "Contraste",
