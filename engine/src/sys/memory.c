@@ -4,6 +4,7 @@
 #endif
 #include "sys.h"
 #include "runtime.h"
+#include "live_knobs.h" // bbport (r84_live-test-knobs): TOOL, BB_LIVE_KNOBS_FILE
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -1140,20 +1141,26 @@ void *runtime_low_map(size_t size, int prot) {
     return found;
 }
 
+// bbport (r84_live-test-knobs): TOOL (dev/test-tools). BB_LIVE_KNOBS_FILE (live_knobs.c), read in
+// the same rounds as the toggle file; NULL: not set. The watcher also runs for it alone, with
+// `path` NULL: then the toggle part below does nothing.
+static const char *live_knobs_path;
+
 static void *toggle_watch(void *path) {
     for (unsigned long long last = ULLONG_MAX;;) {
-        FILE *file = fopen(path, "r");
+        FILE *file = path ? fopen(path, "r") : NULL; // bbport (r84_live-test-knobs): NULL: no toggle file
         unsigned long long value = 0, experiment = 0;
         if (file) {
             if (fscanf(file, "%llu %llu", &value, &experiment) < 1) value = 0;
             fclose(file);
         }
-        experiment_publish(&experiment_file_bits, (uint64_t)experiment); // bbport (r39_master-debug)
-        if (value != last) {
+        if (path) experiment_publish(&experiment_file_bits, (uint64_t)experiment); // bbport (r39_master-debug)
+        if (path && value != last) {
             __atomic_store_n(&runtime_disabled_optimizations, (uint64_t)value, __ATOMIC_RELEASE);
             printf("Runtime: disabled optimizations mask=%llu\n", value);
             last = value;
         }
+        if (live_knobs_path) live_knobs_poll(live_knobs_path); // bbport (r84_live-test-knobs)
         host_sleep_ns(250000000);
     }
     return NULL;
@@ -1180,7 +1187,10 @@ void runtime_memory_set_gpu_hooks(RangeHook map, RangeHook unmap, RangeHook inva
     static int watching;
     static HostThread watcher;
     const char *toggles = getenv("BB_TOGGLE_FILE");
-    if (toggles && !watching) watching = !host_thread_start(&watcher, 0, toggle_watch, (void *)toggles);
+    // bbport (r84_live-test-knobs): TOOL. BB_LIVE_KNOBS_FILE starts the same watcher too
+    const char *knobs = getenv("BB_LIVE_KNOBS_FILE");
+    if (!watching && knobs && knobs[0]) live_knobs_path = knobs;
+    if ((toggles || live_knobs_path) && !watching) watching = !host_thread_start(&watcher, 0, toggle_watch, (void *)toggles);
     writer_enter();
     host_lock(&hook_lock);
     on_map = map;

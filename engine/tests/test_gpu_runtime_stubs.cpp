@@ -36,6 +36,8 @@ int runtime_setjmp(RuntimeRecoverBuf*) { return 0; }
 uint32_t runtime_disabled_optimizations = 0;
 uint64_t runtime_experiment_bits = 0;
 void runtime_experiment_force(uint64_t bits) { runtime_experiment_bits = bits; } // bbport (r39_master-debug)
+uint32_t runtime_live_knobs_generation = 0; // bbport (r84_live-test-knobs): no live knobs file
+int runtime_live_knob(const char*, char*, size_t) { return 0; } // bbport (r84_live-test-knobs)
 uint64_t runtime_tsc_frequency() { return 1000000000; }
 int sys_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t) { std::abort(); }

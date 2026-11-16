@@ -254,6 +254,11 @@ if [[ ${1:-} == --test ]]; then
     out/game-language-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_memory.c src/host.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-memory-test
     out/sys-memory-test
+    # bbport (r84_live-test-knobs): TOOL. The live knobs file (src/sys/live_knobs.c) and its reader
+    "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_live_knobs.c src/sys/live_knobs.c "${test_link[@]}" -o out/live-knobs-test
+    out/live-knobs-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_live_knobs_reader.cpp -o out/live-knobs-reader-test
+    out/live-knobs-reader-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_video_out.c src/host.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-video-out-test
     out/sys-video-out-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_av_player.c src/host.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-av-player-test
