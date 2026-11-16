@@ -16,6 +16,7 @@ namespace BloodborneLauncher.Views
         private readonly Control _enginePreset;
         private readonly Dictionary<string, ToggleSwitch> _features = new();
         private bool _syncing;
+        private readonly ToggleSwitch _previousPaths;
 
         public EnginePage() : base(L.T("Engine"), L.T("The engine preset, its features and every engine switch, in one place."))
         {
@@ -30,6 +31,18 @@ namespace BloodborneLauncher.Views
             _enginePreset = ComboRow(SymbolRegular.Options24, L.T("Engine preset"),
                 L.T("New is the current engine. Legacy runs it the way 0.9.33 did: try it if the game crashes or draws something wrong"),
                 EnginePreset.Choices, () => EnginePreset.Current(S), v => EnginePreset.Apply(S, v), changed: SyncFeatures);
+            // engine_previous_paths, a lantern.ini key (the in-game menu's debug tab has the same
+            // switch): the engine's rendering paths from before its performance work, to tell
+            // whether a problem comes from that work. Graphics > Performance marks the rows it
+            // overrides. The engine reads lantern.ini when it starts. It is one of this page's
+            // switches: the summary row names it while it is on, and Reset all turns it off.
+            _previousPaths = IniToggle(SymbolRegular.History24, L.T("Previous engine paths"),
+                L.T("For troubleshooting; off by default. On: the engine uses its rendering paths from before the performance work, which is slower, and much slower with ray traced lamp shadows. The options in Graphics > Performance are then not used. Use it to see whether a problem comes from that work. A change here applies at the next game start. The in-game menu (Insert or L3 + R3, debug tab) has the same switch; there it acts at once, except for a few parts that change only at the next start."),
+                "engine_previous_paths", changed: ShowChanged);
+            // The game writes lantern.ini too. The switch follows the file when the page is shown,
+            // when the game starts or exits, and after a save (a save reads the file first).
+            Ws.GameStateChanged += ReadPreviousPaths;
+            Ws.Saved += ShowPreviousPaths;
             var exp = Advanced(L.T("Experimental engine features"));
             SettingToggle(SymbolRegular.Code24, L.T("Legacy shader compiler"),
                 L.T("Off by default: the native compiler reads constant data through the GPU's constant cache. On compiles the game's shaders the way 0.9.33 did: try it if something draws wrong. Switching recompiles every shader once"),
@@ -95,7 +108,24 @@ namespace BloodborneLauncher.Views
             ShowChanged();
         }
 
-        public override void OnShown() => ShowChanged();
+        public override void OnShown() => ReadPreviousPaths();
+
+        /// <summary>Reads lantern.ini again and shows the Previous engine paths switch as the file
+        /// has it now: the game's in-game menu switches it too. What the launcher changed and has
+        /// not saved yet is kept (IniFile.Refresh).</summary>
+        private void ReadPreviousPaths()
+        {
+            Ini.Refresh();
+            ShowPreviousPaths();
+        }
+
+        /// <summary>The Previous engine paths switch and the summary row, from the launcher's copy
+        /// of lantern.ini.</summary>
+        private void ShowPreviousPaths()
+        {
+            _previousPaths.IsChecked = Ini.Flag("engine_previous_paths");
+            ShowChanged();
+        }
 
         private void Feature(SymbolRegular icon, string title, string hint, string key, Panel into) =>
             _features[key] = SettingToggle(icon, title, hint, key, into, changed: SyncPreset);
@@ -195,6 +225,10 @@ namespace BloodborneLauncher.Views
             var text = changed.Count == 0
                 ? L.T("None: the engine runs with its own defaults")
                 : L.F($"{changed.Count} passed to the game: ") + string.Join(", ", changed.Select(c => $"{c.Name}={c.Value}"));
+            // Previous engine paths is a switch of this page too (a lantern.ini key, not a variable
+            // passed to the game): while it is on, the engine does not run with its own defaults.
+            if (Ini.Flag("engine_previous_paths"))
+                text = (changed.Count == 0 ? "" : text + "\n") + L.T("Previous engine paths is on");
             if (overridden.Count > 0)
                 text += L.F($"\nExtra variables also set {string.Join(", ", overridden)}: their value is used");
             SetHint(_changedHint, text);
@@ -202,11 +236,16 @@ namespace BloodborneLauncher.Views
 
         private void ResetAll()
         {
-            if (!EngineSwitches.Changed(S).Any()) return;
+            // Previous engine paths, as lantern.ini has it now, is one of the page's switches.
+            ReadPreviousPaths();
+            if (!EngineSwitches.Changed(S).Any() && !Ini.Flag("engine_previous_paths") && !EngineSwitches.DebugOn(Ini)) return;
             if (!Prompt.Confirm(L.T("Reset engine switches"), L.T("Every switch on this page goes back to the engine's default."), L.T("Reset all"))) return;
             EngineSwitches.ResetAll(S);
             foreach (var reset in _resets)
                 reset();
+            Ini.Set("engine_previous_paths", "0");
+            EngineSwitches.ResetDebug(Ini);
+            _previousPaths.IsChecked = false;
             Ws.SaveSoon();
             ShowChanged();
         }

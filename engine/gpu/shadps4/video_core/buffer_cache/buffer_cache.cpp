@@ -2928,6 +2928,7 @@ void BufferCache::NoteGpuWrite(VAddr addr, u64 size) {
 }
 
 void BufferCache::QueueCopyBacks(u64 submitted) {
+    const BbSpike::SplitScope r27_step{BbSpike::SplitCopyBacks}; // bbport (r27_flush-split)
     if (copy_back_blocks.Empty()) {
         return;
     }
@@ -3004,6 +3005,7 @@ void BufferCache::QueueCopyBacks(u64 submitted) {
 }
 
 void BufferCache::QueuePromotions(u64 submitted) {
+    const BbSpike::SplitScope r27_step{BbSpike::SplitPromotions}; // bbport (r27_flush-split)
     if (promote_candidates.Empty()) {
         promote_source.clear();
         return;
@@ -3713,6 +3715,16 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         };
         const auto bind_start = std::chrono::steady_clock::now();
         auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        // bbport (r79_load-crash): a failed bind (not a lost device) went unnoticed and the
+        // submission ran into unbacked pages. Retried while other games' loads pass, logged.
+        for (u32 attempt = 1; submit_result != vk::Result::eSuccess &&
+                              submit_result != vk::Result::eErrorDeviceLost && attempt <= 50;
+             ++attempt) {
+            std::printf("Guest memory: sparse bind failed: %s (attempt %u, %zu arenas)\n",
+                        vk::to_string(submit_result).c_str(), attempt, buffer_binds.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        }
         const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::steady_clock::now() - bind_start)
                            .count();
@@ -3724,6 +3736,11 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
         bind_waits.fetch_add(wait_tick ? 1 : 0, std::memory_order_relaxed);
         bind_ranges.fetch_add(ranges, std::memory_order_relaxed);
         bind_ns.fetch_add(ns, std::memory_order_relaxed);
+        if (BbSpike::on) { // bbport (r23_spike-trace)
+            BbSpike::binds.fetch_add(1, std::memory_order_relaxed);
+            BbSpike::bind_waits.fetch_add(wait_tick ? 1 : 0, std::memory_order_relaxed);
+            BbSpike::bind_ns.fetch_add(ns, std::memory_order_relaxed);
+        }
         for (u64 longest = bind_max_ns.load(std::memory_order_relaxed);
              ns > longest && !bind_max_ns.compare_exchange_weak(longest, ns);) {
         }
@@ -3731,6 +3748,8 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
             Vulkan::Breadcrumbs::ReportDeviceLost("submit");
         }
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+        ASSERT_MSG(submit_result == vk::Result::eSuccess, "Sparse bind failed: {}",
+                   vk::to_string(submit_result)); // bbport (r79_load-crash)
     });
     QueueCopyBacks(submitted); // bound with the next submission
     QueuePromotions(submitted);

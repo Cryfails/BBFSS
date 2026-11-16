@@ -1,16 +1,55 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 #extension GL_EXT_scalar_block_layout : require
+#ifdef WIND
+// bbport (r88_wind-lamp-fog): BB_WIND=1 only: the lamp fog takes the sun fog's noise from the same
+// file (wind_noise.glsl), so the patches of both are the same and drift together
+#extension GL_GOOGLE_include_directive : require
+#endif
+
+#ifdef SHAFTS
+// bbport (r106_lamp-fog-shaft-cap): the shaft table's layout (lamp_fog_shaft_layout.h)
+#extension GL_GOOGLE_include_directive : require
+#include "lamp_fog_shaft_layout.h"
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(scalar, binding = 0) readonly buffer Constants { uint d[]; } cb;
 layout(scalar, binding = 1) readonly buffer Lights { uint d[]; } lights;
 layout(binding = 2) uniform sampler2D depth_tex;
 layout(binding = 3, rgba16f) uniform image2D fog_out;
+#ifdef SHAFTS
+// bbport (r80_lamp-fog-shafts): BB_LAMP_FOG_SHAFTS=1, 2 or 3 only (the builds made with SHAFTS,
+// VIEW for 3; the build without it is the pass of before, word for word): the lamp fog's shadow
+// maps (lamp_fog_shaft_map.comp); bbport (r106): a layer per lamp (the table's record word names
+// it), each texel the free distance in metres from the light's centre along a world direction
+layout(binding = 4) uniform sampler2DArray shaft_maps;
+// bbport (r106_lamp-fog-shaft-cap): the shaft table (lamp_fog_shaft_layout.h): the composite
+// camera's view to world rows (read once in main() into shaft_to_world0..2) and a word per
+// record (its map layer and the shadow's strength)
+layout(scalar, binding = 5) readonly buffer ShaftTable { uint d[]; } shaft_table;
+vec3 shaft_to_world0, shaft_to_world1, shaft_to_world2;
+// bbport (r80b_shafts-smooth-visible): this pixel's and light's noise in [0,1)^3 (main); the jitter of
+// the march's samples at smoothing level 2 (ShaftNoise)
+vec3 shaft_seed;
+vec3 shaftRow(uint i) {
+    return uintBitsToFloat(
+        uvec3(shaft_table.d[i], shaft_table.d[i + 1u], shaft_table.d[i + 2u]));
+}
+#endif
 layout(push_constant) uniform Params {
     uint count;
     float intensity;
     float glow_size;
+#ifdef SHAFTS
+    // bbport (r80_lamp-fog-shafts): BB_LAMP_FOG_SHAFTS only, from the host (lamp_fog_shafts.h
+    // Bias and Segments): Lit()'s bias over the radius and inscatterShadowed()'s segments
+    float shaft_bias;
+    uint shaft_segments;
+    // bbport (r106c_shaft-march-cheaper): 1: the fast march (inscatterShadowedFast), 0: the march of
+    // r106 (BB_LAMP_FOG_SHAFTS_FAST, lamp_fog_shaft_fast.h)
+    uint shaft_fast;
+#endif
 };
 
 // Inverse-square falloff core^2 / (d^2 + core^2), core = glow_size * radius, so the peak is 1 at
@@ -24,6 +63,27 @@ const uint SEGMENTS = 6u;
 float c(uint i) { return uintBitsToFloat(cb.d[i]); }
 vec4 row(uint i) { return vec4(c(i), c(i + 1u), c(i + 2u), c(i + 3u)); }
 bool finite3(vec3 v) { return !any(isnan(v)) && !any(isinf(v)); }
+#ifdef WIND
+#include "wind_noise.glsl"
+#include "lamp_wind_layout.h"
+
+// bbport (r88_wind-lamp-fog): BB_WIND=1 only (VolumetricLight::RecordLampFog): the constants'
+// wind words (lamp_wind_layout.h, words 16-35): the composite camera's view to world matrix (3x4
+// rows, translation in .w), the fog noise's offsets in cells (BbWind::Snapshot off1, off2) and the
+// contrast in wind_off1.w (BbWind::LampFogContrast of BB_WIND_LAMP_FOG). Read once in main().
+vec4 wind_row0, wind_row1, wind_row2, wind_off1, wind_off2;
+
+// The wind's fog density factor m for the half chord from `begin` to `end` (wind_noise.glsl's
+// wind_factor_rows, the sun fog march's own), taken once at the point that splits the half's exact
+// inverse-square energy in two (along + q tan of the mean of its end angles, as lamp_fog_shafts.h
+// EnergyMiddle), not once a segment: 2 noise samples a light per pixel, not 12. Patches smaller
+// than a half chord (the noise's cells are 4.5 m and 12 m across) are not resolved along it.
+float lamp_wind(vec3 ray, float along, float q, float begin, float end) {
+    float middle = along + q * tan(0.5 * (atan((begin - along) / q) + atan((end - along) / q)));
+    return wind_factor_rows(wind_row0, wind_row1, wind_row2, ray * middle, wind_off1.xyz,
+                            wind_off2.xyz, wind_off1.w);
+}
+#endif
 
 float inscatter(vec3 ray, vec3 centre, float radius, float along, float q, float begin, float end) {
     if (end <= begin) return 0.0;
@@ -39,8 +99,203 @@ float inscatter(vec3 ray, vec3 centre, float radius, float along, float q, float
         energy += (angle - previous) * window * window * exp(-0.025 * t);
         previous = angle;
     }
+#ifdef WIND
+    // bbport (r88_wind-lamp-fog): this half chord's fog drifts with the wind (lamp_wind)
+    energy *= lamp_wind(ray, along, q, begin, end);
+#endif
     return energy * 0.025;
 }
+
+#ifdef SHAFTS
+// bbport (r80_lamp-fog-shafts): a direction to the octahedral map's [-1, 1]^2 (+z at the centre,
+// -z at the four corners; lamp_fog_shafts.h OctEncode; lamp_fog_shaft_map.comp's OctDecode is its
+// inverse).
+vec2 OctEncode(vec3 n) {
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    if (n.z < 0.0) {
+        return (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return n.xy;
+}
+
+// bbport (r80b_shafts-smooth-visible): BB_LAMP_FOG_SHAFTS_SMOOTH, the push word's bits 1-2
+// (lamp_fog_shaft_smooth.h): 0 the four-texel steps of r106c, 1 a bilinear filter of them, 2 that plus
+// a jitter of the samples
+uint shaftSmooth() { return (shaft_fast >> SHAFT_PUSH_SMOOTH_SHIFT) & 3u; }
+
+// Noise in [0,1)^3 for the n-th sample of this light at this pixel: the seed moved along the 3D R
+// sequence by n (spread along a half chord).
+vec3 ShaftNoise(uint n) {
+    return fract(shaft_seed + vec3(0.8191725134, 0.6710436067, 0.5497004779) * float(n + 1u));
+}
+
+// The angle at which sample n of a segment (end angles `previous`, `angle`) is taken: the middle (r80's
+// exact energy split) below level 2; level 2 moves it between 0.15 and 0.85 of the segment.
+float ShaftAngle(float previous, float angle, uint n) {
+    if (shaftSmooth() < 2u) return 0.5 * (previous + angle);
+    return mix(previous, angle, mix(0.15, 0.85, ShaftNoise(n).z));
+}
+
+// The share of the four map texels around uv (the gather's texel grid) whose free distance reaches
+// `limit`. Level 0: their mean (quarter steps, r106c). Level 1: the same four tests weighted
+// bilinearly by where uv lies between their centres (the gather's order is (i0,j1), (i1,j1), (i1,j0),
+// (i0,j0)); level 2: uv first moved by up to half a texel each way (ShaftNoise(n).xy).
+float ShaftTaps(vec2 uv, uint layer, float limit, uint n) {
+    uint level = shaftSmooth();
+    if (level == 0u) {
+        return dot(step(vec4(limit), textureGather(shaft_maps, vec3(uv, float(layer)), 0)),
+                   vec4(0.25));
+    }
+    vec2 size = vec2(textureSize(shaft_maps, 0).xy);
+    if (level >= 2u) uv += (ShaftNoise(n).xy - 0.5) / size;
+    vec2 f = fract(uv * size - 0.5);
+    vec4 hit = step(vec4(limit), textureGather(shaft_maps, vec3(uv, float(layer)), 0));
+    vec4 weight = vec4((1.0 - f.x) * f.y, f.x * f.y, f.x * (1.0 - f.y), (1.0 - f.x) * (1.0 - f.y));
+    // four equal tests: exactly that answer (the weights sum to 1 only within rounding, and the fast
+    // march compares answers to decide whether an odd sample reads the map)
+    if (hit.x == hit.y && hit.y == hit.z && hit.z == hit.w) return hit.x;
+    return dot(hit, weight);
+}
+
+// How much of light `layer` reaches the fog at p (view space): the share of the four map texels
+// around the direction from the light's centre to p whose free distance reaches p's distance less
+// shaft_bias of the radius (lamp_fog_shafts.h Lit and Bias). A point at the centre is lit; so is
+// any point within the maps' blind sphere (no hit is kept nearer than it).
+float Lit(vec3 p, vec3 centre, float radius, uint layer, uint sn) {
+    vec3 v = p - centre;
+    float d = length(v);
+    if (!(d > 0.0)) return 1.0;
+    // bbport (r106_lamp-fog-shaft-cap): the maps are kept across frames, in world directions
+    // and metres: the direction turned to the world, the free distances compared in metres
+    vec3 w = vec3(dot(shaft_to_world0, v), dot(shaft_to_world1, v), dot(shaft_to_world2, v));
+    float w_length = length(w);
+    if (!(w_length > 0.0)) return 1.0;
+    vec2 uv = OctEncode(w / w_length) * 0.5 + 0.5;
+    return ShaftTaps(uv, layer, d - shaft_bias * radius, sn); // bbport (r80b_shafts-smooth-visible)
+}
+
+// bbport (r106c_shaft-march-cheaper): Lit() for the fast march: the same four texels and the same
+// test. The direction is not scaled to length 1 first (the octahedral map divides by its own
+// |x| + |y| + |z|): one length and one divide fewer.
+float LitFast(vec3 p, vec3 centre, float radius, uint layer, uint sn) {
+    vec3 v = p - centre;
+    float d = length(v);
+    if (!(d > 0.0)) return 1.0;
+    vec3 w = vec3(dot(shaft_to_world0, v), dot(shaft_to_world1, v), dot(shaft_to_world2, v));
+    float sum = abs(w.x) + abs(w.y) + abs(w.z);
+    if (!(sum > 0.0)) return 1.0;
+    vec3 n = w / sum;
+    vec2 e = n.xy;
+    if (n.z < 0.0) {
+        e = (1.0 - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return ShaftTaps(e * 0.5 + 0.5, layer, d - shaft_bias * radius, sn); // bbport (r80b)
+}
+
+// inscatter() with shaft_segments segments (1 to 32; lamp_fog_shafts.h Segments) and each
+// segment's light times Lit() at the point where the segment's exact inverse-square energy is
+// split in half (lamp_fog_shafts.h EnergyMiddle); a segment the window gives no light reads no
+// texel. `unshadowed` gathers the light without the maps (the debug view's blue is the
+// difference).
+float inscatterShadowed(vec3 ray, vec3 centre, float radius, float along, float q, float begin,
+                        float end, uint layer, bool shadowed, inout float unshadowed) {
+    if (end <= begin) return 0.0;
+    uint segments = clamp(shaft_segments, 1u, 32u);
+    float ds = (end - begin) / float(segments);
+    float energy = 0.0;
+    float previous = atan((begin - along) / q);
+#ifdef WIND
+    // bbport (r88_wind-lamp-fog): this half chord's fog drifts with the wind (lamp_wind), the same
+    // factor for the light that reaches the fog and for the light the maps cut off
+    float wind_m = lamp_wind(ray, along, q, begin, end);
+#endif
+    for (uint i = 0u; i < segments; ++i) {
+        float t0 = begin + float(i) * ds;
+        float angle = atan((t0 + ds - along) / q);
+        float t = t0 + 0.5 * ds;
+        float x = length(ray * t - centre) / radius;
+        float window = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+        float segment = (angle - previous) * window * window * exp(-0.025 * t) * 0.025;
+#ifdef WIND
+        segment *= wind_m; // bbport (r88_wind-lamp-fog)
+#endif
+        if (segment > 0.0) {
+            unshadowed += segment;
+            // bbport (r106_lamp-fog-shaft-cap): a record without a map (`shadowed` false)
+            // reads none
+            if (shadowed) {
+                float middle = along + q * tan(ShaftAngle(previous, angle, i)); // bbport (r80b)
+                energy += segment * Lit(ray * middle, centre, radius, layer, i);
+            } else {
+                energy += segment;
+            }
+        }
+        previous = angle;
+    }
+    return energy;
+}
+
+// bbport (r106c_shaft-march-cheaper): inscatterShadowed() for BB_LAMP_FOG_SHAFTS_FAST on: the same
+// segments, weights and sample points, the map read at fewer of them. A half chord's samples 0, 2, 4,
+// ... and the last read the map ("direct"). An odd sample between two direct ones waits (pend_*) for
+// the next direct sample: its map is read only if the two direct neighbours' answers differ (the
+// answers are multiples of 0.25, so equal means equal), else it takes that answer. A direct sample
+// whose segment is under skip_below (lamp_fog_shaft_layout.h SHAFT_FAST_SKIP over the fog's output
+// scale; main) reads nothing and takes the answer of the direct sample before (1 if none), and
+// leaves lit_prev at -1 so the odd sample before it reads for itself.
+float inscatterShadowedFast(vec3 ray, vec3 centre, float radius, float along, float q, float begin,
+                            float end, uint layer, inout float unshadowed, float skip_below) {
+    if (end <= begin) return 0.0;
+    uint segments = clamp(shaft_segments, 1u, 32u);
+    float ds = (end - begin) / float(segments);
+    float energy = 0.0;
+    float previous = atan((begin - along) / q);
+#ifdef WIND
+    // bbport (r88_wind-lamp-fog): as inscatterShadowed
+    float wind_m = lamp_wind(ray, along, q, begin, end);
+#endif
+    float lit_prev = -1.0;
+    float pend_segment = 0.0, pend_middle = 0.0;
+    uint pend_n = 0u; // bbport (r80b_shafts-smooth-visible): the pending sample's index (its noise)
+    for (uint i = 0u; i < segments; ++i) {
+        float t0 = begin + float(i) * ds;
+        float angle = atan((t0 + ds - along) / q);
+        float t = t0 + 0.5 * ds;
+        float x = length(ray * t - centre) / radius;
+        float window = clamp(1.0 - x * x * x * x, 0.0, 1.0);
+        float segment = (angle - previous) * window * window * exp(-0.025 * t) * 0.025;
+#ifdef WIND
+        segment *= wind_m;
+#endif
+        if (segment > 0.0) unshadowed += segment;
+        float carried = lit_prev >= 0.0 ? lit_prev : 1.0;
+        if ((i & 1u) == 0u || i + 1u == segments) {
+            float lit = -1.0;
+            if (segment > skip_below) {
+                lit = LitFast(ray * (along + q * tan(ShaftAngle(previous, angle, i))), centre, radius,
+                              layer, i); // bbport (r80b_shafts-smooth-visible)
+            }
+            if (pend_segment > 0.0) {
+                float lit_pend = (lit >= 0.0 && lit == lit_prev)
+                                     ? lit
+                                     : LitFast(ray * pend_middle, centre, radius, layer, pend_n);
+                energy += pend_segment * lit_pend;
+                pend_segment = 0.0;
+            }
+            if (segment > 0.0) energy += segment * (lit >= 0.0 ? lit : carried);
+            lit_prev = lit;
+        } else if (segment > skip_below) {
+            pend_segment = segment;
+            pend_middle = along + q * tan(ShaftAngle(previous, angle, i)); // bbport (r80b)
+            pend_n = i;
+        } else if (segment > 0.0) {
+            energy += segment * carried;
+        }
+        previous = angle;
+    }
+    return energy;
+}
+#endif
 
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -59,6 +314,33 @@ void main() {
     vec3 ray = surface / distance_to_surface;
     float limit = depth == 1.0 ? 100.0 : min(distance_to_surface, 100.0);
     vec3 scattering = vec3(0.0);
+#ifdef WIND
+    // bbport (r88_wind-lamp-fog): the wind words (lamp_wind_layout.h; lamp_wind)
+    wind_row0 = row(LAMP_WIND_AT);
+    wind_row1 = row(LAMP_WIND_AT + LAMP_WIND_ROW);
+    wind_row2 = row(LAMP_WIND_AT + 2u * LAMP_WIND_ROW);
+    wind_off1 = row(LAMP_WIND_AT + 3u * LAMP_WIND_ROW);
+    wind_off2 = row(LAMP_WIND_AT + 4u * LAMP_WIND_ROW);
+#endif
+#ifdef VIEW
+    float view_lit = 0.0, view_lost = 0.0; // bbport (r80_lamp-fog-shafts): BB_LAMP_FOG_SHAFTS=3
+#endif
+#ifdef SHAFTS
+    // bbport (r106_lamp-fog-shaft-cap): the composite camera's view to world rows (the table)
+    shaft_to_world0 = shaftRow(SHAFT_TABLE_TO_WORLD);
+    shaft_to_world1 = shaftRow(SHAFT_TABLE_TO_WORLD + 4u);
+    shaft_to_world2 = shaftRow(SHAFT_TABLE_TO_WORLD + 8u);
+    // bbport (r80b_shafts-smooth-visible): this pixel's noise (interleaved gradient noise, three
+    // patterns, a new one each frame: the push word's frame counter) and the gain (1/32 units; 0: 1)
+    vec2 shaft_px = vec2(px) + 5.588238 * float((shaft_fast >> SHAFT_PUSH_FRAME_SHIFT) & 63u);
+    const vec2 ign_scale = vec2(0.06711056, 0.00583715);
+    vec3 shaft_seed0 = vec3(fract(52.9829189 * fract(dot(shaft_px, ign_scale))),
+                            fract(52.9829189 * fract(dot(shaft_px.yx + 31.0, ign_scale))),
+                            fract(52.9829189 * fract(dot(shaft_px + vec2(57.0, 11.0), ign_scale))));
+    uint shaft_gain_bits = (shaft_fast >> SHAFT_PUSH_GAIN_SHIFT) & 255u;
+    float shaft_gain =
+        shaft_gain_bits == 0u ? 1.0 : float(shaft_gain_bits) * (1.0 / SHAFT_PUSH_GAIN_UNIT);
+#endif
     for (uint k = 0u; k < count; ++k) {
         uint at = k * 16u;
         vec3 centre = uintBitsToFloat(uvec3(lights.d[at], lights.d[at + 1u], lights.d[at + 2u]));
@@ -86,10 +368,56 @@ void main() {
         float core = max(clamp(glow_size, 0.03, 0.2) * radius, 0.05);
         float q = sqrt(dot(perpendicular, perpendicular) + core * core);
         float nearest = clamp(along, begin, end);
+#ifdef SHAFTS
+        // bbport (r80_lamp-fog-shafts): each segment's light times the share of its map texels
+        // that reach the segment's sample point (inscatterShadowed)
+        float unshadowed = 0.0;
+        // bbport (r106_lamp-fog-shaft-cap): the record's map layer and shadow strength (the
+        // table): 0 reads no map (the unshadowed fog); between 0 and 1 the lamp fades to or
+        // from it (lamp_fog_shaft_cap.h: over budget, or back in)
+        uint shaft_entry = shaft_table.d[SHAFT_TABLE_RECORDS + k];
+        float strength = float(shaft_entry >> 16u) * (1.0 / 65535.0);
+        uint layer = shaft_entry & SHAFT_LAYER_MASK;
+        bool shadowed = strength > 0.0;
+        // bbport (r80b_shafts-smooth-visible): this light's noise (the pixel's, walked on per light)
+        shaft_seed = fract(shaft_seed0 + vec3(0.7548776662, 0.5698402909, 0.618034) * float(k));
+        float weight = ENERGY * core * core / q;
+        float lit;
+        if (shadowed && (shaft_fast & 1u) != 0u) { // bbport (r80b): bit 0 of the push word
+            // bbport (r106c_shaft-march-cheaper): the fast march; skip_below is a segment's energy
+            // under which its light is under SHAFT_FAST_SKIP of the fog's output (the lamp's colour
+            // peak x weight x 0.35 x intensity, as written below)
+            float skip_below = SHAFT_FAST_SKIP /
+                               max(max(rgb.r, max(rgb.g, rgb.b)) * weight * (0.35 * intensity), 1e-12);
+            lit = inscatterShadowedFast(ray, centre, radius, along, q, begin, nearest, layer,
+                                        unshadowed, skip_below) +
+                  inscatterShadowedFast(ray, centre, radius, along, q, nearest, end, layer,
+                                        unshadowed, skip_below);
+        } else {
+            lit = inscatterShadowed(ray, centre, radius, along, q, begin, nearest, layer,
+                                    shadowed, unshadowed) +
+                  inscatterShadowed(ray, centre, radius, along, q, nearest, end, layer,
+                                    shadowed, unshadowed);
+        }
+        lit = mix(unshadowed, lit, strength);
+        scattering += rgb * weight * lit * shaft_gain; // bbport (r80b_shafts-smooth-visible)
+#ifdef VIEW
+        view_lit += luminance * weight * lit;
+        view_lost += luminance * weight * max(unshadowed - lit, 0.0);
+#endif
+#else
         scattering += rgb * (ENERGY * core * core / q) *
             (inscatter(ray, centre, radius, along, q, begin, nearest) +
              inscatter(ray, centre, radius, along, q, nearest, end));
+#endif
     }
     vec4 previous = imageLoad(fog_out, px);
+#ifdef VIEW
+    // bbport (r80_lamp-fog-shafts): BB_LAMP_FOG_SHAFTS=3: in place of the lamp fog, orange the light
+    // that reaches the fog and blue the light the maps cut off, both 4 times as bright
+    imageStore(fog_out, px, vec4(previous.rgb + vec3(view_lit, 0.5 * view_lit, view_lost) *
+                                                    (4.0 * 0.35 * intensity), 0.0));
+#else
     imageStore(fog_out, px, vec4(previous.rgb + scattering * (0.35 * intensity), 0.0));
+#endif
 }

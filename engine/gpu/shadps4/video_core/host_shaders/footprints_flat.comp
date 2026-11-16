@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r111e_prints-draw): the footprints drawn over the finished scene colour, after the lighting and
+// before the upscaler (renderer_vulkan/vk_footprints.cpp, Footprints::DrawOver; footprints.h has the rules).
+// Two modes, one dispatch over the pixels of the prints' boxes (dispatched with a base: gl_GlobalInvocationID
+// is the pixel):
+//  - FOOTPRINTS_FLAG_SHOW (BB_FOOTPRINTS_SHOW=1, a test view): the ray of each pixel is cut with the
+//    horizontal plane of each print's height; where it falls inside the print's sole rectangle the pixel
+//    becomes flat saturated red (a white dot at the print's centre). No depth test, no lighting, no
+//    G-buffer: it shows where the engine put the prints and whether the picture's camera agrees.
+//  - otherwise (the post stamp, BB_FOOTPRINTS_POST): the pixel's world point from the depth (as
+//    footprints.comp), its up-facing share from the depth of two neighbours, the strongest print of each
+//    kind by the sole's shape within FOOTPRINTS_PRINT_BAND_M of the point's height; a blood print
+//    recolours the lit pixel dark red at its own luminance (the stone's texture and light stay, the hue
+//    does not depend on the light's colour), a wet or mud print darkens it a further share. The G-buffer
+//    change of footprints.comp (albedo, gloss, specular colour) stays as it was; this adds the part of
+//    the look the game's light may leave out (a dark red albedo under a blue moon is black, not red).
+// Counters (FOOTPRINTS_FLAT_WORDS words, one atomic a drawn pixel): red pixels, stamped pixels.
+// (r111f) Also one thread a workgroup: the groups that ran, the frame's stamp, and for the first
+// FOOTPRINTS_FLAT_PROBES prints the pixel where this shader finds the print's centre (from the pushed inverse
+// view) and the scene's depth and view z there. In the flat view every print also gets a hollow marker square
+// at its projected centre (magenta: on the screen; cyan: off it, clamped to the edge; yellow: behind the
+// camera, clamped) and the pass draws a solid green corner square (the beacon: the pass reached the picture).
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+#include "footprints_layout.h"
+
+layout(local_size_x = FOOTPRINTS_GROUP, local_size_y = FOOTPRINTS_GROUP, local_size_z = 1) in;
+
+// FootprintRules::Push, word for word (28 words, 112 bytes, as footprints.comp): `gain` is the stamp's
+// strength here (BB_FOOTPRINTS_GAIN times BB_FOOTPRINTS_POST); `stamp` is not used; (r111j) `hunter.x` is
+// BB_FOOTPRINTS_SHEEN (the blood prints' wet sheen, 0: off), (r111k) `hunter.y` is the look (BB_FOOTPRINTS_LOOK, 1: on,
+// 0: r111j's look), the rest of `hunter` is not used.
+layout(push_constant) uniform Push {
+    vec4 inv_view[3]; // this pass's view to world, rows
+    vec4 proj;        // x scale, y scale (signed: ndc +y down), z scale, z offset
+    vec2 size;        // pixels
+    vec2 jitter;      // render pixels
+    vec4 hunter;
+    uint print_count;
+    uint flags;       // FOOTPRINTS_FLAG_SHOW
+    uint stamp;
+    float gain;
+};
+
+layout(binding = 0, rgba16f) uniform image2D color_img; // the scene colour (HDR, before the tonemap)
+layout(binding = 1) uniform texture2D depth_tex;        // the scene's depth
+struct Print {
+    vec4 a; // x, y, z, strength
+    vec4 b; // dir x, dir z, side, kind
+};
+layout(binding = 2, std430) readonly buffer Prints {
+    Print prints[];
+};
+layout(binding = 3, std430) buffer Counts {
+    uint counts[];
+};
+
+// View depth (metres, in front: positive) from a depth value, as footprints.comp.
+float ViewZ(float depth) {
+    if (!(depth > 0.0) || depth >= 1.0) {
+        return 0.0;
+    }
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+// The world point of pixel `p` at view depth `z`.
+vec3 World(ivec2 p, float z) {
+    const vec2 uv = (vec2(p) + 0.5) / size - jitter / size;
+    const vec2 ndc = uv * 2.0 - 1.0;
+    const vec4 view = vec4(ndc.x * z / proj.x, ndc.y * z / proj.y, z, 1.0);
+    return vec3(dot(inv_view[0], view), dot(inv_view[1], view), dot(inv_view[2], view));
+}
+
+// The world point of a neighbour pixel; false for the sky. (r111h) Also false across a depth jump (its view z
+// differs from the centre pixel's `z0` by more than POST_NEIGHBOUR_M + POST_NEIGHBOUR_REL x z0: a silhouette), so
+// the edge of a character, a hat or a plant never reads as ground from two points on different surfaces.
+bool Neighbour(ivec2 q, float z0, out vec3 w) {
+    const float z = ViewZ(texelFetch(depth_tex, q, 0).x);
+    w = World(q, z);
+    return z > 0.0 && abs(z - z0) < FOOTPRINTS_POST_NEIGHBOUR_M + FOOTPRINTS_POST_NEIGHBOUR_REL * z0;
+}
+
+// (r111f) A world point in view space (view z in front, positive), by the pushed inverse view (rigid: the
+// transpose of its rotation), and the pixel of a view point with positive z, as the shaders' `p`.
+vec3 ViewOf(vec3 c) {
+    const vec3 d = c - vec3(inv_view[0].w, inv_view[1].w, inv_view[2].w);
+    return mat3(inv_view[0].xyz, inv_view[1].xyz, inv_view[2].xyz) * d;
+}
+vec2 PixelOf(vec3 v) {
+    return (vec2(v.x * proj.x, v.y * proj.y) / v.z * 0.5 + 0.5) * size + jitter - 0.5;
+}
+
+// (r111f) One thread of each workgroup (`tile` is its pixel, the group's corner): the proof that the pass
+// ran, and the probes of the prints whose centre falls into this group's tile.
+void GroupWork(ivec2 tile) {
+    atomicAdd(counts[FOOTPRINTS_FLAT_WORD_GROUPS], 1u);
+    atomicMax(counts[FOOTPRINTS_FLAT_WORD_STAMP], stamp);
+    const uint n = min(min(print_count, FOOTPRINTS_MAX_PRINTS), FOOTPRINTS_FLAT_PROBES);
+    for (uint i = 0u; i < n; ++i) {
+        const vec3 v = ViewOf(prints[i].a.xyz);
+        if (!(v.z > 0.05)) {
+            continue;
+        }
+        const ivec2 q = ivec2(floor(PixelOf(v) + 0.5));
+        if (q.x < tile.x || q.y < tile.y || q.x >= tile.x + int(FOOTPRINTS_GROUP) ||
+            q.y >= tile.y + int(FOOTPRINTS_GROUP) || q.x >= int(size.x) || q.y >= int(size.y)) {
+            continue;
+        }
+        const float d = texelFetch(depth_tex, q, 0).x;
+        const uint w = FOOTPRINTS_FLAT_WORD_PROBE + i * FOOTPRINTS_FLAT_PROBE_WORDS;
+        counts[w] = uint(q.x) + 1u;
+        counts[w + 1u] = uint(q.y);
+        counts[w + 2u] = floatBitsToUint(d);
+        counts[w + 3u] = floatBitsToUint(ViewZ(d));
+    }
+}
+
+// (r111j) BloodSheenRules::PeakRoll's arithmetic (r100k): luminance up to the knee as it is, above it an exponential
+// roll-off toward `peak` (continuous, slope 1 at the knee, never above peak).
+float PeakRoll(float luma, float peak) {
+    const float knee = FOOTPRINTS_SHEEN_KNEE * peak;
+    const float span = peak - knee;
+    return luma <= knee ? luma : knee + span * (1.0 - exp(-(luma - knee) / span));
+}
+
+// 0..1: the sole's shape at (u along the step, v across it), as footprints.comp.
+// (r111h) `edge`: where the soft edge starts, as a share of the radius (EDGE for blood, POST_WET_EDGE for wet).
+float Ellipse(vec2 d, vec2 r, float edge) {
+    return 1.0 - smoothstep(edge, 1.0, length(d / r));
+}
+float Sole(float u, float v, float edge) {
+    const float fore = Ellipse(vec2(u - FOOTPRINTS_FORE_U, v), vec2(FOOTPRINTS_FORE_RU, FOOTPRINTS_FORE_RV), edge);
+    const float heel = Ellipse(vec2(u - FOOTPRINTS_HEEL_U, v), vec2(FOOTPRINTS_HEEL_RU, FOOTPRINTS_HEEL_RV), edge);
+    const float waist = Ellipse(vec2(u - FOOTPRINTS_WAIST_U, v), vec2(FOOTPRINTS_WAIST_RU, FOOTPRINTS_WAIST_RV), edge);
+    return max(max(fore, heel), waist);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (gl_LocalInvocationIndex == 0u) {
+        GroupWork(p);
+    }
+    if (p.x >= int(size.x) || p.y >= int(size.y)) {
+        return;
+    }
+    const uint count = min(print_count, FOOTPRINTS_MAX_PRINTS);
+    if ((flags & FOOTPRINTS_FLAG_SHOW) != 0u) {
+        // The pixel's ray (the inverse of the pixel to view rule of World with z = 1), in the world.
+        const vec2 uv = (vec2(p) + 0.5) / size - jitter / size;
+        const vec2 ndc = uv * 2.0 - 1.0;
+        const vec3 vdir = vec3(ndc.x / proj.x, ndc.y / proj.y, 1.0);
+        const vec3 dir = vec3(dot(inv_view[0].xyz, vdir), dot(inv_view[1].xyz, vdir), dot(inv_view[2].xyz, vdir));
+        const vec3 origin = vec3(inv_view[0].w, inv_view[1].w, inv_view[2].w);
+        bool red = false;
+        bool centre = false;
+        int ring = 0; // (r111f) 1 marker on the screen, 2 off it (clamped), 3 behind the camera (clamped)
+        for (uint i = 0u; i < count; ++i) {
+            const Print pr = prints[i];
+            { // (r111f) the print's marker: a hollow square 3 pixels thick at its projected centre
+                const vec3 pv = ViewOf(pr.a.xyz);
+                const bool behind = !(pv.z > 0.05);
+                const vec2 pc = PixelOf(vec3(pv.xy, max(abs(pv.z), 0.05)));
+                const float half_side = float(FOOTPRINTS_FLAT_MARK_HALF);
+                const vec2 mc = floor(clamp(pc, vec2(half_side), size - 1.0 - vec2(half_side)) + 0.5);
+                const vec2 dm = abs(vec2(p) - mc);
+                const float ring_d = max(dm.x, dm.y);
+                if (ring_d <= half_side && ring_d >= half_side - 2.0) {
+                    const bool on_screen = pc.x >= 0.0 && pc.y >= 0.0 && pc.x <= size.x - 1.0 && pc.y <= size.y - 1.0;
+                    ring = behind ? 3 : (on_screen ? 1 : 2);
+                }
+            }
+            if (abs(dir.y) < 1e-6) {
+                continue;
+            }
+            const float t = (pr.a.y - origin.y) / dir.y;
+            if (t <= 0.0) {
+                continue;
+            }
+            const vec3 l = origin + dir * t - pr.a.xyz;
+            const vec2 along = pr.b.xy;
+            const float u = dot(l.xz, along);
+            const float v = dot(l.xz, vec2(-along.y, along.x)) * pr.b.z;
+            if (u >= (FOOTPRINTS_HEEL_U - FOOTPRINTS_HEEL_RU) * FOOTPRINTS_SOLE_SCALE &&
+                u <= (FOOTPRINTS_FORE_U + FOOTPRINTS_FORE_RU) * FOOTPRINTS_SOLE_SCALE &&
+                abs(v) <= FOOTPRINTS_FORE_RV * FOOTPRINTS_SOLE_SCALE) {
+                red = true;
+                centre = centre || length(vec2(u, v)) < 0.02;
+            }
+        }
+        if (p.x < FOOTPRINTS_FLAT_BEACON && p.y < FOOTPRINTS_FLAT_BEACON) { // (r111f) the pass reached the picture
+            imageStore(color_img, p, vec4(0.0, 3.0, 0.0, 1.0));
+            return;
+        }
+        if (ring != 0) { // (r111f)
+            const vec3 ring_colour = ring == 1 ? vec3(3.0, 0.0, 3.0) : (ring == 2 ? vec3(0.0, 3.0, 3.0) : vec3(3.0, 3.0, 0.0));
+            imageStore(color_img, p, vec4(ring_colour, 1.0));
+            return;
+        }
+        if (red) {
+            imageStore(color_img, p, centre ? vec4(4.0, 4.0, 4.0, 1.0) : vec4(FOOTPRINTS_FLAT_RED, 0.0, 0.0, 1.0));
+            atomicAdd(counts[FOOTPRINTS_FLAT_WORD_RED_PX], 1u);
+        }
+        return;
+    }
+    // The post stamp.
+    const float z = ViewZ(texelFetch(depth_tex, p, 0).x);
+    if (z <= 0.0) {
+        return;
+    }
+    const vec3 w = World(p, z);
+    float weight[FOOTPRINTS_KINDS] = float[FOOTPRINTS_KINDS](0.0, 0.0, 0.0);
+    for (uint i = 0u; i < count; ++i) {
+        const Print pr = prints[i];
+        const vec3 l = w - pr.a.xyz;
+        if (abs(l.y) > FOOTPRINTS_PRINT_BAND_M) {
+            continue;
+        }
+        const vec2 along = pr.b.xy;
+        const float u = dot(l.xz, along);
+        const float v = dot(l.xz, vec2(-along.y, along.x)) * pr.b.z;
+        const uint kind = min(uint(pr.b.w + 0.5), FOOTPRINTS_KINDS - 1u);
+        const float s = Sole(u / FOOTPRINTS_SOLE_SCALE, v / FOOTPRINTS_SOLE_SCALE,
+                             kind == FOOTPRINTS_KIND_BLOOD ? FOOTPRINTS_EDGE : FOOTPRINTS_POST_WET_EDGE) * pr.a.w;
+        if (s <= 0.0) {
+            continue;
+        }
+        // (r111h) a pixel much nearer the camera than the print (a character or a plant in front of it) is not
+        // on the print: its view z is under POST_NEAR_FRAC of the print's and more than POST_NEAR_M nearer
+        const float pz = ViewOf(pr.a.xyz).z;
+        if (z < FOOTPRINTS_POST_NEAR_FRAC * pz && pz - z > FOOTPRINTS_POST_NEAR_M) {
+            continue;
+        }
+        weight[kind] = max(weight[kind], s);
+    }
+    if (max(weight[FOOTPRINTS_KIND_WET], max(weight[FOOTPRINTS_KIND_MUD], weight[FOOTPRINTS_KIND_BLOOD])) *
+            gain <= 1.0 / 64.0) {
+        return;
+    }
+    const ivec2 last = ivec2(size) - 1;
+    { // (r111i) next to something much nearer (the hunter's leg or weapon, a plant): not on the print
+        const int sp = max(2, int(size.y * FOOTPRINTS_POST_SILHOUETTE_FRAC + 0.5));
+        const float lim = FOOTPRINTS_POST_SILHOUETTE_M + FOOTPRINTS_POST_SILHOUETTE_REL * z;
+        const ivec2 taps[4] = ivec2[4](ivec2(sp, 0), ivec2(-sp, 0), ivec2(0, sp), ivec2(0, -sp));
+        float zt[4];
+        for (int k = 0; k < 4; ++k) {
+            const float zq = ViewZ(texelFetch(depth_tex, clamp(p + taps[k], ivec2(0), last), 0).x);
+            zt[k] = zq > 0.0 ? zq : z; // the sky or off the picture: no step
+        }
+        // (review) against the straight line through both opposite taps (2z - a - b), not one tap alone: a level
+        // floor's own depth slope (about 0.6 m over 5 px at 13 m) is not a step and must not erase far prints
+        if (2.0 * z - zt[0] - zt[1] > lim || 2.0 * z - zt[2] - zt[3] > lim) {
+            return;
+        }
+    }
+    // The up-facing share from two neighbours (the right or left one, the lower or upper one).
+    // (r111h) POST_NORMAL_PX pixels away, not 1: the cobbles' depth noise made a 1 pixel facing speckle
+    const int nb = FOOTPRINTS_POST_NORMAL_PX;
+    const ivec2 qx = ivec2(p.x + nb <= last.x ? p.x + nb : max(p.x - nb, 0), p.y);
+    const ivec2 qy = ivec2(p.x, p.y + nb <= last.y ? p.y + nb : max(p.y - nb, 0));
+    vec3 wx, wy;
+    float up = 0.0;
+    if (Neighbour(qx, z, wx) && Neighbour(qy, z, wy)) {
+        const vec3 c = cross(wx - w, wy - w);
+        const float l = length(c);
+        up = l > 1e-12 ? abs(c.y) / l : 0.0;
+    }
+    const float face = smoothstep(FOOTPRINTS_UP_MIN, FOOTPRINTS_UP_FULL, up);
+    // (r111i) wet and mud weights are rounded as the blood weight is, 1 - (1 - w)^2: a faded print stays readable
+    const float wet_w = clamp(weight[FOOTPRINTS_KIND_WET] * face * gain, 0.0, 1.0);
+    const float mud_w = clamp(weight[FOOTPRINTS_KIND_MUD] * face * gain, 0.0, 1.0);
+    const float wet = 1.0 - (1.0 - wet_w) * (1.0 - wet_w);
+    const float mud = 1.0 - (1.0 - mud_w) * (1.0 - mud_w);
+    // (r111g) the blood weight is rounded, 1 - (1 - w)^2: the full prints stay 1, a faded one (0.42 at the tail
+    // of a trail) reads 0.66, and the sole's soft edge is a little firmer: the boot's outline reads at 3 to 5 m
+    const float blood_w = clamp(weight[FOOTPRINTS_KIND_BLOOD] * face * gain, 0.0, 1.0);
+    const float blood = 1.0 - (1.0 - blood_w) * (1.0 - blood_w);
+    if (max(wet, max(mud, blood)) <= 1.0 / 64.0) {
+        return;
+    }
+    const vec4 c = imageLoad(color_img, p);
+    const float lum = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
+    const bool look = hunter.y > 0.5; // (r111k) BB_FOOTPRINTS_LOOK: water and blood told apart
+    vec3 rgb = c.rgb * (1.0 - (look ? FOOTPRINTS_K_POST_WET_DARKEN : FOOTPRINTS_POST_WET_DARKEN) * max(wet, mud));
+    const vec3 dark_red = vec3(FOOTPRINTS_POST_BLOOD_TINT_R, FOOTPRINTS_POST_BLOOD_TINT_G, FOOTPRINTS_POST_BLOOD_TINT_B) *
+                          (lum * FOOTPRINTS_POST_BLOOD_LUM);
+    rgb = mix(rgb, dark_red, FOOTPRINTS_POST_BLOOD_COVER * blood);
+    bool lifted = false;
+    // (r111k) the look gives a blood print the sheen's floor even with BB_FOOTPRINTS_SHEEN at 0
+    const float blood_sheen = max(hunter.x, look ? FOOTPRINTS_K_BLOOD_SHEEN : 0.0);
+    if (blood_sheen > 0.0 && blood > max(wet, mud)) { // (r111j) the wet film's faint sky reflection on a blood print
+        const float sheen_floor = PeakRoll(FOOTPRINTS_SHEEN_SKY * blood_sheen, FOOTPRINTS_SHEEN_PEAK);
+        const float lift = max(sheen_floor - dot(rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0) *
+                           FOOTPRINTS_POST_BLOOD_COVER * blood;
+        rgb += vec3(FOOTPRINTS_POST_BLOOD_TINT_R, FOOTPRINTS_POST_BLOOD_TINT_G, FOOTPRINTS_POST_BLOOD_TINT_B) * lift;
+        lifted = lift > 0.0;
+    }
+    if (look && wet > max(mud, blood)) { // (r111k) a wet film on dark ground: a faint cool grey sky reflection, never red
+        const float wet_lift = max(FOOTPRINTS_K_WET_SHEEN - dot(rgb, vec3(0.2126, 0.7152, 0.0722)), 0.0) * wet;
+        rgb += vec3(FOOTPRINTS_K_WET_TINT_R, FOOTPRINTS_K_WET_TINT_G, FOOTPRINTS_K_WET_TINT_B) * wet_lift;
+    }
+    imageStore(color_img, p, vec4(rgb, c.a));
+    atomicAdd(counts[FOOTPRINTS_FLAT_WORD_POST_PX], 1u);
+    if (lifted) { // (r111j)
+        atomicAdd(counts[FOOTPRINTS_FLAT_WORD_SHEEN], 1u);
+    }
+    { // (r111i) the lit luminance before and after the stamp, by kind: what the pass did where it wrote
+        const uint lw = FOOTPRINTS_FLAT_WORD_LUM + (blood > max(wet, mud) ? 3u : 0u);
+        const float after = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        atomicAdd(counts[lw], 1u);
+        atomicAdd(counts[lw + 1u], uint(clamp(lum, 0.0, FOOTPRINTS_FLAT_LUM_CAP) * FOOTPRINTS_FLAT_LUM_SCALE + 0.5));
+        atomicAdd(counts[lw + 2u], uint(clamp(after, 0.0, FOOTPRINTS_FLAT_LUM_CAP) * FOOTPRINTS_FLAT_LUM_SCALE + 0.5));
+    }
+}

@@ -101,6 +101,39 @@ struct MotionVectors {
     static constexpr u8 VertexOutputs = 1;
     static constexpr u8 VertexCapture = 2;
     static constexpr u8 VertexBoth = 3;
+    /// bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1 the capture (VertexCapture) also
+    /// stores per vertex the card UVs of a cut-out pixel shader (RtShadow::CardCapture):
+    /// capture param word 1 is the ring index + 1 (0: none), word 7 the selector
+    /// (Vulkan::PackCardSelector), the ring's address the address block's last member;
+    /// CaptureUvStride bytes a vertex (u, v, the alpha factor and, since r62b, another component
+    /// of the alpha factor's output). Never set with the knob off:
+    /// keys, SPIR-V and address blocks are then as before.
+    static constexpr u8 CaptureUv = 4;
+    static constexpr u32 CaptureUvStride = 16;
+    /// bbport (r89_wind-foliage-sway): with BB_WIND=1 and BB_WIND_SWAY above 0, a motion vertex
+    /// shader (VertexOutputs) whose pixel shader discards first moves its clip position by the
+    /// wind where its draw's motion param word 7 says so (a plant; bbport_wind_sway.h). Never set
+    /// with the knob off: keys and SPIR-V are then as before.
+    static constexpr u8 Sway = 8;
+    /// bbport (r122_game-wind-drive): with BB_WIND_GAME=1 a vertex shader that has the plant sway (Sway) also has
+    /// this bit: the game's own sine terms (the foliage waves of its vertex shaders) are replaced by a constant
+    /// (bbport_wind_game.h; Lifter V_SIN_F32, EmitFPSin). Never set with the knob off: keys and SPIR-V are then as
+    /// before. Bit 16: Kind() looks at bits 0 and 1 only.
+    static constexpr u8 GameCut = 16;
+    /// bbport (r62b_leaf-stage3-followups): the component of the alpha factor's output the
+    /// capture stores fourth (EmitCardUvStore): .y where the factor is .x, else .x. The log reads
+    /// it back to tell a vertex alpha of 1 from a component that is 1 for another reason.
+    static constexpr u32 CaptureUvOther(u32 alpha_comp) {
+        return alpha_comp == 0 ? 1u : 0u;
+    }
+    /// What the capture stores for a value its selector cannot name (a quiet NaN's bits,
+    /// the ring's CARD_UV_RING_UNSET): the expand pass marks such a triangle not finite.
+    static constexpr u32 CaptureUvUnset = 0x7fc00000u;
+    /// The kind of motion (VertexOutputs, VertexCapture or VertexBoth), CaptureUv apart:
+    /// every equality test of a motion_vectors value goes through this.
+    static constexpr u32 Kind(u32 motion_vectors) {
+        return motion_vectors & 3u;
+    }
 };
 
 struct HwLocalRuntimeInfo {

@@ -360,6 +360,17 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                              vk::AccessFlagBits2::eShaderWrite |
                                              vk::AccessFlagBits2::eMemoryWrite;
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
+                // bbport (r22_barriers): as in the full transition below, only while the
+                // subresource states are kept (a full transition drops them for its destination).
+                if (needs_partial_transition && state.layout == dst_layout &&
+                    !(state.access_mask == dst_mask && !is_write) &&
+                    Vulkan::R22Covered(state.pl_stage, state.access_mask, dst_stage, dst_mask) &&
+                    !BbToggle::Experiment(Vulkan::R22BarriersOffBit)) {
+                    if (BbStats::enabled) {
+                        Vulkan::r22_counts.texture_skipped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    continue;
+                }
                 if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
@@ -395,6 +406,18 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                      vk::AccessFlagBits2::eMemoryWrite;
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
         if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+            return;
+        }
+        // bbport (r22_barriers): a read after reads in the same layout that the last barrier's
+        // destination covers (Vulkan::R22Covered): nothing to wait for or to make visible. The
+        // state keeps that wider destination, so a later write waits for this read too.
+        // Experiment 140737488355328 set: a barrier for every different read mask, as before.
+        if (last_state.layout == dst_layout &&
+            Vulkan::R22Covered(last_state.pl_stage, last_state.access_mask, dst_stage, dst_mask) &&
+            !BbToggle::Experiment(Vulkan::R22BarriersOffBit)) {
+            if (BbStats::enabled) {
+                Vulkan::r22_counts.texture_skipped.fetch_add(1, std::memory_order_relaxed);
+            }
             return;
         }
 

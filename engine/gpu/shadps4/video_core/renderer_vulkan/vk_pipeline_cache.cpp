@@ -19,9 +19,16 @@
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "lifter/bridge.h"
+#include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
+#include "bbport_wind_game.h" // bbport (r122_game-wind-drive)
+#include "bbport_wind_hang.h" // bbport (r112_wind-more-things)
+#include "bbport_wind_hang_find.h" // bbport (r112i_hang-find-lanterns)
+#include "bbport_wind_twigs.h" // bbport (r89d_tree-twigs)
+#include "bbport_wind_census.h" // bbport (r89i_twigs-colour-pass)
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/recompiler.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r54_leaf-stage2): CardAlphaOn
 #include "shader_recompiler/native/capture.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -31,6 +38,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_effect_shaders.h"
 #include "video_core/renderer_vulkan/motion_history.h"
+#include "video_core/renderer_vulkan/rt_glass.h" // bbport (r83_glass-water-stage1)
+#include "video_core/renderer_vulkan/rt_glass_probe.h" // bbport (r83b_glass-pane-probe)
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
@@ -209,6 +218,66 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
+// bbport (r62c_leaf-stage3-fix): a capture vertex shader with the card UVs that the lifter
+// declined (or the lifter is off): the recompiler's is used, whose capture made the broken BLAS
+// input of the BB_RT_CARD_ALPHA slowdown (r62d). Said for the first 16, then every 64th.
+static void NoteCardUvRecompiled(u64 pgm_hash, const std::string& why) {
+    static std::atomic<u32> count{0};
+    const u32 n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 16 || n % 64 == 0) {
+        std::printf("Ray tracing card UVs (r62c): the lifter declined capture vertex shader "
+                    "%016llx (%.120s): the recompiler's is used (its BLAS input may be broken); "
+                    "%u so far\n",
+                    static_cast<unsigned long long>(pgm_hash), why.c_str(), n);
+    }
+}
+
+// bbport (r62d_card-uv-diag): whether the selection's pixel shader discards (bound before the
+// vertex stage, RefreshGraphicsStages), for CaptureUvWanted
+static bool FragmentDiscards(const PipelineSelection& sel) {
+    const auto* fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+    return fs && fs->has_discard;
+}
+
+// bbport (r112_wind-more-things): whether the selection's vertex shader reads a bone palette of
+// character size (a stride-16 buffer Motion takes for a Skeleton, by which the rasterizer's
+// Motion block takes a draw for Kind::Skinned), for SwayWanted with BB_WIND_HANG=1
+static bool SkeletonRead(const PipelineSelection& sel) {
+    const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
+    if (!vs) {
+        return false;
+    }
+    for (const auto& resource : vs->buffers) {
+        if (resource.IsSpecial()) {
+            continue;
+        }
+        const auto buffer = resource.GetSharp(*vs);
+        if (buffer.Valid() && buffer.GetStride() == 16 &&
+            Motion::ClassifyBuffer(buffer.GetSize()) == Motion::BufferRole::Skeleton) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// bbport (r89_wind-foliage-sway): MotionVectors::Sway for a motion pipeline whose pixel shader
+// discards (a cut-out: what a plant is drawn with), only with BB_WIND=1 and BB_WIND_SWAY above 0
+// (read once). Which of its draws sway is the draw's motion param word 7 (WindSwayWord).
+static bool SwayWanted(const PipelineSelection& sel) {
+    // bbport (r112_wind-more-things): with BB_WIND_HANG=1 also one whose vertex shader reads a
+    // skeleton (SkeletonRead), cut-out or not: it may draw a hanging thing (bbport_wind_hang.h)
+    return sel.motion && BbWindSway::KnobOnce().on &&
+           (FragmentDiscards(sel) || (BbWindHang::KnobOnce().on && SkeletonRead(sel)) ||
+            // bbport (r112i_hang-find-lanterns): an opaque static one (no skeleton): a lantern, chain or cage
+            (BbWindHangFind::StaticOn() && !SkeletonRead(sel)) ||
+            // bbport (r89d_tree-twigs): BB_WIND_TWIGS_REACH=2: also every skeleton draw (an opaque tree)
+            (BbWindTwigs::ReachOpaque() && SkeletonRead(sel)) ||
+            // bbport (r89i_twigs-colour-pass): BB_WIND_TWIGS_STATIC=2 (a test): also an opaque pipeline with no skeleton
+            (BbWindCensus::StaticOpaque() && !SkeletonRead(sel)) ||
+            // bbport (r89j_twigs-pick-trees): BB_WIND_TWIGS_TREES: also an opaque pipeline with a small bone palette (a tree)
+            (BbWindTwigs::TreesWanted() && !SkeletonRead(sel)));
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& sel, HwStage stage,
                                                              SwStage l_stage) {
     auto& info = sel.runtime_infos[u32(l_stage)];
@@ -284,8 +353,17 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& se
             !instance.IsDepthClipControlSupported() &&
             regs.clipper_control.clip_space == AmdGpu::ClipSpace::MinusWToW;
         info.hw.vs.clip_disable = regs.IsClipDisabled();
+        // bbport (r54_leaf-stage2): CaptureUv: the capture stores the card UVs too
+        // (BB_RT_CARD_ALPHA=1, read once; the key below says the same)
+        // bbport (r62d_card-uv-diag): CaptureUvWanted is CardAlphaOn() unless
+        // BB_RT_CARD_UV_DIAG is 2 (never) or 4/5 (with a pixel shader that discards only)
         info.hw.vs.motion_vectors =
-            u8((sel.capture ? Shader::MotionVectors::VertexCapture : 0) | (sel.motion ? 1 : 0));
+            u8((sel.capture ? Shader::MotionVectors::VertexCapture : 0) | (sel.motion ? 1 : 0) |
+               (sel.capture && Shader::Optimization::CaptureUvWanted(FragmentDiscards(sel))
+                    ? Shader::MotionVectors::CaptureUv
+                    : 0) |
+               (BbWindGame::CutWanted(SwayWanted(sel)) ? Shader::MotionVectors::GameCut : 0) | // bbport (r122_game-wind-drive)
+               (SwayWanted(sel) ? Shader::MotionVectors::Sway : 0)); // bbport (r89_wind-foliage-sway)
         break;
     }
     case HwStage::Fragment: {
@@ -838,6 +916,41 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
     if (!RefreshGraphicsStages(sel)) {
         return false;
     }
+    // bbport (r83_glass-water-stage1): BB_RT_GLASS (rt_glass.h, read once; off by default): a
+    // forward draw of a shader pair the knob names (a window pane: 1 or 2 colour targets, a depth
+    // target, one sample, clipping on, plain VS stages, as the capture rule above asks of the
+    // passes) gets the capture variant too, so RtShadow can keep the pane under RtGlassMask,
+    // which no ray traces yet. The stages are bound again with it, as for motion below. Off: one
+    // test of a static bool, the key as before.
+    if (position_capture && !sel.capture && RtGlassOn()) {
+        u32 bound = 0;
+        for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS && !skip_cb_binding; ++cb) {
+            bound += (regs.color_buffers[cb] && regs.color_target_mask.GetMask(cb)) ? 1 : 0;
+        }
+        const auto* glass_vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
+        const auto* glass_fs = sel.infos[static_cast<u32>(Shader::SwStage::Fragment)];
+        // bbport (r83b_glass-pane-probe): r83's test in its steps, each counted for the r83b line
+        // (rt_glass_probe.h): the pair, its targets, then depth, one sample, clipping and the VS
+        // stage. The result is r83's.
+        const bool glass_pair =
+            glass_vs && glass_fs &&
+            (RtGlassMatch(glass_vs->pgm_hash, glass_fs->pgm_hash) ||
+             // bbport (r86g_glint-find-bottles): BB_RT_GLASS=auto: blended with depth write (the fit
+             // test below keeps the G-buffer and the shadow pass out)
+             (RtGlassAuto() && RtGlassAutoKey(regs.blend_control[0].enable != 0,
+                                              regs.depth_control.depth_write_enable != 0)));
+        const bool glass_fit = glass_pair && RtGlassTargetsFit(bound);
+        const bool glass_depth = glass_fit && regs.depth_buffer.DepthValid() &&
+                                 regs.depth_buffer.NumSamples() == 1 && !regs.IsClipDisabled() &&
+                                 regs.stage_enable.raw == AmdGpu::ShaderStageEnable::VgtStages::Vs;
+        RtGlassProbe::NoteKey(glass_pair, glass_fit, glass_depth, bound);
+        if (glass_depth) {
+            sel.capture = true;
+            if (!RefreshGraphicsStages(sel)) {
+                return false;
+            }
+        }
+    }
     if (motion_possible) {
         const auto* vs = sel.infos[static_cast<u32>(Shader::SwStage::Vertex)];
         if (vs) {
@@ -884,6 +997,11 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         if (all_motion) {
             sel.motion = true;
         }
+        // bbport (r89i_twigs-colour-pass): BB_WIND_TWIGS_STATIC: a G-buffer pipeline with no bone palette whose pixel
+        // shader discards (a cut-out; =2: any) takes the motion variant, so it can carry the sway bit (SwayWanted)
+        if (!sel.motion && vs && BbWindCensus::StaticWanted(FragmentDiscards(sel))) {
+            sel.motion = true;
+        }
         if (sel.motion && !RefreshGraphicsStages(sel)) {
             return false;
         }
@@ -921,10 +1039,21 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
 
     if (sel.capture) {
         key.motion_vectors = Shader::MotionVectors::VertexCapture;
+        // bbport (r54_leaf-stage2, r62d_card-uv-diag): as the vertex stage's runtime info
+        if (Shader::Optimization::CaptureUvWanted(FragmentDiscards(sel))) {
+            key.motion_vectors |= Shader::MotionVectors::CaptureUv;
+        }
     }
     if (sel.motion) {
         constexpr u32 mv = Shader::MotionVectors::Output;
         key.motion_vectors |= 1;
+        if (SwayWanted(sel)) { // bbport (r89_wind-foliage-sway): as the vertex stage's runtime info
+            key.motion_vectors |= Shader::MotionVectors::Sway;
+            if (BbWindGame::CutOn()) { // bbport (r122_game-wind-drive): the game's own plant waves are cut
+                key.motion_vectors |= Shader::MotionVectors::GameCut;
+                BbWindGame::Announce();
+            }
+        }
         key.mrt_mask |= 1u << mv;
         key.num_color_attachments = mv + 1;
         auto& color_buffer = key.color_buffers[mv];
@@ -1096,13 +1225,35 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     Shader::Native::StoreState(info, runtime_before, code, perm_idx);
     const auto binding_before = binding;
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    // bbport (r54_leaf-stage2, r62c_leaf-stage3-fix): a capture vertex shader with the card UVs
+    // (CaptureUv, BB_RT_CARD_ALPHA on, a pixel shader that discards) is the lifter's too: its
+    // VertexCapture stores the UVs as the recompiler's EmitCardUvStore does (r62c). r54 kept the
+    // recompiler's here, and its capture made broken BLAS input (the BB_RT_CARD_ALPHA slowdown,
+    // r62d). A declined one is said. With the knob off no key has CaptureUv and the lifter is
+    // asked as before.
+    const bool card_uv_capture =
+        info.hw_stage == HwStage::Vertex &&
+        (runtime_before.hw.vs.motion_vectors & Shader::MotionVectors::CaptureUv) != 0;
+    bool bbport_lifted = false; // bbport (r89l_twigs-palette-move): which emitter made this shader (the offset line says)
     if (Lifter::GetMode() != Lifter::Mode::Off && !EffectShaders::KeepRecompiled(info)) {
         auto lifted = Lifter::Lift(Lifter::MakeInput(info, runtime_before, profile, binding_before, code));
         if (lifted.ok() && lifted.uses_tone_curve == info.uses_tone_curve) {
             spv = std::move(lifted.spirv);
+            bbport_lifted = true;
         } else {
             LOG_INFO(Render_Vulkan, "Lifter declined {:#x}: {}", info.pgm_hash, lifted.decline);
+            if (card_uv_capture) { // bbport (r62c_leaf-stage3-fix)
+                NoteCardUvRecompiled(info.pgm_hash, lifted.decline.empty()
+                                                        ? std::string("tone curve")
+                                                        : lifted.decline);
+            }
         }
+    } else if (card_uv_capture) { // bbport (r62c_leaf-stage3-fix)
+        NoteCardUvRecompiled(info.pgm_hash, "lifter off");
+    }
+    // bbport (r112q_hang-bracket-route): with BB_WIND_HANG=1 too (the route lines name the emitter of each vertex shader)
+    if ((BbWindTwigs::ProofOn() || BbWindHang::KnobOnce().on) && info.hw_stage == HwStage::Vertex) { // bbport (r89l_twigs-palette-move, TOOL)
+        BbWindTwigs::NoteShaderPath(info.pgm_hash, bbport_lifted);
     }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 

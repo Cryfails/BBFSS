@@ -439,9 +439,19 @@ int Main(std::vector<std::wstring> arguments) {
                 Log("Engine: Lamp2Lamp off: %s", e.what());
             }
         }
+        // bbport (r67_test-mods-list): BB_MODS_CONFIG_OVERRIDE, when set, is this run's mods list
+        // instead of BB_MODS_CONFIG, and mods are on for the run (the launcher always sets both
+        // from its own settings). Automated tests use it to compare a mod on against off without
+        // touching the player's mods.json. Not set: nothing changes.
+        // bbport (r74_mods-override-not-a-file): a set path that is not a regular file stops the
+        // start (the catch below logs it and returns 1), so a mistyped path cannot load every mod.
+        const std::string mods_override = Env("BB_MODS_CONFIG_OVERRIDE", "");
+        if (!mods_override.empty() && !fs::is_regular_file(Path(mods_override), error))
+            throw Error("BB_MODS_CONFIG_OVERRIDE is not a file: " + mods_override);
+        if (!mods_override.empty()) Log("Mods: list for this run (BB_MODS_CONFIG_OVERRIDE): %s", mods_override.c_str());
         merged = BuildModsOverlay(original, out, Path(Env("BB_MODS_DIR", Utf8(data / "mods"))),
-                                  Path(Env("BB_MODS_CONFIG", Utf8(data / "mods.json"))), Env("BB_MODS_ENABLED", "1") == "1",
-                                  first_layers);
+                                  Path(mods_override.empty() ? Env("BB_MODS_CONFIG", Utf8(data / "mods.json")) : mods_override),
+                                  !mods_override.empty() || Env("BB_MODS_ENABLED", "1") == "1", first_layers);
     } catch (const std::exception& e) {
         Log("Mods: %s", e.what());
         return 1;
@@ -769,6 +779,15 @@ int Main(std::vector<std::wstring> arguments) {
     } catch (const std::exception&) {
     }
     const fs::path probe = out / "bb-probe.exe";
+    // bbport (r66_test-saves-folder): BB_USER_DIR_OVERRIDE, when set, is this run's saves folder
+    // instead of BB_USER_DIR (which the launcher always sets from its own settings). Automated
+    // tests use it to load a copy of a save at a known place without touching the player's saves
+    // folder. Not set: nothing changes.
+    const std::string user_override = Env("BB_USER_DIR_OVERRIDE", "");
+    if (!user_override.empty()) {
+        SetEnv("BB_USER_DIR", user_override);
+        std::printf("Saves folder for this run (BB_USER_DIR_OVERRIDE): %s\n", user_override.c_str());
+    }
     std::vector<std::wstring> command{(out / "boot-linked.bin").native(), L"--content-profile", (out / "content.bin").native(),
                                       L"--patches", (out / "patches.bin").native(), L"--app0", merged.native(), L"--user",
                                       Path(Env("BB_USER_DIR", Utf8(data / "user"))).native(), L"--timeout",

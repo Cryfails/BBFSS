@@ -31,6 +31,10 @@ constexpr u64 PREWARM_BLOCKS = 8;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 constexpr u64 BLOCK_SIZE = 16_MB;
 
+// bbport (r33_staging-trim): buffers the trims of this frame may still free. Set by TickFrame
+// (the one pool is ticked by the renderer thread only).
+u32 r33_trim_budget = ~0u;
+
 u64 RoundAllocationSize(u64 size) {
     const u64 step = std::max(std::bit_floor(size) / 4, LARGE_MIN_GRANULARITY);
     return Common::AlignUp(size, step);
@@ -170,10 +174,24 @@ void StagingBufferPool::TickFrame() {
         return env && env[0] ? std::strtoull(env, nullptr, 10) : u64{300};
     }();
     const u32 device_local = u32(VideoCore::MemoryType::DeviceLocal);
-    for (u32 i = 0; i < NUM_TYPES; ++i) {
-        const bool vram = low_vram && i == device_local;
-        TrimRing(rings[i], vram ? 2 : keep_blocks, vram ? vram_idle_frames : RING_IDLE_FRAMES);
-        TrimLarge(large_caches[i], vram ? vram_idle_frames : LARGE_IDLE_FRAMES);
+    {
+        // bbport (r29_bursts): BB_SPIKE_TRACE=1: the trims are a flush split step of their own
+        // ("staging trim") and the buffers they free are counted (Spike lines).
+        const BbSpike::SplitScope r29_trim{BbSpike::SplitStagingTrim};
+        size_t r29_before = 0, r29_after = 0;
+        // bbport (r33_staging-trim): one buffer a frame; experiment 144115188075855872 set =
+        // every idle buffer in the same frame, as before.
+        r33_trim_budget = BbToggle::Experiment(144115188075855872ull) ? ~0u : 1u;
+        for (u32 i = 0; i < NUM_TYPES; ++i) {
+            const bool vram = low_vram && i == device_local;
+            r29_before += rings[i].blocks.size() + large_caches[i].size();
+            TrimRing(rings[i], vram ? 2 : keep_blocks, vram ? vram_idle_frames : RING_IDLE_FRAMES);
+            TrimLarge(large_caches[i], vram ? vram_idle_frames : LARGE_IDLE_FRAMES);
+            r29_after += rings[i].blocks.size() + large_caches[i].size();
+        }
+        if (BbSpike::on && r29_before > r29_after) {
+            BbSpike::staging_freed.fetch_add(r29_before - r29_after, std::memory_order_relaxed);
+        }
     }
     PublishStats();
 }
@@ -186,6 +204,10 @@ void StagingBufferPool::TrimRing(Ring& ring, u64 keep, u64 idle_frames) {
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
+        if (r33_trim_budget == 0) {
+            break;
+        }
+        --r33_trim_budget;
         blocks.erase(blocks.begin() + i);
         if (i < ring.current) {
             --ring.current;
@@ -200,8 +222,12 @@ void StagingBufferPool::TrimRing(Ring& ring, u64 keep, u64 idle_frames) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache, u64 idle_frames) {
     std::erase_if(cache, [this, idle_frames](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= idle_frames &&
-               scheduler.IsFree(entry.tick);
+        if (entry.held || frame - entry.last_used_frame < idle_frames ||
+            !scheduler.IsFree(entry.tick) || r33_trim_budget == 0) {
+            return false;
+        }
+        --r33_trim_budget;
+        return true;
     });
 }
 

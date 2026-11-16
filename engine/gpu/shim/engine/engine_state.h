@@ -22,6 +22,8 @@ bool player_stat_get(const char* name, std::int64_t* value);
 bool player_stat_set(const char* name, std::int64_t value);
 bool player_origin(int* origin);
 bool world_player_block(std::uint32_t* block);
+// bbport (r111_footprints): the hunter's position (x, y, z; y up) as the game's physics keeps it.
+bool world_player_position(float pos[3]);
 bool event_flag_get(std::uint32_t id, bool* value);
 bool event_flag_set(std::uint32_t id, bool value);
 

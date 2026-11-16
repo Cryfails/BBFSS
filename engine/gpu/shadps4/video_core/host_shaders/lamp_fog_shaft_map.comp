@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r80_lamp-fog-shafts): BB_LAMP_FOG_SHAFTS=1, 2 or 3 only (made only then): the lamp
+// fog's shadow maps (lamp_fog_shafts.h), with r106 (lamp_fog_shaft_cap.h) a layer per lamp, kept
+// across frames. Workgroup z is the frame's map job z of the table (lamp_fog_shaft_layout.h:
+// the light's centre in this frame's view space, the reach in metres, the layer to write; only
+// the lamps that get a map this frame within the ray budget). Texel (x, y) of the layer: the
+// WORLD direction the texel's centre decodes to (OctDecode), turned to view space with the
+// world to view rows `to_view0..2`; one ray along it through the frame's ray traced scene
+// (instance mask `mask`, 4: what the ray traced lamp shadows trace), from the blind sphere
+// (`clearance`, at most half the reach) out to the reach, to the nearest hit; the texel keeps
+// the hit's distance in metres, SHAFT_FREE where nothing is hit. The job's layer is written
+// whole; the other layers keep what earlier frames wrote.
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_ray_query : require
+// bbport (r106_lamp-fog-shaft-cap): the table's layout (lamp_fog_shaft_layout.h)
+#extension GL_GOOGLE_include_directive : require
+#include "lamp_fog_shaft_layout.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(scalar, binding = 0) readonly buffer Table { uint d[]; } table; // bbport (r106)
+layout(binding = 1) uniform accelerationStructureEXT scene;
+layout(binding = 2, r16f) uniform writeonly image2DArray maps;
+layout(push_constant) uniform Params {
+    uint count;      // bbport (r106): the frame's map jobs (lamp_fog_shaft_cap.h MapPush)
+    uint mask;       // the scene's instance mask (low 8 bits)
+    float clearance; // the blind sphere at the centre, m
+    float pad;
+    vec4 to_view0, to_view1, to_view2; // world to view, 3x4 rows (.w not used)
+};
+
+bool finite3(vec3 v) { return !any(isnan(v)) && !any(isinf(v)); }
+
+// [-1, 1]^2 to a unit direction: +z at the centre, -z at the four corners (lamp_fog_shafts.h
+// OctDecode; point_volumetric.comp's OctEncode is its inverse).
+vec3 OctDecode(vec2 e) {
+    vec3 v = vec3(e, 1.0 - abs(e.x) - abs(e.y));
+    if (v.z < 0.0) {
+        v.xy = (1.0 - abs(e.yx)) * vec2(e.x >= 0.0 ? 1.0 : -1.0, e.y >= 0.0 ? 1.0 : -1.0);
+    }
+    return normalize(v);
+}
+
+void main() {
+    ivec3 texel = ivec3(gl_GlobalInvocationID);
+    ivec2 size = imageSize(maps).xy;
+    if (any(greaterThanEqual(texel.xy, size)) || uint(texel.z) >= count) return;
+    // bbport (r106_lamp-fog-shaft-cap): job texel.z of the table
+    uint at = SHAFT_TABLE_JOBS + uint(texel.z) * SHAFT_JOB_WORDS;
+    vec3 centre = uintBitsToFloat(uvec3(table.d[at], table.d[at + 1u], table.d[at + 2u]));
+    float reach = uintBitsToFloat(table.d[at + 3u]);
+    uint layer = table.d[at + 4u];
+    if (layer >= uint(imageSize(maps).z)) return;
+    float free_distance = SHAFT_FREE;
+    vec2 e = (vec2(texel.xy) + 0.5) / vec2(size) * 2.0 - 1.0;
+    vec3 world = OctDecode(e);
+    vec3 view = vec3(dot(to_view0.xyz, world), dot(to_view1.xyz, world),
+                     dot(to_view2.xyz, world));
+    if (finite3(centre) && !isinf(reach) && reach > 0.0 && dot(view, view) > 0.0) {
+        rayQueryEXT query;
+        // every instance opaque: one proceed walks the whole ray to the nearest hit
+        rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, mask & 255u, centre,
+                              min(clearance, 0.5 * reach), normalize(view), reach);
+        rayQueryProceedEXT(query);
+        if (rayQueryGetIntersectionTypeEXT(query, true) !=
+            gl_RayQueryCommittedIntersectionNoneEXT) {
+            free_distance = rayQueryGetIntersectionTEXT(query, true);
+        }
+    }
+    imageStore(maps, ivec3(texel.xy, int(layer)), vec4(free_distance));
+}

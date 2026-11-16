@@ -35,12 +35,22 @@ int bbgpu_text_input_begin(const char *initial_utf8, const char *prompt_utf8);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
+/* The overlay's L3 chords on the D-pad, as SDL gamepad button bits: bits 0-15 the D-pad buttons
+ * whose down event the overlay has seen with no up event since, bits 16-31 those of them whose
+ * down event fired a chord (BbOverlay::PadChords). */
+uint32_t bbgpu_overlay_pad_chords(void);
 int bbgpu_window_in_background(void);
 void bbgpu_anti_lag_before_input(void);
 /* Patches the loaded image before the game runs (image still writable): libGnm entry hooks. */
 void bbgpu_patch_image(unsigned char *image, uint64_t size);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+/* bbport (r108_spark-probe, TOOL): the pad buttons the game was just given (scePadReadState);
+ * BB_SPARK_PROBE=1 takes the transform button's presses from them, otherwise it returns at once. */
+void bbgpu_spark_probe_pad(uint32_t buttons);
+/* bbport (r110_weapon-sparks): the pad buttons the game was just given (scePadReadState);
+ * BB_WEAPON_SPARKS takes the transform button's presses from them, otherwise it returns at once. */
+void bbgpu_weapon_sparks_pad(uint32_t buttons);
 #ifdef __cplusplus
 }
 #endif

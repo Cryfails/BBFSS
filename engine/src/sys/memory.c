@@ -4,6 +4,7 @@
 #endif
 #include "sys.h"
 #include "runtime.h"
+#include "live_knobs.h" // bbport (r84_live-test-knobs): TOOL, BB_LIVE_KNOBS_FILE
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -102,6 +103,25 @@ typedef int (*BackingMaker)(uint64_t phys, uint64_t size);
 
 uint64_t runtime_disabled_optimizations;
 uint64_t runtime_experiment_bits;
+// bbport (r39_master-debug): the word BbToggle::Experiment loads (one load of one word, as
+// before) is the experiment bits of BB_TOGGLE_FILE ORed with the bits the engine_previous_paths
+// setting forces. It is composed here, where it is written: each writer (the watcher thread for
+// the file; the start and the menu thread for the forced bits) stores its part and publishes the
+// OR under one lock that only writers take, so the word is always the OR of the two newest
+// parts, whichever thread wrote last.
+static HostMutex experiment_lock = HOST_MUTEX_INIT;
+static uint64_t experiment_file_bits, experiment_forced_bits; // under experiment_lock
+
+static void experiment_publish(uint64_t *part, uint64_t bits) {
+    host_lock(&experiment_lock);
+    *part = bits;
+    __atomic_store_n(&runtime_experiment_bits, experiment_file_bits | experiment_forced_bits, __ATOMIC_RELEASE);
+    host_unlock(&experiment_lock);
+}
+
+void runtime_experiment_force(uint64_t bits) {
+    experiment_publish(&experiment_forced_bits, bits);
+}
 __thread RuntimeRecoverBuf *runtime_fault_recover;
 
 static HostRwlock table_lock = HOST_RWLOCK_INIT;
@@ -383,12 +403,70 @@ static int space_ready(void) {
     return win_mem_space(LOW_START, USER_END);
 }
 
+// bbport (r78_guest-memory-resident): BB_ZERO_TRIM=1, see the patch header. One pass: the
+// direct and flexible mappings (under the read lock, 64 host pages at a time, each batch checked
+// to be still the same mapping), then the pool view (always mapped).
+static uint64_t zero_trim_batch(uintptr_t at, unsigned pages) {
+    uint64_t mask = win_mem_trim_mask(at, pages), dropped = 0;
+    for (unsigned i = 0; mask; ++i, mask >>= 1)
+        if (mask & 1) dropped += (uint64_t)win_mem_trim_page(at + (uintptr_t)i * HOST_PAGE);
+    return dropped;
+}
+
+static void zero_trim_thread(void) {
+    for (unsigned pass = 1;; ++pass) {
+        win_mem_sleep(15000);
+        uint64_t started = win_mem_ms(), dropped = 0;
+        Range *list = NULL;
+        size_t n = 0;
+        reader_enter();
+        const RangeTable *table = atomic_load_explicit(&ranges, memory_order_relaxed);
+        size_t count = atomic_load_explicit(&range_count, memory_order_relaxed);
+        list = table && count ? malloc(count * sizeof(Range)) : NULL;
+        for (size_t i = 0; list && i < count; ++i)
+            if (table->items[i].kind == RANGE_DIRECT || table->items[i].kind == RANGE_FLEXIBLE) list[n++] = table->items[i];
+        reader_leave();
+        for (size_t k = 0; k < n; ++k) {
+            for (uint64_t at = list[k].start; at < list[k].end; at += 64 * HOST_PAGE) {
+                unsigned pages = (unsigned)lower(64, (list[k].end - at) / HOST_PAGE);
+                reader_enter();
+                const RangeTable *now = atomic_load_explicit(&ranges, memory_order_relaxed);
+                size_t now_count = atomic_load_explicit(&range_count, memory_order_relaxed);
+                size_t i = now ? index_in(now, now_count, at) : now_count;
+                if (i < now_count && now->items[i].start <= at && now->items[i].end >= at + pages * HOST_PAGE &&
+                    now->items[i].kind == list[k].kind &&
+                    now->items[i].phys + (at - now->items[i].start) == list[k].phys + (at - list[k].start))
+                    dropped += zero_trim_batch((uintptr_t)at, pages);
+                reader_leave();
+            }
+        }
+        free(list);
+        for (uint64_t at = 0, total = pool_bytes() + FLEX_SPAN; at < total; at += 64 * HOST_PAGE)
+            dropped += zero_trim_batch((uintptr_t)(backing + at), (unsigned)lower(64, (total - at) / HOST_PAGE));
+        if (pass <= 8 || dropped >= (UINT64_C(64) << 8)) {
+            printf("Runtime: zero trim pass %u: %" PRIu64 " MiB of all-zero pages left RAM in %" PRIu64 " ms\n", pass,
+                   dropped >> 8, win_mem_ms() - started);
+            fflush(stdout);
+        }
+    }
+}
+
+static void zero_trim_start(void) {
+    const char *setting = getenv("BB_ZERO_TRIM");
+    if (!(setting && setting[0] == '1')) return;
+    if (win_mem_spawn(zero_trim_thread)) return;
+    printf("Runtime: zero trim on (BB_ZERO_TRIM=1): every 15 s, resident all-zero pages of the game's "
+           "memory leave RAM\n");
+    fflush(stdout);
+}
+
 static int backing_open(void) {
     if (backing_ready) return 0;
     void *view;
     if (space_ready() || win_mem_section(pool_bytes() + FLEX_SPAN, &view)) return -1;
     backing = view;
     backing_ready = 1;
+    zero_trim_start(); // bbport (r78_guest-memory-resident)
     return 0;
 }
 
@@ -1063,20 +1141,26 @@ void *runtime_low_map(size_t size, int prot) {
     return found;
 }
 
+// bbport (r84_live-test-knobs): TOOL (dev/test-tools). BB_LIVE_KNOBS_FILE (live_knobs.c), read in
+// the same rounds as the toggle file; NULL: not set. The watcher also runs for it alone, with
+// `path` NULL: then the toggle part below does nothing.
+static const char *live_knobs_path;
+
 static void *toggle_watch(void *path) {
     for (unsigned long long last = ULLONG_MAX;;) {
-        FILE *file = fopen(path, "r");
+        FILE *file = path ? fopen(path, "r") : NULL; // bbport (r84_live-test-knobs): NULL: no toggle file
         unsigned long long value = 0, experiment = 0;
         if (file) {
             if (fscanf(file, "%llu %llu", &value, &experiment) < 1) value = 0;
             fclose(file);
         }
-        __atomic_store_n(&runtime_experiment_bits, (uint64_t)experiment, __ATOMIC_RELEASE);
-        if (value != last) {
+        if (path) experiment_publish(&experiment_file_bits, (uint64_t)experiment); // bbport (r39_master-debug)
+        if (path && value != last) {
             __atomic_store_n(&runtime_disabled_optimizations, (uint64_t)value, __ATOMIC_RELEASE);
             printf("Runtime: disabled optimizations mask=%llu\n", value);
             last = value;
         }
+        if (live_knobs_path) live_knobs_poll(live_knobs_path); // bbport (r84_live-test-knobs)
         host_sleep_ns(250000000);
     }
     return NULL;
@@ -1103,7 +1187,10 @@ void runtime_memory_set_gpu_hooks(RangeHook map, RangeHook unmap, RangeHook inva
     static int watching;
     static HostThread watcher;
     const char *toggles = getenv("BB_TOGGLE_FILE");
-    if (toggles && !watching) watching = !host_thread_start(&watcher, 0, toggle_watch, (void *)toggles);
+    // bbport (r84_live-test-knobs): TOOL. BB_LIVE_KNOBS_FILE starts the same watcher too
+    const char *knobs = getenv("BB_LIVE_KNOBS_FILE");
+    if (!watching && knobs && knobs[0]) live_knobs_path = knobs;
+    if ((toggles || live_knobs_path) && !watching) watching = !host_thread_start(&watcher, 0, toggle_watch, (void *)toggles);
     writer_enter();
     host_lock(&hook_lock);
     on_map = map;

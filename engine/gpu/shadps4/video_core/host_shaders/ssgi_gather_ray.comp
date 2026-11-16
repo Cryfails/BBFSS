@@ -4,6 +4,11 @@
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_ray_query : require
+#ifdef GLASS_SCENE
+// bbport (r83_glass-water-stage1): BB_RT_GLASS on: window panes are in the scene under their own
+// instance mask (RT_GLASS_MASK); the bounced light passes through them, as without the knob
+#include "rt_glass_layout.h"
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -147,7 +152,11 @@ void main() {
         const vec3 dir = normalize(tangent * (s * cos(a)) + bitangent * (s * sin(a)) +
                                    n * sqrt(max(1.0 - u, 0.0)));
         rayQueryEXT query;
+#ifdef GLASS_SCENE
+        rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xffu & ~RT_GLASS_MASK, origin, reach * 0.5, dir, REACH);
+#else
         rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xffu, origin, reach * 0.5, dir, REACH);
+#endif
         rayQueryProceedEXT(query);
         if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
             continue;

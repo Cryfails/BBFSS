@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r95_halation): film halation on the scene colour before the upscaler (BB_HALATION;
+// renderer_vulkan/halation_params.h has the rules, vk_halation.cpp records the passes). One build,
+// four passes chosen by the push word `mode`:
+//   0 down    source: the scene (texelFetch); target: the quarter image A; the key buffer
+//   1 blur x  source: A (bilinear); target: B
+//   2 blur y  source: B (bilinear); target: A
+//   3 add     source: A (bilinear); target: the scene, read and written in place
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "halation_layout.h"
+
+layout(local_size_x = HALATION_GROUP, local_size_y = HALATION_GROUP, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D source;
+layout(binding = 1, rgba16f) uniform image2D target;
+// Two slots of HalationParams::KeySlotWords words: log-luminance sum, texels, pixels over the
+// threshold, unused. `slot` is this frame's (cleared before the down pass), the other the frame
+// before's.
+layout(binding = 2, std430) buffer KeySums {
+    uint key_words[];
+};
+
+// HalationParams::Push, word for word.
+layout(push_constant) uniform Push {
+    uint mode;
+    uint slot;
+    uint scene_w;
+    uint scene_h;
+    uint quarter_w;
+    uint quarter_h;
+    uint taps;
+    uint show;
+    float sigma;
+    float threshold_stops;
+    float cap_stops;
+    float gain;
+    float tint_r;
+    float tint_g;
+    float tint_b;
+    float hue_keep;
+    float key_scale;
+    float key_bias;
+    float key_floor;
+    float pad0;
+};
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+// The quarter images are RGBA16F: what is stored in them stays below half its largest finite value,
+// so a weighted mean of it stays finite too (an infinity would reach the scene and the upscaler's
+// history).
+const float QUARTER_MAX = 32768.0;
+const float HALF_MAX = 65504.0;
+
+shared uint group_sum;
+shared uint group_count;
+shared uint group_over;
+
+// A broken texel (NaN, infinite) adds nothing; a negative channel is no light.
+vec3 Clean(vec3 c) {
+    if (any(isnan(c)) || any(isinf(c))) {
+        return vec3(0.0);
+    }
+    return clamp(c, vec3(0.0), vec3(HALF_MAX));
+}
+
+void Down() {
+    const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    const bool inside = q.x < int(quarter_w) && q.y < int(quarter_h);
+    if (gl_LocalInvocationIndex == 0u) {
+        group_sum = 0u;
+        group_count = 0u;
+        group_over = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    // The frame before's key; none yet (its first frame): no glow this frame.
+    const uint before = (1u - slot) * HALATION_SLOT_WORDS;
+    const uint before_count = key_words[before + 1u];
+    const bool keyed = before_count > 0u;
+    const float key =
+        keyed ? exp2(float(key_words[before]) / float(before_count) / key_scale - key_bias) : 0.0;
+    const float threshold = key * exp2(threshold_stops);
+    const float cap = threshold * exp2(cap_stops);
+    if (inside) {
+        const ivec2 last = ivec2(int(scene_w) - 1, int(scene_h) - 1);
+        vec3 glow = vec3(0.0);
+        float tone = 0.0;
+        uint over = 0u;
+        for (int y = 0; y < 4; ++y) {
+            for (int x = 0; x < 4; ++x) {
+                const vec3 c = Clean(texelFetch(source, min(q * 4 + ivec2(x, y), last), 0).rgb);
+                const float l = dot(c, LUMA);
+                tone += l;
+                if (keyed && l > threshold) {
+                    const float excess = l - threshold;
+                    glow += c * (excess / (1.0 + excess / cap) / l);
+                    over += 1u;
+                }
+            }
+        }
+        imageStore(target, q, vec4(min(glow * (1.0 / 16.0), vec3(QUARTER_MAX)), 1.0));
+        const float stops = clamp(log2(max(tone * (1.0 / 16.0), key_floor)), -key_bias, key_bias);
+        atomicAdd(group_sum, uint((stops + key_bias) * key_scale + 0.5));
+        atomicAdd(group_count, 1u);
+        atomicAdd(group_over, over);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && group_count > 0u) {
+        const uint at = slot * HALATION_SLOT_WORDS;
+        atomicAdd(key_words[at], group_sum);
+        atomicAdd(key_words[at + 1u], group_count);
+        atomicAdd(key_words[at + 2u], group_over);
+    }
+}
+
+// A Gaussian of `sigma` texels along `axis`, `taps` texels a side, two texels a bilinear read.
+void Blur(vec2 axis) {
+    const ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (q.x >= int(quarter_w) || q.y >= int(quarter_h)) {
+        return;
+    }
+    const vec2 texel = 1.0 / vec2(quarter_w, quarter_h);
+    const vec2 uv = (vec2(q) + 0.5) * texel;
+    const float spread = 2.0 * sigma * sigma;
+    vec3 sum = textureLod(source, uv, 0.0).rgb;
+    float weights = 1.0;
+    for (uint i = 1u; i <= taps; i += 2u) {
+        const float a = float(i);
+        const float b = float(i + 1u);
+        const float wa = exp(-a * a / spread);
+        const float wb = i + 1u <= taps ? exp(-b * b / spread) : 0.0;
+        const float w = wa + wb;
+        const vec2 d = axis * ((a * wa + b * wb) / w) * texel;
+        sum += (textureLod(source, uv + d, 0.0).rgb + textureLod(source, uv - d, 0.0).rgb) * w;
+        weights += 2.0 * w;
+    }
+    imageStore(target, q, vec4(sum / weights, 1.0));
+}
+
+void Add() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(scene_w) || p.y >= int(scene_h)) {
+        return;
+    }
+    // The quarter texel centres sit at 4q + 2 pixels.
+    const vec2 uv = (vec2(p) + 0.5) * 0.25 / vec2(quarter_w, quarter_h);
+    const vec3 g = textureLod(source, uv, 0.0).rgb;
+    const float l = dot(g, LUMA);
+    // Nothing to add: the pixel is left as it is (no read, no write).
+    if (show != HALATION_SHOW_GLOW_ONLY && !(l * gain >= 1e-6)) {
+        return;
+    }
+    const vec3 glow =
+        gain * (l * vec3(tint_r, tint_g, tint_b) * (1.0 - hue_keep) + g * hue_keep);
+    const vec4 scene = imageLoad(target, p);
+    const vec3 sum = show == HALATION_SHOW_GLOW_ONLY ? glow : scene.rgb + glow;
+    imageStore(target, p, vec4(min(sum, vec3(HALF_MAX)), scene.a));
+}
+
+void main() {
+    if (mode == HALATION_MODE_DOWN) {
+        Down();
+    } else if (mode == HALATION_MODE_BLUR_X) {
+        Blur(vec2(1.0, 0.0));
+    } else if (mode == HALATION_MODE_BLUR_Y) {
+        Blur(vec2(0.0, 1.0));
+    } else if (mode == HALATION_MODE_ADD) {
+        Add();
+    }
+}

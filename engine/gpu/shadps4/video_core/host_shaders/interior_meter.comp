@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r99_interior-exposure, r99b_interior-brightness): the interior exposure meter
+// (vk_interior_exposure.cpp). One group of 256 threads takes grid.x * grid.y samples at cell
+// centres over the render size: a sample whose depth is 1 (the clear value: sky) is counted apart,
+// every other one adds log2 of its Rec.709 luminance clamped to [lum_min, lum_max] (pushed from
+// bbport_interior_exposure.h's LumMin, LumMax; one that is not a number is left out) and, when
+// open_m > 0, is counted at view depths of at least a quarter, half, one and two times open_m
+// (view depth z = z_offset / (depth - z_scale), the projection's z terms as camera_motion.comp
+// takes them). Thread 0 writes the sums and the frame number into one slot of a small host
+// buffer; the CPU reads it once the GPU has passed that frame (gpu/shim/bbport_interior_exposure.h
+// has the rule).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 256) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D scene_img; // HDR scene, before the tone curve
+layout(binding = 1) uniform texture2D depth_tex;                 // D32, 1 = sky
+
+struct Slot {
+    float log_sum; // sum of log2 luminance over the ground samples
+    float samples; // ground samples
+    float sky;     // sky samples
+    float quarter; // ground samples at least open_m / 4 away
+    uint frame;    // the frame number pushed with this dispatch
+    float halfway; // ground samples at least open_m / 2 away
+    float open;    // ground samples at least open_m away
+    float twice;   // ground samples at least 2 * open_m away
+};
+layout(binding = 2, std430) writeonly buffer Slots {
+    Slot slots[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 size; // render pixels
+    uvec2 grid; // samples across, down
+    uint slot;
+    uint frame;
+    float lum_min; // each sample's luminance clamp
+    float lum_max;
+    float z_scale;  // depth = z_scale + z_offset / z
+    float z_offset;
+    float open_m;   // 0: no distance counts
+    float pad0;
+};
+
+shared float s_log[256];
+shared float s_ground[256];
+shared float s_sky[256];
+shared vec4 s_far[256];
+
+void main() {
+    const uint t = gl_LocalInvocationIndex;
+    const uint count = grid.x * grid.y;
+    float log_sum = 0.0;
+    float ground = 0.0;
+    float sky = 0.0;
+    vec4 far = vec4(0.0);
+    const vec4 reach = vec4(0.25, 0.5, 1.0, 2.0) * open_m;
+    for (uint i = t; i < count; i += 256u) {
+        const uvec2 cell = uvec2(i % grid.x, i / grid.x);
+        const ivec2 p = ivec2((vec2(cell) + 0.5) * vec2(size) / vec2(grid));
+        const float depth = texelFetch(depth_tex, p, 0).r;
+        if (depth >= 1.0) {
+            sky += 1.0;
+            continue;
+        }
+        const float y = dot(imageLoad(scene_img, p).rgb, vec3(0.2126, 0.7152, 0.0722));
+        if (isnan(y) || isinf(y)) {
+            continue;
+        }
+        log_sum += log2(clamp(y, lum_min, lum_max));
+        ground += 1.0;
+        if (open_m > 0.0) {
+            const float z = z_offset / min(depth - z_scale, -1e-8);
+            far += vec4(greaterThanEqual(vec4(z), reach));
+        }
+    }
+    s_log[t] = log_sum;
+    s_ground[t] = ground;
+    s_sky[t] = sky;
+    s_far[t] = far;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (t < stride) {
+            s_log[t] += s_log[t + stride];
+            s_ground[t] += s_ground[t + stride];
+            s_sky[t] += s_sky[t + stride];
+            s_far[t] += s_far[t + stride];
+        }
+        barrier();
+    }
+    if (t == 0u) {
+        slots[slot] = Slot(s_log[0], s_ground[0], s_sky[0], s_far[0].x, frame, s_far[0].y,
+                           s_far[0].z, s_far[0].w);
+    }
+}

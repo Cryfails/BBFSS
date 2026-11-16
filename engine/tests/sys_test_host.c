@@ -15,11 +15,14 @@ WEAK uint64_t host_monotonic_ns(void) { return 0; }
 WEAK void host_sleep_until_ns(uint64_t deadline) { (void)deadline; }
 WEAK int bbgpu_window_in_background(void) { return 0; }
 WEAK int bbgpu_overlay_captures_input(void) { return 0; }
+WEAK uint32_t bbgpu_overlay_pad_chords(void) { return 0; }
 WEAK void bbgpu_anti_lag_before_input(void) {}
 WEAK int bbgpu_menu_buttons(uint32_t *confirm, uint32_t *back) { (void)confirm; (void)back; return 0; }
 WEAK int bbgpu_pc_input(BbPcPad *pad, const _Bool *keys, int count, int gamepad) { (void)pad; (void)keys; (void)count; (void)gamepad; return 0; }
 WEAK int bbgpu_text_input_begin(const char *initial, const char *prompt) { (void)initial; (void)prompt; return 0; }
 WEAK int bbgpu_text_input_poll(char *out, uint64_t size) { (void)out; (void)size; return 0; }
+WEAK void bbgpu_spark_probe_pad(uint32_t buttons) { (void)buttons; }
+WEAK void bbgpu_weapon_sparks_pad(uint32_t buttons) { (void)buttons; }
 WEAK int runtime_block_begin(int kind, uintptr_t object) { (void)kind; (void)object; return 0; }
 WEAK void runtime_block_end(int slot) { (void)slot; }
 WEAK void runtime_wait_note(int kind, uint64_t ns) { (void)kind; (void)ns; }

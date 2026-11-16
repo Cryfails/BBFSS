@@ -5,6 +5,7 @@
 #include "bbport_settings.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -37,7 +38,8 @@ struct Row {
 };
 std::uint64_t g_file = 0;
 std::vector<Row> g_rows;
-std::array<float, 4> g_said{1, 1, 1, 1};
+std::array<float, 4> g_said{1, 1, 1, 1}, g_said_asked{1, 1, 1, 1};
+std::atomic<float> g_orbit{1.0f};
 unsigned g_ticks = 0;
 
 template <typename T> bool Peek(std::uint64_t at, T* out) {
@@ -132,13 +134,18 @@ bool Install(std::uint8_t* image, std::size_t size) {
 
 bool Active() { return g_active; }
 
+void SetOrbitDistance(float factor) { g_orbit.store(factor, std::memory_order_relaxed); }
+
 void Tick() {
     if (!g_active) return;
     const auto& s = BbSettings::Get();
-    const std::array<float, 4> scale = {g_controls ? s.camera_distance_scale.load() : 1.0f,
+    const std::array<float, 4> asked = {g_controls ? s.camera_distance_scale.load() : 1.0f,
                                         g_controls ? s.camera_height_scale.load() : 1.0f,
                                         g_controls ? s.camera_fov_scale.load() : 1.0f, Widescreen::NarrowFovFactor()};
-    for (const float f : scale) if (!std::isfinite(f)) return;
+    for (const float f : asked) if (!std::isfinite(f)) return;
+    // Camera mode's orbit radius rides on the distance; it is exactly 1 while the orbit is off.
+    std::array<float, 4> scale = asked;
+    scale[0] *= g_orbit.load(std::memory_order_relaxed);
     const bool neutral = scale == std::array<float, 4>{1, 1, 1, 1};
     if (neutral && g_said == scale) return;
     if (!g_file || g_ticks++ % 150 == 0) {
@@ -166,8 +173,12 @@ void Tick() {
         }
     }
     if (scale != g_said) {
-        std::printf("Engine: camera distance x%.2f, height x%.2f, FOV x%.2f, Vert+ x%.4f\n", scale[0], scale[1],
-                    scale[2], scale[3]);
+        // The settings only: the orbit's eased radius would print a line every frame.
+        if (asked != g_said_asked) {
+            std::printf("Engine: camera distance x%.2f, height x%.2f, FOV x%.2f, Vert+ x%.4f\n", asked[0], asked[1],
+                        asked[2], asked[3]);
+            g_said_asked = asked;
+        }
         g_said = scale;
     }
 }

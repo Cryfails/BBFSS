@@ -193,6 +193,15 @@ static void WaitPreviousFrame() {
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
             .count(),
         std::memory_order_relaxed);
+    // bbport r8 (BbSubmitDiag): the game thread blocked on the GPU, and after which of the frame's
+    // guest submissions (a wait in sceGnmSubmitDone counts all of them).
+    BbSubmitDiag::guest_waits.fetch_add(1, std::memory_order_relaxed);
+    BbSubmitDiag::guest_wait_ns.fetch_add(
+        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                                 start)
+                .count()),
+        std::memory_order_relaxed);
+    BbSubmitDiag::guest_wait_index.fetch_add(submits_this_frame, std::memory_order_relaxed);
     BbTimeline::Note(BbTimeline::GuestWaitEnd, u64(frames_submitted));
 }
 
@@ -2509,12 +2518,17 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
     BbStats::submit_done_calls.fetch_add(1, std::memory_order_relaxed);
+    if (BbSpike::on) { // bbport (r23_spike-trace): the game thread's frame boundary
+        BbSpike::NoteGameFrame();
+    }
     BbTimeline::Note(BbTimeline::GuestSubmitDone, u64(frames_submitted) + 1);
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     if (SubmitLockOnDecode()) {
         // A frame without submissions waits here, as the lock made sceGnmSubmitDone wait.
         WaitPreviousFrame();
+        BbSubmitDiag::guest_submits.fetch_add(submits_this_frame, std::memory_order_relaxed); // r8
+        BbSubmitDiag::guest_frames.fetch_add(1, std::memory_order_relaxed);
         submits_this_frame = 0;
         WatchOverlapLeak();
         ++frames_submitted;

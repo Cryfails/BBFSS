@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r82_wind-stage1): runs wind_noise.glsl on the GPU for tests/test_wind_noise.cpp, which
+// compares it with gpu/shim/bbport_wind.h. One invocation per case; not used by the engine.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 64) in;
+
+#include "wind_noise.glsl"
+
+// Per case eight vec4: (p, contrast), (off1, density), (off2, ds), (jitter, vis seed, zero, -),
+// the view to world matrix's three rows, (the unit view ray, -). `zero` is 0 read from the
+// buffer, so a contrast of 0 is only known at run time, as BB_WIND_FOG=0 is in the game.
+layout(std430, binding = 0) readonly buffer Cases { vec4 v[]; } cases;
+// Per case two vec4: (Noise3(p), Field, Density, the factor at view point p through the rows) and
+// (p through the rows, the test view's shade of Density).
+layout(std430, binding = 1) writeonly buffer Values { vec4 v[]; } values;
+// Per case the floats (as bits) of three 32-step marches along the ray: as without wind,
+// wind_ray_step at contrast `zero`, wind_ray_step at the contrast; then the last one's excess.
+layout(std430, binding = 2) writeonly buffer Marches { uvec4 v[]; } marches;
+layout(push_constant) uniform Push { uint count; };
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= count) return;
+    vec4 p = cases.v[id * 8u], o1 = cases.v[id * 8u + 1u], o2 = cases.v[id * 8u + 2u];
+    vec4 extra = cases.v[id * 8u + 3u];
+    vec4 r0 = cases.v[id * 8u + 4u], r1 = cases.v[id * 8u + 5u], r2 = cases.v[id * 8u + 6u];
+    vec3 ray = cases.v[id * 8u + 7u].xyz;
+    float m = wind_density(p.xyz, o1.xyz, o2.xyz, p.w);
+    values.v[id * 2u] = vec4(wind_noise3(p.xyz), wind_field(p.xyz, o1.xyz, o2.xyz), m,
+                             wind_factor_rows(r0, r1, r2, p.xyz, o1.xyz, o2.xyz, p.w));
+    values.v[id * 2u + 1u] = vec4(wind_view_to_world(r0, r1, r2, p.xyz), wind_view_shade(m, p.w));
+    float density = o1.w, ds = o2.w, jitter = extra.x;
+    float plain = 0.0, flat_energy = 0.0, flat_excess = 0.0, energy = 0.0, excess = 0.0;
+    for (uint i = 0u; i < 32u; ++i) {
+        float t = (float(i) + jitter) * ds;
+        float vis = fract(float(i) * 0.6180339 + extra.y);
+        plain += exp(-density * t) * density * ds * vis;
+        wind_ray_step(flat_energy, flat_excess, density, ray, t, ds, jitter, vis, r0, r1, r2,
+                      o1.xyz, o2.xyz, extra.z);
+        wind_ray_step(energy, excess, density, ray, t, ds, jitter, vis, r0, r1, r2, o1.xyz,
+                      o2.xyz, p.w);
+    }
+    marches.v[id] = uvec4(floatBitsToUint(plain), floatBitsToUint(flat_energy),
+                          floatBitsToUint(energy), floatBitsToUint(excess));
+}

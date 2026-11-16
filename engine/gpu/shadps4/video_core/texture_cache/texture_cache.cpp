@@ -16,6 +16,7 @@
 #include "engine/key_prompts.h"
 #include "engine/hud_clean.h"
 #include <zlib.h>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -28,11 +29,13 @@
 #include "common/div_ceil.h"
 #include "common/hash.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_bind_helper.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -229,7 +232,10 @@ u64 ImageFreeDelayFrames() {
 }
 } // namespace
 
-TextureCache::~TextureCache() = default;
+TextureCache::~TextureCache() {
+    // bbport: the UI worker is joined before the jobs it works on are freed (UiReplacement).
+    StopUiWorker();
+}
 
 /// bbport BB_REFRESH_TRACE=1 (diagnostics): for images of 4 MiB and up, the writes that mark one
 /// dirty (and their kind, InvalidateReason) and its refreshes, with the flags they found and what
@@ -776,10 +782,30 @@ vk::Format UiFormat(vk::Format original) {
     }
 }
 
-bool ReadUiFile(const std::filesystem::path& path, std::vector<u8>& pixels, int& w, int& h) {
-    std::ifstream in(path, std::ios::binary);
-    const std::vector<u8> file{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    if (file.size() < 12 || std::memcmp(file.data(), "BBUI", 4) != 0) {
+u64 NsSince(std::chrono::steady_clock::time_point start) {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                   .count());
+}
+
+// bbport: the file in one read of its size (an istreambuf_iterator read it a byte at a time), then
+// inflated; `read_ns` and `inflate_ns`, when given, add the time of each.
+bool ReadUiFile(const std::filesystem::path& path, std::vector<u8>& pixels, int& w, int& h,
+                u64* read_ns = nullptr, u64* inflate_ns = nullptr) {
+    const auto start = std::chrono::steady_clock::now();
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    const std::streamoff length = in ? std::streamoff(in.tellg()) : std::streamoff(-1);
+    if (length < 12) {
+        return false;
+    }
+    std::vector<u8> file(static_cast<std::size_t>(length));
+    in.seekg(0);
+    if (!in.read(reinterpret_cast<char*>(file.data()), length)) {
+        return false;
+    }
+    if (read_ns) {
+        *read_ns += NsSince(start);
+    }
+    if (std::memcmp(file.data(), "BBUI", 4) != 0) {
         return false;
     }
     u32 fw = 0, fh = 0;
@@ -788,10 +814,14 @@ bool ReadUiFile(const std::filesystem::path& path, std::vector<u8>& pixels, int&
     if (!fw || !fh || fw > 16384 || fh > 16384) {
         return false;
     }
+    const auto inflate_start = std::chrono::steady_clock::now();
     pixels.resize(std::size_t(fw) * fh * 4);
     uLongf size = uLongf(pixels.size());
     if (uncompress(pixels.data(), &size, file.data() + 12, uLong(file.size() - 12)) != Z_OK || size != pixels.size()) {
         return false;
+    }
+    if (inflate_ns) {
+        *inflate_ns += NsSince(inflate_start);
     }
     w = int(fw);
     h = int(fh);
@@ -848,6 +878,64 @@ void Halve(std::vector<u8>& pixels, int& w, int& h, bool srgb) {
     w = nw;
     h = nh;
 }
+
+// BB_UI_2K=1: replacements drawn at half their size (a 2x copy at the game's own size).
+bool UiHalfDetail() {
+    static const bool half_detail = [] {
+        const char* env = std::getenv("BB_UI_2K");
+        return env && env[0] == '1';
+    }();
+    return half_detail;
+}
+
+// A replacement's image, with its full mip chain laid out one level after another; `bytes`: the
+// chain's size.
+ImageInfo UiChainInfo(int w, int h, vk::Format format, u64& bytes) {
+    ImageInfo info{};
+    info.pixel_format = format;
+    info.type = AmdGpu::ImageType::Color2D;
+    info.size = {u32(w), u32(h), 1};
+    info.resources.layers = 1;
+    info.num_bits = 32;
+    info.pitch = u32(w);
+    bytes = 0;
+    for (u32 level = 0, lw = u32(w), lh = u32(h); level < info.mips_layout.size(); ++level) {
+        info.mips_layout[level] = {lw * lh * 4, lw, lh, u32(bytes)};
+        bytes += u64(lw) * lh * 4;
+        info.resources.levels = level + 1;
+        if (lw == 1 && lh == 1) {
+            break;
+        }
+        lw = std::max(1u, lw / 2);
+        lh = std::max(1u, lh / 2);
+    }
+    return info;
+}
+
+// bbport: the budget held for a replacement of a `w`x`h` texture while the UI worker makes it,
+// before its file is read: the pack's 4x size, reduced as UiReplacement reduces it.
+u64 UiReservedBytes(u32 w, u32 h, vk::Format format) {
+    u32 rw = w * 4, rh = h * 4;
+    while (rw > kUiLargestSide || rh > kUiLargestSide) {
+        rw = std::max(1u, rw / 2);
+        rh = std::max(1u, rh / 2);
+    }
+    if (UiHalfDetail() && rw >= w * 4 && rh >= h * 4) {
+        rw = std::max(1u, rw / 2);
+        rh = std::max(1u, rh / 2);
+    }
+    u64 bytes = 0;
+    UiChainInfo(int(rw), int(rh), format, bytes);
+    return bytes;
+}
+
+void TellUiLoad(const ImageInfo& info, int w, int h, u64 ui_bytes) {
+    static int told = 0;
+    if (told++ < 8) {
+        std::printf("UI textures: %ux%u drawn from its %dx%d replacement (%llu MiB in use)\n", info.size.width,
+                    info.size.height, w, h, static_cast<unsigned long long>(ui_bytes >> 20));
+    }
+}
 }
 
 bool TextureCache::UiReplacementsLoaded() {
@@ -886,6 +974,11 @@ void TextureCache::NoteUiTexture(Image& image) {
     }
 }
 
+// bbport: a replacement's file is read, inflated and its mip chain made on the UI worker
+// (UiWorker): a 4096 texture took 100-260 ms of the GPU thread at its first bind, the 1600x1600
+// item art 20-40 ms each. The first bind queues it and the game's own art is drawn meanwhile; a
+// bind after the worker is done creates and uploads the image (FinishUiJob). Experiment 4096:
+// all of it at the first bind, as before.
 Image* TextureCache::UiReplacement(const Image& image) {
     if (!image.ui_key) {
         return nullptr;
@@ -893,7 +986,12 @@ Image* TextureCache::UiReplacement(const Image& image) {
     if (const auto it = ui_images.find(image.ui_key); it != ui_images.end()) {
         return it->second.get();
     }
-    if (ui_missing.count(image.ui_key) || ui_bytes >= kUiBudget) {
+    if (!ui_jobs.empty()) {
+        if (const auto job = ui_jobs.find(image.ui_key); job != ui_jobs.end()) {
+            return FinishUiJob(image, job);
+        }
+    }
+    if (ui_missing.count(image.ui_key) || ui_bytes + ui_reserved >= kUiBudget) {
         return nullptr;
     }
     const UiPack& pack = Pack();
@@ -904,17 +1002,39 @@ Image* TextureCache::UiReplacement(const Image& image) {
     char name[96];
     std::snprintf(name, sizeof name, "%ux%u_%u_%016llx.bbui", entry->second.width, entry->second.height, entry->second.size,
                   static_cast<unsigned long long>(image.ui_key));
+    const vk::Format format = UiFormat(image.info.pixel_format);
+    // A BC1 the game reads as RGB has no alpha: its three-colour blocks' fourth texel is opaque
+    // black there, where the replacement (made from the RGBA reading) holds alpha 0.
+    const bool opaque = image.info.pixel_format == vk::Format::eBc1RgbUnormBlock ||
+                        image.info.pixel_format == vk::Format::eBc1RgbSrgbBlock;
+    if (!BbToggle::Experiment(4096)) {
+        auto job = std::make_unique<UiJob>();
+        job->path = pack.dir / name;
+        job->format = format;
+        job->opaque = opaque;
+        job->game_width = image.info.size.width;
+        job->game_height = image.info.size.height;
+        job->reserved = UiReservedBytes(image.info.size.width, image.info.size.height, format);
+        ui_reserved += job->reserved;
+        if (!ui_worker.joinable()) {
+            ui_worker = std::thread([this] { UiWorker(); });
+        }
+        {
+            std::scoped_lock lock{ui_queue_mutex};
+            ui_queue.push_back(job.get());
+        }
+        ui_queue_cv.notify_one();
+        ui_jobs.emplace(image.ui_key, std::move(job));
+        return nullptr;
+    }
+    const auto start = std::chrono::steady_clock::now();
     int w = 0, h = 0;
     std::vector<u8> pixels;
     if (!ReadUiFile(pack.dir / name, pixels, w, h)) {
         ui_missing.insert(image.ui_key);
         return nullptr;
     }
-    const vk::Format format = UiFormat(image.info.pixel_format);
-    // A BC1 the game reads as RGB has no alpha: its three-colour blocks' fourth texel is opaque
-    // black there, where the replacement (made from the RGBA reading) holds alpha 0.
-    if (image.info.pixel_format == vk::Format::eBc1RgbUnormBlock ||
-        image.info.pixel_format == vk::Format::eBc1RgbSrgbBlock) {
+    if (opaque) {
         for (std::size_t i = 3; i < pixels.size(); i += 4) {
             pixels[i] = 255;
         }
@@ -922,20 +1042,166 @@ Image* TextureCache::UiReplacement(const Image& image) {
     while (u32(w) > kUiLargestSide || u32(h) > kUiLargestSide) {
         Halve(pixels, w, h, format == vk::Format::eR8G8B8A8Srgb);
     }
-    static const bool half_detail = [] {
-        const char* env = std::getenv("BB_UI_2K");
-        return env && env[0] == '1';
-    }();
-    if (half_detail && u32(w) >= image.info.size.width * 4 && u32(h) >= image.info.size.height * 4) {
+    if (UiHalfDetail() && u32(w) >= image.info.size.width * 4 && u32(h) >= image.info.size.height * 4) {
         Halve(pixels, w, h, format == vk::Format::eR8G8B8A8Srgb);
     }
     Image* out = UploadUi(image.ui_key, pixels, w, h, format);
-    static int told = 0;
-    if (told++ < 8) {
-        std::printf("UI textures: %ux%u drawn from its %dx%d replacement (%llu MiB in use)\n", image.info.size.width,
-                    image.info.size.height, w, h, static_cast<unsigned long long>(ui_bytes >> 20));
-    }
+    ++ui_loaded;
+    ui_upload_ns += NsSince(start);
+    TellUiLoad(image.info, w, h, ui_bytes);
     return out;
+}
+
+// bbport: the UI worker's part of a replacement (UiReplacement): no texture cache state, `job` only.
+void TextureCache::PrepareUi(UiJob& job) {
+    int w = 0, h = 0;
+    std::vector<u8> pixels;
+    if (!ReadUiFile(job.path, pixels, w, h, &job.read_ns, &job.inflate_ns)) {
+        return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const bool srgb = job.format == vk::Format::eR8G8B8A8Srgb;
+    if (job.opaque) {
+        for (std::size_t i = 3; i < pixels.size(); i += 4) {
+            pixels[i] = 255;
+        }
+    }
+    while (u32(w) > kUiLargestSide || u32(h) > kUiLargestSide) {
+        Halve(pixels, w, h, srgb);
+    }
+    if (UiHalfDetail() && u32(w) >= job.game_width * 4 && u32(h) >= job.game_height * 4) {
+        Halve(pixels, w, h, srgb);
+    }
+    job.w = w;
+    job.h = h;
+    // The levels as UploadUi copies them, each made from the one before (Halve).
+    u64 bytes = 0;
+    const ImageInfo info = UiChainInfo(w, h, job.format, bytes);
+    job.levels.resize(bytes);
+    for (u32 level = 0; level < info.resources.levels; ++level) {
+        if (level) {
+            Halve(pixels, w, h, srgb);
+        }
+        std::memcpy(job.levels.data() + info.mips_layout[level].offset, pixels.data(), pixels.size());
+    }
+    job.mips_ns = NsSince(start);
+    job.ok = true;
+}
+
+// bbport: a queued replacement once the worker is done with it: its image created and uploaded
+// here, or its failure remembered (ui_missing); either way its reserved budget is given back.
+// Nullptr while the worker is on it, and on the bind helper, which records no uploads
+// (Rasterizer::TexturesBindableOnHelper leaves stages with a pending replacement to this thread).
+Image* TextureCache::FinishUiJob(const Image& image, UiJobs::iterator it) {
+    UiJob& job = *it->second;
+    if (!job.done.load(std::memory_order_acquire) || Vulkan::BindHelper::OnHelper()) {
+        return nullptr;
+    }
+    ui_reserved -= job.reserved;
+    ui_read_ns += job.read_ns;
+    ui_inflate_ns += job.inflate_ns;
+    ui_mips_ns += job.mips_ns;
+    Image* out = nullptr;
+    if (job.ok) {
+        const auto start = std::chrono::steady_clock::now();
+        out = UploadUi(it->first, job.levels, job.w, job.h, job.format, true);
+        ++ui_loaded;
+        ui_upload_ns += NsSince(start);
+        TellUiLoad(image.info, job.w, job.h, ui_bytes);
+    } else {
+        ui_missing.insert(it->first);
+    }
+    ui_jobs.erase(it);
+    return out;
+}
+
+void TextureCache::UiWorker() {
+    Common::SetCurrentThreadName("bb:UiLoad");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    std::unique_lock lock{ui_queue_mutex};
+    for (;;) {
+        ui_queue_cv.wait(lock, [this] { return ui_worker_stop || !ui_queue.empty(); });
+        if (ui_worker_stop) {
+            return;
+        }
+        UiJob* job = ui_queue.front();
+        ui_queue.pop_front();
+        lock.unlock();
+        // bbport: a failed allocation (a 4096 chain is ~150 MB while it is made) fails the job,
+        // not the process: `ok` is set last, so a throw leaves it a failed job (FinishUiJob).
+        try {
+            PrepareUi(*job);
+        } catch (...) {
+            job->ok = false;
+        }
+        // The recording thread may free the job from here on.
+        job->done.store(true, std::memory_order_release);
+        lock.lock();
+    }
+}
+
+void TextureCache::StopUiWorker() {
+    if (!ui_worker.joinable()) {
+        return;
+    }
+    {
+        std::scoped_lock lock{ui_queue_mutex};
+        ui_worker_stop = true;
+    }
+    ui_queue_cv.notify_one();
+    ui_worker.join();
+}
+
+// bbport: finished jobs no bind has taken yet (FinishUiJob takes them at a bind): a failure is
+// remembered and its budget given back here, and a replacement not drawn within kUiStaleFrames of
+// being made is dropped with its budget and texels, to be queued again if it is drawn later. Else a
+// texture drawn only while its job ran (a menu passed through) held both until shutdown.
+// RunGarbageCollector: no bind runs meanwhile (the draw pipe is drained).
+void TextureCache::SweepUiJobs() {
+    if (ui_jobs.empty()) {
+        return;
+    }
+    constexpr u32 kUiStaleFrames = 600;
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    for (auto it = ui_jobs.begin(); it != ui_jobs.end();) {
+        UiJob& job = *it->second;
+        if (!job.done.load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        if (job.ok && !job.swept) {
+            job.swept = true;
+            job.done_frame = frame;
+        }
+        if (job.ok && frame - job.done_frame < kUiStaleFrames) {
+            ++it;
+            continue;
+        }
+        if (!job.ok) {
+            ui_missing.insert(it->first);
+        }
+        ui_reserved -= job.reserved;
+        ui_read_ns += job.read_ns;
+        ui_inflate_ns += job.inflate_ns;
+        ui_mips_ns += job.mips_ns;
+        it = ui_jobs.erase(it);
+    }
+}
+
+// bbport: the replacements loaded so far and where their time went, at most every 300 frames and
+// only after new loads (RunGarbageCollector). The synchronous path (Experiment 4096) counts all
+// of it as upload on stage B.
+void TextureCache::ReportUiLoads() {
+    const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (ui_loaded == ui_reported || frame - ui_report_frame < 300) {
+        return;
+    }
+    ui_reported = ui_loaded;
+    ui_report_frame = frame;
+    std::printf("UI replacements: %llu loaded, read %.1f ms, inflate %.1f ms, mips %.1f ms on the worker, "
+                "upload %.1f ms on stage B\n",
+                static_cast<unsigned long long>(ui_loaded), ui_read_ns / 1e6, ui_inflate_ns / 1e6, ui_mips_ns / 1e6,
+                ui_upload_ns / 1e6);
 }
 
 // Scales the rectangle of `src` (`src_w` wide) up `s` times into the same rectangle of `dst`
@@ -969,38 +1235,28 @@ static void UpscaleRect(const std::vector<u8>& src, int src_w, int rx, int ry, i
     }
 }
 
-Image* TextureCache::UploadUi(u64 key, std::vector<u8>& pixels, int w, int h, vk::Format format) {
+Image* TextureCache::UploadUi(u64 key, std::vector<u8>& pixels, int w, int h, vk::Format format, bool chain) {
     const bool srgb = format == vk::Format::eR8G8B8A8Srgb;
     // The full mip chain: a menu draws its art at a quarter of the replacement's size (a 4x copy at
     // the game's own size), and a single level sampled that small skips three texels in four.
-    ImageInfo info{};
-    info.pixel_format = format;
-    info.type = AmdGpu::ImageType::Color2D;
-    info.size = {u32(w), u32(h), 1};
-    info.resources.layers = 1;
-    info.num_bits = 32;
-    info.pitch = u32(w);
     u64 bytes = 0;
-    for (u32 level = 0, lw = u32(w), lh = u32(h); level < info.mips_layout.size(); ++level) {
-        info.mips_layout[level] = {lw * lh * 4, lw, lh, u32(bytes)};
-        bytes += u64(lw) * lh * 4;
-        info.resources.levels = level + 1;
-        if (lw == 1 && lh == 1) {
-            break;
-        }
-        lw = std::max(1u, lw / 2);
-        lh = std::max(1u, lh / 2);
-    }
+    const ImageInfo info = UiChainInfo(w, h, format, bytes);
     auto replacement = std::make_unique<Image>(instance, runtime, slot_image_views, info);
     scheduler.EndRendering();
     // A level at a time: a 4096x4096 chain (85 MB) at once is most of the stream buffer.
     auto& stream = buffer_cache.GetStreamBuffer();
     for (u32 level = 0; level < info.resources.levels; ++level) {
-        if (level) {
+        // bbport: `chain`: the levels were made on the UI worker (PrepareUi), at their offsets.
+        const auto& mip = info.mips_layout[level];
+        if (chain) {
+            w = int(mip.pitch);
+            h = int(mip.height);
+        } else if (level) {
             Halve(pixels, w, h, srgb);
         }
         const vk::BufferImageCopy copy{
-            .bufferOffset = stream.Copy(pixels.data(), pixels.size(), 256),
+            .bufferOffset = chain ? stream.Copy(pixels.data() + mip.offset, mip.size, 256)
+                                  : stream.Copy(pixels.data(), pixels.size(), 256),
             .imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, 1},
             .imageExtent = {u32(w), u32(h), 1},
         };
@@ -1693,6 +1949,82 @@ bool TextureCache::IsExactMatch(ImageId image_id, const ImageInfo& info) const {
            image.info.resources == info.resources && image.info.LayoutKey() == info.LayoutKey();
 }
 
+// bbport (ghost fix): which of several images starting at one address FindImageFromRange returns
+// when none has the requested size. The one the guest bound last: FindImage (every return) and
+// the render/depth target memos (MarkFound) set tick_accessed_last on every binding, so the live
+// target carries this frame's tick while a superseded alias keeps the tick of its last use.
+// Ties: the image bound as a target, then one inside the range, then the larger, then the older
+// (FindImage's exact search and the page table find the earlier registered image first).
+static bool PreferForRange(const Image& a, const Image& b, u64 size) {
+    if (a.tick_accessed_last != b.tick_accessed_last) {
+        return a.tick_accessed_last > b.tick_accessed_last;
+    }
+    if (a.binding.is_target != b.binding.is_target) {
+        return a.binding.is_target != 0;
+    }
+    const bool a_inside = a.info.guest_size <= size;
+    const bool b_inside = b.info.guest_size <= size;
+    if (a_inside != b_inside) {
+        return a_inside;
+    }
+    if (a.info.guest_size != b.info.guest_size) {
+        return a.info.guest_size > b.info.guest_size;
+    }
+    return a.image_uid < b.image_uid;
+}
+
+// bbport: the ambiguous lookup is reported once per (address, size), then at most once every
+// 10 s with the number of lookups in between; at most 16 new (address, size) pairs per 10 s.
+// Only the ambiguous path gets here (several images at one address, none of the size).
+namespace AmbiguousRange {
+struct Note {
+    VAddr address;
+    u64 size;
+    s64 last_ns;
+    u64 skipped;
+};
+static std::mutex note_mutex;
+static std::array<Note, 32> notes{};
+static u32 notes_next = 0;
+static s64 window_ns = 0;
+static u32 window_new = 0;
+static std::atomic<u64> total{0};
+
+static bool ShouldLog(VAddr address, u64 size, u64& skipped, bool& first) {
+    total.fetch_add(1, std::memory_order_relaxed);
+    constexpr s64 Interval = 10'000'000'000;
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    std::scoped_lock lock{note_mutex};
+    for (auto& note : notes) {
+        if (note.address == address && note.size == size && note.last_ns != 0) {
+            if (now - note.last_ns < Interval) {
+                ++note.skipped;
+                return false;
+            }
+            skipped = note.skipped;
+            note.skipped = 0;
+            note.last_ns = now;
+            first = false;
+            return true;
+        }
+    }
+    if (now - window_ns >= Interval) {
+        window_ns = now;
+        window_new = 0;
+    }
+    if (window_new >= 16) {
+        return false;
+    }
+    ++window_new;
+    notes[notes_next++ % notes.size()] = {address, size, now, 0};
+    skipped = 0;
+    first = true;
+    return true;
+}
+} // namespace AmbiguousRange
+
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
@@ -1716,11 +2048,136 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                 return image_ids[i];
             }
         }
-        LOG_WARNING(Render_Vulkan,
-                    "Failed to find exact image match for copy addr={:#x}, size={:#x}", address,
-                    size);
+        // bbport (ghost fix): several images start here and none has the size asked for (the
+        // game's depth block copy: 0x2878000 bytes = depth plane + padding + stencil, the depth
+        // image is 0x1fe0000). Null made every caller act as if there were no image: the depth
+        // block's texel buffer was never filled again and the R32F copy the game samples kept
+        // one old frame until restart. Now the image bound last (PreferForRange).
+        // Experiment bit 16384: null, the old lookup.
+        ImageId best = image_ids[0];
+        for (size_t i = 1; i < image_ids.size(); ++i) {
+            if (PreferForRange(slot_images[image_ids[i]], slot_images[best], size)) {
+                best = image_ids[i];
+            }
+        }
+        // Only for lookups that want GPU-written data (the copies): the others (a clear's
+        // destination, a copy's destination) keep the old answer, their fallback writes the
+        // buffer and so marks every image at the address.
+        const bool old_lookup = BbToggle::Experiment(16384);
+        const ImageId result = (!ensure_valid || old_lookup) ? ImageId{} : best;
+        u64 skipped = 0;
+        bool first = false;
+        if (AmbiguousRange::ShouldLog(address, size, skipped, first)) {
+            std::string candidates;
+            for (const ImageId id : image_ids) {
+                const Image& image = slot_images[id];
+                candidates += fmt::format(
+                    " [{}uid {} {:#x}+{:#x} {}x{} {} tile {} alt {} bits {} flags {:#x}{}{}{}{}{}{}"
+                    " last bound tick {} writes {}]",
+                    id == result ? "chosen " : "", image.image_uid, image.info.guest_address,
+                    image.info.guest_size, image.info.size.width, image.info.size.height,
+                    vk::to_string(image.info.pixel_format), u32(image.info.tile_mode),
+                    image.info.alt_tile ? 1 : 0, image.info.num_bits, u32(image.flags),
+                    image.usage.texture ? " tex" : "", image.usage.storage ? " storage" : "",
+                    image.usage.render_target ? " RT" : "", image.usage.depth_target ? " DT" : "",
+                    image.binding.is_bound ? " bound" : "", image.binding.is_target ? " target" : "",
+                    image.tick_accessed_last, image.write_seq);
+            }
+            LOG_WARNING(Render_Vulkan,
+                        "Failed to find exact image match for copy addr={:#x}, size={:#x}: {} "
+                        "images start there, none of that size; {} (ensure_valid {}, tick {}, {} "
+                        "such lookups so far{}):{}",
+                        address, size, image_ids.size(),
+                        result       ? "using the one bound last"
+                        : old_lookup ? "returning none (experiment 16384, the old lookup)"
+                                     : "returning none (not a lookup for GPU-written data)",
+                        ensure_valid, scheduler.CurrentTick(),
+                        AmbiguousRange::total.load(std::memory_order_relaxed),
+                        first ? std::string{}
+                              : fmt::format(", {} more in the last 10 s not shown", skipped),
+                        candidates);
+        }
+        return result;
     }
     return {};
+}
+
+bool TextureCache::TestDepthAliasOn() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_TEST_DEPTH_ALIAS");
+        return env && env[0] >= '1' && env[0] <= '9';
+    }();
+    return on;
+}
+
+// bbport (test only, BB_TEST_DEPTH_ALIAS): the ghost needs hours to appear by itself. Some time
+// after the first depth block copy, register what the real duplicate looks like in code: a second
+// GPU-written, clean image at the depth target's address that no binding visits again (its
+// alt_tile differs, so ResolveOverlap rejects it for every request at that address and its
+// reject() keeps it, being GpuModified; the collector keeps it too). It holds a frozen copy of the
+// depth at that moment, so returning it instead of the live image would show as a ghost as well.
+// Render thread (ExecuteRtCopyShaderHLE), like FindImage's own image creation.
+void TextureCache::TestDepthAlias(VAddr address, u64 bytes) {
+    static const s64 delay_s = [] {
+        const char* env = std::getenv("BB_TEST_DEPTH_ALIAS");
+        const s64 n = env ? std::atoll(env) : 0;
+        return n > 1 ? n : s64{10};
+    }();
+    static std::chrono::steady_clock::time_point armed{};
+    static bool armed_set = false;
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    ImageId live_id{};
+    ForEachImageInRegion(address, bytes, [&](ImageId id, Image& image) {
+        if (!live_id && image.info.guest_address == address && image.info.props.is_depth &&
+            image.info.pixel_format != vk::Format::eUndefined && image.info.guest_size < bytes &&
+            image.SafeToDownload()) {
+            live_id = id;
+        }
+    });
+    if (!live_id) {
+        return; // not the depth block copy
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (!armed_set) {
+        armed_set = true;
+        armed = now;
+        std::printf("Test (BB_TEST_DEPTH_ALIAS): depth block copy seen at %#llx; a stale alias of "
+                    "its depth image is registered in %lld s\n",
+                    static_cast<unsigned long long>(address), static_cast<long long>(delay_s));
+        return;
+    }
+    if (now - armed < std::chrono::seconds(delay_s)) {
+        return;
+    }
+    done = true;
+    ImageId alias_id{};
+    {
+        std::scoped_lock lock{mutex};
+        ImageInfo info = slot_images[live_id].info;
+        info.alt_tile = !info.alt_tile;
+        info.meta_info = {};
+        info.stencil_addr = 0;
+        info.stencil_size = 0;
+        alias_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        RegisterImage(alias_id);
+    }
+    Image& live = slot_images[live_id];
+    Image& alias = slot_images[alias_id];
+    alias.usage.depth_target = 1u;
+    runtime.CopyImage(&live, &alias); // this frame's depth, frozen
+    alias.flags = ImageFlagBits::Registered | ImageFlagBits::GpuModified;
+    alias.tick_accessed_last = live.tick_accessed_last ? live.tick_accessed_last - 1 : 0;
+    std::printf("Test (BB_TEST_DEPTH_ALIAS): registered stale alias uid %llu of depth image uid "
+                "%llu at %#llx+%#x %ux%u %s; experiment bit 16384 set: ghost expected, clear: "
+                "the picture stays live\n",
+                static_cast<unsigned long long>(alias.image_uid),
+                static_cast<unsigned long long>(live.image_uid),
+                static_cast<unsigned long long>(address), alias.info.guest_size,
+                alias.info.size.width, alias.info.size.height,
+                vk::to_string(alias.info.pixel_format).c_str());
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc, ViewMemo* memo,
@@ -1922,7 +2379,14 @@ void TextureCache::RefreshImage(Image& image) {
     obtain_scope.End();
     part_timer.emplace(BbStats::t_refresh_detile);
     BbSections::Scope detile_scope{BbSections::RefreshDetile};
+    // bbport: BB_GPU_PROFILE labels the detile dispatch (it was charged to the label before the
+    // binding that refreshed the image).
+    std::optional<Vulkan::Runtime::TransferMark> detile_mark;
+    if (image.info.props.is_tiled) {
+        detile_mark.emplace(runtime, "image detile", image);
+    }
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    detile_mark.reset();
     detile_scope.End();
     part_timer.reset();
     for (auto& copy : image_copies) {
@@ -2389,6 +2853,8 @@ void TextureCache::RunGarbageCollector() {
     // deleted long enough ago (ImageFreeDelayFrames).
     sched_tick_at_gc[gc_tick % sched_tick_at_gc.size()] = scheduler.CurrentTick();
     FlushImageGraveyard();
+    SweepUiJobs();
+    ReportUiLoads();
 
     GarbageCollectImages();
     GarbageCollectSamplers();
@@ -2440,15 +2906,19 @@ void TextureCache::DeleteImage(ImageId image_id) {
 
 void TextureCache::ReclaimImage(ImageId image_id) {
     // Reclaim image and any image views it references.
-    scheduler.DeferOperation([this, image_id] {
-        Image& image = slot_images[image_id];
-        for (auto& backing : image.backing_images) {
-            for (const ImageViewId image_view_id : backing.image_view_ids) {
-                slot_image_views.erase(image_view_id);
+    // bbport (r35_pending-ops): a pure free (the image is unregistered and was kept
+    // ImageFreeDelayFrames passes already): it may run in a later frame (carry).
+    scheduler.DeferOperation(
+        [this, image_id] {
+            Image& image = slot_images[image_id];
+            for (auto& backing : image.backing_images) {
+                for (const ImageViewId image_view_id : backing.image_view_ids) {
+                    slot_image_views.erase(image_view_id);
+                }
             }
-        }
-        slot_images.erase(image_id);
-    });
+            slot_images.erase(image_id);
+        },
+        "image free (ReclaimImage)", true);
 }
 
 void TextureCache::FlushImageGraveyard() {

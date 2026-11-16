@@ -27,6 +27,111 @@ foreach (var knob in Looks.Knobs)
     Require(Looks.Normal(knob, knob.Default) != null, knob.Key + ": bad default");
     Require(knob.Min < knob.Max, knob.Key + ": bad range");
 }
+// The performance options (Graphics > Performance): lantern.ini settings that start at the engine's
+// defaults, go into shared settings and are not part of a look.
+var performance = new (string Key, string Start, string Other)[]
+{
+    ("graphics_rt_sun_half", "0", "1"), ("graphics_lamp_shadow_half", "0", "1"), ("graphics_rt_far_refit", "0", "1"),
+    ("graphics_gi_reflections_fewer_rays", "0", "1"), ("object_motion_store", "auto", "small"),
+    ("graphics_sun_far_shadows", "game", "rare"),
+};
+var performanceIni = new IniFile();
+foreach (var option in performance)
+{
+    Require(IniFile.Defaults.Count(d => d.Key == option.Key) == 1 && IniFile.Defaults.Single(d => d.Key == option.Key).Value == option.Start,
+        option.Key + ": not in the settings defaults once, at the engine's default");
+    Require(!knobs.Contains(option.Key), option.Key + ": a performance option is part of a look");
+    performanceIni.Set(option.Key, option.Other);
+}
+Require(Choices.MotionStore.Select(c => c.Value).SequenceEqual(new[] { "auto", "large", "small" }), "The motion vector store's values changed");
+Require(Choices.IndexOf(Choices.MotionStore, "auto") == 0 && Choices.IndexOf(Choices.MotionStore, "") == 0, "The motion vector store does not start at auto");
+Require(Choices.MotionStore.Skip(1).All(c => c.Note is { Length: > 0 }), "A motion vector store size does not say what it costs");
+Require(Choices.SunFarShadows.Select(c => c.Value).SequenceEqual(new[] { "game", "alternate", "rare" }), "The far sun shadow values changed");
+Require(Choices.IndexOf(Choices.SunFarShadows, "game") == 0 && Choices.IndexOf(Choices.SunFarShadows, "") == 0, "Far sun shadows does not start at the game's own");
+Require(Choices.SunFarShadows[0].Note == null && Choices.SunFarShadows.Skip(1).All(c => c.Note is { Length: > 0 and <= 110 }),
+    "A far sun shadow choice does not say what it gains in a note the row shows whole");
+// Lamp shadow softness (Graphics > Lighting): starts at the engine's default, soft, and is in no look.
+Require(Choices.LampShadowSoftness.Select(c => c.Value).SequenceEqual(new[] { "sharp", "soft", "softer" }), "The lamp shadow softness values changed");
+Require(IniFile.Defaults.Count(d => d.Key == "graphics_lamp_shadow_softness") == 1 &&
+        IniFile.Defaults.Single(d => d.Key == "graphics_lamp_shadow_softness").Value == "soft",
+    "graphics_lamp_shadow_softness: not in the settings defaults once, at soft");
+Require(!knobs.Contains("graphics_lamp_shadow_softness"), "Lamp shadow softness is part of a look");
+// The row shows what the engine reads: a value it does not know is soft (not the first choice, sharp).
+Require(Choices.LampShadowSoftness.Select(c => Choices.IndexOf(Choices.LampShadowSoftness, Choices.LampShadowSoftnessValue(c.Value))).SequenceEqual(new[] { 0, 1, 2 }) &&
+        new[] { "bogus", "", "Sharp", "2", "hard" }.All(v => Choices.IndexOf(Choices.LampShadowSoftness, Choices.LampShadowSoftnessValue(v)) == 1) &&
+        Choices.LampShadowSoftnessValue(null) == "soft",
+    "A graphics_lamp_shadow_softness the engine does not know does not show as soft");
+Require(Choices.LampShadowSoftness[1].Note == null && Choices.LampShadowSoftness.Where((c, i) => i != 1).All(c => c.Note is { Length: > 0 and <= 110 }),
+    "A lamp shadow softness choice does not say what it changes in a note the row shows whole");
+// The strength sliders (Graphics > Lighting; r109b): lantern.ini settings the engine reads every frame,
+// starting at its defaults: halation 1, flicker on lamps the game keeps steady 1, flicker on lamps the
+// game already flickers 0 (BbSettings::HalationStrengthDefault, LampFlickerSteadyDefault,
+// LampFlickerOnGameDefault; engine/tests/test_settings.cpp pins the same 1.00, 1.00, 0.00). They are in
+// no look: a look sets the picture's knobs, and these are effects of their own that a look leaves as
+// the player set them (Original look and Game's own picture do not switch the halation or the flicker).
+foreach (var (strengthKey, strengthStart) in new[] { ("graphics_halation_strength", "1.00"), ("graphics_lamp_flicker_strength", "1.00"), ("graphics_lamp_flicker_on_game_strength", "0.00"), ("graphics_heat_haze_strength", "0.00") })
+{
+    Require(IniFile.Defaults.Count(d => d.Key == strengthKey) == 1 &&
+            IniFile.Defaults.Single(d => d.Key == strengthKey).Value == strengthStart,
+        strengthKey + ": not in the settings defaults once, at the engine's default");
+    Require(!knobs.Contains(strengthKey), strengthKey + ": a strength slider is part of a look");
+}
+// The interior brightness (r99c): a lantern.ini setting the engine reads every frame, default 0.75 stops
+// (BbSettings::InteriorBrightnessDefault; engine/tests/test_settings.cpp pins the same). It is in no
+// look: a look sets the picture's knobs, and this is an effect of its own that a look leaves as the
+// player set it.
+Require(IniFile.Defaults.Count(d => d.Key == "graphics_interior_brightness") == 1 &&
+        IniFile.Defaults.Single(d => d.Key == "graphics_interior_brightness").Value == "0.75",
+    "graphics_interior_brightness: not in the settings defaults once, at the engine's default");
+Require(!knobs.Contains("graphics_interior_brightness"), "graphics_interior_brightness: the interior brightness is part of a look");
+var performanceShared = SharedSettings.Parse(SharedSettings.ToCode(SharedSettings.Take(performanceIni, new LauncherSettings())));
+Require(performance.All(p => performanceShared.Ini.TryGetValue(p.Key, out var shared) && shared == p.Other), "A performance option is left out of shared settings");
+Console.WriteLine("PASS performance options: " + performance.Length + " settings at their defaults, in shared settings, in no look");
+
+// Previous engine paths (More > Engine): a troubleshooting switch. It starts off and is in no
+// look. It is a tested setting at off, as Legacy shader compiler and Occlusion culling are: a
+// beta's "use the tested settings" offer names it while it is on and turns it off. It stays on
+// the PC it was set on: shared settings do not carry it and a code that names it does not set it.
+const string previousPaths = "engine_previous_paths";
+Require(IniFile.Defaults.Count(d => d.Key == previousPaths) == 1 && IniFile.Defaults.Single(d => d.Key == previousPaths).Value == "0",
+    previousPaths + ": not in the settings defaults once, off");
+Require(!knobs.Contains(previousPaths), previousPaths + ": the troubleshooting switch is part of a look");
+Require(TestedSettings.All.Count(t => t.Key == previousPaths) == 1 && TestedSettings.All.Single(t => t.Key == previousPaths) is { Tested: "0", Default: "0", Launcher: false },
+    previousPaths + ": not a tested setting once, off, read from lantern.ini");
+Require(TestedSettings.All.All(t => t.Key != "graphics_sun_far_shadows"), "Far sun shadows is a tested setting: the other performance options are not");
+Require(TestedSettings.Differences(performanceIni, new LauncherSettings()).All(t => t.Key != previousPaths), previousPaths + ": off is listed against the tested settings");
+performanceIni.Set(previousPaths, "1");
+Require(performanceIni.Flag(previousPaths), previousPaths + ": not kept as set");
+Require(TestedSettings.Differences(performanceIni, new LauncherSettings()).Any(t => t.Key == previousPaths), previousPaths + ": on is not listed against the tested settings");
+var withPrevious = SharedSettings.Parse(SharedSettings.ToCode(SharedSettings.Take(performanceIni, new LauncherSettings())));
+Require(!withPrevious.Ini.ContainsKey(previousPaths), "Shared settings carry the troubleshooting switch");
+Require(withPrevious.Ini.TryGetValue("graphics_sun_far_shadows", out var sharedFar) && sharedFar == "rare", "Far sun shadows is left out of shared settings");
+var namesPrevious = SharedSettings.Parse("{\"bbpc_settings\":1,\"ini\":{\"engine_previous_paths\":\"1\",\"graphics_sun_far_shadows\":\"alternate\"},\"launcher\":{\"engine_previous_paths\":true}}");
+Require(namesPrevious.Ini.Count == 1 && namesPrevious.Ini["graphics_sun_far_shadows"] == "alternate" && namesPrevious.Launcher.Count == 0,
+    "A settings code can turn the troubleshooting switch on");
+Console.WriteLine("PASS previous engine paths: off by default, in no look, a tested setting at off, not carried or set by shared settings");
+
+// Reset all (More > Engine) also turns the engine's debug switches off: they are lantern.ini keys that
+// persist, with no row on the page.
+var debugIni = new IniFile();
+Require(EngineSwitches.DebugKeys.Length == 9 && EngineSwitches.DebugKeys.Distinct().Count() == 9 && EngineSwitches.DebugKeys.All(k => k.StartsWith("debug_")),
+    "The debug switch list is not nine distinct debug_ keys");
+Require(EngineSwitches.DebugKeys.All(k => !knobs.Contains(k) && IniFile.Defaults.All(d => d.Key != k)), "A debug switch is a look knob or a settings default");
+Require(!EngineSwitches.DebugOn(debugIni), "A debug switch starts on");
+foreach (var key in EngineSwitches.DebugKeys)
+{
+    debugIni.Set(key, "1");
+    Require(EngineSwitches.DebugOn(debugIni), key + ": on is not seen");
+    debugIni.Set(key, "0");
+}
+foreach (var key in EngineSwitches.DebugKeys)
+    debugIni.Set(key, "1");
+debugIni.Set("debug_menu", "1");
+EngineSwitches.ResetDebug(debugIni);
+Require(EngineSwitches.DebugKeys.All(k => debugIni.Raw(k) == "0") && !EngineSwitches.DebugOn(debugIni), "Reset all leaves a debug switch on");
+Require(debugIni.Raw("debug_menu") == "1", "Reset all turned off a debug key that is not an engine debug switch");
+Console.WriteLine("PASS debug switches: Reset all sets " + EngineSwitches.DebugKeys.Length + " debug_ keys to 0");
+
 foreach (var look in Looks.Presets)
 {
     Require(look.BuiltIn && look.Description.Length > 0, look.Name + ": a preset says what it costs");

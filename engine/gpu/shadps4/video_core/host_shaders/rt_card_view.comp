@@ -1,0 +1,237 @@
+#version 460
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r62_leaf-stage3): the card debug view (BB_RT_CARD_ALPHA_VIEW, with BB_RT_CARD_ALPHA=2;
+// CardAlpha::View before the upscaler). It proves the chain a stage 4 ray will use, end to end,
+// before any shadow changes: TLAS custom index -> card row -> pool record -> layer -> the game's
+// rule. Per pixel, a ray from the camera (the origin of the TLAS's view space) towards the point
+// the game's depth gives meets every candidate up to just past that point (no opaque flag: card
+// candidates are tested, the others confirmed). The nearest card candidate in front of the first
+// other hit is tested with cardTestLod and compared with what the game did there: its depth lies
+// at the card (the game kept the card's texel) or behind it (the game dropped it).
+// The game ran its alpha test at its own mip: far or grazing leaves read a coarse, blurred level.
+// The view reads the layer level that matches it (CardViewLod: the coordinates' difference to
+// the neighbouring pixels of the same card, shared in the group), so a correct chain agrees
+// there too. The class (rt_card_layers.h, CardViewClass) tints the picture and is counted; a
+// card the GO line does not judge (a sun pass card, a dithered one, one whose game mip is coarser
+// than the layers' last level: CardViewExcluded) is counted by that reason and drawn hatched.
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+
+#define CARD_BINDING_ROWS 3
+#define CARD_BINDING_POOL 4
+#define CARD_BINDING_LAYER_INFO 5
+#define CARD_BINDING_ALPHA 6
+#include "rt_cards.glsl"
+
+layout(local_size_x = CARD_VIEW_GROUP, local_size_y = CARD_VIEW_GROUP) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1) uniform sampler2D depth_tex;
+layout(set = 0, binding = 2, rgba16f) uniform image2D color;
+layout(set = 0, binding = 7, std430) buffer Counters {
+    uint counters[];
+};
+
+layout(push_constant) uniform Push {
+    vec4 proj;   // CameraMotion's: x scale, y scale, z scale, z offset
+    vec2 jitter; // render pixels, x right, y down
+    uvec2 size;
+    uint mode;   // CARD_VIEW_OVERLAY, CARD_VIEW_ALPHA, CARD_VIEW_UV
+    uint flags;
+    uint unused0;
+    uint unused1;
+    vec4 unused2;
+} pc;
+
+shared uint group_counts[CARD_VIEW_COUNTERS];
+// Each pixel's card candidate (its slot, 0: none or no data) and raw coordinates, for the
+// neighbours' footprint (CardViewLod).
+shared uint group_slot[CARD_VIEW_GROUP * CARD_VIEW_GROUP];
+shared vec2 group_raw[CARD_VIEW_GROUP * CARD_VIEW_GROUP];
+
+// CardViewClass
+uint viewClass(bool sky, bool card, float t_card, uint status, float depth_t) {
+    if (sky) {
+        return CARD_VIEW_SKY;
+    }
+    if (!card) {
+        return CARD_VIEW_NO_CARD;
+    }
+    const float tol = float(CARD_VIEW_TOL_REL) * depth_t + float(CARD_VIEW_TOL_ABS);
+    if (depth_t < t_card - tol) {
+        return CARD_VIEW_NO_CARD;
+    }
+    if (status == CARD_NO_DATA) {
+        return CARD_VIEW_NO_DATA;
+    }
+    const bool game_kept = depth_t <= t_card + tol;
+    const bool ray_kept = status == CARD_KEPT;
+    if (game_kept) {
+        return ray_kept ? CARD_VIEW_AGREE_KEPT : CARD_VIEW_RAY_DROPPED_GAME_KEPT;
+    }
+    return ray_kept ? CARD_VIEW_RAY_KEPT_GAME_DROPPED : CARD_VIEW_AGREE_DROPPED;
+}
+
+// CardViewLod
+float viewLod(vec2 dx, bool has_x, vec2 dy, bool has_y) {
+    const float f = max(has_x ? length(dx) : 0.0, has_y ? length(dy) : 0.0);
+    if (!(has_x || has_y) || !(f > 0.0)) {
+        return 0.0;
+    }
+    return log2(f * float(CARD_LAYER_SIZE));
+}
+
+// CardViewExcluded
+uint viewExcluded(uint row_flags, float lod) {
+    if ((row_flags & CARD_ROW_CLEAR) != 0u) {
+        return CARD_VIEW_CLEAR; // (r62b) the rule keeps no alpha: drawn white, not judged
+    }
+    if ((row_flags & CARD_ROW_SUN) != 0u) {
+        return CARD_VIEW_SUN_CARD;
+    }
+    if ((row_flags & CARD_ROW_DITHER) != 0u) {
+        return CARD_VIEW_DITHERED;
+    }
+    return lod > float(CARD_LAYER_MIPS - 1) ? CARD_VIEW_COARSE : 0u;
+}
+
+void main() {
+    const uint local = gl_LocalInvocationIndex;
+    if (local < uint(CARD_VIEW_COUNTERS)) {
+        group_counts[local] = 0u;
+    }
+
+    // 1. The ray, its card candidate, and that candidate's raw coordinates (level 0 test).
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const bool inside = p.x < int(pc.size.x) && p.y < int(pc.size.y);
+    bool sky = true;
+    bool card = false;
+    float t_card = 0.0;
+    float depth_t = 0.0;
+    uint best_slot = 0u, best_primitive = 0u;
+    vec2 best_bary = vec2(0.0);
+    CardResult first = CardResult(CARD_NO_DATA, 0.0, vec2(0.0), vec2(0.0), 0u);
+    if (inside) {
+        const float depth = texelFetch(depth_tex, p, 0).r;
+        sky = depth >= 1.0;
+        if (!sky) {
+            // camera_motion.comp's reconstruction: ndc +y down, the jitter taken out.
+            const vec2 size = vec2(pc.size);
+            const vec2 scene_uv = (vec2(p) + 0.5) / size - pc.jitter / size;
+            const vec2 ndc = scene_uv * 2.0 - 1.0;
+            const float z = pc.proj.w / min(depth - pc.proj.z, -1e-8);
+            const vec3 point = vec3(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z);
+            depth_t = length(point);
+            const vec3 dir = point / max(depth_t, 1e-6);
+            const float tol = float(CARD_VIEW_TOL_REL) * depth_t + float(CARD_VIEW_TOL_ABS);
+            rayQueryEXT query;
+            rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, 0xffu, vec3(0.0), 0.0, dir,
+                                  depth_t + 2.0 * tol);
+            float best_t = 1e30;
+            while (rayQueryProceedEXT(query)) {
+                if (rayQueryGetIntersectionTypeEXT(query, false) !=
+                    gl_RayQueryCandidateIntersectionTriangleEXT) {
+                    continue;
+                }
+                const uint slot = rayQueryGetIntersectionInstanceCustomIndexEXT(query, false);
+                if (slot == 0u) {
+                    rayQueryConfirmIntersectionEXT(query);
+                    continue;
+                }
+                const float t = rayQueryGetIntersectionTEXT(query, false);
+                if (t < best_t) {
+                    best_t = t;
+                    best_slot = slot;
+                    best_primitive = rayQueryGetIntersectionPrimitiveIndexEXT(query, false);
+                    best_bary = rayQueryGetIntersectionBarycentricsEXT(query, false);
+                }
+            }
+            float opaque_t = 1e30;
+            if (rayQueryGetIntersectionTypeEXT(query, true) ==
+                gl_RayQueryCommittedIntersectionTriangleEXT) {
+                opaque_t = rayQueryGetIntersectionTEXT(query, true);
+            }
+            card = best_t < opaque_t;
+            if (card) {
+                t_card = best_t;
+                first = cardTestLod(best_slot, best_primitive, best_bary, 0.0);
+            }
+        }
+    }
+    const bool has_raw = card && first.status != CARD_NO_DATA;
+    group_slot[local] = has_raw ? best_slot : 0u;
+    group_raw[local] = first.raw;
+    barrier();
+
+    // 2. The game's mip from the neighbours on the same card (the other pixel of this pixel's
+    // pair in x and in y: always in the group), the test at that level, the class.
+    if (inside) {
+        CardResult result = first;
+        uint excluded = 0u;
+        if (has_raw) {
+            const uvec2 l = gl_LocalInvocationID.xy;
+            const uint nx = l.y * CARD_VIEW_GROUP + (l.x ^ 1u);
+            const uint ny = (l.y ^ 1u) * CARD_VIEW_GROUP + l.x;
+            const bool has_x = group_slot[nx] == best_slot;
+            const bool has_y = group_slot[ny] == best_slot;
+            const float lod = viewLod(group_raw[nx] - first.raw, has_x, group_raw[ny] - first.raw,
+                                      has_y);
+            result = cardTestLod(best_slot, best_primitive, best_bary,
+                                 clamp(lod, 0.0, float(CARD_LAYER_MIPS - 1)));
+            excluded = viewExcluded(result.flags, lod);
+        }
+        const uint cls = viewClass(sky, card, t_card, result.status, depth_t);
+        // CardViewCounter: a judged class of an excluded card counts as its reason.
+        const bool judged = cls >= CARD_VIEW_AGREE_KEPT && cls <= CARD_VIEW_RAY_DROPPED_GAME_KEPT;
+        const uint counter = judged && excluded != 0u ? excluded : cls;
+        atomicAdd(group_counts[CARD_VIEW_PIXELS], 1u);
+        atomicAdd(group_counts[counter], 1u);
+        if (card) {
+            atomicAdd(group_counts[CARD_VIEW_CARD_HITS], 1u);
+        }
+
+        vec4 c = imageLoad(color, p);
+        const float light = max(dot(c.rgb, vec3(0.3333)), 0.2);
+        if (pc.mode == CARD_VIEW_OVERLAY) {
+            vec3 tint = vec3(0.0);
+            float w = 0.0;
+            if (cls == CARD_VIEW_AGREE_KEPT) {
+                tint = vec3(0.0, 1.0, 0.0);
+                w = 0.35;
+            } else if (cls == CARD_VIEW_AGREE_DROPPED) {
+                tint = vec3(0.0, 0.8, 0.8);
+                w = 0.2;
+            } else if (cls == CARD_VIEW_RAY_KEPT_GAME_DROPPED) {
+                tint = vec3(1.0, 0.0, 0.0);
+                w = 0.6;
+            } else if (cls == CARD_VIEW_RAY_DROPPED_GAME_KEPT) {
+                tint = vec3(1.0, 0.0, 1.0);
+                w = 0.6;
+            } else if (cls == CARD_VIEW_NO_DATA) {
+                tint = vec3(0.0, 0.2, 1.0);
+                w = 0.5;
+            }
+            if (judged && excluded == CARD_VIEW_CLEAR) {
+                tint = vec3(1.0); // (r62b) fully clear: white, whole
+                w = 0.5;
+            } else if (excluded != 0u && judged && ((p.x + p.y) & 1) != 0) {
+                w = 0.0; // not judged: hatched (every other pixel keeps the game's colour)
+            }
+            c.rgb = mix(c.rgb, tint * light * 2.0, w);
+        } else if (pc.mode == CARD_VIEW_ALPHA) {
+            c.rgb = card && result.status != CARD_NO_DATA ? vec3(result.alpha) * light * 2.0
+                                                          : c.rgb * 0.25;
+        } else if (pc.mode == CARD_VIEW_UV) {
+            c.rgb = card && result.status != CARD_NO_DATA ? vec3(result.uv, 0.0) * light * 2.0
+                                                          : c.rgb * 0.25;
+        }
+        imageStore(color, p, c);
+    }
+    barrier();
+    if (local < uint(CARD_VIEW_COUNTERS)) {
+        const uint n = group_counts[local];
+        if (n != 0u) {
+            atomicAdd(counters[local], n);
+        }
+    }
+}

@@ -1,0 +1,138 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r105_cloud-shadows): FEATURE, BB_CLOUD_SHADOWS above 0 only. Slow moving cloud shadows:
+// a large, soft, world anchored mask that dims the sun or moon term, made by
+// renderer_vulkan/vk_cloud_shadow.cpp (the knobs and rules are cloud_shadow_params.h's).
+//  - the default build: on the screen shadow target, right after the ray traced sun (or the VSM)
+//    wrote its alpha, the sun visibility the game's directional light reads (RtShadow::Record in
+//    ContactShadow::Flush). alpha *= the cloud's light share where 0 < depth < 1 and alpha > 0:
+//    sky, shadow and interiors the ray traced sun shuts (alpha 0) are not written at all.
+//  - GATE: on the sun fog's ray traced gate (volumetric_rt_gate.comp's cells, R8, 1 where the
+//    sun reaches the cell), right after it is traced (VolumetricLight::Integrate): every GATE build
+//    of the march multiplies its sun answer by the gate, so its lit samples dim under the clouds.
+// The cloud mask: the world point p is carried along the light to a plane, q = p.xz - p.y *
+// slope, slope = L.xz / max(L.y, 0.1) (L toward the light, world space, +y up), so walls take the
+// pattern stretched along the light as real cloud shadows do. n = 0.5 + the sum of WEIGHTk (Nk -
+// 0.5) of three value noises Nk (fog_noise.glsl's fog_noise_value, shared with r94's fog noise,
+// on its lattice: cells of the size, 0.43 and 0.19 of it, each turned about the up axis by
+// fog_noise_cells), read at (q.x, 0, q.y) / size minus each octave's offset (the drift along xz,
+// a slow morph along the third axis). The light kept is 1 - depth * smoothstep(low, high, n).
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+#ifdef GATE
+layout(local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+#endif
+
+layout(scalar, binding = 0) readonly buffer ShadowConstants { uint d[]; } cb;
+#ifdef GATE
+layout(scalar, binding = 1) readonly buffer SceneConstants { uint d[]; } ub;
+layout(binding = 2, r8) uniform image3D gate_img;
+#else
+layout(binding = 1) uniform sampler2D depth_tex;
+layout(binding = 2, rgba8) uniform image2D shadow_img;
+#endif
+
+// CloudShadows::Push (cloud_shadow_params.h, 120 bytes)
+layout(push_constant) uniform Params {
+    vec4 cloud_row0, cloud_row1, cloud_row2; // view to world, 3x4 rows (the frame's camera)
+    vec4 cloud_off0; // octave 0's offset in its lattice cells; w: depth (strength x the full depth)
+    vec4 cloud_off1; // octave 1's offset; w: 1 / size (1/m)
+    vec4 cloud_off2; // octave 2's offset; w: low (n below it: no cloud)
+    vec2 cloud_slope; // L.xz / max(L.y, 0.1)
+    float cloud_high; // n above it: a full cloud
+    uint offsets;     // the shadow constants' byte offset (bits 0-7), the uniforms' (8-15)
+    float reach;      // GATE: the march's reach (m), as GateRange
+    uint unused;
+};
+
+// fog_noise.glsl's value noise and lattice turn only (its fog_noise_m reads r94's push words)
+#define FOG_NOISE_VALUE_ONLY
+#include "fog_noise.glsl"
+
+shared mat4 shared_inverse_projection;
+#ifdef GATE
+shared float shared_range;
+#endif
+
+float c(uint base, int i) { return uintBitsToFloat(cb.d[base + uint(i)]); }
+vec4 row(uint base, int i) { return vec4(c(base, i), c(base, i + 1), c(base, i + 2), c(base, i + 3)); }
+
+// The share of the sun or moon light a cloud lets through at world point p: 1 - depth *
+// smoothstep(low, high, n); 1 for a point that is not finite.
+float cloud_light(vec3 p) {
+    vec2 q = p.xz - p.y * cloud_slope;
+    vec3 x = vec3(q.x, 0.0, q.y) * cloud_off1.w;
+    if (any(isnan(x)) || any(isinf(x))) return 1.0;
+    float n = 0.5;
+    n += float(FOG_NOISE_WEIGHT0) *
+         (fog_noise_value(fog_noise_cells(x, float(FOG_NOISE_YAW_COS0), float(FOG_NOISE_YAW_SIN0),
+                                          float(FOG_NOISE_RATIO0)) - cloud_off0.xyz) - 0.5);
+    n += float(FOG_NOISE_WEIGHT1) *
+         (fog_noise_value(fog_noise_cells(x, float(FOG_NOISE_YAW_COS1), float(FOG_NOISE_YAW_SIN1),
+                                          float(FOG_NOISE_RATIO1)) - cloud_off1.xyz) - 0.5);
+    n += float(FOG_NOISE_WEIGHT2) *
+         (fog_noise_value(fog_noise_cells(x, float(FOG_NOISE_YAW_COS2), float(FOG_NOISE_YAW_SIN2),
+                                          float(FOG_NOISE_RATIO2)) - cloud_off2.xyz) - 0.5);
+    return 1.0 - cloud_off0.w * smoothstep(cloud_off2.w, cloud_high, n);
+}
+
+vec3 to_world(vec3 v) {
+    vec4 h = vec4(v, 1.0);
+    return vec3(dot(cloud_row0, h), dot(cloud_row1, h), dot(cloud_row2, h));
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        uint base = (offsets & 255u) >> 2;
+        shared_inverse_projection = transpose(mat4(row(base, 0), row(base, 4), row(base, 8),
+                                                   row(base, 12)));
+#ifdef GATE
+        // as volumetric_rt_gate.comp's prepare(): the shadow distance when shorter than the reach
+        uint ubase = ((offsets >> 8) & 255u) >> 2;
+        float d = uintBitsToFloat(ub.d[ubase + 72u]);
+        shared_range = d > 0.0 && d < reach ? d : reach;
+#endif
+    }
+    barrier();
+#ifdef GATE
+    // A cell's centre as volumetric_rt_gate.comp places it: the view ray through the column's
+    // centre, at the slice's distance range * s^2, s = (slice + 0.5) / slices.
+    ivec3 cell = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(gate_img);
+    if (any(greaterThanEqual(cell, size))) return;
+    float open = imageLoad(gate_img, cell).r;
+    if (!(open > 0.0)) return;
+    vec2 uv = (vec2(cell.xy) + 0.5) / vec2(size.xy);
+    vec4 h = shared_inverse_projection * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0);
+    if (abs(h.w) < 1e-8) return;
+    vec3 ray = h.xyz / h.w;
+    float len = length(ray);
+    if (!(ray.z > 0.0 && len > 0.0)) return;
+    float s = (float(cell.z) + 0.5) / float(size.z);
+    float k = cloud_light(to_world(ray / len * (shared_range * s * s)));
+    if (!(k < 1.0)) return;
+    imageStore(gate_img, cell, vec4(open * k));
+#else
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(shadow_img);
+    if (any(greaterThanEqual(px, size))) return;
+    vec2 uv = (vec2(px) + 0.5) / vec2(size);
+    float depth = textureLod(depth_tex, uv, 0.0).r;
+    if (!(depth > 0.0 && depth < 1.0)) return;
+    vec4 target = imageLoad(shadow_img, px);
+    if (!(target.a > 0.0)) return;
+    vec4 h = shared_inverse_projection * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    if (abs(h.w) < 1e-8) return;
+    float k = cloud_light(to_world(h.xyz / h.w));
+    if (!(k < 1.0)) return;
+    // A fixed per-pixel dither of under half an 8-bit step (interleaved gradient noise), so a
+    // slow cloud edge does not show the alpha's 1/255 steps as bands.
+    float dither = 0.98 * (fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715)))) -
+                           0.5) / 255.0;
+    target.a = clamp(target.a * k + dither, 0.0, 1.0);
+    imageStore(shadow_img, px, target);
+#endif
+}

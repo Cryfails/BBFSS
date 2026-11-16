@@ -4,11 +4,16 @@
 #include "native_sss.h"
 #include "bbport_platform.h"
 #include "bbport_settings.h"
+#include "bbport_toggles.h"
+#include "bbport_sun_cascades.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -43,6 +48,28 @@ constexpr std::uint8_t kDirectionalSizeCode[] = {
     0xb8, 0x00, 0x08, 0x00, 0x00, 0x48, 0x83, 0xf9, 0x03, 0x77, 0x0a,
     0x48, 0x8d, 0x05, 0x1e, 0xd4, 0x9f, 0x03, 0x8b, 0x04, 0x88};
 std::atomic<bool> g_cascade_overlap{false};
+// bbport (r14_cascade-rotate): the top of the game's cascade loop (in 0x229cb70): r14d is the
+// cascade, r15 the shadow object, [rbp-0x998] the camera block, [rbp-0x960] the light direction.
+// A cascade left out runs "inc r14d" and jumps to the exit test "cmp r14d,4; jne top", so the
+// game neither draws it nor touches its matrices (they stay as when it last drew).
+constexpr std::size_t kCascadeLoopTop = 0x229cfc0, kCascadeLoopTest = 0x229d263;
+constexpr std::uint8_t kCascadeLoopTopCode[] = {0x48, 0x8b, 0x95, 0x68, 0xf6, 0xff, 0xff, 0xc5, 0xf8, 0x28,
+                                                0x02, 0xc5, 0xf8, 0x29, 0x85, 0x40, 0xff, 0xff, 0xff};
+constexpr std::uint8_t kCascadeLoopTestCode[] = {0x41, 0x83, 0xfe, 0x04, 0x0f, 0x85, 0x53, 0xfd, 0xff, 0xff};
+constexpr std::uint8_t kNextCascade[] = {0x41, 0xff, 0xc6}; // inc r14d
+constexpr std::uint64_t kLoopCamera = 0x998, kLoopLight = 0x960; // below rbp
+constexpr std::size_t kSunDistances = 0x6d0, kShadowAtlasWidth = 0x860;    // in the shadow object
+constexpr std::size_t kCascadeParams = 0x550, kCascadeParamSize = 0x50, kParamStable = 0x31;
+constexpr unsigned kSunWarmup = 4, kSunLogRuns = 600;
+constexpr float kSunMarginTexels = 8;
+std::array<unsigned, 4> g_sun_every{1, 1, 1, 1}, g_sun_phase{};
+unsigned g_sun_period = 0; ///< BbSunCascades::skip_period while the experiment bit is clear
+bool g_sun_rotate = false; ///< four periods given (else the first N cascades every frame)
+// bbport (r15_far-shadow-setting): the schedule of each graphics_sun_far_shadows value, as
+// BB_SUN_CASCADES would give it; "game" installs nothing.
+constexpr const char* kSunFarPatterns[] = {nullptr, "1 1 2 2", "1 1 8 8"};
+static_assert(sizeof(kSunFarPatterns) / sizeof(kSunFarPatterns[0]) == BbSettings::SunFarShadowsCount);
+char g_sun_from[48] = "BB_SUN_CASCADES"; ///< what chose the schedule, for the log
 
 constexpr std::size_t kLocalShadowPool = 0x22440b0, kLocalShadowSize = 0x224443f;
 constexpr std::uint8_t kLocalShadowPoolEntry[] = {
@@ -180,6 +207,292 @@ GUEST_ABI std::int64_t BeforeSsaoDraw(std::uint64_t, const std::uint64_t* saved)
     Tune(object + kSsaoScale, active, [k](float v) { return v * k; });
     Tune(object + kSsaoOffset, active, [k](float v) { return v * k + (1 - k); });
     return 0;
+}
+
+/// bbport (r14_cascade-rotate): which sun cascades the game draws in a run of its cascade loop.
+using SunVec = std::array<float, 3>;
+struct SunCamera { ///< the camera block the cascade loop copies ([rbp-0x998]; 0x2291c30 reads it)
+    float world[16];            ///< view to world, row vectors (what the fit moves the corners by)
+    float other[4];
+    float fov, clip_near, clip_far; ///< vertical field of view (radians), clip distances
+    std::uint32_t width, height;
+};
+static_assert(offsetof(SunCamera, fov) == 0x50 && offsetof(SunCamera, width) == 0x5c && sizeof(SunCamera) == 0x64,
+              "the game's camera block");
+struct SunBox { ///< what a cascade covered when it last drew, in the light axes it was fitted in
+    std::array<SunVec, 3> axis{};
+    SunVec light{}; ///< the sun's direction then (unit length)
+    float centre[3]{}, half[3]{}, margin[3]{};
+    bool valid = false;
+};
+/// A kept cascade is drawn again once the sun has turned more than 0.25 degrees since it drew
+/// (cos 0.25 deg): its map would show shadows cast from the old direction.
+constexpr float kSunLightKeep = 0.9999905f;
+struct SunTrack { ///< one shadow object (one view's sun shadows)
+    std::uint64_t object = 0;
+    std::uint32_t runs = 0, warm = 0, atlas = 0;
+    std::chrono::steady_clock::time_point last{};
+    std::array<SunBox, 4> box{};
+    std::array<bool, 4> draw{};
+};
+std::mutex g_sun_mutex;
+std::array<SunTrack, 4> g_sun_tracks;
+std::array<std::array<unsigned, 4>, 3> g_sun_counts{}; ///< left out, drawn as the camera left, other early draws
+unsigned g_sun_runs = 0;
+int g_sun_said = -1;
+bool g_sun_fit_said = false;
+
+float SunDot(const SunVec& a, const SunVec& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+SunVec SunCross(const SunVec& a, const SunVec& b) {
+    return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+}
+bool SunUnit(SunVec& v) {
+    const float l = std::sqrt(SunDot(v, v));
+    if (!(l > 1e-6f) || !std::isfinite(l)) return false;
+    for (float& x : v) x /= l;
+    return true;
+}
+
+/// The light axes of the game's fit (0xeb1ef0): z = -light as it is (not normalised), x across
+/// "up" ((0,1,0), or (1,0,0) for a light within 2.6 degrees of vertical), y across both. Signs do
+/// not matter here.
+bool SunAxes(const float* light, std::array<SunVec, 3>& axis) {
+    axis[2] = {-light[0], -light[1], -light[2]};
+    const SunVec up = std::fabs(axis[2][1]) > 0.999f ? SunVec{1, 0, 0} : SunVec{0, 1, 0};
+    axis[0] = SunCross(up, axis[2]);
+    axis[1] = SunCross(axis[2], axis[0]);
+    return SunUnit(axis[0]) && SunUnit(axis[1]) && std::isfinite(SunDot(axis[2], axis[2]));
+}
+
+/// The corners of cascade c's slice of the camera's view in world space as the game's fit builds
+/// them: near and far as 0xeac540 picks them (BeforeCascadeRangeStores moves near), the corners as
+/// 0x22926f0 (far plane first, x sign alternating), moved to world space by the camera matrix
+/// (0x2291c30 inverts it twice; 0xeb1ef0 uses the result as is). Returns why it cannot, or null.
+const char* SunWorldCorners(std::uint64_t object, const SunCamera& cam, unsigned c, std::array<SunVec, 8>& out) {
+    float s[6]; // near, far, fade, ends of c0..c2: 0xeac210 writes them right before the loop
+    std::memcpy(s, reinterpret_cast<const void*>(object + kSunDistances), sizeof s);
+    const float lo[] = {s[0], s[3], s[4], s[5]}, hi[] = {s[3], s[4], s[5], s[1] + s[2]};
+    float from = lo[c], to = hi[c];
+    if (!(to - from > 1e-5f)) to = from + 0.001f;
+    to = std::min(to, cam.clip_far);
+    if (c > 0 && g_cascade_overlap.load(std::memory_order_relaxed)) {
+        const float previous = c > 1 ? s[1 + c] : 0.0f;
+        if (from > previous && cam.clip_near <= from)
+            from = std::max(cam.clip_near, from - kCascadeBlend * (from - previous));
+    }
+    const float t = std::tan(cam.fov * 0.5f);
+    const float aspect = cam.height ? float(cam.width) / float(cam.height) : 0.0f;
+    if (!std::isfinite(from) || !std::isfinite(to) || !(to > from) || !std::isfinite(t) || !(t > 0) ||
+        !std::isfinite(aspect) || !(aspect > 0)) return "the camera or the cascade distances look wrong";
+    const float* m = cam.world;
+    if (std::fabs(m[3]) > 1e-3f || std::fabs(m[7]) > 1e-3f || std::fabs(m[11]) > 1e-3f || std::fabs(m[15] - 1) > 1e-3f)
+        return "the camera matrix is not a row-vector affine one";
+    for (unsigned i = 0; i < 8; ++i) {
+        const float z = i < 4 ? to : from;
+        const float x = ((i & 1) ? -z : z) * t * aspect, y = ((i & 2) ? -z : z) * t;
+        for (unsigned j = 0; j < 3; ++j) out[i][j] = x * m[j] + y * m[4 + j] + z * m[8 + j] + m[12 + j];
+        if (!std::isfinite(out[i][0]) || !std::isfinite(out[i][1]) || !std::isfinite(out[i][2]))
+            return "the camera matrix looks wrong";
+    }
+    return nullptr;
+}
+
+/// What cascade c covers as the game fits it now (0xeb1ef0): with the cascade's "stable" switch a
+/// cube of the slice's diameter around the middle of its light-space bounds, moved by whole texels;
+/// without it the bounds themselves. kSunMarginTexels are kept back for that texel move and the
+/// filters. Returns why it cannot tell, or null.
+const char* SunFit(SunBox& box, std::uint64_t object, const SunCamera& cam, unsigned c, const float* light) {
+    box.valid = false;
+    const std::uint64_t params = object + kCascadeParams + c * kCascadeParamSize;
+    std::uint32_t fit = 0, atlas = 0;
+    std::uint8_t stable = 0;
+    std::memcpy(&fit, reinterpret_cast<const void*>(params), sizeof fit);
+    std::memcpy(&stable, reinterpret_cast<const void*>(params + kParamStable), sizeof stable);
+    std::memcpy(&atlas, reinterpret_cast<const void*>(object + kShadowAtlasWidth), sizeof atlas);
+    if (!fit) return "the cascade uses the game's other light fit (0xeb1030)";
+    if (!SunAxes(light, box.axis)) return "the light direction looks wrong";
+    box.light = {light[0], light[1], light[2]};
+    if (!SunUnit(box.light)) return "the light direction looks wrong";
+    std::array<SunVec, 8> w;
+    if (const char* why = SunWorldCorners(object, cam, c, w)) return why;
+    std::array<SunVec, 8> q;
+    SunVec lo{}, hi{};
+    for (unsigned i = 0; i < 8; ++i) {
+        for (unsigned k = 0; k < 3; ++k) {
+            q[i][k] = SunDot(w[i], box.axis[k]);
+            lo[k] = i ? std::min(lo[k], q[i][k]) : q[i][k];
+            hi[k] = i ? std::max(hi[k], q[i][k]) : q[i][k];
+        }
+    }
+    const auto apart = [&q](unsigned a, unsigned b) {
+        const SunVec d{q[a][0] - q[b][0], q[a][1] - q[b][1], q[a][2] - q[b][2]};
+        return std::sqrt(SunDot(d, d));
+    };
+    const float diameter = std::max(apart(0, 3), apart(0, 7)); // the game's two diagonals
+    const float texels = float(std::max(atlas / 2, 1u));
+    for (unsigned k = 0; k < 3; ++k) {
+        box.centre[k] = 0.5f * (lo[k] + hi[k]);
+        box.half[k] = stable ? 0.5f * diameter : 0.5f * (hi[k] - lo[k]);
+        box.margin[k] = kSunMarginTexels * 2 * box.half[k] / texels;
+        if (!std::isfinite(box.centre[k]) || !std::isfinite(box.half[k]) || !(box.half[k] > 0))
+            return "the fit came out empty";
+    }
+    box.valid = true;
+    return nullptr;
+}
+
+/// Whether the camera's slice for cascade c still lies inside what the cascade covered when it
+/// last drew, with the sun where it was then. The game's resolve does not check: a lookup
+/// outside reads the next quadrant.
+bool SunCovered(const SunBox& box, std::uint64_t object, const SunCamera& cam, unsigned c, const float* light) {
+    std::array<SunVec, 8> w;
+    SunVec sun{light[0], light[1], light[2]};
+    if (!box.valid || !SunUnit(sun) || !(SunDot(sun, box.light) >= kSunLightKeep) ||
+        SunWorldCorners(object, cam, c, w)) return false;
+    for (const SunVec& p : w) {
+        for (unsigned k = 0; k < 3; ++k) {
+            if (!(std::fabs(SunDot(p, box.axis[k]) - box.centre[k]) <= box.half[k] - box.margin[k])) return false;
+        }
+    }
+    return true;
+}
+
+void SunSay(bool off) {
+    if (off) {
+        std::printf("Engine: sun cascades: the game draws all four every frame (experiment bit set)\n");
+    } else if (!g_sun_rotate) {
+        std::printf("Engine: sun cascades: the game draws the first %u of 4 every frame (%s)\n",
+                    unsigned(std::count(g_sun_every.begin(), g_sun_every.end(), 1u)), g_sun_from);
+    } else {
+        std::printf("Engine: sun cascades: the game draws c0..c3 every %u/%u/%u/%u frames (0 never, "
+                    "%s), a left-out one sooner when the camera leaves what it covers; skip period %u\n",
+                    g_sun_every[0], g_sun_every[1], g_sun_every[2], g_sun_every[3], g_sun_from, g_sun_period);
+    }
+}
+
+/// BB_SUN_CASCADES: "N" (1-4) draws the first N cascades every frame (r13's meaning), or
+/// "e0 e1 e2 e3" draws cascade c every e_c frames (1 every frame, 0 never, at most 60). e0 must
+/// be 1: c0's first command (0xeb0d90, its 0x118 flag) clears the whole atlas, so a frame
+/// without c0 would draw the other cascades over last frame's depth.
+bool SunParse(const char* text) {
+    std::array<unsigned long, 5> n{};
+    unsigned count = 0;
+    for (const char* p = text; *p;) {
+        if (*p == ' ' || *p == ',' || *p == '\t') { ++p; continue; }
+        char* end = nullptr;
+        const unsigned long v = std::strtoul(p, &end, 10);
+        if (end == p || count == n.size()) return false;
+        n[count++] = v;
+        p = end;
+    }
+    if (count == 1 && n[0] >= 1 && n[0] <= 4) {
+        for (unsigned c = 0; c < 4; ++c) g_sun_every[c] = c < n[0] ? 1 : 0;
+        g_sun_rotate = false;
+        g_sun_period = 0;
+        return true;
+    }
+    if (count != 4 || n[0] != 1 ||
+        std::any_of(n.begin(), n.begin() + 4, [](unsigned long v) { return v > 60; })) return false;
+    g_sun_rotate = true;
+    g_sun_period = 0;
+    unsigned rotating = 0;
+    for (int c = 3; c >= 0; --c) { // farthest first: c3 and c2 at period 2 take turns
+        g_sun_every[c] = unsigned(n[c]);
+        if (g_sun_every[c] > 1) g_sun_phase[c] = rotating++ % g_sun_every[c];
+        if (g_sun_every[c] > 1) g_sun_period = std::max(g_sun_period, g_sun_every[c]);
+    }
+    return true;
+}
+
+SunTrack& SunTrackFor(std::uint64_t object) {
+    SunTrack* slot = &g_sun_tracks[0];
+    for (SunTrack& t : g_sun_tracks) {
+        if (t.object == object) return t;
+        if (t.last < slot->last) slot = &t; // a new view takes the slot used longest ago
+    }
+    *slot = {};
+    slot->object = object;
+    slot->draw.fill(true);
+    return *slot;
+}
+
+/// The plan for one run of the loop, made when it reaches cascade 0.
+void SunPlan(SunTrack& t, std::uint64_t rbp, std::uint64_t object) {
+    const bool off = BbToggle::Experiment(BbSunCascades::kOffBit);
+    if (g_sun_said != int(off)) {
+        g_sun_said = int(off);
+        BbSunCascades::skip_period.store(off ? 0 : g_sun_period, std::memory_order_relaxed);
+        SunSay(off);
+    }
+    t.draw.fill(true);
+    const auto now = std::chrono::steady_clock::now();
+    std::uint32_t atlas = 0;
+    std::memcpy(&atlas, reinterpret_cast<const void*>(object + kShadowAtlasWidth), sizeof atlas);
+    // The experiment bit, a new atlas (0xeac210 reallocates it) or a pause of the loop (loading):
+    // every cascade is drawn again for kSunWarmup runs before any is left out.
+    if (off || atlas != t.atlas || now - t.last > std::chrono::milliseconds(500)) {
+        t.warm = 0;
+        for (SunBox& b : t.box) b.valid = false;
+    }
+    t.last = now;
+    t.atlas = atlas;
+    if (off) return;
+    ++t.runs;
+    const bool warm = t.warm < kSunWarmup;
+    if (warm) ++t.warm;
+    SunCamera cam{};
+    float light[4] = {};
+    std::uint64_t camera = 0;
+    std::memcpy(&camera, reinterpret_cast<const void*>(rbp - kLoopCamera), sizeof camera);
+    std::memcpy(light, reinterpret_cast<const void*>(rbp - kLoopLight), sizeof light);
+    if (camera) std::memcpy(&cam, reinterpret_cast<const void*>(camera), sizeof cam);
+    bool any = false;
+    for (unsigned c = 0; c < 4; ++c) {
+        const unsigned every = g_sun_every[c];
+        bool draw = every == 1 || (every > 1 && t.runs % every == g_sun_phase[c]);
+        if (every > 1 && !draw) {
+            const int why =
+                warm || !camera || !t.box[c].valid ? 2 : SunCovered(t.box[c], object, cam, c, light) ? 0 : 1;
+            draw = why != 0;
+            ++g_sun_counts[why][c];
+        }
+        t.draw[c] = draw;
+        any = any || draw;
+    }
+    // A run that draws nothing would leave the game's shadow constants unwritten for the frame.
+    for (unsigned c = 0; c < 4 && !any; ++c) {
+        if (!g_sun_every[c]) continue;
+        t.draw[c] = any = true;
+        --g_sun_counts[0][c];
+        ++g_sun_counts[2][c];
+    }
+    for (unsigned c = 0; c < 4; ++c) {
+        if (!t.draw[c] || g_sun_every[c] < 2) continue;
+        const char* why = camera ? SunFit(t.box[c], object, cam, c, light) : "no camera block";
+        if (why && !g_sun_fit_said) {
+            g_sun_fit_said = true;
+            std::printf("Engine: sun cascades: c%u is drawn every frame while this lasts: %s\n", c, why);
+        }
+    }
+    if (++g_sun_runs % kSunLogRuns == 0) {
+        const auto& n = g_sun_counts;
+        std::printf("Engine: sun cascades: in %u loop runs c0..c3 left out %u %u %u %u times, drawn early as the "
+                    "camera left what they cover %u %u %u %u, for a (re)start or without a record %u %u %u %u\n",
+                    kSunLogRuns, n[0][0], n[0][1], n[0][2], n[0][3], n[1][0], n[1][1], n[1][2], n[1][3], n[2][0],
+                    n[2][1], n[2][2], n[2][3]);
+        g_sun_counts = {};
+    }
+}
+
+/// At the loop top, once per cascade (r14d) on the game's render thread: non-zero leaves the
+/// cascade out (the stub runs "inc r14d" and jumps to the exit test).
+GUEST_ABI std::int64_t AtCascadeLoopTop(std::uint64_t, const std::uint64_t* saved) {
+    const std::uint64_t cascade = saved[kSavedR14] & 0xffffffffu, rbp = saved[kSavedRbp], object = saved[kSavedR15];
+    if (cascade > 3 || !rbp || !object) return 0;
+    std::scoped_lock lock(g_sun_mutex);
+    SunTrack& t = SunTrackFor(object);
+    if (cascade == 0) SunPlan(t, rbp, object);
+    return t.draw[cascade] ? 0 : 1;
 }
 
 GUEST_ABI std::int64_t BeforeShadowSetup(std::uint64_t, const std::uint64_t* saved) {
@@ -424,8 +737,43 @@ bool Install(std::uint8_t* image, std::size_t size) {
         FreeStub(fog_stub);
     }
     g_post_block = image + block;
+    // bbport (r14_cascade-rotate, r15_far-shadow-setting): the cascade loop is hooked only with
+    // BB_SUN_CASCADES or when lantern.ini's graphics_sun_far_shadows asks for fewer far cascade
+    // draws. The start value is used: the hook is installed once, a change applies at restart.
+    // The variable wins over the ini: test runs drive the schedule with it.
+    Hook loop;
+    const int far_shadows =
+        std::clamp(BbSettings::Get().startup_sun_far_shadows, 0, BbSettings::SunFarShadowsCount - 1);
+    const char* v = std::getenv("BB_SUN_CASCADES");
+    if (v && *v) {
+        if (far_shadows != BbSettings::SunFarGame) {
+            std::printf("Engine: sun cascades: BB_SUN_CASCADES is set and decides; graphics_sun_far_shadows=%s "
+                        "is not used\n", BbSettings::SunFarShadowsNames[far_shadows]);
+        }
+    } else {
+        v = kSunFarPatterns[far_shadows];
+        std::snprintf(g_sun_from, sizeof g_sun_from, "graphics_sun_far_shadows=%s",
+                      BbSettings::SunFarShadowsNames[far_shadows]);
+    }
+    if (v && *v) {
+        if (!SunParse(v)) {
+            std::printf("Engine: BB_SUN_CASCADES='%s' ignored: give N (1-4, the first N cascades) or four periods "
+                        "'1 e1 e2 e3' (1 every frame, 0 never, at most 60; c0 every frame, its pass clears the "
+                        "whole atlas)\n", v);
+        } else if (!Matches(image, size, kCascadeLoopTest, kCascadeLoopTestCode, sizeof kCascadeLoopTestCode) ||
+                   !PrepareBranch(loop, image, size, kCascadeLoopTop, kCascadeLoopTopCode, AtCascadeLoopTop,
+                                  kNextCascade, kCascadeLoopTest)) {
+            std::printf("Engine: %s ignored: the cascade loop is not 1.09's\n", g_sun_from);
+        } else {
+            const bool off = BbToggle::Experiment(BbSunCascades::kOffBit);
+            g_sun_said = int(off);
+            BbSunCascades::skip_period.store(off ? 0 : g_sun_period, std::memory_order_relaxed);
+            SunSay(off);
+        }
+    }
     Sss::Install(image, size);
     Commit(hooks);
+    if (loop.site) Commit(std::span<Hook>{&loop, 1});
     if (fog) CommitFogUpload(image, fog_stub);
     g_enabled = true;
     std::printf("Engine: picture tuning ready (%s, live): AA, SSAO, AO strength, shadow distance, bloom, saturation, "

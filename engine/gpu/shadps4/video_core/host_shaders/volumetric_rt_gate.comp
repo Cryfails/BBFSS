@@ -1,0 +1,319 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r51b_volumetric-rt-check): the ray traced sun gate of the volumetric sunlight. One ray
+// toward the sun from the centre of every cell of a grid in front of the camera: columns and rows
+// across the screen, slices in the square root of the distance out to the gate's range (the
+// shadow distance when it is shorter than the march's reach, else the reach; GateRange in
+// volumetric_light.comp). 1 where the ray left the scene, 0 where it hit something. The march's
+// GATE builds multiply their atlas answer by it, so the gate only removes light: a roof or a
+// bridge that no cascade of the game's sun atlas holds but the ray traced scene does
+// (RtShadow::PrepareScene: this frame's instances in the camera's view space) no longer lets the
+// sun into the fog under it.
+// bbport (r76_sun-fog-outdoors): a workgroup is a 2x2 block of columns with all their slices
+// (local_size_z is GateSlices, 32, which vk_volumetric_light.cpp's static_assert assumes; nothing
+// checks the shader's local size against it), so it also writes, for every column, the first
+// slice whose ray left the scene into gate_first (32 where every ray of the column hit
+// something). The march's GATE builds start each pixel at the first sample that can read an open
+// cell (GateShutTo in volumetric_light.comp).
+// bbport (r76_sun-fog-outdoors): the DIAG build (made only with BB_VOLUMETRIC_GATE_PROBE=1 or
+// BB_VOLUMETRIC_GATE_VIEW=1) traces the same rays without TerminateOnFirstHit, so the hit it
+// reports is the nearest (whether a cell is shut is the same), and as the push word's bits above
+// the instance mask ask (GateDiagProbe 0x100, GateDiagBand 0x200 in volumetric_occlusion.h)
+// counts the shut cells in front of the visible surface (depth_tex, the march's own limit) by the
+// hit's distance into `probe` and writes each cell's band into gate_band for the march's view.
+#version 460
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 2, local_size_y = 2, local_size_z = 32) in;
+
+layout(scalar, binding = 0) readonly buffer ShadowConstants { uint d[]; } cb;
+layout(scalar, binding = 1) readonly buffer SceneConstants { uint d[]; } ub;
+layout(binding = 2) uniform accelerationStructureEXT scene;
+layout(binding = 3, r8) uniform writeonly image3D gate_out;
+// bbport (r76_sun-fog-outdoors): per column (the cells' x and y), (first open slice + 0.25) / 255
+layout(binding = 4, r8) uniform writeonly image2D gate_first;
+#ifdef DUAL
+// bbport (r115_sun-fog-indoors): BB_VOLUMETRIC_AREA_GATE=2 only (VolumetricLight::DualReady): the
+// wider answer, a second ray from each cell the first ray leaves open, with the push word's bits
+// 16-23 as its instance mask (the first one's mask and the camera's geometry): 1 where it too left
+// the scene, 0 where either ray hit (the march's DUAL build keeps what it lets through whole)
+#ifdef DIAG
+#error DUAL is not built with DIAG
+#endif
+layout(binding = 5, r8) uniform writeonly image3D gate_open;
+#endif
+#ifdef DIAG
+// bbport (r76_sun-fog-outdoors): each cell's band / 255: 0 open or not asked, 1 to 5 the nearest
+// hit's distance below 5, 15, 40, 150 m and beyond (VolumetricOcclusion::GateBand)
+layout(binding = 5, r8) uniform writeonly image3D gate_band;
+// The probe's words (VolumetricOcclusion::GateProbe*; VolumetricLight reads the first 79): shut
+// cells in front of the visible surface by band; of them those whose hit instance has mask bit 2
+// and not bit 1 (camera pass only); the cells in front of the surface asked; the direction toward
+// the light in view space; the centre column's 32 slices, two words each (the hit distance's bits,
+// 0xFFFFFFFF open, 0xFFFFFFFE not asked; the instance id, 0xFFFFFFFF none), all of them, also
+// those behind the surface; the centre column's surface distance (m; 1e30 sky, -1 none); then each
+// instance's record mask, four to a word, which the host writes.
+layout(scalar, binding = 6) buffer GateProbe {
+    uint shut[5];
+    uint camera_only[5];
+    uint asked;
+    float direction[3];
+    uint column[64];
+    float centre_surface;
+    uint masks[];
+} probe;
+const uint DiagProbe = 0x100u, DiagBand = 0x200u;
+// bbport (r76_sun-fog-outdoors): the camera's depth, as the march reads it (its depth_tex): the
+// probe counts only cells nearer than the visible surface, the air the march walks through
+layout(binding = 7) uniform sampler2D depth_tex;
+// bbport (r76c_sun-fog-shells): with the probe, ten words per instance of the scene (GateStat* in
+// volumetric_occlusion.h, GateStatWords): shut cells in front of the surface, of them hit on a
+// front face, the nearest and farthest hit (m), the lowest and highest hit point above the camera
+// (world y, m), the nearest and farthest hit point from the camera (m), the cells whose ray
+// straight up hit this instance first, and the nearest such hit (m). A minimum is kept as the
+// largest complement, so a buffer of zeros starts every word empty.
+layout(scalar, binding = 8) buffer GateProbeStats { uint s[]; } stats;
+const uint StatWords = 10u;
+// A float's bits in an order that compares as the floats do (VolumetricOcclusion::GateOrdered)
+uint Ordered(float f) {
+    uint b = floatBitsToUint(f);
+    return (b & 0x80000000u) != 0u ? ~b : (b | 0x80000000u);
+}
+#endif
+
+layout(push_constant) uniform Params {
+    uint offsets;       // as the march's: bits 0-7 the shadow constants' bytes, 8-15 the uniforms'
+    float reach;        // the march's reach (m)
+    uint mask;          // the scene's instance mask (BB_VOLUMETRIC_RT_GATE)
+    float max_distance; // how far a ray looks for a hit (m), as the ray traced sun's
+};
+
+shared mat4 shared_inverse_projection;
+shared vec3 shared_direction;
+shared float shared_range;
+shared uint shared_valid;
+shared uint shared_first[4]; // bbport (r76_sun-fog-outdoors): per column of the workgroup
+#ifdef DIAG
+shared uint shared_probe[11]; // bbport (r76_sun-fog-outdoors): the group's shut[], camera_only[], asked
+#endif
+
+uint base;
+float c(int i) { return uintBitsToFloat(cb.d[base + uint(i)]); }
+vec4 row(int i) { return vec4(c(i), c(i + 1), c(i + 2), c(i + 3)); }
+
+// As volumetric_light.comp's prepare(): the camera's inverse projection and the direction toward
+// the sun from cascade 0's light matrix; and the gate's range as its GateRange() reads it.
+void prepare() {
+    shared_inverse_projection = transpose(mat4(row(0), row(4), row(8), row(12)));
+    mat4 projection = inverse(shared_inverse_projection);
+    mat4 light = transpose(mat4(row(16), row(20), row(24), row(28))) * projection;
+    vec3 a = vec3(light[0][0], light[1][0], light[2][0]);
+    vec3 b = vec3(light[0][1], light[1][1], light[2][1]);
+    vec3 z = vec3(light[0][2], light[1][2], light[2][2]);
+    vec3 direction = cross(a, b);
+    uint ubase = ((offsets >> 8) & 255u) >> 2;
+    float d = uintBitsToFloat(ub.d[ubase + 72u]);
+    shared_range = d > 0.0 && d < reach ? d : reach;
+    shared_valid = 0u;
+    if (any(isnan(direction)) || any(isinf(direction)) || dot(direction, direction) < 1e-16) return;
+    direction = normalize(direction);
+    shared_direction = dot(z, direction) > 0.0 ? -direction : direction;
+    shared_valid = 1u;
+}
+
+void main() {
+    base = (offsets & 255u) >> 2;
+    if (gl_LocalInvocationIndex == 0u) prepare();
+    // bbport (r76_sun-fog-outdoors): no open slice found yet in the workgroup's four columns
+    if (gl_LocalInvocationIndex < 4u) shared_first[gl_LocalInvocationIndex] = gl_WorkGroupSize.z;
+#ifdef DIAG
+    if (gl_LocalInvocationIndex < 11u) shared_probe[gl_LocalInvocationIndex] = 0u;
+#endif
+    barrier();
+
+    ivec3 cell = ivec3(gl_GlobalInvocationID);
+    ivec3 size = imageSize(gate_out);
+    // bbport (r76_sun-fog-outdoors): no early return, every invocation reaches the barrier below
+    bool inside = all(lessThan(cell, size));
+    // Open (1) where nothing can be asked: the march keeps the atlas's answer there.
+    float open = 1.0;
+#ifdef DUAL
+    float open_wider = 1.0; // bbport (r115_sun-fog-indoors): open where nothing can be asked too
+#endif
+#ifdef DIAG
+    // bbport (r76_sun-fog-outdoors): the nearest hit's band (0: open or not asked), distance and
+    // instance id, whether a ray was traced, and the column's visible surface (m; 1e30 sky, -1
+    // none) and whether the cell lies in front of it
+    uint band = 0u;
+    float hit_t = 0.0;
+    uint hit_instance = 0xFFFFFFFFu;
+    bool asked = false;
+    float surface = -1.0;
+    bool front = false;
+    // bbport (r76c_sun-fog-shells): the probe's hit point (height above the camera in world y,
+    // distance from it), the face hit, and the nearest hit of the ray straight up from the cell
+    float hit_height = 0.0;
+    float hit_eye = 0.0;
+    bool hit_front = false;
+    uint up_instance = 0xFFFFFFFFu;
+    float up_t = 0.0;
+#endif
+    vec2 uv = (vec2(cell.xy) + 0.5) / vec2(size.xy);
+    vec4 h = shared_inverse_projection * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.5, 1.0);
+    if (inside && shared_valid != 0u && abs(h.w) >= 1e-8) {
+        vec3 ray = h.xyz / h.w;
+        float len = length(ray);
+        if (ray.z > 0.0 && len > 0.0) {
+            float s = (float(cell.z) + 0.5) / float(size.z);
+            vec3 p = ray / len * (shared_range * s * s);
+            rayQueryEXT query;
+#ifdef DIAG
+            // bbport (r76_sun-fog-outdoors): to the nearest hit (every instance is opaque, so one
+            // proceed walks the whole ray); the instance mask is the push word's low 8 bits
+            rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, mask & 255u, p, 0.02,
+                                  shared_direction, max_distance);
+#else
+            rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                                  mask, p, 0.02, shared_direction, max_distance);
+#endif
+            rayQueryProceedEXT(query);
+            open = rayQueryGetIntersectionTypeEXT(query, true) ==
+                           gl_RayQueryCommittedIntersectionNoneEXT
+                       ? 1.0
+                       : 0.0;
+#ifdef DUAL
+            // bbport (r115_sun-fog-indoors): the wider ray only from a cell the first left open (a
+            // cell the first shut is shut for both); the first ray's cull mask took the low 8 bits
+            open_wider = open;
+            if (open != 0.0) {
+                rayQueryEXT wider;
+                rayQueryInitializeEXT(wider, scene,
+                                      gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT,
+                                      (mask >> 16) & 255u, p, 0.02, shared_direction, max_distance);
+                rayQueryProceedEXT(wider);
+                open_wider = rayQueryGetIntersectionTypeEXT(wider, true) ==
+                                     gl_RayQueryCommittedIntersectionNoneEXT
+                                 ? 1.0
+                                 : 0.0;
+            }
+#endif
+#ifdef DIAG
+            asked = true;
+            // As the march's limit: depth 1 is sky (the whole column), a depth outside (0, 1] or a
+            // surface not in front of the camera is no air the march walks through.
+            float depth = textureLod(depth_tex, uv, 0.0).r;
+            if (depth == 1.0) {
+                surface = 1e30;
+            } else if (depth > 0.0 && depth < 1.0) {
+                vec4 q = shared_inverse_projection *
+                         vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+                if (abs(q.w) >= 1e-8 && q.z / q.w > 0.0) surface = length(q.xyz / q.w);
+            }
+            front = shared_range * s * s < surface;
+            if (open == 0.0) {
+                hit_t = rayQueryGetIntersectionTEXT(query, true);
+                hit_instance = uint(rayQueryGetIntersectionInstanceIdEXT(query, true));
+                band = 1u + uint(hit_t >= 5.0) + uint(hit_t >= 15.0) + uint(hit_t >= 40.0) +
+                       uint(hit_t >= 150.0);
+                // bbport (r76c_sun-fog-shells): with the probe, for a cell in front of the surface:
+                // the instance's world-to-object rows (its object space is the world: the scene's
+                // records place world space meshes with the camera's view), whose row y read across
+                // the columns is world +y in this view space; the hit point's height above the
+                // camera and distance from it, the face, and one ray straight up (same mask)
+                if ((mask & DiagProbe) != 0u && front) {
+                    mat4x3 to_world = rayQueryGetIntersectionWorldToObjectEXT(query, true);
+                    vec3 up = vec3(to_world[0][1], to_world[1][1], to_world[2][1]);
+                    vec3 hit = p + shared_direction * hit_t;
+                    hit_height = dot(up, hit);
+                    hit_eye = length(hit);
+                    hit_front = rayQueryGetIntersectionFrontFaceEXT(query, true);
+                    if (dot(up, up) > 0.25) {
+                        rayQueryEXT above;
+                        rayQueryInitializeEXT(above, scene, gl_RayFlagsOpaqueEXT, mask & 255u, p, 0.02,
+                                              normalize(up), max_distance);
+                        rayQueryProceedEXT(above);
+                        if (rayQueryGetIntersectionTypeEXT(above, true) !=
+                            gl_RayQueryCommittedIntersectionNoneEXT) {
+                            up_t = rayQueryGetIntersectionTEXT(above, true);
+                            up_instance = uint(rayQueryGetIntersectionInstanceIdEXT(above, true));
+                        }
+                    }
+                }
+            }
+#endif
+        }
+    }
+    if (inside) imageStore(gate_out, cell, vec4(open));
+#ifdef DUAL
+    if (inside) imageStore(gate_open, cell, vec4(open_wider)); // bbport (r115_sun-fog-indoors)
+#endif
+#ifdef DIAG
+    // bbport (r76_sun-fog-outdoors): the band for the view (every cell: the march's view walks only
+    // the cells in front of its surface); the probe's counts of the cells in front of the surface
+    // (by group first) and the centre column (all its slices) with its surface
+    if (inside && (mask & DiagBand) != 0u) imageStore(gate_band, cell, vec4(float(band) / 255.0));
+    if ((mask & DiagProbe) != 0u) {
+        if (asked && front) atomicAdd(shared_probe[10], 1u);
+        if (band != 0u && front) {
+            atomicAdd(shared_probe[band - 1u], 1u);
+            uint at = hit_instance >> 2;
+            uint m = at < uint(probe.masks.length())
+                         ? (probe.masks[at] >> ((hit_instance & 3u) * 8u)) & 255u
+                         : 0u;
+            if ((m & 2u) != 0u && (m & 1u) == 0u) atomicAdd(shared_probe[4u + band], 1u);
+            // bbport (r76c_sun-fog-shells): the hit instance's words, and the up ray's instance's
+            uint at_stat = hit_instance * StatWords;
+            if (at_stat + StatWords <= uint(stats.s.length())) {
+                atomicAdd(stats.s[at_stat], 1u);
+                if (hit_front) atomicAdd(stats.s[at_stat + 1u], 1u);
+                atomicMax(stats.s[at_stat + 2u], ~floatBitsToUint(hit_t));
+                atomicMax(stats.s[at_stat + 3u], floatBitsToUint(hit_t));
+                atomicMax(stats.s[at_stat + 4u], ~Ordered(hit_height));
+                atomicMax(stats.s[at_stat + 5u], Ordered(hit_height));
+                atomicMax(stats.s[at_stat + 6u], ~floatBitsToUint(hit_eye));
+                atomicMax(stats.s[at_stat + 7u], floatBitsToUint(hit_eye));
+            }
+            if (up_instance != 0xFFFFFFFFu) {
+                uint up_stat = up_instance * StatWords;
+                if (up_stat + StatWords <= uint(stats.s.length())) {
+                    atomicAdd(stats.s[up_stat + 8u], 1u);
+                    atomicMax(stats.s[up_stat + 9u], ~floatBitsToUint(up_t));
+                }
+            }
+        }
+        if (inside && all(equal(cell.xy, size.xy / 2))) {
+            probe.column[2 * cell.z] = band != 0u ? floatBitsToUint(hit_t)
+                                                  : (asked ? 0xFFFFFFFFu : 0xFFFFFFFEu);
+            probe.column[2 * cell.z + 1] = hit_instance;
+            if (cell.z == 0) probe.centre_surface = surface;
+        }
+    }
+#endif
+    // bbport (r76_sun-fog-outdoors): the column's first open slice, stored by its slice 0; the
+    // quarter keeps the store's rounding to the 8-bit value on F, whichever way it rounds
+    uint column = gl_LocalInvocationID.x + 2u * gl_LocalInvocationID.y;
+    if (inside && open != 0.0) atomicMin(shared_first[column], uint(cell.z));
+    barrier();
+    if (inside && gl_LocalInvocationID.z == 0u) {
+        imageStore(gate_first, cell.xy, vec4((float(shared_first[column]) + 0.25) / 255.0));
+    }
+#ifdef DIAG
+    if ((mask & DiagProbe) != 0u) {
+        uint i = gl_LocalInvocationIndex;
+        if (i < 11u && shared_probe[i] != 0u) {
+            if (i < 5u) {
+                atomicAdd(probe.shut[i], shared_probe[i]);
+            } else if (i < 10u) {
+                atomicAdd(probe.camera_only[i - 5u], shared_probe[i]);
+            } else {
+                atomicAdd(probe.asked, shared_probe[i]);
+            }
+        }
+        if (all(equal(gl_GlobalInvocationID, uvec3(0u)))) {
+            for (int k = 0; k < 3; ++k) {
+                probe.direction[k] = shared_valid != 0u ? shared_direction[k] : 0.0;
+            }
+        }
+    }
+#endif
+}

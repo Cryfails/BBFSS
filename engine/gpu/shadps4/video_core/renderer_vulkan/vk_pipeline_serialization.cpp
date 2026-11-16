@@ -15,9 +15,17 @@
 #include <algorithm>
 #include <stdexcept>
 #include "bbport_threads.h"
+#include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
+#include "bbport_wind_game.h" // bbport (r122_game-wind-drive)
+#include "bbport_wind_shelter.h" // bbport (r117_wind-shelter)
+#include "bbport_wind_hang.h" // bbport (r112_wind-more-things)
+#include "bbport_wind_twigs.h" // bbport (r89d_tree-twigs)
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50_leaf-stage1)
+#include "video_core/renderer_vulkan/rt_card_layers.h"      // bbport (r62_leaf-stage3): CUT1
+#include "video_core/renderer_vulkan/vk_card_alpha.h"       // bbport (r62_leaf-stage3): counts
 #include "shader_recompiler/native/froyok_composite.h"
 #include "shader_recompiler/native/gt7_tonemap.h"
 #include "video_core/cache_storage.h"
@@ -33,6 +41,17 @@ static constexpr u32 MotionShaderBinaryVersion = 8u; // runtime address descript
 static constexpr u32 CaptureShaderBinaryVersion = 9u;
 static constexpr u32 ShaderMetaVersion = 8u; // bbport: HwFragmentRuntimeInfo::depth_first
 static constexpr u32 PipelineKeyVersion = 6u; // pointer-free pipeline state + generated fragment
+// bbport (r89b_wind-sway-ripple): a vertex shader with the plant sway (MotionVectors::Sway): its
+// code changed with the ripple, so a sway shader saved by a build before it is built again
+static constexpr u32 SwayShaderBinaryVersion = 11u; // bbport (r89c_wind-lean): the lean
+// bbport (r112_wind-more-things): a vertex shader with the plant sway built with BB_WIND_HANG=1
+// (its code has the hanging rule; without it the emitters add nothing): its own version, so a run
+// with the other setting builds it again
+static constexpr u32 HangShaderBinaryVersion = 22u; // bbport (r112g): short meshes scale
+static_assert(HangShaderBinaryVersion != SwayShaderBinaryVersion &&
+              HangShaderBinaryVersion != CaptureShaderBinaryVersion &&
+              HangShaderBinaryVersion != MotionShaderBinaryVersion &&
+              HangShaderBinaryVersion != ShaderBinaryVersion);
 } // namespace Serialization
 
 namespace Vulkan {
@@ -75,6 +94,20 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                                        fmt::format("g_{:#018x}", hash), ar.TakeOff());
 }
 
+// bbport (r89b_wind-sway-ripple): the binary version of a stage: SwayShaderBinaryVersion for a
+// vertex shader with MotionVectors::Sway, `version` (as before) for every other
+static u32 SwayOr(u32 version, bool vertex_motion, const Shader::StageSpecialization& spec) {
+    return vertex_motion &&
+                   (spec.runtime_info.hw.vs.motion_vectors & Shader::MotionVectors::Sway) != 0
+               ? (BbWindHang::KnobOnce().on ? Serialization::HangShaderBinaryVersion // (r112)
+                                            : Serialization::SwayShaderBinaryVersion) +
+                     BbWindShelter::BinaryOffset() + // (r117_wind-shelter: 1000 with the field's read)
+                     BbWindTwigs::BinaryOffset() + // (r89d_tree-twigs: 2000 with the twigs)
+                     BbWindHang::PostBinaryOffset() + // (r112s_hang-bracket-move: 50000 with the post rule in the SPIR-V)
+                     BbWindHang::ProofBinaryOffset() // (r112q_hang-bracket-route: 100000 with BB_WIND_HANG_PROOF=1, its tint is in the SPIR-V)
+               : version;
+}
+
 std::vector<u8> SerializeShaderMeta(const Shader::Info& info, const Shader::StageSpecialization& spec,
                                     size_t perm_hash, size_t perm_idx) {
     Serialization::Archive ar;
@@ -84,9 +117,10 @@ std::vector<u8> SerializeShaderMeta(const Shader::Info& info, const Shader::Stag
     const bool vertex_motion = info.hw_stage == Shader::HwStage::Vertex &&
                                spec.runtime_info.hw.vs.motion_vectors;
     const bool vertex_capture = vertex_motion && (spec.runtime_info.hw.vs.motion_vectors & 2) != 0;
-    meta.Write(vertex_capture ? Serialization::CaptureShaderBinaryVersion
+    meta.Write(SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
                              : vertex_motion ? Serialization::MotionShaderBinaryVersion
-                             : Serialization::ShaderBinaryVersion);
+                             : Serialization::ShaderBinaryVersion,
+                      vertex_motion, spec)); // bbport (r89b_wind-sway-ripple)
     meta.Write(perm_hash);
     meta.Write(perm_idx);
     spec.Serialize(ar);
@@ -124,9 +158,10 @@ void RegisterShaderMeta(const Shader::Info& info,
     const bool vertex_motion = info.hw_stage == Shader::HwStage::Vertex &&
                                spec.runtime_info.hw.vs.motion_vectors;
     const bool vertex_capture = vertex_motion && (spec.runtime_info.hw.vs.motion_vectors & 2) != 0;
-    meta.Write(vertex_capture ? Serialization::CaptureShaderBinaryVersion
+    meta.Write(SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
                              : vertex_motion ? Serialization::MotionShaderBinaryVersion
-                             : Serialization::ShaderBinaryVersion);
+                             : Serialization::ShaderBinaryVersion,
+                      vertex_motion, spec)); // bbport (r89b_wind-sway-ripple)
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -161,9 +196,20 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 binary_version{};
     meta.Read(binary_version);
+    // bbport (r112q_hang-bracket-route): the version as saved (it may carry the hang proof's add: the check at the end of this function compares
+    // it with the current one); the known-version tests below see it with that add taken out
+    const u32 binary_saved = binary_version;
+    binary_version = BbWindHang::StripProofVersion(binary_version);
     if (binary_version != Serialization::ShaderBinaryVersion &&
         binary_version != Serialization::MotionShaderBinaryVersion &&
-        binary_version != Serialization::CaptureShaderBinaryVersion) {
+        binary_version != Serialization::CaptureShaderBinaryVersion &&
+        binary_version != Serialization::SwayShaderBinaryVersion && // bbport (r89b)
+        binary_version != Serialization::HangShaderBinaryVersion && // bbport (r112)
+        binary_version != Serialization::SwayShaderBinaryVersion + BbWindShelter::BinaryAdd && // (r117)
+        binary_version != Serialization::HangShaderBinaryVersion + BbWindShelter::BinaryAdd &&
+        !BbWindTwigs::KnownVersion(binary_version, Serialization::SwayShaderBinaryVersion,
+                                   Serialization::HangShaderBinaryVersion,
+                                   BbWindShelter::BinaryAdd)) { // bbport (r89d_tree-twigs)
         return false;
     }
 
@@ -184,9 +230,10 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     const bool vertex_motion = info.hw_stage == Shader::HwStage::Vertex &&
                                spec.runtime_info.hw.vs.motion_vectors;
     const bool vertex_capture = vertex_motion && (spec.runtime_info.hw.vs.motion_vectors & 2) != 0;
-    if (binary_version != (vertex_capture ? Serialization::CaptureShaderBinaryVersion
+    if (binary_saved != SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
                              : vertex_motion ? Serialization::MotionShaderBinaryVersion
-                                        : Serialization::ShaderBinaryVersion)) {
+                                        : Serialization::ShaderBinaryVersion,
+                                 vertex_motion, spec)) { // bbport (r89b_wind-sway-ripple)
         return false;
     }
 
@@ -319,6 +366,32 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy
         !instance.GetPhysicalDevice().getFeatures().vertexPipelineStoresAndAtomics) {
         return false;
     }
+    // bbport (r54_leaf-stage2): a capture key of the other BB_RT_CARD_ALPHA setting is not
+    // built: no draw of this run asks for it, and one with the card UVs (CaptureUv) would read
+    // an address past the 16 or 32 bytes of the address block the knob off binds.
+    // bbport (r62d_card-uv-diag): nor one of another BB_RT_CARD_UV_DIAG rule (CaptureUvWanted:
+    // with 0, 1 and 3 the test of before). With 4 or 5 a capture key has the card UVs exactly
+    // when its pixel shader discards: checked once the stages are loaded (uv_by_fragment).
+    const bool key_uv = (sel.graphics_key.motion_vectors & Shader::MotionVectors::CaptureUv) != 0;
+    const bool key_capture =
+        (sel.graphics_key.motion_vectors & Shader::MotionVectors::VertexCapture) != 0;
+    const bool uv_by_fragment = key_capture && Shader::Optimization::CaptureUvWanted(true) &&
+                                !Shader::Optimization::CaptureUvWanted(false);
+    if (!uv_by_fragment &&
+        key_uv != (key_capture && Shader::Optimization::CaptureUvWanted(true))) {
+        return false;
+    }
+    // bbport (r89_wind-foliage-sway): nor a key with the plant sway (a run with BB_WIND=1 and
+    // BB_WIND_SWAY above 0 saved it) when this run's knob is off: no draw asks for it, and its
+    // vertex shader would read sway words the motion buffer does not have.
+    if ((sel.graphics_key.motion_vectors & Shader::MotionVectors::Sway) != 0 &&
+        !BbWindSway::KnobOnce().on) {
+        return false;
+    }
+    // bbport (r122_game-wind-drive): nor a key with the game-wind cut when this run's knob is off
+    if ((sel.graphics_key.motion_vectors & Shader::MotionVectors::GameCut) != 0 && !BbWindGame::CutOn()) {
+        return false;
+    }
 
     GraphicsPipeline::SerializationSupport sdata{};
     if (!sdata.Deserialize(ar, legacy)) {
@@ -371,6 +444,28 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy
         }
         expected.unified += warmup_count[stage_idx].unified;
         expected.buffer += warmup_count[stage_idx].buffer;
+    }
+    // bbport (r62d_card-uv-diag): BB_RT_CARD_UV_DIAG=4 or 5, see above (a key without a
+    // fragment stage has no pixel shader that discards; sel.infos may hold an earlier key's)
+    if (uv_by_fragment) {
+        const auto* fs = sel.graphics_key.stage_hashes[u32(Shader::SwStage::Fragment)]
+                             ? sel.infos[u32(Shader::SwStage::Fragment)]
+                             : nullptr;
+        if (key_uv != Shader::Optimization::CaptureUvWanted(fs && fs->has_discard)) {
+            return false;
+        }
+    }
+    // bbport (r62d_card-uv-diag): with BB_RT_CARD_UV_DIAG 1 to 5, nor a capture key whose vertex
+    // module (the permutation its record names) has the card UVs other than the key: a run of
+    // another rule saved its own module at that index. No draw takes that pipeline (a live draw
+    // takes only a module of its own specialization, CaptureUv included), so it is not built.
+    if (key_capture && Shader::Optimization::CardUvDiag() != 0 &&
+        sel.graphics_key.stage_hashes[u32(Shader::SwStage::Vertex)]) {
+        const auto& vs_loaded = sel.runtime_infos[u32(Shader::SwStage::Vertex)];
+        if (vs_loaded.hw_stage == Shader::HwStage::Vertex &&
+            ((vs_loaded.hw.vs.motion_vectors & Shader::MotionVectors::CaptureUv) != 0) != key_uv) {
+            return false;
+        }
     }
     // Without dynamic vertex input (RX 400/500, Vega, older APUs on AMD's legacy driver) the
     // vertex input is baked into the pipeline from the record: a record made where it was dynamic
@@ -457,6 +552,28 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
         const u32 opcode = spv[word] & 0xffff;
         discards |= opcode == 252u || opcode == 5380u;
         word += count;
+    }
+
+    // bbport (r50_leaf-stage1): with BB_RT_CARD_ALPHA_LOG=1 a pixel shader that discards
+    // compiles again in play, so the cut-out analysis sees its IR.
+    if (discards && program->info.sw_stage == Shader::SwStage::Fragment &&
+        Shader::Optimization::CutoutAnalysisOn()) {
+        // bbport (r62_leaf-stage3): with BB_RT_CARD_ALPHA alone a record that brought its
+        // cut-out record (the CUT1 part) is taken: ResolveCardDraw reads info.cutout. A record
+        // without the part compiles once in play and is saved with it.
+        // bbport (r62b_leaf-stage3-followups): with the log knob too: the restored record gives
+        // its shader line and counts (NoteCutoutRestored) as the analysis of a compile would, so
+        // neither knob compiles in play a record that has the part.
+        if (program->info.cutout.verdict != Shader::Info::Cutout::Verdict::NotAnalysed) {
+            NoteCardCutoutLoaded();
+            if (Shader::Optimization::CutoutLogOn()) {
+                Shader::Optimization::NoteCutoutRestored(program->info, spec.runtime_info);
+            }
+        } else {
+            NoteCardCutoutRefused();
+            Shader::Optimization::NoteCutoutCacheRefusal();
+            return false;
+        }
     }
 
     auto it = program_cache.find(program->info.pgm_hash);
@@ -826,6 +943,26 @@ static constexpr u32 ToneCurveTag = 0x31584354;
 static constexpr u32 Gt7CheckedTag = 0x33375447;
 // "FRY1": the Froyok composite, whose startup selection differs from the original shader.
 static constexpr u32 FroyokTag = 0x31525946;
+// bbport (r62_leaf-stage3): "CUT1" (Vulkan::CardCutoutTag): a pixel shader's cut-out record, with
+// a version and its size (rt_card_layers.h). Its bytes are Info::Cutout's: a change of that
+// struct must change Vulkan::CardCutoutFormat (the size check below fails first); a change of
+// the matcher, Shader::Optimization::CutoutAnalysisVersion.
+static_assert(std::is_trivially_copyable_v<Info::Cutout>);
+static_assert(sizeof(Info::Cutout) == 104, "Info::Cutout changed: bump Vulkan::CardCutoutFormat");
+static_assert(Vulkan::CardCutoutTag != ToneCurveTag && Vulkan::CardCutoutTag != Gt7CheckedTag &&
+              Vulkan::CardCutoutTag != FroyokTag);
+static constexpr u32 CutoutPartVersion =
+    Vulkan::CardCutoutVersion(Shader::Optimization::CutoutAnalysisVersion);
+// Info::Cutout's padding bytes (one byte after layer, num_inputs and samples_screen: clang's
+// record layout, checked by the asserts), written as 0 so a record's bytes depend on its values
+// alone.
+static constexpr std::array<std::size_t, 3> CutoutPadding{offsetof(Info::Cutout, layer) + 1,
+                                                          offsetof(Info::Cutout, num_inputs) + 1,
+                                                          offsetof(Info::Cutout, samples_screen) + 1};
+static_assert(offsetof(Info::Cutout, layer_value) == offsetof(Info::Cutout, layer) + 2 &&
+                  offsetof(Info::Cutout, input_default_mask) == offsetof(Info::Cutout, num_inputs) + 2 &&
+                  sizeof(Info::Cutout) == offsetof(Info::Cutout, samples_screen) + 2,
+              "Info::Cutout's padding moved: update CutoutPadding");
 
 void Info::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer info{ar};
@@ -847,6 +984,15 @@ void Info::Serialize(Serialization::Archive& ar) const {
         Serialization::Writer tail{ar};
         tail.Write(FroyokTag);
     }
+    // bbport (r62_leaf-stage3): an analysed pixel shader's cut-out record: analysed in a run with
+    // BB_RT_CARD_ALPHA or the log knob, or restored from a CUT1 part (a knob-off run re-saving
+    // a permutation keeps the part it loaded).
+    if (cutout.verdict != Cutout::Verdict::NotAnalysed) {
+        std::array<u8, Vulkan::CardCutoutBytes<Cutout>> part{};
+        Vulkan::CardCutoutEncode(cutout, CutoutPartVersion, CutoutPadding, part.data());
+        Serialization::Writer tail{ar};
+        tail.Write(part.data(), part.size());
+    }
 }
 
 bool Info::Deserialize(Serialization::Archive& ar) {
@@ -864,6 +1010,7 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     uses_tone_curve = false;
     gt7_checked = false;
     uses_froyok_bloom = false;
+    cutout = {}; // bbport (r62_leaf-stage3): unless a CUT1 part restores it
     while (!ar.IsEoS()) {
         // bbport: zero bytes to the end are room the writer left after a vertex shader's fetch
         // shader data (up to 0.9.37 beta 5): not a part. Taken for one, they left every such shader
@@ -886,6 +1033,17 @@ bool Info::Deserialize(Serialization::Archive& ar) {
         } else if (tag == FroyokTag) {
             ar.Advance(sizeof(tag));
             uses_froyok_bloom = true;
+        } else if (tag == Vulkan::CardCutoutTag) { // bbport (r62_leaf-stage3)
+            const u8* payload = nullptr;
+            const std::size_t used = Vulkan::CardCutoutPart<Cutout>(
+                ar.CurrPtr(), ar.Remaining(), CutoutPartVersion, payload);
+            if (used == 0) {
+                return false;
+            }
+            if (payload && Vulkan::CardCutoutBytesValid<Cutout>(payload)) {
+                std::memcpy(&cutout, payload, sizeof(cutout));
+            }
+            ar.Advance(used);
         } else if (!table_plan.Deserialize(ar)) {
             return false;
         }

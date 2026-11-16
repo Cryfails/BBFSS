@@ -11,13 +11,43 @@
 #include <thread>
 #include "common/recursive_lock.h"
 #include "engine/batch.h"
+#include "bbport_wind.h" // bbport (r82_wind-stage1)
+#include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
+#include "bbport_wind_game.h" // bbport (r122_game-wind-drive)
+#include "video_core/renderer_vulkan/vk_wind_shelter.h" // bbport (r117_wind-shelter)
+#include "bbport_wind_hang.h" // bbport (r112_wind-more-things)
+#include "bbport_wind_twigs.h" // bbport (r89d_tree-twigs)
+#include "bbport_wind_census.h" // bbport (r89i_twigs-colour-pass)
+#include "bbport_wind_trees.h" // bbport (r89j_twigs-pick-trees)
+#include "bbport_wind_hang_still.h" // bbport (r112d_hang-still-test)
+#include "bbport_wind_hang_actors.h" // bbport (r112h_hang-not-the-hunter)
+#include "bbport_wind_hang_gpu.h" // bbport (r112p_hang-gpu-palette-lanterns)
+#include "bbport_wind_hang_find.h" // bbport (r112i_hang-find-lanterns)
+#include "bbport_wind_hang_route.h" // bbport (r112q_hang-bracket-route)
+#include "bbport_wind_hang_probe.h" // bbport (r112b_hang-probe, TOOL)
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_ambient_particles.h" // bbport (r98_ambient-particles)
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
+#include "video_core/renderer_vulkan/cloud_probe.h" // bbport (r104_cloud-probe): TOOL
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_contact_shadow.h"
+#include "video_core/renderer_vulkan/vk_cloud_shadow.h" // bbport (r105_cloud-shadows)
+#include "video_core/renderer_vulkan/vk_cloud_layer.h" // bbport (r119_volumetric-clouds)
 #include "video_core/renderer_vulkan/vk_depth_of_field.h"
+#include "video_core/renderer_vulkan/vk_drawn_look.h"
+#include "video_core/renderer_vulkan/vk_footprints.h" // bbport (r111_footprints)
+#include "video_core/renderer_vulkan/vk_card_alpha.h" // bbport (r62_leaf-stage3)
+#include "video_core/renderer_vulkan/vk_heat_haze.h" // bbport (r97_heat-haze)
+#include "video_core/renderer_vulkan/vk_halation.h" // bbport (r95_halation)
+#include "video_core/renderer_vulkan/vk_test_world_at.h" // bbport (r120_test-camera-lookat, TOOL): BB_TEST_WORLD_AT
+#include "video_core/renderer_vulkan/vk_blood_sheen.h" // bbport (r100_blood-sheen)
+#include "video_core/renderer_vulkan/vk_glass_glint.h" // bbport (r86b_glass-visible)
+#include "video_core/renderer_vulkan/rt_glass_pick.h" // bbport (r86l_glint-pick-glass, TOOL)
+#include "video_core/renderer_vulkan/rt_glass_tri.h" // bbport (r86m_glint-pane-from-triangle, TOOL)
+#include "video_core/renderer_vulkan/vk_caustics.h" // bbport (r107_caustics)
+#include "video_core/renderer_vulkan/vk_blood_pool_probe.h" // bbport (r100c_blood-pool-probe, TOOL)
 #include "video_core/renderer_vulkan/vk_froyok_bloom.h"
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
 #include "video_core/renderer_vulkan/vk_point_shadow.h"
@@ -33,6 +63,7 @@
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/ui_composition.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -332,6 +363,8 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     void NotifyUiDraw(const GraphicsPipeline* pipeline);
+    /// bbport (r77_parallel-test-runs): clean shot leaves this draw of the game's UI out.
+    bool CleanShotEarly(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     RenderState BeginRenderingFull(const GraphicsPipeline* pipeline);
     /// bbport: a pass drawn into the upscaler's output-size images (UI, display pass): what its
@@ -397,15 +430,157 @@ private:
     void UpdateViewportScissorState() const;
     vk::Rect2D DrawScissor(u32 viewport) const;
     void EffectsOnFrameEnd();
+    void WindOnFrameEnd(); ///< bbport (r82_wind-stage1): first in EffectsOnFrameEnd
+    /// bbport (r89_wind-foliage-sway): a skinned draw of a pipeline with MotionVectors::Sway: its
+    /// motion param word 7 (BbWindSway::PackWord; 0: no sway); the log lines at each frame end
+    /// bbport (r89e_twigs-big-trees): small_palette 0 or 1 for a static cut-out candidate of the twigs
+    /// (1: it read a small bone palette), -1 for a skinned draw
+    /// bbport (r112i_hang-find-lanterns): hang_static: an opaque static draw (small_palette 0 or 1, its
+    /// palette flag) that may hang (BB_WIND_HANG_STATIC): no plant, no tree, no twig candidate
+    u32 WindSwayWord(const GraphicsPipeline* pipeline, int small_palette = -1,
+                     bool hang_static = false);
+    void WindSwayFrameEnd();
+    /// bbport (r89d_tree-twigs, bbport_wind_twigs.h): whether a skinned sway draw's stream may be a
+    /// tree a sun shadow pass draws, its sway word once it has its slot, the Motion block's draws the
+    /// sway cannot reach (counted; returns 0) and the twigs' line every 600 frames.
+    bool WindTwigTree(u64 positions, u32 positions_size);
+    /// bbport (r89e_twigs-big-trees): static cut-out candidates (BB_WIND_TWIGS_SMALL)
+    bool WindTwigSmall(const GraphicsPipeline* pipeline, u64 positions, u32 positions_size,
+                       u32 stride, bool floats, bool palette);
+    void WindTwigSmallVerdict(BbWindTwigs::Entry& entry, u64 positions);
+    u32 WindTwigWord(u32* words, u32 frame_slot, u32 view, const BbWindSway::Slots::Taken& taken,
+                     u64 positions, u32 positions_size, u64 frame, double time, bool small = false);
+    u32 WindTwigSkip(bool skinned, bool sway_bit);
+    void WindTwigsReport();
+    /// bbport (r89i_twigs-colour-pass, TOOL; BB_WIND_TWIGS_CENSUS=1): one draw of a colour pass for the census
+    /// (kind_slot: BbWindCensus::KindSkinned .. KindNone; sway: its sway word; base_vertex: its base vertex)
+    void WindTwigCensus(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs, bool is_indexed,
+                        u32 index_offset, int kind_slot, u32 sway, int base_vertex);
+    /// bbport (r89j_twigs-pick-trees; BB_WIND_TWIGS_TREES=1): whether the candidate draw (trees_draw) is a tree-shaped
+    /// mesh of its own and the camera is outdoors; true: positions and positions_size become its vertex range
+    /// bbport (r89k_twigs-opaque-word): `opaque` (the pixel shader does not discard): a draw the shape rule refuses may
+    /// then be taken as a limb piece of a tree (BbWindTrees::LimbOf; BB_WIND_TWIGS_LIMBS)
+    bool WindTreesDraw(u64& positions, u32& positions_size, u32 stride, bool floats, bool opaque);
+    /// bbport (r89j_twigs-pick-trees, TOOL; BB_WIND_TWIGS_PICK): a G-buffer draw of a pick frame gets an occlusion query
+    void WindTreesPickQuery(const GraphicsPipeline* pipeline, const AmdGpu::Regs& regs, u32 index_offset,
+                            s32 base_vertex, vk::QueryPool& pool, u32& index);
+    /// the trees' line every report, the pick's frames and results (once a frame)
+    void WindTreesPickFrameEnd();
+    /// bbport (r112_wind-more-things): with BB_WIND_HANG=1, whether a skinned draw that is no plant
+    /// is a hanging thing's (bbport_wind_hang.h), and once it has a slot its sway word (0, or one
+    /// with HangBit: a ramp of 0 while its height is read); a view's push table is filled at its
+    /// first pushed draw of a frame
+    /// bbport (r112i_hang-find-lanterns): hang_static and stride: an opaque static draw's stream, judged
+    /// by the ray traced scene's boxes (WindHangStaticAllowed) and the GPU's keys, with no palette
+    bool WindHangVerdict(const GraphicsPipeline* pipeline, u64 positions, u32 positions_size,
+                         bool hang_static = false, u32 stride = 0);
+    /// bbport (r112h_hang-not-the-hunter): a stream whose box keys read as still: may it hang (not the
+    /// hunter's gear, not a figure, not indoors, placed)? False: it is refused and held as moving.
+    bool WindHangActorsClear(u64 positions, u64 frame, bool hang_static = false);
+    /// bbport (r112i_hang-find-lanterns): an opaque static draw's stream: may it hang (BB_WIND_HANG_STATIC:
+    /// small, a box of 0.15-2 m in the ray traced scene, hanging, not the ground)? The scene's boxes are
+    /// read every RefreshFrames frames for the verdicts; the survey (BB_WIND_HANG_FIND) every 600 frames
+    bool WindHangStaticAllowed(u64 positions, u32 positions_size, u32 stride, u64 frame, u64 vs = 0);
+    void WindHangFindRefresh(u64 frame);
+    void WindHangFindReport();
+    /// bbport (r112k_hang-lantern-verdict): whether a GPU-palette draw's stream is a static candidate
+    /// (BB_WIND_HANG_STATIC_GPU), and, for the survey (BB_WIND_HANG_FIND), what the Motion block made of a draw
+    bool WindHangGpuStatic(const GraphicsPipeline* pipeline);
+    void WindHangFindRoute(const GraphicsPipeline* pipeline, char kind, u32 sway, bool delivered);
+    u32 WindHangWord(u32* words, u32 frame_slot, u32 view, u32 slot, bool reset, u64 positions,
+                     u64 frame, const BbWind::Snapshot& now);
+    /// bbport (r112q_hang-bracket-route, TOOL; BB_WIND_HANG_FIND=1): the counters a draw's sway word moves, the draw's note (its pair of
+    /// shaders, kind, word and delivery), the report every 600 frames, and the word of BB_WIND_HANG_FORCE
+    BbWindHangRoute::Mark WindHangRouteMark();
+    void WindHangRouteNote(const GraphicsPipeline* pipeline, char kind, u32 word, bool delivered);
+    void WindHangRouteReport();
+    bool WindHangProofDraw(const GraphicsPipeline* pipeline, char kind, u32 word, bool delivered); // bbport (r112r_hang-bracket-judge, TOOL)
+    u32 WindPostWord(u32* words, u32 frame_slot, u32 view, u32 slot, bool reset, u64 positions, u32 positions_size, u32 positions_stride, u64 frame,
+                     const BbWind::Snapshot& now); // bbport (r112s_hang-bracket-move)
+    u32 WindHangForceWord(u32* words, u32 frame_slot, u32 view, u32 slot, const BbWind::Snapshot& now);
+    /// bbport (r112b_hang-probe, TOOL; BB_WIND_HANG_PROBE=1): a skinned sway draw's first bone
+    /// palette goes to hang_probe (from WindHangVerdict); the report goes out once, with r112's
+    /// 600-frame lines
+    void WindHangProbeSkin(const GraphicsPipeline* pipeline, u64 positions, u32 positions_size);
+    void WindHangProbeReport();
+    /// bbport (r7_cascades): far sun cascades kept from an earlier frame (sun_hold,
+    /// vk_rasterizer_effects.cpp). All run on the thread recording draws (stage B).
+    bool SunHoldEarly(const GraphicsPipeline* pipeline);
+    void SunHoldBeforePass(RenderState& state);
+    void SunHoldInPass(const RenderState& state);
+    void SunHoldDrawn();
+    void SunHoldOther(const Shader::Info* first, const Shader::Info* second, bool graphics);
+    void SunHoldFlush();
+    void SunHoldClear(u32 quadrants);
+    bool SunHoldImageIntact();
+    void SunHoldOff(const char* why);
+    void SunHoldFrameEnd();
+    /// bbport (r14_cascade_keep): the atlas quadrants of cascades the game left undrawn keep their
+    /// depth (sun_keep, vk_rasterizer_effects.cpp). On the thread recording draws.
+    bool SunKeepGate() const;
+    void SunKeepBeforePass(RenderState& state, bool indirect);
+    void SunKeepInPass(const RenderState& state);
+    /// bbport: the game's sun shadow atlas (sun_atlas, vk_rasterizer_effects.cpp).
+    void SunAtlasResolve(const Shader::Info& ps);
+    bool SunAtlasSkipDraw(const GraphicsPipeline* pipeline, const RenderState& state);
+    void SunAtlasReader(const char* what, u64 hash);
+    void SunAtlasFrameEnd();
+    /// bbport (r12_atlas_skip_live): readers of the atlas while far cascades are left out.
+    bool SunAtlasLiveReader(const GraphicsPipeline* pipeline, const RenderState& state,
+                            u64 ps_hash);
+    void SunAtlasReaderQuery(vk::QueryPool& pool, u32& index);
+    void SunAtlasQueriesFrameEnd();
+    /// r7 diagnostics of the sun atlas (vk_rasterizer_effects.cpp); they change nothing drawn.
+    void SunAtlasLight(const GraphicsPipeline* pipeline, u32 cascade, float width, float height);
+    void SunAtlasDescribeReader(const GraphicsPipeline* pipeline, const RenderState& state);
+    void SunAtlasStatsFrameEnd();
+    void SunAtlasStatsReport(double frames);
+    /// bbport (r64_surface-probe): BB_SURFACE_PROBE=1 (read once at start, off by default) logs how
+    /// the game draws each pair of vertex and pixel shaders, so that one short walk tells how window
+    /// panes, lantern glass, small water and blood are drawn (vk_rasterizer_effects.cpp). Log only:
+    /// nothing is drawn, bound, measured or compiled for it. Called only while surface_probe_on.
+    static bool SurfaceProbeWanted();
+    void SurfaceProbeDraw(const GraphicsPipeline* pipeline, bool indirect);
+    void SurfaceProbeLamps(const u32* lights, u32 count);
+    void SurfaceProbeWater(const u64* counts, u32 count);
+    void SurfaceProbeFrameEnd();
+    /// bbport (r64b_surface-probe-more): the readback at the first blended scene draw, and the ray
+    /// traced scene's counts before its frame end. Called only while surface_probe_on.
+    void SurfaceProbeBlendedScene();
+    void SurfaceProbeRtScene();
+    const bool surface_probe_on = SurfaceProbeWanted(); ///< bbport (r64_surface-probe)
+    const bool cloud_probe_on = CloudProbe::Wanted(); ///< bbport (r104_cloud-probe): TOOL
+    /// bbport (r108_spark-probe, TOOL): BB_SPARK_PROBE=1 (read once at start, off by default) logs, a
+    /// second after each press of the transform button (L1), the draws new against the second before
+    /// the press and those whose largest draw grew (vk_spark_probe.cpp). Log only. Called only while
+    /// spark_probe_on.
+    static bool SparkProbeWanted();
+    void SparkProbeDraw(const GraphicsPipeline* pipeline, bool indirect);
+    const bool spark_probe_on = SparkProbeWanted(); ///< bbport (r108_spark-probe, TOOL)
+    /// bbport (r110_weapon-sparks): BB_WEAPON_SPARKS=1|2 (read once at start, off by default) draws
+    /// the game's own trick weapon transform effect again for 1.5 s after each press of the transform
+    /// button (L1): brighter, and with 2 also falling copies (vk_weapon_sparks.cpp). Called only
+    /// while weapon_sparks_on, right after the draw command.
+    static bool WeaponSparksWanted();
+    void WeaponSparksAfterDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 num_indices,
+                               u32 num_instances, u32 first_vertex, u32 first_instance);
+    const bool weapon_sparks_on = WeaponSparksWanted(); ///< bbport (r110_weapon-sparks)
+    /// Lamps apart (vk_point_shadow.h): something that is not a draw may touch the light targets.
+    void EffectsEndLampBatch();
     void EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                             u32 index_offset);
     void EffectsBeforeTargets(const GraphicsPipeline* pipeline);
     void EffectsAfterTargets(const GraphicsPipeline* pipeline);
     void EffectsBlendedScene();
+    void EffectsSceneComposite(const GraphicsPipeline* pipeline); // bbport (r45_drawn-look)
     void EffectsBeforeUpscaler(u64 compute_hash);
     void EffectsBeforeResources(const GraphicsPipeline* pipeline);
     void EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                            u32 index_offset, u32 first_vertex);
+    /// bbport (r96_lamp-flicker-colour): BB_LAMP_FLICKER: a light draw's records with its flame
+    /// lamps flickered, its buffer 1 bound to them (null: the draw is left as it is).
+    const u32* LampFlickerBind(const GraphicsPipeline* pipeline, const Shader::Info& ps,
+                               VAddr lights, u32 count);
     vk::Rect2D EffectTile(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                           u32 index_offset, u32 first_vertex) const;
     void EffectsAfterDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed, u32 num_indices,
@@ -609,17 +784,414 @@ private:
     std::unique_ptr<SsrTemporal> ssr_temporal;
     std::unique_ptr<RtShadow> rt_shadow;
     std::unique_ptr<ContactShadow> contact_shadow;
+    /// bbport (r105_cloud-shadows): made only with BB_CLOUD_SHADOWS above 0 or
+    /// BB_CLOUD_SHADOWS_SHOW=1 (CloudShadow::Wanted), else null.
+    std::unique_ptr<CloudShadow> cloud_shadow;
+    /// bbport (r119_volumetric-clouds): made only with BB_VOLUMETRIC_CLOUDS=1 (CloudLayer::Wanted), else
+    /// null: its hooks are null pointer tests. Declared after cloud_shadow: it reads that one's clock.
+    std::unique_ptr<CloudLayer> cloud_layer;
     std::unique_ptr<PointShadow> point_shadow;
     std::unique_ptr<VolumetricLight> volumetric_light;
+    /// bbport (r82_wind-stage1): the shared wind (bbport_wind.h) and the steady clock at its
+    /// last advance (zero: not advanced yet); both change only with BB_WIND=1 (WindOnFrameEnd).
+    BbWind::State wind;
+    std::chrono::steady_clock::time_point wind_time{};
+    /// bbport (r89_wind-foliage-sway): the plants' base slots, this frame's views (their 28
+    /// constants, sway_views of them, of ObjectMotion frame sway_frame), the log's counts and
+    /// the frame ends counted (all only with BB_WIND=1 and BB_WIND_SWAY above 0)
+    BbWindSway::Slots sway_slots;
+    std::array<BbWindSway::ViewKey, BbWindSway::Views> sway_keys{};
+    u32 sway_views = 0;
+    u64 sway_frame = ~u64{0};
+    BbWindSway::Stats sway_stats;
+    /// bbport (r89b_wind-sway-ripple): the ripple's wave phases (BB_WIND_SWAY_RIPPLE above 0)
+    BbWindSway::Ripple sway_ripple;
+    /// bbport (r117_wind-shelter): made only with BB_WIND=1 and BB_WIND_SHELTER above 0
+    /// (WindShelter::Wanted, read once), else null: its hooks are null pointer tests.
+    std::unique_ptr<WindShelter> wind_shelter;
+    u64 sway_frames = 0;
+    BbWindTwigs::Book twig_book;   // bbport (r89d_tree-twigs): sun-drawn streams judged
+    BbWindTwigs::Stats twig_stats; // and the line's counts
+    BbWindCensus::Book twig_census; // bbport (r89i_twigs-colour-pass, TOOL): the colour passes' rows
+    /// bbport (r89j_twigs-pick-trees): the index range of the candidate draw being recorded (WindTreesDraw), the verdicts
+    /// on draw ranges, the counters; the pick's note of the draw (kind, sway word), queries and patch
+    struct TreesDraw {
+        u64 index_address = 0;
+        u32 num_indices = 0;
+        s32 base_vertex = 0;
+        u32 index_size = 0;
+        bool valid = false;
+    } trees_draw;
+    BbWindTrees::Book trees_book;
+    BbWindTrees::Stats trees_stats;
+    unsigned trees_lines = 0;
+    bool trees_last_limb = false; ///< bbport (r89k_twigs-opaque-word): the draw WindTreesDraw took last is a limb piece
+    u64 trees_frames = 0;
+    struct TreesPickNote {
+        int kind = 3;
+        u32 sway = 0;
+    } trees_pick_note;
+    struct TreesPickGroup {
+        u32 used = 0;
+        bool pending = false;
+        u64 tick = 0;
+        u32 point = 0;
+        u32 skipped = 0;
+        u32 meet = 0, apart = 0; ///< bbport (r89k): G-buffer scissors that met / missed the patch
+        u64 frame = 0;           ///< the frame it was drawn in
+        bool cam_ok = false;
+        std::array<float, 3> cam{};
+        BbWindTrees::Rect rect{};
+        std::vector<BbWindTrees::PickDraw> draws;
+    };
+    struct TreesPick {
+        vk::UniqueQueryPool pool{};
+        bool tried = false;
+        bool said = false;
+        u32 group = 0;
+        u64 frame = 0;
+        std::array<TreesPickGroup, BbWindTrees::PickGroups> groups;
+    } trees_pick;
+    bool trees_pick_rect_on = false; ///< this frame draws only the pick's patch of the G-buffer
+    vk::Rect2D trees_pick_rect{};
+    /// bbport (r89k): scissors that met / missed this frame's patch; mutable: UpdateViewportScissorState is const
+    mutable u32 trees_pick_meet = 0, trees_pick_apart = 0;
+    // bbport (r86l_glint-pick-glass, TOOL): the glass pick. trees_pick_draw: this draw is narrowed to the patch and given a query
+    // (the G-buffer's, as r89j had it, and with the glass pick armed the forward draws of the scene); trees_pick_glass: the glass
+    // pick is armed (its draw facts are kept); trees_pick_indexed: the draw is indexed; glass_pick_note: the capture hook's facts
+    // of the draw the query site asks about
+    bool trees_pick_draw = false;
+    bool trees_pick_glass = false;
+    bool trees_pick_indexed = false;
+    RtGlassPick::PaneSpec glass_pick_panes{};
+    struct GlassPickNote {
+        bool valid = false;
+        u64 positions = 0, key = 0;
+        u32 index_count = 0;
+        u32 flags = 0;
+    } glass_pick_note;
+    void GlassPickPoll();
+    void GlassPickStash(const RtShadow::Draw& draw);
+    void GlassPickGroup(const TreesPickGroup& g, const std::vector<u64>& counts, vk::Result result,
+                        const BbWindTrees::Point& pt);
+    // bbport (r86m_glint-pane-from-triangle, TOOL; BB_GLASS_PICK_TRI=1): the G-buffer's texels at the pick pixels, once when the
+    // pick is armed. glass_tri_read: wanted at the next blended draw of a frame that is no pick frame; glass_tri_gb, glass_tri_depth:
+    // the targets of the last G-buffer pass (EffectsAfterTargets); glass_tri_job: the copy on its way (GlassTriReadPoll).
+    const bool glass_tri_on = RtGlassTri::On();
+    bool glass_tri_read = false;
+    std::array<VideoCore::ImageId, 5> glass_tri_gb{};
+    VideoCore::ImageId glass_tri_depth{};
+    struct GlassTriJob;
+    std::shared_ptr<GlassTriJob> glass_tri_job;
+    void GlassTriReadback();
+    void GlassTriReadPoll();
+    BbWindTrees::Rect trees_pick_game{}; ///< bbport (r89l_twigs-palette-move): this frame's patch in game-target pixels
+    /// bbport (r112_wind-more-things): the hanging things' streams, the log's counts, the push
+    /// tables' follower, and which views of ObjectMotion frame hang_frame have their table
+    BbWindHang::Book hang_book;
+    BbWindHang::Stats hang_stats;
+    BbWindHangStill::Book hang_still; // bbport (r112d_hang-still-test): palettes' content
+    BbWindHangStill::BoxBook hang_box; // bbport (r112f_hang-gpu-judge): the GPU keys' verdicts
+    bool hang_judge = false; // set by WindHangVerdict: this draw's stream wants the judging word
+    /// bbport (r112p_hang-gpu-palette-lanterns): the streams the CPU palette test refuses (census), the pages of the first
+    /// GPU-written palettes watched for a shader write (watch; fed by BindBuffers), the counts of the report window
+    BbWindHangGpu::Census hang_gpu_census;
+    BbWindHangGpu::Watch hang_gpu_watch;
+    BbWindHangGpu::Stats hang_gpu_stats;
+    /// bbport (r112h_hang-not-the-hunter): who may hang: the tests, the hunter, the facts of the judging
+    /// draws, the sway words lost for want of a motion parameter
+    BbWindHangActors::Book hang_actors;
+    /// bbport (r112i_hang-find-lanterns): the static streams' verdicts, the ray traced scene's boxes they
+    /// are measured against, the capture draws' shaders (the survey) and the counts
+    BbWindHangFind::StaticBook hang_static_book;
+    BbWindHangFind::BoxSet hang_find_boxes;
+    BbWindHangFind::Draws hang_find_draws;
+    BbWindHangFind::Routes hang_find_routes; // bbport (r112k_hang-lantern-verdict, TOOL grade): the survey's routes
+    BbWindHangFind::Stats hang_find_stats;
+    BbWindHang::Push hang_push;
+    u64 hang_frame = ~u64{0};
+    std::array<bool, BbWindSway::Views> hang_filled{};
+    BbWindHangRoute::TintBook hang_tint; // bbport (r112r_hang-bracket-judge, TOOL): the pairs' hang words since the start
+    bool hang_proof_hide = false; // the Motion block's verdict for the draw in flight: leave it out (BB_WIND_HANG_PROOF_HIDE)
+    BbWindHang::PostBook hang_post; // bbport (r112s_hang-bracket-move): the bracket lanterns' posts (BB_WIND_HANG_POST)
+    BbWindHangRoute::Book hang_route; // bbport (r112q_hang-bracket-route, TOOL): the stream groups' routes
+    BbWindHangRoute::Mark hang_route_before; // the counters before the draw's word
+    std::unique_ptr<BbWindHangProbe::Skin> hang_probe; // bbport (r112b, TOOL): null when off
     std::unique_ptr<SkySeam> sky_seam;
     std::unique_ptr<SkyZenith> sky_zenith;
+    /// bbport (r98_ambient-particles): made only with BB_PARTICLES above 0 and the upscaler
+    /// on, else null; it draws through TemporalUpscaler::after_upscale.
+    std::unique_ptr<AmbientParticles> ambient_particles;
+    /// bbport (r100c_blood-pool-probe, TOOL): made only with BB_BLOOD_POOL_PROBE not off at start
+    /// (BloodPoolProbe::Wanted), else null: its hooks are null pointer tests. BloodPoolProbeBefore
+    /// (vk_blood_pool_probe.cpp) hands it a draw's targets; called only while it is made.
+    std::unique_ptr<BloodPoolProbe> blood_pool_probe;
+    void BloodPoolProbeBefore(const GraphicsPipeline* pipeline, bool indirect, bool light);
+    /// bbport (r100d_blood-pool-draws, TOOL): a probed draw's index range and textures once they are
+    /// bound (vk_blood_pool_probe.cpp); called only while blood_pool_probe is made.
+    void BloodPoolProbeNote(const GraphicsPipeline* pipeline, bool indirect, bool is_indexed,
+                            u32 index_offset);
     std::unique_ptr<DepthOfField> depth_of_field;
     std::unique_ptr<FroyokBloom> froyok_bloom;
+    /// bbport (r95_halation, r109a): null until the first frame with a strength above 0
+    /// (Halation::Strength), then made (EffectsBeforeUpscaler) and kept.
+    std::unique_ptr<Halation> halation;
+    /// bbport (r120_test-camera-lookat, TOOL): null until the first BB_TEST_WORLD_AT read (or BB_TEST_CAMERA=lookat:centre), then made
+    /// (EffectsBeforeUpscaler) and kept; its hooks are null pointer tests.
+    std::unique_ptr<TestWorldAt> test_world_at;
+    /// bbport (r100_blood-sheen): made only with BB_BLOOD_SHEEN on (BloodSheen::Wanted), else
+    /// null: its hooks are null pointer tests.
+    std::unique_ptr<BloodSheen> blood_sheen;
+    /// bbport (r86b_glass-visible): made only with BB_GLASS_GLINT and BB_RT_GLASS on
+    /// (GlassGlint::Wanted), else null: its hooks are null pointer tests. glint_pending: the
+    /// pipeline of the pane draw EffectsCaptureDraw admitted, for its EffectsAfterDraw.
+    std::unique_ptr<GlassGlint> glass_glint;
+    const GraphicsPipeline* glint_pending = nullptr;
+    /// bbport (r86i_glint-find-gbuffer): a pane drawn by the G-buffer (BB_GLASS_BOX_PANES): its glint waits
+    /// for the lit scene (EffectsBlendedScene); the draw's pair and counts for the log; cleared at the frame end.
+    ::BbGlassGlint::PaneDraw glint_gpane{};
+    bool glint_gpane_on = false;
+    /// bbport (r111_footprints): made only with BB_FOOTPRINTS on (Footprints::Wanted), else null:
+    /// its two hooks are null pointer tests.
+    std::unique_ptr<Footprints> footprints;
+    std::unique_ptr<DrawnLook> drawn_look; // bbport (r45_drawn-look)
+    // bbport (r107_caustics): made only while BB_CAUSTICS gives a strength above 0 or "show"
+    // (Caustics::Wanted, read once), else null: its three hooks are null pointer tests.
+    std::unique_ptr<Caustics> caustics;
+    // bbport (r97_heat-haze): made only while BB_HEAT_HAZE gives a strength above 0
+    // (HeatHaze::Wanted, read once), else null: its hooks are null pointer tests.
+    std::unique_ptr<HeatHaze> heat_haze;
+    // bbport (r62_leaf-stage3): made only with BB_RT_CARD_ALPHA=2 (CardAlpha::Wanted), else null;
+    // card_bound_on: it is made and on (set once, at the start; read by the binding helper too):
+    // BindTextures notes what a pixel shader's binding found (DrawContext::card_bound) and a
+    // cut-out draw asks for its card's layer.
+    std::unique_ptr<CardAlpha> card_alpha;
+    bool card_bound_on = false;
     bool effects_wanted = false;
+    /// bbport (r45_drawn-look): DrawnLook::Wanted() as EffectsOnFrameEnd read it. Apart from
+    /// effects_wanted: wanting the look starts none of the other effects' work on every draw.
+    bool drawn_look_wanted = false;
     u32 ssr_frame = 0;
     u32 shadow_frame = 0;
     vk::Rect2D effect_tile{};
+    /// bbport: of the draw EffectsBeforeBind is called for: its pass's size, and whether its first
+    /// two colour targets are cleared when the pass begins (lamps apart, vk_point_shadow.h).
+    vk::Extent2D effect_pass{};
+    bool effect_plain_pair = false;
+    bool effect_skip_draw = false; ///< bbport: EffectsBeforeBind left this draw out
+    /// bbport: the game's sun shadow atlas while the ray traced sun or the VSM replaces the
+    /// game's sun shadow: draws into cascades nothing samples are left out (SunAtlasSkipDraw;
+    /// experiment 8192 draws them all, as before).
+    struct SunAtlas {
+        VAddr address = 0;             ///< the shadow resolve's image 1 (0: none seen)
+        std::array<float, 3> splits{}; ///< the resolve's cascade splits (constants 80..82)
+        bool splits_valid = false;
+        float coverage = 0.0f;         ///< the resolve's uniforms 72 (shadow distance)
+        float reach = 0.0f;            ///< the volumetric march's this frame (0: not sampled)
+        bool resolved = false;         ///< a resolve was seen this frame
+        bool other_reader = false;     ///< sampled by something else: never left out again
+        bool any_skipped = false;      ///< a draw was left out this frame
+        u32 steady = 0;                ///< frames in a row whose sun shadow was replaced
+        u32 needed = 4;                ///< cascades the volumetric march samples
+        u32 skip_from = 4;             ///< first cascade left out (4: none)
+        u32 skipped_mask = 0;          ///< cascades with draws left out since the last resolve
+        u32 drawn_mask = 0;            ///< cascades with draws this frame
+        // bbport (r51_volumetric-leak): the cascades the volumetric march read at the last resolve
+        // (VolumetricOcclusion::Valid), and in how many of the frames it marched; the r19 path
+        // counts draws into drawn_mask while the march wants it (mask_wanted), looking the depth
+        // target up once a pass (mask_pass, mask_atlas); mask_spread counts this frame's atlas
+        // draws across quadrants or without a single viewport (all four for the mask, as r14
+        // counts them), spread_frames the frames with one. mask_wanted ends with a frame
+        // without a resolve.
+        u32 valid_mask = 0xF;
+        std::array<u32, 4> valid_frames{};
+        u32 march_frames = 0;
+        bool mask_wanted = false;
+        u64 mask_pass = ~0ull;
+        bool mask_atlas = false;
+        u32 mask_spread = 0, spread_frames = 0;
+        u32 frames = 0, left_out_frames = 0;
+        std::array<u64, 4> cascade_draws{}, cascade_skipped{}, cascade_frames{};
+        // r7 (diagnostics only): every draw into the atlas is counted, whatever is left out.
+        u64 reader_vs = 0, reader_ps = 0; ///< the other reader's shaders (0: none, or a dispatch)
+        u64 reader_draws = 0;             ///< its draws since the last report
+        u64 last_pass = ~0ull;            ///< Scheduler::PassesBegun at the last atlas draw
+        const GraphicsPipeline* last_pipeline = nullptr;
+        u64 atlas_draws = 0, atlas_passes = 0, clear_passes = 0, clear_draws = 0;
+        u64 no_viewport = 0, spanning = 0, same_pipeline = 0, no_constants = 0;
+        struct PassNote {
+            u8 cascade = 0; ///< 0..3; 4 across cascades, 5 no single viewport, 6 mixed
+            u8 clear = 0;   ///< 1: the pass begins with a clear, 2: a DB clear draw in it
+            u16 draws = 0;
+            s16 x = 0, y = 0;
+            u16 w = 0, h = 0;
+        };
+        std::array<PassNote, 64> pass_notes{};
+        u32 pass_count = 0, pass_logs = 0;
+        bool pass_log = false, note_open = false, check_frame = false;
+        u64 stats_frame = 0;
+        struct Light {
+            std::array<float, 28> m{};         ///< projection (4x4 rows), view to world (3x4 rows)
+            float width = 0.0f, height = 0.0f; ///< the cascade's viewport
+            bool valid = false;
+        };
+        std::array<Light, 4> light{}, previous_light{};
+        u32 light_mask = 0; ///< cascades whose light matrix was read this frame
+        struct LightStats {
+            u64 compared = 0, same = 0, turned = 0, moved = 0, measured = 0, whole = 0;
+            u64 checked = 0, other_matrix = 0;
+            double sum_texels = 0.0, max_texels = 0.0, max_delta = 0.0;
+        };
+        std::array<LightStats, 4> light_stats{};
+    } sun_atlas;
+    /// bbport (r19_draw-cost): what this draw's Motion block found (DrawRecord), for
+    /// EffectsCaptureDraw of the same draw: its index range check and, when its buffer walk met
+    /// no skeleton and no GPU-written palette (complete), its bone palette hash.
+    struct R19Motion {
+        bool valid = false;
+        bool indices_valid = false;
+        bool palette_complete = false;
+        u64 palette = 0;
+    } r19_motion;
+    /// bbport (r19_draw-cost): short path counters, printed every 600 frames (EffectsOnFrameEnd).
+    struct R19Stats {
+        u64 frames = 0, sun_short = 0, motion_indices = 0, motion_palettes = 0;
+    } r19_stats;
+    /// bbport (r12_atlas_skip_live, experiment bit 549755813888 clear): who else samples the sun
+    /// atlas. The water (ps e3021062) is measured by occlusion queries of its own around its draws,
+    /// read without waiting once the GPU is past the frame; far cascades are left out only while it
+    /// showed no samples for QuietFrames frames. Any other draw reader, or a dispatch or indirect
+    /// draw using the atlas, keeps every cascade for the rest of the session (as before).
+    struct SunReader {
+        static constexpr u32 Groups = 8;      ///< frames of water queries in flight at most
+        static constexpr u32 PerGroup = 8;    ///< water draws measured in a frame at most
+        static constexpr u64 QuietFrames = 8; ///< frames without water samples before leaving out
+        static constexpr u64 MaxLag = 4;      ///< an answer later than this: the water counts as seen
+        vk::UniqueQueryPool pool{};
+        bool pool_tried = false;
+        bool measure_now = false; ///< the draw being recorded is a water draw (SunAtlasSkipDraw)
+        bool latched = false;     ///< another reader: every cascade is drawn from now on
+        bool water_noted = false;
+        bool cleared = false; ///< this frame's atlas pass began with a clear of the whole image
+        VideoCore::ImageId cleared_image{}; ///< the image that clear was of
+        bool quiet = false;   ///< no water samples (nor unmeasured water draws) lately
+        bool blocked = false; ///< this frame's query group still waits for its answer
+        bool water_now = false, unmeasured_now = false; ///< this frame
+        bool water_before = false; ///< the frame before drew the water
+        u32 group = 0;                    ///< this frame's group of queries
+        std::array<u32, Groups> used{};   ///< queries begun in a group's frame
+        std::array<u64, Groups> tick{};   ///< the scheduler tick at that frame's end
+        std::array<u64, Groups> frame{};  ///< that frame's frame_index
+        std::array<bool, Groups> pending{}; ///< its answers not read yet
+        u64 frame_index = 0;
+        u64 last_seen = 0; ///< the last frame whose water had samples or was not measured
+        // Report (every 600 frames, with the "Sun atlas:" lines).
+        u64 water_draws = 0, measured = 0, unmeasured = 0, water_frames = 0;
+        u64 seen_frames = 0, hidden_frames = 0, late = 0, blocked_frames = 0, other_draws = 0;
+        u64 clear_kept = 0, colour_kept = 0, motion_kept = 0;
+        std::array<u64, 4> capture_kept{};
+    } sun_reader;
+    /// bbport (r7_cascades): far sun cascades kept from an earlier frame. A cascade whose caster
+    /// draws carry the light matrix, viewport and scissor its quadrant was drawn with is not drawn
+    /// again (BB_SUN_CASCADE_EVERY; experiment 268435456 draws every cascade every frame).
+    struct SunHold {
+        struct Light {
+            std::array<float, 28> m{}; ///< projection (4x4 rows), view to world (3x4 rows)
+            u64 view = 0;              ///< SunViewKey of its draws (viewport, scissor registers)
+            bool valid = false;
+        };
+        struct ViewEntry {
+            u64 key = 0;
+            u8 cascade = 4; ///< 0..3; 4: more than one quadrant, or no single viewport
+            bool used = false;
+        };
+        bool active = false;       ///< asked for, experiment 268435456 clear, not off for good
+        bool off_for_good = false; ///< something it does not handle was seen (printed)
+        std::array<u32, 4> every{1, 1, 1, 1}; ///< BB_SUN_CASCADE_EVERY
+        VAddr atlas = 0;     ///< sun_atlas.address at the last frame end
+        VAddr z_address = 0; ///< the atlas's depth base register (learned from its passes)
+        VideoCore::ImageId image{};
+        u64 image_uid = 0;
+        const void* backing = nullptr;
+        VideoCore::SubresourceRange range{};
+        u32 width = 0, height = 0;
+        RenderState last_state{}; ///< an atlas pass drawing depth, loading it (SunHoldFlush)
+        bool last_state_valid = false;
+        std::array<ViewEntry, 16> views{};
+        u32 next_view = 0;
+        // The draw being recorded (SunHoldEarly, SunHoldInPass, SunHoldDrawn).
+        u64 draw_key = 0;
+        u8 draw_cascade = 4; ///< a classified atlas draw going to be drawn (4: none)
+        u8 draw_learned = 4;
+        bool draw_known = false;
+        bool atlas_pass = false;
+        // This frame.
+        u32 plan = 0, plan_start = 0; ///< cascades to keep (drawn after all if their matrix moved)
+        u32 decided = 0, confirmed = 0, spared = 0, pending_clear = 0, stale = 0;
+        float clear_depth = 1.0f;
+        bool image_checked = false, force = false;
+        const char* why = "";
+        u32 atlas_draws = 0, unknown_draws = 0, spanning_draws = 0;
+        std::array<u32, 4> arrived{}, drawn{};
+        std::array<Light, 4> frame_light{};
+        std::array<VAddr, 4> const_address{};
+        std::array<bool, 4> match{}, multi{}, special{}, no_constants{};
+        // Across frames.
+        std::array<Light, 4> held{}; ///< what each quadrant was last drawn in full with
+        std::array<u32, 4> age{};    ///< frames it has been kept since
+        std::array<float, 3> splits{};
+        bool splits_valid = false;
+        Light previous_c0{};
+        u32 steady = 0;
+        u64 frame = 0, frames_total = 0;
+        // Report (every 600 frames).
+        u32 frames = 0, kept_frames = 0, forced_frames = 0;
+        const char* last_why = "none";
+        std::array<u64, 4> skipped{}, kept{}, planned{}, broke{}, flushed{};
+        u64 converted = 0, unconverted = 0, flush_failed = 0, mismatched = 0, lost = 0;
+        u64 stale_draws = 0, unknown_total = 0, spanning_total = 0;
+    } sun_hold;
+    /// bbport (r14_cascade_keep): while the game leaves sun cascades undrawn on some frames
+    /// (BbSunCascades::skip_period > 1, experiment 1099511627776 clear) the atlas's clear of the
+    /// whole image is taken over: each quadrant is cleared right before the first draw into it, so
+    /// a quadrant its cascade did not draw into keeps its depth (the game keeps that cascade's
+    /// matrices too). Learned from the draws that arrive; an atlas frame runs from one clear of
+    /// the whole image to the next.
+    struct SunKeep {
+        bool active = false;  ///< at the last clear of the whole image: clears are taken over
+        bool open = false;    ///< this atlas frame's clear was taken over
+        bool tracked = false; ///< `image` was cleared whole or by quadrants since it was made
+        u32 linger = 0;       ///< atlas frames still taken over once the game stops skipping
+        u32 period = 0;       ///< skip_period when last asked
+        VideoCore::ImageId image{}; ///< the atlas image at the last atlas draw
+        u64 image_uid = 0;
+        const void* backing = nullptr;
+        u64 write_seq = 0;         ///< its write_seq then (one count per pass begun on it)
+        u32 width = 0, height = 0; ///< the size of the pass the clear was taken over in
+        float clear_depth = 1.0f;
+        u64 clear_pass = ~0ull; ///< PassesBegun() of the pass whose clear was taken over
+        // The draw being recorded (SunKeepBeforePass, SunKeepInPass).
+        bool atlas_pass = false, indirect = false, take_clear = false;
+        // This atlas frame.
+        u32 cleared = 0xFu;     ///< quadrants cleared (or owed a clear: pending) since its clear
+        u32 drawn = 0;          ///< quadrants with draws
+        u32 pending = 0;        ///< clears owed: recorded with the next draw in a pass that can
+        bool whole_now = false; ///< a fallback cleared every quadrant: nothing kept
+        // Across atlas frames.
+        std::array<u32, 4> age{}; ///< atlas frames in a row a quadrant kept its depth
+        u32 blank = 0;            ///< quadrants holding only the clear value
+        // Report (every 600 atlas frames).
+        u32 frames = 0, mode_frames = 0;
+        u64 taken = 0, whole = 0, rects = 0, deferred = 0;
+        const char* last_whole = "none";
+        std::array<u64, 4> clears{}, expired{}, kept{};
+    } sun_keep;
     bool scene_started = false;
+    /// bbport (r77_parallel-test-runs): clean shot as the last display pass read it, for the
+    /// whole frame (a change never splits a frame's UI), and where that frame is and its UI's
+    /// targets (CleanShotEarly).
+    bool clean_shot_frame = false;
+    UiComposition::CleanShotFrame clean_shot_state;
     /// bbport: the scene depth of the frame before (SkipUncompiledDraw).
     VideoCore::ImageId previous_scene_depth{};
     std::unique_ptr<ObjectMotion> object_motion;
@@ -725,6 +1297,9 @@ private:
     /// Whether the entry's FindImage memo holds in registry generation `generation`: memoized
     /// in it, or an exact match still registered (then taken into it).
     bool LookupMemoized(ImageDescCacheEntry& entry, u64 generation);
+    /// bbport (r62_leaf-stage3): a cut-out draw's card gets its alpha layer (CardAlpha::NoteDraw)
+    /// from the image this draw's pixel shader binding found for the card's T# (card_bound).
+    void NoteCardLayer(CardDraw& card, const Shader::Info& ps);
     ImageDescCacheEntry& CachedImageDescEntry(const AmdGpu::Image& sharp,
                                               const Shader::ImageResource& res) {
         return CachedImageDescEntry(sharp, res, ImageDescHash(sharp, res));
@@ -747,6 +1322,60 @@ private:
         u64 offset;
         vk::IndexType type;
     };
+    /// bbport (r21_draw-sort): experiment bit: set = the old binds (every draw records its
+    /// vertex input, vertex buffers and index buffer) and nothing counted for "Draw order (r21)".
+    static constexpr u64 R21DrawSortOffBit = 70368744177664ull;
+    /// bbport (r21_draw-sort): the vertex input, vertex buffers and index buffer last recorded;
+    /// in force while Scheduler::R21Serial() and R21Epoch() are still `serial` and `epoch`.
+    struct R21Bound {
+        u64 serial = ~0ull;
+        u64 epoch = ~0ull;
+        bool input_known = false, buffers_known = false, index_known = false;
+        VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+        VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+        VertexInputs<vk::Buffer> buffers;
+        VertexInputs<vk::DeviceSize> offsets;
+        u32 num_buffers = 0;
+        IndexBind index{};
+    } r21_bound;
+    /// What the current draw's binds did: 0 nothing to bind (or experiment set), 1 left out
+    /// (equal to the bind in force), 2 recorded (another in force), 3 recorded (unknown what).
+    struct R21Outcome {
+        u8 input = 0, buffers = 0, index = 0;
+    } r21_outcome;
+    struct R21Row {
+        u64 draws = 0, descriptors = 0;
+        std::array<std::array<u64, 4>, 3> binds{}; ///< vertex input, vertex buffers, index buffer
+    };
+    struct R21Stats {
+        u32 frame = 0;
+        u64 frames = 0;
+        bool window_off = false; ///< the experiment bit for every frame of this window
+        u64 pass = ~0ull;        ///< Scheduler::R21FreshPasses of the last counted draw
+        bool atlas_pass = false; ///< that pass draws into the sun atlas
+        const GraphicsPipeline* atlas_last = nullptr;
+        std::array<const GraphicsPipeline*, 64> pass_seen{};
+        u32 pass_seen_n = 0;
+        std::array<const GraphicsPipeline*, 256> frame_seen{};
+        u32 frame_seen_n = 0;
+        struct Counts {
+            R21Row all, atlas;
+            u64 atlas_passes = 0, atlas_changes = 0, atlas_pass_distinct = 0,
+                atlas_frame_distinct = 0;
+        } c;
+    } r21_stats;
+    /// bbport (r21_draw-sort): BB_DRAW_ORDER=1: R21AfterDraw counts and prints "Draw order
+    /// (r21)". Off: nothing counted (the bind skip does not depend on it).
+    static bool R21Counting() noexcept {
+        static const bool on = [] {
+            const char* env = std::getenv("BB_DRAW_ORDER");
+            return env && env[0] == '1';
+        }();
+        return on;
+    }
+    bool R21Begin(bool dynamic_input);
+    void R21End(bool on, u64 serial, u64 epoch);
+    void R21AfterDraw(const GraphicsPipeline* pipeline, bool is_indexed);
     /// The direct draw whose vertex/index buffers BindResources may resolve early.
     struct DrawInputs {
         const GraphicsPipeline* pipeline;
@@ -909,6 +1538,8 @@ private:
     std::array<VertexMemo, 4096> vertex_memo{};
     BbEngine::Batch::Mode vertex_memo_mode = BbEngine::Batch::Off;
     std::pair<const VideoCore::Buffer*, u64> BindVertexMemo(VAddr base, u64 size);
+    /// bbport: the vertex memo is used (on unless LANTERN_VERTEX_MEMO=0; experiment 2097152: off).
+    [[nodiscard]] bool VertexMemoOn() const;
     struct SealedBind {
         VAddr base = 0;
         u64 size = 0;
@@ -956,6 +1587,17 @@ private:
         VertexBinds vertex_binds;
         IndexBind index_bind{};
         DrawInputs draw_inputs{};
+        // bbport (r62_leaf-stage3): with card_bound_on, what the pixel shader's texture binding
+        // of this draw found, image by image (a texture set hit: the set's entries; otherwise its
+        // lookups, before any depth redirect), with the image uids, for NoteCardLayer. stage:
+        // the pixel shader it is for (null: not known, as when an image took several bindings).
+        // 208 bytes a draw context, made for every player; written only with the knob.
+        struct CardBound {
+            const Shader::Info* stage = nullptr;
+            u32 count = 0;
+            std::array<VideoCore::ImageId, TextureSet::MaxImages> ids{};
+            std::array<u64, TextureSet::MaxImages> uids{};
+        } card_bound;
     };
     std::unique_ptr<DrawContext> main_context = std::make_unique<DrawContext>();
     static inline thread_local DrawContext* thread_context = nullptr;

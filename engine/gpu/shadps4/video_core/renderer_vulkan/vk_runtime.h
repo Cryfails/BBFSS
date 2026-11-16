@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <optional>
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -19,6 +20,53 @@ namespace Vulkan {
 
 class GpuProfiler;
 class SceneTargets;
+
+/// bbport (r22_barriers): experiment bit: set = every barrier recorded as before (texture cache
+/// reads after reads, scene proxy barriers in calls of their own). Read at each site.
+inline constexpr u64 R22BarriersOffBit = 140737488355328ull;
+/// bbport (r22_barriers): counts since the last "Barriers (r22):" line (Runtime::TickFrame),
+/// only with BB_FRAME_STATS=1 (BbStats::enabled; every increment tests it first).
+/// Relaxed atomics: texture binds may transit images on the binding helper thread.
+struct R22Counts {
+    std::atomic<u64> flushes{0}, flush_images{0}, texture_issued{0}, texture_skipped{0},
+        proxy_issued{0}, proxy_merged_flush{0}, proxy_merged_pair{0}, proxy_skipped_resolve{0},
+        proxy_skipped_copy{0}, proxy_skipped_read{0};
+};
+inline R22Counts r22_counts;
+/// bbport (r22_barriers): the read accesses (no write of any kind).
+inline constexpr vk::AccessFlags2 R22Reads =
+    vk::AccessFlagBits2::eIndirectCommandRead | vk::AccessFlagBits2::eIndexRead |
+    vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eUniformRead |
+    vk::AccessFlagBits2::eInputAttachmentRead | vk::AccessFlagBits2::eShaderRead |
+    vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eHostRead |
+    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eShaderSampledRead |
+    vk::AccessFlagBits2::eShaderStorageRead;
+/// bbport (r22_barriers): the last barrier of a subresource had the destination
+/// (`had_stages`, `had_access`) and only reads were declared since (`had_access` read only): it
+/// made every earlier write visible to those stages and accesses, and nothing wrote since. A new
+/// read (`stages`, `access`) in the same layout that it covers needs no barrier (read after read).
+/// A later write still waits for the new read: its barrier's source is `had_stages`, which holds
+/// `stages`. Writers that bypass the tracked state must bracket themselves with full barriers
+/// (ClampSceneEdges, vk_temporal_upscaler.cpp, does: eAllCommands before, eAllCommands after).
+inline bool R22Covered(vk::PipelineStageFlags2 had_stages, vk::AccessFlags2 had_access,
+                       vk::PipelineStageFlags2 stages, vk::AccessFlags2 access) {
+    const auto read_only = [](vk::AccessFlags2 a) { return bool(a) && !(a & ~R22Reads); };
+    if (!had_stages || !read_only(had_access) || !read_only(access)) {
+        return false;
+    }
+    if (!(had_stages & vk::PipelineStageFlagBits2::eAllCommands) && (stages & ~had_stages)) {
+        return false;
+    }
+    if (had_access & vk::AccessFlagBits2::eMemoryRead) {
+        return true;
+    }
+    if (had_access & vk::AccessFlagBits2::eShaderRead) { // = sampled | storage read (and more)
+        had_access |=
+            vk::AccessFlagBits2::eShaderSampledRead | vk::AccessFlagBits2::eShaderStorageRead;
+    }
+    return !(access & ~had_access);
+}
 
 class Instance;
 class Scheduler;
@@ -116,6 +164,12 @@ public:
     void NoteAliasedAccess(const VideoCore::Buffer* handle, u64 offset, u64 size);
 
     void FlushBarriers();
+    /// bbport (r22_barriers): a barrier of an image the texture cache does not track (a scene
+    /// proxy), recorded by the next FlushBarriers in its call.
+    void QueueImageBarrier(const vk::ImageMemoryBarrier2& barrier) {
+        BeforeImageAccess();
+        image_barriers.push_back(barrier);
+    }
 
     /// bbport: runs before this thread changes image state (layouts, pending image
     /// barriers): the rasterizer joins its texture binding helper there (BindHelper).

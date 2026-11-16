@@ -8,6 +8,7 @@
 #include <string.h>
 
 static int capture, menu, failures;
+static uint32_t overlay_chords;
 static bool keyboard[SDL_SCANCODE_COUNT];
 
 #define CHECK(condition) do { if (!(condition)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); ++failures; } } while (0)
@@ -16,6 +17,7 @@ uint64_t host_monotonic_ns(void) {
     return SDL_GetTicksNS();
 }
 int bbgpu_overlay_captures_input(void) { return capture; }
+uint32_t bbgpu_overlay_pad_chords(void) { return overlay_chords; }
 void bbgpu_anti_lag_before_input(void) {}
 int bbgpu_pc_input(BbPcPad *pad, const bool *keys, int count, int gamepad) {
     (void)pad;
@@ -158,6 +160,66 @@ int main(void) {
     menu = 0;
     CHECK(read(1, &data) == 0 && !(data.buttons & (PAD_CROSS | PAD_CIRCLE)));
     CHECK(sys_pad_button(PAD_CROSS, 0) == SDL_GAMEPAD_BUTTON_EAST);
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_EAST, false));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, false));
+    // A virtual trigger at rest is SDL_JOYSTICK_AXIS_MIN (SDL_SetJoystickVirtualAxis); 0 is half pressed.
+    CHECK(SDL_SetJoystickVirtualAxis(joystick, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, SDL_JOYSTICK_AXIS_MIN));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == 0);
+
+    // L3 + a D-pad direction is an overlay chord: a D-pad button pressed while L3 is held is not
+    // the game's until it is released; L3 is, and so is a D-pad button held before L3.
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_UP, true));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == PAD_UP);
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_LEFT_STICK, true));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == (PAD_L3 | PAD_UP));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_LEFT, true));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, true));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_DOWN, true));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == (PAD_L3 | PAD_UP));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_LEFT_STICK, false));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_UP, false));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == 0); // L3 let go first: the chord's stay away
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_LEFT, false));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_DOWN, false));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == 0);
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, false));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_LEFT, true));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == PAD_LEFT); // pressed again without L3
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_LEFT, false));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == 0);
+
+    // Once the overlay has seen a press it decides (bbgpu_overlay_pad_chords): a press that fired
+    // a chord stays away after L3 is let go; a press it saw fire none is the game's with L3 down
+    // (D-pad Down with scout mode off, or D-pad pressed just before L3).
+    const uint32_t left = 1u << SDL_GAMEPAD_BUTTON_DPAD_LEFT, down = 1u << SDL_GAMEPAD_BUTTON_DPAD_DOWN;
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_LEFT_STICK, true));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_LEFT, true));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == PAD_L3); // not seen by the overlay yet
+    overlay_chords = left | left << 16;                    // seen: it fired clean shot
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_LEFT_STICK, false));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == 0);
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_LEFT_STICK, true));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_DOWN, true));
+    update();
+    CHECK(read(1, &data) == 0 && data.buttons == PAD_L3); // new with L3 down, not seen yet
+    overlay_chords |= down;                               // seen: no chord
+    CHECK(read(1, &data) == 0 && data.buttons == (PAD_L3 | PAD_DOWN));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_LEFT_STICK, false));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_LEFT, false));
+    CHECK(SDL_SetJoystickVirtualButton(joystick, SDL_GAMEPAD_BUTTON_DPAD_DOWN, false));
+    update();
+    overlay_chords = 0;
+    CHECK(read(1, &data) == 0 && data.buttons == 0);
 
     SDL_CloseJoystick(joystick);
     SDL_DetachVirtualJoystick(id);
@@ -165,6 +227,6 @@ int main(void) {
     remove(pad_file);
     remove(config);
     if (failures) return 1;
-    puts("PASS: pad ABI, left/right clicks, SDL touch coordinates, overlay capture, controls, menu buttons");
+    puts("PASS: pad ABI, left/right clicks, SDL touch coordinates, overlay capture, controls, menu buttons, L3 chords");
     return 0;
 }

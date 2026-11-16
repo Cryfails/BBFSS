@@ -1,0 +1,75 @@
+#version 460
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r62_leaf-stage3): one card alpha layer from a game texture (CardAlpha::RecordFills).
+// The source is the game's own view of the texture (Image::FindView with the draw's T# and
+// resource), sampled through a linear sampler: BC1 (its punch-through alpha decodes to 0 or 1),
+// BC3, BC7 and sRGB views are decoded by the hardware as for the game, and the view's component
+// mapping is the T#'s, so view lane `lane` reads what the game's cut-out test reads. One thread
+// a texel of level 0, of level 1 below half the size, of level 2 below a quarter: each level
+// samples the source at its own footprint (rt_card_layers.h, CardFillLod), so no level waits on
+// another inside the dispatch.
+#extension GL_GOOGLE_include_directive : require
+
+#include "rt_card_layers_layout.h"
+
+layout(local_size_x = CARD_FILL_GROUP, local_size_y = CARD_FILL_GROUP) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, r8) uniform writeonly image2DArray level0;
+layout(set = 0, binding = 2, r8) uniform writeonly image2DArray level1;
+layout(set = 0, binding = 3, r8) uniform writeonly image2DArray level2;
+
+layout(push_constant) uniform Push {
+    uint layer;
+    uint lane;
+    uint unused0;
+    uint unused1;
+} pc;
+
+float lane(vec4 texel) {
+    return texel[min(pc.lane, 3u)];
+}
+
+// CardFillAxisTaps: the source texels an axis covers, as a count of taps (1 to the most).
+int axisTaps(float texels) {
+    return int(clamp(ceil(texels - 1e-3), 1.0, float(CARD_FILL_MAX_TAPS)));
+}
+
+// CardFillLod: the level from the smaller side's ratio (log2(ratio) - 1, or 0 when that side is
+// no larger than the level), then on each axis as many bilinear taps as source texels it covers
+// there, spread evenly over the destination texel (a box filter of its footprint).
+float alphaAt(ivec2 p, float size) {
+    const vec2 src_size = vec2(textureSize(src, 0));
+    const float top = float(max(textureQueryLevels(src), 1) - 1);
+    const vec2 ratio = max(src_size, vec2(1.0)) / size;
+    const float small = min(ratio.x, ratio.y);
+    const float lod = small <= 1.0 ? 0.0 : clamp(log2(small) - 1.0, 0.0, top);
+    const vec2 texels = ratio * exp2(-lod);
+    const int nu = axisTaps(texels.x);
+    const int nv = axisTaps(texels.y);
+    const vec2 origin = vec2(p) / size; // the destination texel's corner
+    float sum = 0.0;
+    for (int j = 0; j < nv; ++j) {
+        for (int i = 0; i < nu; ++i) {
+            const vec2 at = origin + (vec2(i, j) + 0.5) / (vec2(nu, nv) * size);
+            sum += lane(textureLod(src, at, lod));
+        }
+    }
+    return sum / float(nu * nv);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const int size = CARD_LAYER_SIZE;
+    if (p.x >= size || p.y >= size) {
+        return;
+    }
+    const int layer = int(pc.layer);
+    imageStore(level0, ivec3(p, layer), vec4(alphaAt(p, float(size))));
+    if (p.x < size / 2 && p.y < size / 2) {
+        imageStore(level1, ivec3(p, layer), vec4(alphaAt(p, float(size / 2))));
+    }
+    if (p.x < size / 4 && p.y < size / 4) {
+        imageStore(level2, ivec3(p, layer), vec4(alphaAt(p, float(size / 4))));
+    }
+}

@@ -13,6 +13,9 @@ namespace Lifter {
 
 static_assert(MotionParamsCapacity == Shader::MotionVectors::ParamsCapacity);
 static_assert(CaptureParamsCapacity == Shader::MotionVectors::CaptureParamsCapacity);
+// bbport (r62c_leaf-stage3-fix): the lifter's card UV store writes 3 or 4 floats a vertex
+static_assert(Shader::MotionVectors::CaptureUvStride == 12 ||
+              Shader::MotionVectors::CaptureUvStride == 16);
 
 namespace {
 
@@ -364,6 +367,15 @@ Input MakeInput(const Shader::Info& info, const Shader::RuntimeInfo& rt,
         }
         in.vertex_motion = (vs.motion_vectors & Shader::MotionVectors::VertexOutputs) != 0;
         in.vertex_capture = (vs.motion_vectors & Shader::MotionVectors::VertexCapture) != 0;
+        // bbport (r89_wind-foliage-sway): the plant sway, as the recompiler's EmitVertexSway
+        in.vertex_sway = in.vertex_motion && (vs.motion_vectors & Shader::MotionVectors::Sway) != 0;
+        // bbport (r122_game-wind-drive): the game's own sine terms give a constant (Lift_::LiftVop, V_SIN_F32)
+        in.vertex_game_cut = in.vertex_sway && (vs.motion_vectors & Shader::MotionVectors::GameCut) != 0;
+        // bbport (r62c_leaf-stage3-fix): the card UVs, as the recompiler's EmitCardUvStore
+        in.capture_uv =
+            in.vertex_capture && (vs.motion_vectors & Shader::MotionVectors::CaptureUv) != 0;
+        in.capture_uv_stride = Shader::MotionVectors::CaptureUvStride;
+        in.capture_uv_unset = Shader::MotionVectors::CaptureUvUnset;
     }
     if (info.hw_stage == HwStage::Fragment) {
         in.tone_curve = Shader::Native::ToneCurveEnabled();

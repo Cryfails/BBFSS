@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "video_core/renderer_vulkan/vk_common.h"
 
 namespace Vulkan::Streamline {
@@ -19,5 +21,15 @@ PFN_vkGetInstanceProcAddr LoadBeforeVulkan();
 void OnDeviceCreated(vk::PhysicalDevice physical);
 /// Before the device is destroyed.
 void Shutdown();
+
+/// bbport: Reflex frame numbers (vk_streamline.cpp). A game thread before it reads the pad: once
+/// per game frame, the Reflex sleep and the frame's simulation start marker (experiment mask 512:
+/// the sleep in the flip step instead; 8388608: no sleep).
+void BeforeGameInput();
+/// A game thread handing a frame over for display (its flip; not for a blank flip): the frame's
+/// number, 0 without Streamline.
+[[nodiscard]] std::uint32_t OnGameFlip();
+/// The GPU command thread right before that flip's PrepareFrame: the number OnGameFlip gave.
+void SetFlipFrame(std::uint32_t index);
 
 } // namespace Vulkan::Streamline

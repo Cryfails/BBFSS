@@ -1,0 +1,573 @@
+#version 460
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r86b_glass-visible): the lamps' glints on the window panes and the glass (bottles, jars)
+// that BB_RT_GLASS puts into the ray traced scene under RT_GLASS_MASK (GlassGlint, right after a
+// pane's forward draw; renderer_vulkan/glass_glint.h has the rules, glass_glint_layout.h the
+// numbers). Two builds:
+//  - COARSE: a thread a block of 4x4 pixels: one camera ray through the block's centre pixel that
+//    meets only panes, up to the depth's distance + 2 cm + 0.2 %. A hit flags the block (1); in the
+//    test view a second ray to the far distance flags a block whose pane lies only behind the depth
+//    (2).
+//  - SHADE: a workgroup an 8x8 tile of pixels (or, when more than 10 % of the blocks are flagged,
+//    of 2x2 quads: a 16x16 tile) runs only when a block under the tile or its one-unit border is
+//    flagged. One pane ray a unit (pixel or quad) of the tile and its border; the normal from the
+//    pane points of the neighbours (central differences 2 units apart, a neighbour farther from the
+//    centre's t than 3 cm + 1 % left out), turned toward the camera; each lamp of the pass a
+//    normalised Blinn-Phong term with Schlick's Fresnel and the lamp's falloff (1 - d / reach)^2;
+//    one shadow ray (lamp mask) to the brightest lamp when its term counts; the sum x strength, put
+//    into 0 to 8 a channel, added to the scene colour. No tint: untinted specular.
+// The ray traced scene is in the view space of CameraMotion's pass camera (the TLAS's instance
+// transform); the camera is at its origin. Ray direction from the pixel as rt_card_view.comp
+// reconstructs it: ndc +y down, the jitter taken out; view z = proj.w / (depth - proj.z).
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "rt_glass_layout.h"
+#include "glass_glint_layout.h"
+
+#if defined(COARSE) == defined(SHADE)
+#error "glass_glint.comp: build it with exactly one of COARSE and SHADE"
+#endif
+
+layout(local_size_x = GLASS_GLINT_GROUP, local_size_y = GLASS_GLINT_GROUP) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1) uniform texture2D depth_tex; // the pane draw's depth, 0..1
+layout(set = 0, binding = 2, rgba16f) uniform image2D scene_img; // the pane draw's target 0
+layout(set = 0, binding = 3, std430) buffer Work {
+    uint block_flags[]; // a word a block, row by row: 0 none, 1 a pane in front, 2 only behind
+};
+layout(set = 0, binding = 4, std430) buffer Counters {
+    uint counters[]; // GLASS_GLINT_SLOTS counter slots, then their data blocks
+};
+
+layout(push_constant) uniform Push {
+    vec4 proj;   // CameraMotion's: x scale, y scale, z scale, z offset
+    vec4 frame;  // width, height (render pixels), jitter x, y (pixels)
+    uvec4 info;  // blocks across, blocks down, slot, flags
+    vec4 params; // strength, exponent, (exponent + 8) / 8 (the game's lamp units), 0
+} pc;
+
+uint SlotBase() {
+    return pc.info.z * GLASS_GLINT_SLOT_WORDS;
+}
+
+uint DataBase() {
+    return GLASS_GLINT_SLOTS * GLASS_GLINT_SLOT_WORDS + pc.info.z * GLASS_GLINT_DATA_WORDS;
+}
+
+ivec2 Size() {
+    return ivec2(pc.frame.xy);
+}
+
+bool Show() {
+    return (pc.info.w & GLASS_GLINT_FLAG_SHOW) != 0u;
+}
+
+// The unit camera ray through `pos` (render pixels, continuous: a pixel's centre is + 0.5).
+vec3 RayDir(vec2 pos) {
+    const vec2 ndc = (pos - pc.frame.zw) / pc.frame.xy * 2.0 - 1.0;
+    // view z = proj.w / (depth - proj.z) with depth - proj.z below 0: z has the sign of -proj.w
+    const float z_sign = pc.proj.w < 0.0 ? 1.0 : -1.0;
+    return normalize(vec3(ndc.x / pc.proj.x, ndc.y / pc.proj.y, 1.0) * z_sign);
+}
+
+// The distance from the camera to the point the depth holds at pixel `p`; the sky is FAR away.
+float DepthT(ivec2 p) {
+    const float depth = texelFetch(depth_tex, p, 0).r;
+    if (!(depth < 1.0)) {
+        return float(GLASS_GLINT_FAR);
+    }
+    const float z = pc.proj.w / min(depth - pc.proj.z, -1e-8);
+    const vec2 ndc = (vec2(p) + 0.5 - pc.frame.zw) / pc.frame.xy * 2.0 - 1.0;
+    return length(vec3(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z));
+}
+
+// How far a pane may lie and still be in front of the depth at distance `t`.
+float Reach(float t) {
+    return t + float(GLASS_GLINT_TOL_ABS) + float(GLASS_GLINT_TOL_REL) * t;
+}
+
+// The nearest pane on the camera ray along `dir` up to `tmax` (`any`: the first found), or -1.
+float PaneT(vec3 dir, float tmax, bool any) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene,
+                          gl_RayFlagsOpaqueEXT | (any ? gl_RayFlagsTerminateOnFirstHitEXT : 0u),
+                          RT_GLASS_MASK, vec3(0.0), 0.0, dir, tmax);
+    while (rayQueryProceedEXT(query)) {
+    }
+    return rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT
+               ? rayQueryGetIntersectionTEXT(query, true)
+               : -1.0;
+}
+
+// bbport (r86e_glint-hit-distance): raw values for the log (glass_glint_layout.h GLASS_GLINT_DBG_*):
+// where this slot's records start in the counters buffer
+uint DbgBase() {
+    return GLASS_GLINT_SLOTS * GLASS_GLINT_SLOT_WORDS + GLASS_GLINT_SLOTS * GLASS_GLINT_DATA_WORDS +
+           pc.info.z * GLASS_GLINT_DBG_WORDS;
+}
+
+// The view-space point the depth `raw` gives at pixel `p`, as DepthT builds it (0 for the sky).
+vec3 DepthPoint(ivec2 p, float raw) {
+    if (!(raw < 1.0)) {
+        return vec3(0.0);
+    }
+    const float z = pc.proj.w / min(raw - pc.proj.z, -1e-8);
+    const vec2 ndc = (vec2(p) + 0.5 - pc.frame.zw) / pc.frame.xy * 2.0 - 1.0;
+    return vec3(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z);
+}
+
+// The pass's lamp nearest to `pos` (as the host wrote them): its view position, distance, reach; d -1: none.
+void NearestLamp(vec3 pos, out vec3 lamp_pos, out float d, out float reach) {
+    const uint data = DataBase();
+    const uint n = min(counters[data + GLASS_GLINT_DATA_COUNT], GLASS_GLINT_MAX_LAMPS);
+    lamp_pos = vec3(0.0);
+    d = -1.0;
+    reach = 0.0;
+    for (uint k = 0u; k < n; ++k) {
+        const uint w = data + GLASS_GLINT_DATA_LAMPS + k * 8u;
+        const vec4 lamp = uintBitsToFloat(uvec4(counters[w], counters[w + 1u], counters[w + 2u], counters[w + 3u]));
+        const float dd = length(lamp.xyz - pos);
+        if (d < 0.0 || dd < d) {
+            lamp_pos = lamp.xyz;
+            d = dd;
+            reach = lamp.w;
+        }
+    }
+}
+
+// One record of 16 words at `at` (see GLASS_GLINT_DBG_* in glass_glint_layout.h).
+void DbgRecord(uint at, uint kind, ivec2 p, float t_pane, vec3 pane_pos) {
+    const float raw = texelFetch(depth_tex, p, 0).r;
+    const vec3 depth_point = DepthPoint(p, raw);
+    vec3 lamp_pos;
+    float lamp_d, lamp_reach;
+    NearestLamp(t_pane >= 0.0 ? pane_pos : depth_point, lamp_pos, lamp_d, lamp_reach);
+    counters[at] = kind;
+    counters[at + 1u] = uint(p.x) | (uint(p.y) << 16);
+    counters[at + 2u] = floatBitsToUint(raw);
+    counters[at + 3u] = floatBitsToUint(DepthT(p));
+    counters[at + 4u] = floatBitsToUint(depth_point.x);
+    counters[at + 5u] = floatBitsToUint(depth_point.y);
+    counters[at + 6u] = floatBitsToUint(depth_point.z);
+    counters[at + 7u] = floatBitsToUint(t_pane);
+    counters[at + 8u] = floatBitsToUint(pane_pos.x);
+    counters[at + 9u] = floatBitsToUint(pane_pos.y);
+    counters[at + 10u] = floatBitsToUint(pane_pos.z);
+    counters[at + 11u] = floatBitsToUint(lamp_pos.x);
+    counters[at + 12u] = floatBitsToUint(lamp_pos.y);
+    counters[at + 13u] = floatBitsToUint(lamp_pos.z);
+    counters[at + 14u] = floatBitsToUint(lamp_d);
+    counters[at + 15u] = floatBitsToUint(lamp_reach);
+}
+
+#ifdef COARSE
+shared uint group_blocks, group_flagged, group_behind;
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        group_blocks = 0u;
+        group_flagged = 0u;
+        group_behind = 0u;
+    }
+    barrier();
+    const uvec2 b = gl_GlobalInvocationID.xy;
+    if (b.x < pc.info.x && b.y < pc.info.y) {
+        const ivec2 p = min(ivec2(b) * GLASS_GLINT_BLOCK + GLASS_GLINT_BLOCK / 2, Size() - 1);
+        const vec3 dir = RayDir(vec2(p) + 0.5);
+        uint flag = 0u;
+        if (PaneT(dir, min(Reach(DepthT(p)), float(GLASS_GLINT_PANE_MAX)), true) >= 0.0) { // bbport (r86e)
+            flag = 1u;
+        } else if (Show() && PaneT(dir, float(GLASS_GLINT_PANE_MAX), true) >= 0.0) { // bbport (r86e)
+            flag = 2u;
+        }
+        // bbport (r86e_glint-hit-distance): 12 fixed blocks (4 across, 3 down): the nearest pane on the
+        // camera ray at any distance, with the raw depth and the nearest lamp, for the log
+        const uint gx = pc.info.x / 4u, gy = pc.info.y / 3u;
+        if (gx != 0u && gy != 0u && b.x % gx == gx / 2u && b.y % gy == gy / 2u && b.x / gx < 4u &&
+            b.y / gy < 3u) {
+            const float t_far = PaneT(dir, float(GLASS_GLINT_FAR), false);
+            DbgRecord(DbgBase() + GLASS_GLINT_DBG_FIRST +
+                          (GLASS_GLINT_DBG_PANE_MAX + b.x / gx + 4u * (b.y / gy)) * GLASS_GLINT_DBG_RECORD,
+                      2u, p, t_far, dir * max(t_far, 0.0));
+        }
+        block_flags[b.y * pc.info.x + b.x] = flag;
+        atomicAdd(group_blocks, 1u);
+        if (flag == 1u) {
+            atomicAdd(group_flagged, 1u);
+        } else if (flag == 2u) {
+            atomicAdd(group_behind, 1u);
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u && group_blocks != 0u) {
+        const uint base = SlotBase();
+        atomicAdd(counters[base + GLASS_GLINT_W_BLOCKS], group_blocks);
+        if (group_flagged != 0u) {
+            atomicAdd(counters[base + GLASS_GLINT_W_FLAGGED], group_flagged);
+        }
+        if (group_behind != 0u) {
+            atomicAdd(counters[base + GLASS_GLINT_W_BEHIND], group_behind);
+        }
+    }
+}
+#endif
+
+#ifdef SHADE
+const uint GRID = uint(GLASS_GLINT_GROUP) + 2u; // the tile's units and a border of one
+const uint CELLS = GRID * GRID;
+const uint THREADS = uint(GLASS_GLINT_GROUP * GLASS_GLINT_GROUP);
+const uint SPAN = 6u; // blocks across the widest unit range (20 px in the quad mode)
+
+// A unit's pane point (view space) and its t; w below 0: no pane in front of the depth.
+shared vec4 group_hit[CELLS];
+shared vec4 group_lamp[GLASS_GLINT_MAX_LAMPS * 2u]; // position, reach | colour, 0
+shared uint group_live;
+shared uint group_count[GLASS_GLINT_W_COUNT];
+
+// bbport (r86c_glass-glint-visible): this thread's numbers for the log (Glint fills them, main
+// flushes them into the slot): pane point x lamp pairs inside the lamp's reach and those facing the
+// lamp, the sum (cm) and the nearest (0xFFFFFFFF less mm) of the distances, the highest N.H, the
+// brightest lamp term before the strength and the shadow test.
+uint d_pairs = 0u, d_facing = 0u, d_dist_sum = 0u, d_dist_min = 0u;
+float d_nh = 0.0, d_best = 0.0;
+
+bool Near(vec4 a, vec4 centre) {
+    return a.w >= 0.0 &&
+           abs(a.w - centre.w) <= float(GLASS_GLINT_NEAR_ABS) + float(GLASS_GLINT_NEAR_REL) * centre.w;
+}
+
+// The difference across the centre on one axis: both neighbours, else one side, else none.
+bool Across(vec4 lo, vec4 hi, vec4 centre, out vec3 d) {
+    const bool l = Near(lo, centre), h = Near(hi, centre);
+    d = l && h ? hi.xyz - lo.xyz : h ? hi.xyz - centre.xyz : l ? centre.xyz - lo.xyz : vec3(0.0);
+    return l || h;
+}
+
+bool GridNormal(uint c, vec4 centre, out vec3 n) {
+    n = vec3(0.0);
+    vec3 dx, dy;
+    if (!Across(group_hit[c - 1u], group_hit[c + 1u], centre, dx) ||
+        !Across(group_hit[c - GRID], group_hit[c + GRID], centre, dy)) {
+        return false;
+    }
+    const vec3 m = cross(dx, dy);
+    const float len = length(m);
+    if (!(len > 1e-12)) {
+        return false;
+    }
+    n = m / len;
+    if (dot(n, centre.xyz) > 0.0) { // toward the camera at the origin
+        n = -n;
+    }
+    return true;
+}
+
+// bbport (r86c_glass-glint-visible): is the pane curved at this point: the normal from the two units
+// before the centre and the one from the two after it differ by more than 2.6 degrees (a bottle's
+// body does at a pixel, a flat window does not). Only where both neighbours of both axes are on the
+// same surface. Log only.
+bool Curved(uint c, vec4 centre) {
+    const vec4 lx = group_hit[c - 1u], hx = group_hit[c + 1u];
+    const vec4 ly = group_hit[c - GRID], hy = group_hit[c + GRID];
+    if (!(Near(lx, centre) && Near(hx, centre) && Near(ly, centre) && Near(hy, centre))) {
+        return false;
+    }
+    const vec3 a = cross(centre.xyz - lx.xyz, centre.xyz - ly.xyz);
+    const vec3 b = cross(hx.xyz - centre.xyz, hy.xyz - centre.xyz);
+    const float la = length(a), lb = length(b);
+    return la > 1e-12 && lb > 1e-12 && dot(a, b) < 0.999 * la * lb;
+}
+
+// The glint at pane point `p` with normal `n` from the pass's lamps (x strength).
+vec3 Glint(vec3 p, vec3 n, uint lamp_count, inout uint shadow_rays, inout uint shadowed) {
+    const vec3 v = normalize(-p);
+    vec3 sum = vec3(0.0), best_term = vec3(0.0), best_l = vec3(0.0);
+    float best = 0.0, best_d = 0.0;
+    for (uint k = 0u; k < lamp_count; ++k) {
+        const vec4 lamp = group_lamp[2u * k];
+        const vec3 to = lamp.xyz - p;
+        const float d = length(to);
+        if (!(d < lamp.w) || d < 1e-4) {
+            continue;
+        }
+        const vec3 l = to / d;
+        ++d_pairs; // bbport (r86c_glass-glint-visible): the numbers of the log's second line
+        d_dist_sum += uint(d * 100.0);
+        d_dist_min = max(d_dist_min, 0xFFFFFFFFu - uint(d * 1000.0));
+        const float nl = dot(n, l);
+        if (!(nl > 0.0)) {
+            continue;
+        }
+        ++d_facing;
+        const vec3 h = normalize(l + v);
+        const float nh = max(dot(n, h), 0.0);
+        d_nh = max(d_nh, nh);
+        const float vh = clamp(dot(v, h), 0.0, 1.0);
+        const float fresnel =
+            float(GLASS_GLINT_F0) + (1.0 - float(GLASS_GLINT_F0)) * pow(1.0 - vh, 5.0);
+        const float fall = 1.0 - d / lamp.w;
+        const vec3 term = group_lamp[2u * k + 1u].rgb *
+                          (fall * fall * nl * fresnel * pc.params.z * float(GLASS_GLINT_GAIN) *
+                           pow(nh, pc.params.y));
+        sum += term;
+        const float m = max(term.r, max(term.g, term.b));
+        d_best = max(d_best, m); // bbport (r86c_glass-glint-visible)
+        if (m > best) {
+            best = m;
+            best_term = term;
+            best_l = l;
+            best_d = d;
+        }
+    }
+    if (best * pc.params.x > float(GLASS_GLINT_SHADOW_LEVEL)) {
+        ++shadow_rays;
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, scene,
+                              gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                              GLASS_GLINT_LAMP_MASK, p, float(GLASS_GLINT_SHADOW_TMIN), best_l,
+                              max(best_d - float(GLASS_GLINT_LAMP_STOP),
+                                  float(GLASS_GLINT_SHADOW_TMIN) * 2.0));
+        while (rayQueryProceedEXT(query)) {
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            ++shadowed;
+            sum -= best_term;
+        }
+    }
+    const vec3 add = sum * pc.params.x;
+    if (any(isnan(add)) || any(isinf(add))) {
+        return vec3(0.0);
+    }
+    return clamp(add, vec3(0.0), vec3(float(GLASS_GLINT_ADD_MAX)));
+}
+
+void main() {
+    const uint lid = gl_LocalInvocationIndex;
+    const uint blocks = pc.info.x * pc.info.y;
+    // COARSE's count (a barrier lies between the two dispatches): the same for every group
+    const bool quads =
+        counters[SlotBase() + GLASS_GLINT_W_FLAGGED] * 100u > blocks * GLASS_GLINT_QUAD_PERCENT;
+    const int scale = quads ? 2 : 1;
+    const ivec2 size = Size();
+    const ivec2 tile0 = ivec2(gl_WorkGroupID.xy) * (GLASS_GLINT_GROUP * scale);
+    // The dispatch is sized for 8x8 pixel tiles: in the quad mode its far half has none.
+    if (tile0.x >= size.x || tile0.y >= size.y) {
+        return; // the whole group: before any barrier
+    }
+    if (lid == 0u) {
+        group_live = 0u;
+    }
+    if (lid < GLASS_GLINT_W_COUNT) {
+        group_count[lid] = 0u;
+    }
+    barrier();
+    // Live: a block under the units of the tile and its border is flagged (1; also 2 in the test
+    // view, for its blue).
+    const ivec2 lo = max(tile0 - scale, ivec2(0)) / GLASS_GLINT_BLOCK;
+    const ivec2 hi =
+        (min(tile0 + (GLASS_GLINT_GROUP + 1) * scale, size) - 1) / GLASS_GLINT_BLOCK;
+    const ivec2 b = lo + ivec2(int(lid % SPAN), int(lid / SPAN));
+    if (lid < SPAN * SPAN && b.x <= hi.x && b.y <= hi.y && b.x < int(pc.info.x) &&
+        b.y < int(pc.info.y)) {
+        const uint flag = block_flags[uint(b.y) * pc.info.x + uint(b.x)];
+        if ((flag & (Show() ? 3u : 1u)) != 0u) {
+            atomicOr(group_live, 1u);
+        }
+    }
+    const uint data = DataBase();
+    const uint lamp_count = min(counters[data + GLASS_GLINT_DATA_COUNT], GLASS_GLINT_MAX_LAMPS);
+    if (lid < lamp_count * 2u) {
+        const uint w = data + GLASS_GLINT_DATA_LAMPS + lid * 4u;
+        group_lamp[lid] = uintBitsToFloat(
+            uvec4(counters[w], counters[w + 1u], counters[w + 2u], counters[w + 3u]));
+    }
+    barrier();
+    if (group_live == 0u) {
+        return; // the same for the whole group (shared, after the barrier)
+    }
+    // One pane ray a unit of the tile and its border.
+    for (uint c = lid; c < CELLS; c += THREADS) {
+        const ivec2 u = ivec2(int(c % GRID), int(c / GRID)) - 1;
+        const ivec2 first = tile0 + u * scale;
+        vec4 hit = vec4(0.0, 0.0, 0.0, -1.0);
+        if (all(greaterThanEqual(first, ivec2(0))) && all(lessThan(first, size))) {
+            const vec3 dir = RayDir(vec2(first) + 0.5 * float(scale));
+            float t_depth = DepthT(first);
+            if (quads) { // the farthest of the quad's pixels; each still tests its own below
+                const ivec2 last = min(first + 1, size - 1);
+                t_depth = max(max(t_depth, DepthT(ivec2(last.x, first.y))),
+                              max(DepthT(ivec2(first.x, last.y)), DepthT(last)));
+            }
+            const float t = PaneT(dir, min(Reach(t_depth), float(GLASS_GLINT_PANE_MAX)), false); // bbport (r86e)
+            if (t >= 0.0) {
+                hit = vec4(dir * t, t);
+            }
+        }
+        group_hit[c] = hit;
+    }
+    barrier();
+    const ivec2 lu = ivec2(gl_LocalInvocationID.xy);
+    const uint c = uint(lu.y + 1) * GRID + uint(lu.x + 1);
+    const ivec2 first = tile0 + lu * scale;
+    const vec4 hit = group_hit[c];
+    uint glass = 0u, rejected = 0u, glints = 0u, shadow_rays = 0u, shadowed = 0u, no_normal = 0u;
+    uint units = 0u, curved = 0u, t_sum = 0u; // bbport (r86c_glass-glint-visible)
+    uint d_far_sum = 0u, d_sky = 0u, d_near = 0u; // bbport (r86d_glint-pane-depth)
+    float max_add = 0.0;
+    if (first.x < size.x && first.y < size.y) {
+        vec3 add = vec3(0.0);
+        bool behind = false;
+        if (hit.w >= 0.0) {
+            vec3 n;
+            units = 1u; // bbport (r86c_glass-glint-visible): the log's second line
+            t_sum = uint(min(hit.w, 100.0) * 100.0);
+            // bbport (r86d_glint-pane-depth): how far the pane really is; is the depth the sky
+            d_far_sum = max(uint(min(hit.w, float(GLASS_GLINT_FAR))), 1u);
+            d_sky = texelFetch(depth_tex, first, 0).r < 1.0 ? 0u : 1u;
+            d_near = hit.w < 50.0 ? 1u : 0u;
+            // bbport (r86e_glint-hit-distance): every 211th pane pixel, the first 8 of the pass: raw values
+            if (((uint(first.x) * 7u + uint(first.y) * 13u) % 211u) == 0u) {
+                const uint taken = atomicAdd(counters[DbgBase()], 1u);
+                if (taken < GLASS_GLINT_DBG_PANE_MAX) {
+                    DbgRecord(DbgBase() + GLASS_GLINT_DBG_FIRST + taken * GLASS_GLINT_DBG_RECORD, 1u, first, hit.w,
+                              hit.xyz);
+                }
+            }
+            if (GridNormal(c, hit, n)) {
+                add = Glint(hit.xyz, n, lamp_count, shadow_rays, shadowed);
+                if (Curved(c, hit)) {
+                    ++curved;
+                }
+            } else {
+                ++no_normal;
+            }
+        } else if (Show()) {
+            behind = PaneT(RayDir(vec2(first) + 0.5 * float(scale)), float(GLASS_GLINT_PANE_MAX), true) >= 0.0; // bbport (r86e)
+        }
+        const float peak = max(add.r, max(add.g, add.b));
+        for (int j = 0; j < scale; ++j) {
+            for (int i = 0; i < scale; ++i) {
+                const ivec2 p = first + ivec2(i, j);
+                if (p.x >= size.x || p.y >= size.y) {
+                    continue;
+                }
+                const bool on = hit.w >= 0.0 && (!quads || hit.w <= Reach(DepthT(p)));
+                if (!on && !behind) {
+                    continue;
+                }
+                glass += on ? 1u : 0u;
+                rejected += on ? 0u : 1u;
+                const bool glint = on && peak > float(GLASS_GLINT_GLINT_LEVEL);
+                glints += glint ? 1u : 0u;
+                max_add = on ? max(max_add, peak) : max_add;
+                const vec4 colour = imageLoad(scene_img, p);
+                if (Show()) {
+                    // cyan: a pane in front of the depth; blue: only behind it; magenta: a glint
+                    const vec3 tint = glint ? vec3(1.0, 0.0, 1.0)
+                                      : on  ? vec3(0.0, 1.0, 1.0)
+                                            : vec3(0.0, 0.25, 1.0);
+                    const float level = max(max(colour.r, max(colour.g, colour.b)), 0.1);
+                    imageStore(scene_img, p, vec4(mix(colour.rgb, tint * level, 0.5) + add, colour.a));
+                } else if (peak > 0.0 && on) {
+                    imageStore(scene_img, p, vec4(colour.rgb + add, colour.a));
+                }
+            }
+        }
+    }
+    if (glass != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_GLASS], glass);
+    }
+    if (rejected != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_REJECTED], rejected);
+    }
+    if (glints != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_GLINT], glints);
+    }
+    if (shadow_rays != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_SHADOW_RAYS], shadow_rays);
+    }
+    if (shadowed != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_SHADOWED], shadowed);
+    }
+    if (no_normal != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_NO_NORMAL], no_normal);
+    }
+    if (max_add > 0.0) {
+        atomicMax(group_count[GLASS_GLINT_W_MAX_ADD], floatBitsToUint(max_add));
+    }
+    // bbport (r86c_glass-glint-visible): the log's second line
+    if (units != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_UNITS], units);
+        atomicAdd(group_count[GLASS_GLINT_W_T_SUM], t_sum);
+    }
+    if (curved != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_CURVED], curved);
+    }
+    // bbport (r86d_glint-pane-depth)
+    if (d_far_sum != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_FAR_SUM], d_far_sum);
+    }
+    if (d_sky != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_SKY], d_sky);
+    }
+    if (d_near != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_NEAR], d_near);
+    }
+    if (d_pairs != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_PAIRS], d_pairs);
+        atomicAdd(group_count[GLASS_GLINT_W_DIST_SUM], d_dist_sum);
+        atomicMax(group_count[GLASS_GLINT_W_DIST_MIN], d_dist_min);
+    }
+    if (d_facing != 0u) {
+        atomicAdd(group_count[GLASS_GLINT_W_FACING], d_facing);
+        atomicMax(group_count[GLASS_GLINT_W_NH_MAX], floatBitsToUint(d_nh));
+    }
+    if (d_best > 0.0) {
+        atomicMax(group_count[GLASS_GLINT_W_BEST_MAX], floatBitsToUint(d_best));
+    }
+    barrier();
+    if (lid == 0u) {
+        const uint base = SlotBase();
+        atomicAdd(counters[base + GLASS_GLINT_W_TILES], 1u);
+        if (quads) {
+            atomicAdd(counters[base + GLASS_GLINT_W_QUAD_TILES], 1u);
+        }
+        for (uint w = GLASS_GLINT_W_GLASS; w <= GLASS_GLINT_W_SHADOWED; ++w) {
+            if (group_count[w] != 0u) {
+                atomicAdd(counters[base + w], group_count[w]);
+            }
+        }
+        if (group_count[GLASS_GLINT_W_NO_NORMAL] != 0u) {
+            atomicAdd(counters[base + GLASS_GLINT_W_NO_NORMAL], group_count[GLASS_GLINT_W_NO_NORMAL]);
+        }
+        if (group_count[GLASS_GLINT_W_MAX_ADD] != 0u) {
+            atomicMax(counters[base + GLASS_GLINT_W_MAX_ADD], group_count[GLASS_GLINT_W_MAX_ADD]);
+        }
+        // bbport (r86d_glint-pane-depth): the log's third line (sums)
+        for (uint w = GLASS_GLINT_W_FAR_SUM; w <= GLASS_GLINT_W_NEAR; ++w) {
+            if (group_count[w] != 0u) {
+                atomicAdd(counters[base + w], group_count[w]);
+            }
+        }
+        // bbport (r86c_glass-glint-visible): the log's second line (sums, then the largest)
+        for (uint w = GLASS_GLINT_W_UNITS; w <= GLASS_GLINT_W_DIST_SUM; ++w) {
+            if (group_count[w] != 0u) {
+                atomicAdd(counters[base + w], group_count[w]);
+            }
+        }
+        for (uint w = GLASS_GLINT_W_DIST_MIN; w <= GLASS_GLINT_W_NH_MAX; ++w) {
+            if (group_count[w] != 0u) {
+                atomicMax(counters[base + w], group_count[w]);
+            }
+        }
+        for (uint w = GLASS_GLINT_W_CURVED; w <= GLASS_GLINT_W_T_SUM; ++w) {
+            if (group_count[w] != 0u) {
+                atomicAdd(counters[base + w], group_count[w]);
+            }
+        }
+    }
+}
+#endif

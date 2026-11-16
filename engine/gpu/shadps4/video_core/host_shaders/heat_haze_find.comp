@@ -1,0 +1,170 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r97f_haze-per-flame): the heat haze's flame finder (BB_HEAT_HAZE_FLAMES; vk_heat_haze.cpp,
+// the numbers in heat_haze_find_layout.h). The game's lamp lights sit where its artists put them (the
+// middle of a post, one light for two lanterns), not on the flames, so the haze looks for the flames
+// themselves in the scene colour: one workgroup a lamp scans a square of the view plane around the
+// lamp's light (HF_GRID x HF_GRID cells, 4 x 4 taps each: a flame a few pixels wide is not missed between taps), takes each cell's mean luma (cells that
+// are blue-ish count 0: a flame is not blue), subtracts the mean of the cell's 8 neighbours (a small
+// bright source stands out of a lit wall), and keeps up to HF_PEAKS strongest cells at least `blob
+// minimum` above their surround (and a third of the strongest), each at the blob's centroid. The
+// answer, in metres of the view plane from the light, goes to a small buffer the engine reads a frame
+// or two later. Reads the scene colour only; writes nothing else.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+#include "heat_haze_find_layout.h"
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D scene_img;
+layout(std430, binding = 1) buffer Blocks {
+    uint words[HF_WORDS_TOTAL];
+};
+
+// heat_haze_flames.h FindPush, field for field.
+layout(push_constant) uniform Push {
+    ivec4 info;   // slot, id (echoed), tag (echoed), 0
+    vec4 centre;  // the light's pixel x, y; pixels a metre at its depth, x and y (signed, as the projection's)
+    vec4 window;  // half side (m), blob minimum (HDR luma), the scene's width and height (px)
+};
+
+const uint CELLS = HF_GRID * HF_GRID;
+shared float cell_luma[CELLS]; // -1: the cell is outside the scene
+shared float cell_blob[CELLS];
+
+const vec3 luma_weights = vec3(0.2126, 0.7152, 0.0722);
+
+// The pixel of a point of the grid (in cells, 0 to HF_GRID a side) in the view plane around the light.
+vec2 PixelOf(vec2 grid) {
+    const vec2 metres = (grid / float(HF_GRID) * 2.0 - 1.0) * window.x;
+    return centre.xy + metres * centre.zw;
+}
+
+float CellLuma(uint idx) {
+    const vec2 cell = vec2(float(idx % HF_GRID), float(idx / HF_GRID));
+    const ivec2 size = ivec2(window.zw);
+    vec3 sum = vec3(0.0);
+    float n = 0.0;
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
+            const ivec2 p = ivec2(floor(PixelOf(cell + vec2(0.125 + 0.25 * float(i), 0.125 + 0.25 * float(j)))));
+            if (all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, size))) {
+                vec3 c = imageLoad(scene_img, p).rgb;
+                c = (any(isnan(c)) || any(isinf(c))) ? vec3(0.0) : clamp(c, vec3(0.0), vec3(64.0));
+                sum += c;
+                n += 1.0;
+            }
+        }
+    }
+    if (n < 0.5) {
+        return -1.0;
+    }
+    const vec3 mean = sum / n;
+    return mean.b <= 1.05 * mean.r ? dot(mean, luma_weights) : 0.0;
+}
+
+void main() {
+    const uint t = gl_LocalInvocationIndex;
+    for (uint k = 0u; k < CELLS / 256u; ++k) {
+        cell_luma[t + 256u * k] = CellLuma(t + 256u * k);
+    }
+    memoryBarrierShared();
+    barrier();
+    for (uint k = 0u; k < CELLS / 256u; ++k) {
+        const uint idx = t + 256u * k;
+        const float v = cell_luma[idx];
+        float blob = 0.0;
+        if (v > 0.0) {
+            const int cx = int(idx % HF_GRID), cy = int(idx / HF_GRID);
+            float sum = 0.0, n = 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const int nx = cx + dx, ny = cy + dy;
+                    if ((dx != 0 || dy != 0) && nx >= 0 && ny >= 0 && nx < int(HF_GRID) && ny < int(HF_GRID)) {
+                        sum += max(cell_luma[uint(ny) * HF_GRID + uint(nx)], 0.0);
+                        n += 1.0;
+                    }
+                }
+            }
+            blob = v - sum / max(n, 1.0);
+        }
+        cell_blob[idx] = max(blob, 0.0);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (t != 0u) {
+        return;
+    }
+    // One invocation picks the peaks (1024 cells, up to 3 passes: a few microseconds a lamp).
+    const uint base = uint(info.x) * HF_BLOCK_WORDS;
+    float bright = 0.0;
+    uint inside = 0u;
+    for (uint i = 0u; i < CELLS; ++i) {
+        const float v = cell_luma[i];
+        bright = max(bright, v);
+        inside += v >= 0.0 ? 1u : 0u;
+    }
+    uint found = 0u;
+    float first = 0.0;
+    for (uint k = 0u; k < HF_PEAKS; ++k) {
+        float best = 0.0;
+        uint at = CELLS;
+        for (uint i = 0u; i < CELLS; ++i) {
+            if (cell_blob[i] > best) {
+                best = cell_blob[i];
+                at = i;
+            }
+        }
+        if (at == CELLS || best < window.y || (k > 0u && best < 0.35 * first)) {
+            break;
+        }
+        if (k == 0u) {
+            first = best;
+        }
+        const int cx = int(at % HF_GRID), cy = int(at / HF_GRID);
+        float wsum = 0.0;
+        vec2 pos = vec2(0.0);
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                const int nx = cx + dx, ny = cy + dy;
+                if (nx >= 0 && ny >= 0 && nx < int(HF_GRID) && ny < int(HF_GRID)) {
+                    const float w = cell_blob[uint(ny) * HF_GRID + uint(nx)];
+                    wsum += w;
+                    pos += w * vec2(float(nx) + 0.5, float(ny) + 0.5);
+                }
+            }
+        }
+        pos /= max(wsum, 1e-6);
+        const vec2 metres = (pos / float(HF_GRID) * 2.0 - 1.0) * window.x;
+        const uint p0 = base + HF_WORD_PEAK0 + k * HF_PEAK_WORDS;
+        words[p0] = floatBitsToUint(metres.x);
+        words[p0 + 1u] = floatBitsToUint(metres.y);
+        words[p0 + 2u] = floatBitsToUint(best);
+        for (int dy = -HF_SUPPRESS; dy <= HF_SUPPRESS; ++dy) {
+            for (int dx = -HF_SUPPRESS; dx <= HF_SUPPRESS; ++dx) {
+                const int nx = cx + dx, ny = cy + dy;
+                if (nx >= 0 && ny >= 0 && nx < int(HF_GRID) && ny < int(HF_GRID)) {
+                    cell_blob[uint(ny) * HF_GRID + uint(nx)] = 0.0;
+                }
+            }
+        }
+        ++found;
+    }
+    for (uint k = found; k < HF_PEAKS; ++k) {
+        const uint p0 = base + HF_WORD_PEAK0 + k * HF_PEAK_WORDS;
+        words[p0] = 0u;
+        words[p0 + 1u] = 0u;
+        words[p0 + 2u] = 0u;
+    }
+    words[base + HF_WORD_ID] = uint(info.y);
+    words[base + HF_WORD_TAG] = uint(info.z);
+    words[base + HF_WORD_COUNT] = found;
+    words[base + HF_WORD_BEST] = floatBitsToUint(first);
+    words[base + HF_WORD_BRIGHT] = floatBitsToUint(bright);
+    words[base + HF_WORD_CELLS] = inside;
+    uint check = 2166136261u;
+    for (uint k = 0u; k < HF_WORD_CHECK; ++k) {
+        check = (check ^ words[base + k]) * 16777619u;
+    }
+    words[base + HF_WORD_CHECK] = check;
+}

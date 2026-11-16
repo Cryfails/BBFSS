@@ -6,7 +6,8 @@
 // Streamline's proxies, which add what its plugins need and let DLSS-G present the real and the
 // generated frames. Reflex runs with it, as NVIDIA requires.
 //
-// Per game frame: the GPU command thread numbers it (Reflex sleep and markers), the frame
+// Per game frame: the game numbers it as it hands it over and Reflex sleeps before the game
+// reads its input (vk_streamline.cpp, "Reflex frame numbers"), the frame
 // generator's captures (depth, motion vectors, the frame without its UI) are copied into the
 // presentation frame's slot, and on the swap thread the frame's constants and tags go out right
 // before its present, with a UI alpha image made from the back buffer and the HUD-less frame.
@@ -59,10 +60,12 @@ public:
 
     // GPU command thread.
 
-    /// The index of the game frame being recorded (its Reflex sleep and first markers went out
-    /// with the first call), 0 without Streamline.
+    /// In PrepareFrame: the number of the game frame being recorded (the one the game gave its
+    /// flip, Streamline::SetFlipFrame; its start markers go out here when nobody sent them), 0
+    /// without Streamline or without a new number.
     u32 CurrentFrame();
-    /// After the frame's submission (PrepareFrame): its render submit ended; the next one begins.
+    /// After the frame's submission (PrepareFrame): its render submit ended. Experiment mask 512
+    /// (the old behaviour): the next frame starts here, after its Reflex sleep.
     void OnFrameSubmitted();
     /// Makes `slot`'s depth and motion images `w` x `h` (waits for the GPU when they change).
     void EnsureSlot(u32 slot, u32 w, u32 h);
@@ -78,10 +81,15 @@ public:
     /// differs from it: the game's UI and the engine's overlay). `hudless` is the HUD-less frame
     /// through the post process (General, `frame_extent`, the back buffer's format), placed in
     /// the back buffer as the frame is (`fit`).
+    /// bbport: `compare_final` and `compare_hudless` (both or none): the frame and its HUD-less
+    /// copy as the presenter has them before the encode (General, the back buffer's size, no
+    /// menu layer); for a frame that fills the back buffer the UI alpha is made from them,
+    /// without the back buffer's copy into final_image.
     void RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& info, vk::Image hudless,
                        vk::ImageView hudless_view, vk::Extent2D frame_extent,
                        vk::Image backbuffer, vk::Format format, vk::Extent2D extent,
-                       vk::Rect2D fit);
+                       vk::Rect2D fit, vk::ImageView compare_final = {},
+                       vk::ImageView compare_hudless = {});
     /// Right before vkQueuePresentKHR: DLSS-G's mode, the frame's constants and tags, the present
     /// start marker. `info` null: not a game frame.
     void BeforePresent(const DlssFrameInfo* info, bool menu_open, bool hdr);
@@ -104,7 +112,12 @@ private:
     std::vector<Slot> slots;
 
     // GPU command thread.
-    u32 current_frame = 0;
+    u32 current_frame = 0; ///< the frame being recorded, 0: none
+    u32 last_frame = 0;    ///< the last frame recorded (numbers only go up)
+    // bbport: BB_FRAME_STATS: time spent in the Reflex sleep in the flip step (OnFrameSubmitted,
+    // experiment masks 512 and 8388608), printed every 300 frames.
+    u64 sleep_ns = 0;
+    u32 sleeps = 0;
 
     // Swap thread.
     VideoCore::UniqueImage hudless_image, final_image, ui_image;

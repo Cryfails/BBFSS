@@ -120,6 +120,14 @@ void BenchTick(bool loading, bool ended, Clock::time_point now) {
 }
 }
 
+// bbport (r104_cloud-probe): TOOL, the cloud probe's read of WindWorld (loading.h).
+bool PeekWindWorld(std::uint64_t* object, void* bytes, std::size_t size) {
+    constexpr std::uint64_t kWindWorld = 0x5540060;
+    *object = g_image ? Follow(Image() + kWindWorld) : 0;
+    return *object != 0 &&
+           BbPlatform::ReadProcessMemory(reinterpret_cast<const void*>(*object), bytes, size);
+}
+
 void Install(std::uint8_t* image) {
     g_image = image;
     g_started = Clock::now();

@@ -58,6 +58,19 @@ public:
     [[nodiscard]] bool PreviewFrame() const noexcept {
         return last_frame_gbuffer_passes > 1 && !last_frame_reflection;
     }
+    /// bbport (r107_caustics): the height (world y) of the water plane this frame's G-buffer
+    /// passes so far are mirrored in: the midpoint of the first and the last pass's camera
+    /// heights, when they are the world and its mirror image (MirroredPasses: the same x and z,
+    /// another height). False, and `y` untouched, otherwise.
+    [[nodiscard]] bool MirrorPlane(float& y) const noexcept {
+        const u32 n = frame_gbuffer_passes < u32(pass_positions.size()) ? frame_gbuffer_passes
+                                                                          : u32(pass_positions.size());
+        if (n < 2 || !MirroredPasses()) {
+            return false;
+        }
+        y = 0.5f * (pass_positions[0][1] + pass_positions[n - 1][1]);
+        return true;
+    }
     [[nodiscard]] VideoCore::ImageId Depth() const noexcept {
         return depth_id;
     }

@@ -261,6 +261,11 @@ public:
         return sw_stage == SwStage::Vertex && hw_stage == HwStage::Vertex &&
                runtime_info.hw.vs.motion_vectors;
     }
+    /// bbport (r122_game-wind-drive): a vertex shader built with MotionVectors::GameCut (the plant sway pipelines with
+    /// BB_WIND_GAME=1): the game's own v_sin_f32 terms give a constant (EmitFPSin)
+    [[nodiscard]] bool GameWindCut() const {
+        return VertexMotion() && (runtime_info.hw.vs.motion_vectors & MotionVectors::GameCut) != 0;
+    }
     [[nodiscard]] bool FragmentMotion() const {
         return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
     }

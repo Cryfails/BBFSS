@@ -120,6 +120,13 @@ public:
     void NewPacket() noexcept {
         ++packet_epoch;
     }
+    /// bbport: that housekeeping (Maintain) for a binding that does not reach EnsureResident (the
+    /// vertex memo's hits), once per packet as there.
+    void MaintainPacket() {
+        if (maintained_epoch != packet_epoch) {
+            Maintain();
+        }
+    }
 
     /// bbport (BB_FRAME_STATS): ObtainBuffer calls made for the copy shader HLE (set around
     /// them on the draw recording thread), counted by path: [read, written] x [in place, stream

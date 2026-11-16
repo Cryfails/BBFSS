@@ -4,6 +4,9 @@
 #include <string>
 
 #include <atomic>
+#include <cstdint> // bbport (r39_master-debug): the mask, and the early reader of the debug_* keys
+#include <cstdio>
+#include <cstdlib>
 
 namespace BbSettings {
 
@@ -121,9 +124,30 @@ inline constexpr float FroyokBlendMin = 0.1f, FroyokBlendMax = 0.3f;
 inline constexpr float FroyokSpreadMin = 0.5f, FroyokSpreadDefault = 0.85f, FroyokSpreadMax = FroyokSpreadDefault;
 inline constexpr float WetGroundMin = 0.0f, WetGroundMax = 1.0f, WetGroundDefault = 0.5f;
 inline constexpr float DofIntensityMin = 0.0f, DofIntensityMax = 3.0f;
+// bbport (r45_drawn-look): the drawn look's keys (graphics_drawn_look_*) that do not run 0..1.
+inline constexpr float DrawnLookStrengthDefault = 0.6f;
+inline constexpr float DrawnLookStrokeSizeMin = 0.6f, DrawnLookStrokeSizeMax = 1.4f;
+inline constexpr float DrawnLookTextureMax = 1.2f;
+inline constexpr float DrawnLookOutlinesDefault = 0.35f, DrawnLookCharactersDefault = 0.5f;
+inline constexpr float DrawnLookShadowSoftMin = 0.05f, DrawnLookShadowSoftMax = 0.3f,
+                       DrawnLookShadowSoftDefault = 0.12f;
+inline constexpr int DrawnLookDebugMax = 4; // DrawnLookParams::ViewMax (drawn_look_params.h)
 inline constexpr float LocalLightIntensityMin = 0.0f, LocalLightIntensityMax = 4.0f;
 // Source size of local lights under inverse-square falloff, as a fraction of the light radius.
 inline constexpr float LocalLightCoreMin = 0.0f, LocalLightCoreMax = 0.35f, LocalLightCoreDefault = 0.05f;
+// bbport (r99c_interior-default): the interior brightness, the largest lift in stops of the dark-interior
+// exposure lift (live; 0 = off; a set BB_INTERIOR_EXPOSURE or BB_INTERIOR_EXPOSURE_MAX_EV wins). Tied to
+// BbInteriorExposure by static_asserts in vk_interior_exposure.cpp.
+inline constexpr float InteriorBrightnessMin = 0.0f, InteriorBrightnessMax = 3.0f, InteriorBrightnessDefault = 0.75f;
+// bbport (r109a_strength-settings-engine): the halation's and the lamp flicker's strengths (live;
+// a set BB_HALATION, BB_LAMP_FLICKER or BB_LAMP_FLICKER_ON_GAME wins). Tied to HalationParams and
+// LampFlicker by static_asserts in vk_halation.cpp and vk_rasterizer_effects.cpp.
+inline constexpr float HalationStrengthMin = 0.0f, HalationStrengthMax = 2.0f, HalationStrengthDefault = 1.0f;
+inline constexpr float LampFlickerStrengthMin = 0.0f, LampFlickerStrengthMax = 1.0f;
+inline constexpr float LampFlickerSteadyDefault = 1.0f, LampFlickerOnGameDefault = 0.0f;
+// bbport (r97e_heat-haze-option): the heat haze's strength (live; 0 = off, the default; a set
+// BB_HEAT_HAZE wins). Tied to BbHeatHaze by static_asserts in vk_heat_haze.cpp.
+inline constexpr float HeatHazeStrengthMin = 0.0f, HeatHazeStrengthMax = 2.0f, HeatHazeStrengthDefault = 0.0f;
 
 inline constexpr int DlssPresetDefault = 0, DlssPresetK = 11, DlssPresetMax = 26;
 inline constexpr int DlssPresetAuto = -1, DlssPresetL = 12, DlssPresetM = 13;
@@ -139,6 +163,199 @@ static_assert(sizeof(ButtonPromptsNames) / sizeof(ButtonPromptsNames[0]) == Prom
 enum PadIcons : int { PadIconsAuto = 0, PadIconsPlayStation = 1, PadIconsXbox = 2, PadIconsCount };
 inline constexpr const char* PadIconsNames[] = {"auto", "playstation", "xbox"};
 static_assert(sizeof(PadIconsNames) / sizeof(PadIconsNames[0]) == PadIconsCount);
+
+// bbport (r15_far-shadow-setting): how often the game draws its two far sun shadow cascades
+// (shim/engine/graphics.cpp hooks its cascade loop at start; BB_SUN_CASCADES, when set, wins).
+// Game: every frame, nothing hooked. Alternate: the far two take turns. Rare: each every 8th frame.
+enum SunFarShadows : int { SunFarGame = 0, SunFarAlternate = 1, SunFarRare = 2, SunFarShadowsCount };
+inline constexpr const char* SunFarShadowsNames[] = {"game", "alternate", "rare"};
+static_assert(sizeof(SunFarShadowsNames) / sizeof(SunFarShadowsNames[0]) == SunFarShadowsCount);
+
+// bbport (r37_menu-options): the motion-vector vertex store (renderer_vulkan/vk_object_motion.cpp
+// makes it at start; BB_OBJECT_MOTION_VERTICES, when set, wins). Large: 8388608 vertices a frame
+// half (256 MiB in all); small: 4194304 (128 MiB); auto: large, small where Instance::IsLowVramAmd
+// (an AMD discrete card whose largest device-local heap is at most 8 GiB + 512 MiB, or BB_AMD_LOW_VRAM=1).
+enum MotionStore : int { MotionStoreAuto = 0, MotionStoreLarge = 1, MotionStoreSmall = 2, MotionStoreCount };
+inline constexpr const char* MotionStoreNames[] = {"auto", "large", "small"};
+static_assert(sizeof(MotionStoreNames) / sizeof(MotionStoreNames[0]) == MotionStoreCount);
+
+// bbport (r48_lamp-softness): how soft the ray traced lamp shadows are, as the lamp's radius
+// (renderer_vulkan/lamp_shadow_tune.h LampSoftnessRadii): sharp a point (every lamp traced, no
+// history), soft 0.1 m (the default, the lamp of r42), softer 0.2 m. Live (vk_point_shadow.cpp
+// takes it at every pass); BB_LAMP_SHADOW_SOFT, when set to a number, wins.
+enum LampSoftness : int { LampSoftnessSharp = 0, LampSoftnessSoft = 1, LampSoftnessSofter = 2, LampSoftnessCount };
+inline constexpr const char* LampSoftnessNames[] = {"sharp", "soft", "softer"};
+static_assert(sizeof(LampSoftnessNames) / sizeof(LampSoftnessNames[0]) == LampSoftnessCount);
+
+// bbport (r39_master-debug): engine_previous_paths (lantern.ini and the menu's Debug tab; 0|1,
+// default 0). On: these experiment bits are forced (a set bit is the earlier path of that
+// part), ORed with the bits of BB_TOGGLE_FILE, live (ApplyPreviousPaths). In it:
+// the first measured mask (1023959505797356640, the before/after measurements of the work), and
+// 13, 20, 54 and 56 (read in the source to be the earlier path and safe to set at any time; not
+// part of that first mask).
+// bbport (r40_master-bits): 7 and 9 are in it as well, so that the switch takes as many of the
+// earlier paths as the run-time switches allow. 7 set: the lamps of ray traced lamp shadows are
+// not drawn apart for one pass; together with 6 that is the old batching (a batch with a
+// whole-image snapshot and a shadow pass per tile, vk_point_shadow.h), which now traces (see
+// below). 9 set: the Reflex sleep in the flip step as before, not before the game reads input
+// (vk_streamline.cpp). The whole mask as it is now, 1114031498345823968 (so with 13, 20, 54 and
+// 56 set too), was measured through BB_TOGGLE_FILE with 7 and 9 set, before they were added to
+// this list (uncapped, one heavy spot, picture and run stable), bits clear against set: 90.2
+// against 63.6 FPS with ray tracing off, 74.9 against 26.4 with it on, 59.3 against 24.0 game
+// FPS with DLSS frame generation as well. Those figures are old paths against new paths in one
+// build, not the engine before the work. With the switch on the lamps are traced one pass per
+// tile (the tile count fix has no bit), which the engine before the work never did, so ray
+// traced lamp shadows cost several times more while it is on; the row's hint says so. That
+// engine was not measured at that spot (engine/docs/renderer-performance-0.9.43.md). Every
+// default-on fix kept out of the list is named in that doc under "Not restored by the switch":
+// 14 (the ghost fix: set brings the fault back; the row's hint names it) and, below, 45 and
+// 60-63. Not in it because set is not an earlier path: 0-4 (upstream's own experiments), 8 (a
+// diagnostic: shared ray tracing copies never refreshed), 23 (no Reflex sleep at all), 28 (acts
+// only with BB_SUN_CASCADE_EVERY) and 51 (acts only with BB_RT_UPKEEP_FREEZE).
+// bbport (r41_lamp-shadows): 45 (35184372088832; set = ray traced lamp shadows before their
+// repair, vk_rt_shadow.h LampRepairOffBit) is not in it either, for the reason 14 is not: set
+// brings picture faults back (doubled and faint torch shadows).
+// bbport (r43_copy-turns): nor is 60 (1152921504606846976; set = the rebuilds of shared ray
+// tracing copies go to the first in draw order, bbport_toggles.h BbCopyTurns::OldBit), for the
+// same reason: set brings lamp shadows that do not move back.
+// bbport (r44_half-area-lamp): nor is 61 (2305843009213693952; set = point lamps without a
+// history in the half-resolution lamp shadow pass, vk_point_shadow.cpp HalfPointsBit), for the
+// same reason: set brings the hard-edged torch shadows back.
+// bbport (r46_lamp-cards): nor is 63 (9223372036854775808; set = lamp rays leave out as cut-out
+// cards only what the rule of before did, vk_rt_shadow.h LampCardsOldBit), for the same reason:
+// set brings the plants' whole-polygon lamp shadows back.
+// bbport (r47_still-check): nor is 62 (4611686018427387904; set = a ray tracing caster held for
+// still is built once and never looked at again, and a small bone palette in memory the GPU wrote
+// is known by its bytes again, not by where it lies (r47b); vk_rt_shadow.h StillCheckOldBit), for
+// the same reason: set brings the lamp shadow that stays where a carried torch was first drawn
+// back.
+inline constexpr int PreviousPathsBits[] = {5, 6, 7, 9, 10, 11, 12, 13, 15, 16, 17, 18, 19, 20,
+                                            21, 22, 24, 25, 26, 27, 30, 31, 33, 34, 35, 36, 37, 39,
+                                            40, 42, 44, 46, 47, 48, 50, 52, 53, 54, 56, 57, 58, 59};
+inline constexpr std::uint64_t PreviousPathsMask = [] {
+    std::uint64_t mask = 0;
+    for (const int bit : PreviousPathsBits) {
+        mask |= std::uint64_t{1} << bit;
+    }
+    return mask;
+}();
+static_assert(PreviousPathsMask == 1114031498345823968ull); // bbport (r40_master-bits)
+/// Forces PreviousPathsMask while engine_previous_paths is on and nothing while it is off; one
+/// log line when it is on at the start and at each change. Defined in bbgpu.cpp: it needs the
+/// runtime's runtime_experiment_force, which the settings tests do not link.
+void ApplyPreviousPaths();
+
+// bbport (r39_master-debug): the measuring and tracing switches of the menu's Debug tab. Each
+// is a lantern.ini key (0|1, default 0) that stands for an environment variable the engine
+// reads once at the start. With the key 1 and the variable not set (or empty), the variable is
+// put into the process environment before anything reads it; a variable that is set decides.
+// The value put is DebugSwitchValue: it starts with 1, which is all the readers look at, and
+// it tells a later engine process that inherits it (the restart from the menu starts the next
+// process with this one's environment) that the variable came from the key and not from the
+// user: that process follows its key again, and takes the variable out when the key is 0.
+// BB_FRAME_STATS and BB_SPIKE_TRACE are read during static initialization (bbport_toggles.h),
+// before Load: so this reader is header-only and those initializers call DebugSwitchesAtStart
+// first.
+enum DebugSwitchId : int { DebugFrameStats, DebugGpuProfile, DebugGpuProfileSplit, DebugSpikeTrace,
+                           DebugSubmitDiag, DebugSceneTrips, DebugRtLampTrace, DebugDrawOrder,
+                           DebugSunAtlasIgnoreReader, DebugSwitchCount };
+struct DebugSwitch {
+    const char* key; ///< in lantern.ini
+    const char* env; ///< the variable it stands for
+};
+inline constexpr DebugSwitch DebugSwitches[] = {
+    {"debug_frame_stats", "BB_FRAME_STATS"},
+    {"debug_gpu_profile", "BB_GPU_PROFILE"},
+    {"debug_gpu_profile_split", "BB_GPU_PROFILE_SPLIT"},
+    {"debug_spike_trace", "BB_SPIKE_TRACE"},
+    {"debug_submit_diag", "BB_SUBMIT_DIAG"},
+    {"debug_scene_trips", "BB_SCENE_TRIPS"},
+    {"debug_rt_lamp_trace", "BB_RT_LAMP_TRACE"},
+    {"debug_draw_order", "BB_DRAW_ORDER"},
+    {"debug_sun_atlas_ignore_reader", "BB_SUN_ATLAS_IGNORE_READER"},
+};
+static_assert(sizeof(DebugSwitches) / sizeof(DebugSwitches[0]) == DebugSwitchCount);
+inline constexpr const char* DebugSwitchValue = "1:lantern.ini";
+inline int DebugSwitchOfKey(const std::string& key) {
+    for (int d = 0; d < DebugSwitchCount; ++d) {
+        if (key == DebugSwitches[d].key) {
+            return d;
+        }
+    }
+    return -1;
+}
+struct DebugSwitchState {
+    bool ini[DebugSwitchCount]{};     ///< the key was 1 in the file
+    bool env_set[DebugSwitchCount]{}; ///< the variable was set from outside (not empty): it decides
+    bool applied[DebugSwitchCount]{}; ///< the variable is in the environment because of the key
+};
+/// The settings file: BB_CONFIG, else lantern.ini in the working directory.
+inline const char* IniPath() {
+    const char* env = std::getenv("BB_CONFIG");
+    return env && env[0] ? env : "lantern.ini";
+}
+/// The debug_* keys of a settings file, read as Load reads them (the same lines of at most 255
+/// characters, blanks cut at the end only, '#' lines and lines without '=' left out, the key up
+/// to the first '=', on only for the value 1, the last line of a key decides).
+inline void ReadDebugSwitches(const char* path, bool (&on)[DebugSwitchCount]) {
+    for (bool& value : on) {
+        value = false;
+    }
+    if (std::FILE* file = std::fopen(path, "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof(line), file)) {
+            std::string text{line};
+            text.erase(text.find_last_not_of(" \t\r\n") + 1);
+            const auto eq = text.find('=');
+            if (text.empty() || text[0] == '#' || eq == std::string::npos) {
+                continue;
+            }
+            for (int d = 0; d < DebugSwitchCount; ++d) {
+                if (text.compare(0, eq, DebugSwitches[d].key) == 0) {
+                    on[d] = text.compare(eq + 1, std::string::npos, "1") == 0;
+                }
+            }
+        }
+        std::fclose(file);
+    }
+}
+/// Reads the keys of `path`; puts the variable of each key that is 1 into the process
+/// environment unless the variable is set from outside, and takes out a variable an earlier
+/// engine process put there whose key is no longer 1. Changes the environment: not for a
+/// running engine, see DebugSwitchesAtStart.
+inline DebugSwitchState ApplyDebugSwitches(const char* path) {
+    DebugSwitchState state;
+    ReadDebugSwitches(path, state.ini);
+    for (int d = 0; d < DebugSwitchCount; ++d) {
+        const char* name = DebugSwitches[d].env;
+        const char* env = std::getenv(name);
+        const bool inherited = env && std::string(env) == DebugSwitchValue; // from the key, earlier
+        state.env_set[d] = env && env[0] && !inherited;
+        if (state.env_set[d]) {
+            continue;
+        }
+#ifdef _WIN32
+        if (state.ini[d]) {
+            state.applied[d] = inherited || _putenv_s(name, DebugSwitchValue) == 0;
+        } else if (inherited) {
+            _putenv_s(name, ""); // an empty value takes the variable out
+        }
+#else
+        if (state.ini[d]) {
+            state.applied[d] = inherited || setenv(name, DebugSwitchValue, 1) == 0;
+        } else if (inherited) {
+            unsetenv(name);
+        }
+#endif
+    }
+    return state;
+}
+/// Once per process, at its first call: during static initialization in the engine (before main
+/// and before any other thread of the engine exists), else at the first Load.
+inline const DebugSwitchState& DebugSwitchesAtStart() {
+    static const DebugSwitchState state = ApplyDebugSwitches(IniPath());
+    return state;
+}
 
 struct Values {
     std::atomic<MenuLanguage> menu_language{MenuLanguage::English};
@@ -163,6 +380,7 @@ struct Values {
     std::atomic<bool> jitter{true};
     std::atomic<bool> reactive{false};
     std::atomic<bool> object_motion{true};
+    std::atomic<int> object_motion_store{MotionStoreAuto}; // bbport (r37_menu-options), restart
     std::atomic<float> reactive_scale{1.0f};
     std::atomic<float> reactive_threshold{0.2f};
     std::atomic<float> reactive_max{0.9f};
@@ -170,6 +388,17 @@ struct Values {
         fsr3_shading_change_scale{1.0f}, fsr3_accumulation{0.333f}, fsr3_min_disocclusion{-0.333f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
+    // bbport (r77_parallel-test-runs): clean shot: in every frame that draws the world the
+    // renderer leaves out the game's HUD and menus, from the first UI draw onto the finished frame
+    // to the display pass (Rasterizer::CleanShotEarly, UiComposition::CleanShotSkip); loading
+    // screens keep theirs. The overlay then shows only what takes input (BbOverlay::Visible).
+    // Set at the start by BB_CLEAN_SHOT=1 (Load), toggled in play by camera mode's F3 or
+    // L3 + D-pad Left, ended by opening the settings menu: no ini key, never saved.
+    std::atomic<bool> clean_shot{false};
+    // bbport (r102_camera-mode-3-4): camera mode's freeze (F8 in play, BbOverlay ToggleFreeze): the
+    // game's flip waits while it is set (lantern_video_out.cpp HoldFrozen). Runtime only: no ini
+    // key, false at every start, never saved; the settings menu and BB_CAMERA_FREEZE_S end it.
+    std::atomic<bool> camera_freeze{false};
     std::atomic<bool> voice_enabled{true}, voice_push_to_talk{true}, voice_mic_muted{false};
     std::atomic<int> voice_talk_key{25};
     std::atomic<float> voice_volume{1.0f};
@@ -237,6 +466,46 @@ struct Values {
     std::atomic<float> graphics_point_fog_glow_size{0.08f}; // Lamp fog inverse-square core / radius, 0.03-0.20.
     std::atomic<int> graphics_shadow_resolution{1},graphics_local_shadow_resolution{0},graphics_motion_blur_quality{1};
     std::atomic<int> graphics_ao_quality{1}; // 0 regular GTAO, 1 high (full-res bitmask GTAO)
+    std::atomic<int> graphics_sun_far_shadows{SunFarGame}; // bbport (r15_far-shadow-setting), restart
+    // bbport (r37_menu-options): performance modes that were environment variables only (named
+    // after each); a set variable still decides. Live: the renderer reads them every frame.
+    std::atomic<bool> graphics_lamp_shadow_half{false};          // BB_LAMP_SHADOW_HALF
+    std::atomic<int> graphics_lamp_shadow_softness{LampSoftnessSoft}; // bbport (r48_lamp-softness), live; BB_LAMP_SHADOW_SOFT
+    std::atomic<bool> graphics_gi_reflections_fewer_rays{false}; // BB_SSGI_HALF
+    std::atomic<bool> graphics_rt_sun_half{false};               // BB_RT_SUN_HALF
+    std::atomic<bool> graphics_rt_far_refit{false};              // BB_RT_REFIT_EVERY=8
+    // bbport (r45_drawn-look): the drawn look, an optional hand-painted look (renderer_vulkan/
+    // vk_drawn_look.h). All live. While the switch is off or the strength is 0 nothing of it
+    // runs. The renderer reads the switch, strength, stroke_size, texture, characters and debug
+    // so far; the others are parsed, clamped and saved for the parts of the look that are not
+    // built yet (ink lines, painted shadow edges).
+    std::atomic<bool> graphics_drawn_look{false};
+    std::atomic<float> graphics_drawn_look_strength{DrawnLookStrengthDefault}; // 0..1; 0: no pass
+    std::atomic<float> graphics_drawn_look_stroke_size{1.0f};  // 0.6..1.4, a factor on the strokes' size
+    std::atomic<float> graphics_drawn_look_texture{1.0f};      // 0..1.2, the brush's marks in a stroke
+    std::atomic<float> graphics_drawn_look_outlines{DrawnLookOutlinesDefault}; // 0..1, ink on characters
+    std::atomic<float> graphics_drawn_look_shadow_edges{1.0f}; // 0..1; 0: the game's shadows as they are
+    std::atomic<float> graphics_drawn_look_ink_world{0.0f};    // 0..1, ink on the world
+    std::atomic<float> graphics_drawn_look_characters{DrawnLookCharactersDefault}; // 0..1, the strength on characters
+    std::atomic<float> graphics_drawn_look_shadow_soft{DrawnLookShadowSoftDefault}; // 0.05..0.3
+    std::atomic<int> graphics_drawn_look_quality{1};           // 0 low, 1 high
+    // 0 the look; 1, 2, 4 the test view: every stroke in a flat colour of its own (sizes as the
+    // look mixes them, all fine, all bold); 3 is kept for the ink lines' view.
+    std::atomic<int> graphics_drawn_look_debug{0};
+    // Why the drawn look cannot run, for the menu; null while it can. Set by the renderer.
+    std::atomic<const char*> drawn_look_problem{nullptr};
+    // bbport (r109a_strength-settings-engine): live, the renderer reads them every frame; a set
+    // BB_HALATION, BB_LAMP_FLICKER or BB_LAMP_FLICKER_ON_GAME wins over its key.
+    std::atomic<float> graphics_halation_strength{HalationStrengthDefault}; // 0..2; 0: nothing drawn
+    std::atomic<float> graphics_lamp_flicker_strength{LampFlickerSteadyDefault}; // 0..1, flame lamps the game keeps steady
+    std::atomic<float> graphics_lamp_flicker_on_game_strength{LampFlickerOnGameDefault}; // 0..1, flame lamps the game changes; 0: left alone
+    // bbport (r97e_heat-haze-option): live; 0..2, 0 (the default): off, nothing is made or drawn
+    std::atomic<float> graphics_heat_haze_strength{HeatHazeStrengthDefault};
+    // bbport (r99c_interior-default): live, the renderer reads it at every frame; a set BB_INTERIOR_EXPOSURE
+    // or BB_INTERIOR_EXPOSURE_MAX_EV wins over it.
+    std::atomic<float> graphics_interior_brightness{InteriorBrightnessDefault}; // 0..3 stops; 0: off
+    std::atomic<bool> engine_previous_paths{false}; // bbport (r39_master-debug): PreviousPathsMask, live
+    std::atomic<bool> debug_switches[DebugSwitchCount]{}; // bbport (r39_master-debug): debug_* keys, restart
     std::atomic<int> look_choice{0};
     std::atomic<float> graphics_fog{1},graphics_brightness{1},graphics_contrast{1},graphics_hue{0};
     std::atomic<float> camera_fov_scale{1.0f}, camera_distance_scale{1.0f}, camera_height_scale{1.0f};
@@ -280,6 +549,9 @@ struct Values {
     int startup_frame_gen = FrameGenOff;
     int startup_upscaler = UpscalerFsr3;
     bool startup_object_motion = true;
+    int startup_object_motion_store = MotionStoreAuto; // bbport (r37_menu-options): what ObjectMotion uses
+    bool startup_engine_previous_paths = false; // bbport (r39_master-debug): the store, thread placement
+    bool startup_debug_switches[DebugSwitchCount]{}; // bbport (r39_master-debug)
     int startup_motion_blur_quality = 1;
     int startup_specular_model = SpecularGgxFull;
     bool startup_local_inverse_square = false;
@@ -292,6 +564,7 @@ struct Values {
     int startup_ao_quality = 1;
     int startup_shadow_resolution = 1;
     int startup_local_shadow_resolution = 0;
+    int startup_sun_far_shadows = SunFarGame; // bbport (r15_far-shadow-setting): what the hook uses
     bool startup_effects[EffectCount]{};
     int startup_model_lod = -2;
     int startup_output_res = OutputDefault;

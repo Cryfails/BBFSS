@@ -15,6 +15,7 @@
 #include "bbport_platform.h"
 #include "bbport_threads.h"
 #include "bbport_sections.h"
+#include "bbport_toggles.h" // bbport (r29_bursts): BbSpike
 
 #include <array>
 #include <atomic>
@@ -198,6 +199,10 @@ public:
     [[nodiscard]] u64 ConsumedPackets() const noexcept {
         return consumed_packets.load(std::memory_order_acquire);
     }
+    /// bbport (r29_bursts): the counter itself, for the spike trace (read once a flip).
+    [[nodiscard]] const std::atomic<u64>* PacketCounter() const noexcept {
+        return &consumed_packets;
+    }
     /// The packet at `position` (Consumed() <= position < Published()): its payload and size,
     /// and the position after it. A wrap marker gives no payload and the ring's next lap.
     [[nodiscard]] const u8* PacketAt(u64 position, u32& payload, u64& next) const noexcept {
@@ -273,6 +278,8 @@ private:
     /// ms of kernel time in a 330 ms stall, a core taken from the threads doing the work.
     template <typename Done, typename Target>
     void WaitUntil(Done&& done, Target&& target) {
+        // bbport (r29_bursts): BB_SPIKE_TRACE=1: stage A's time in its waits for stage B
+        const BbSpike::NsScope r29_wait{BbSpike::stage_a_wait_ns};
         for (u32 spins = 0; spins < 4096; ++spins) {
             if (done()) {
                 return;

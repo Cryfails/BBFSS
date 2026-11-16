@@ -11,6 +11,7 @@
 #include "common/assert.h"
 #include "video_core/host_shaders/contact_shadow_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_cloud_shadow.h" // bbport (r105_cloud-shadows)
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -149,7 +150,8 @@ void ContactShadow::Flush(bool native_blur) {
             return;
         }
         target_view = proxy.view;
-        depth_view = scene_targets.Read(depth_id, depth_info).view;
+        // bbport (r22_barriers): right after the target's barrier (its Read, compute stage)
+        depth_view = scene_targets.ReadNext(depth_id, depth_info).view;
         const auto size = scene_targets.ProxySize(target);
         width = size.width;
         height = size.height;
@@ -207,7 +209,7 @@ void ContactShadow::Flush(bool native_blur) {
     const auto in = pending_inputs;
     const bool filter_on = use_filter;
     if (!use_contact && !use_filter) {
-        rt_shadow.Record({.constants = in.constants,
+        sun_replaced = rt_shadow.Record({.constants = in.constants,
                           .constants_offset = in.constants_offset,
                           .constants_range = in.constants_range,
                           .uniforms = in.uniforms,
@@ -219,6 +221,11 @@ void ContactShadow::Flush(bool native_blur) {
                           .frame_index = in.frame_index,
                           .width = width,
                           .height = height});
+        // bbport (r105_cloud-shadows): the clouds into the alpha the ray traced sun (or the
+        // VSM) just wrote, before the game's directional light reads it (null when off)
+        if (auto* clouds = CloudShadow::Active(); clouds && sun_replaced) {
+            clouds->Ground(in, depth_view, target_view, width, height);
+        }
         return;
     }
     EffectPass::Mark(4, "contact shadows and PCSS");

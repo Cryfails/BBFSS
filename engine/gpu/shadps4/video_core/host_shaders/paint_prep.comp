@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r45_drawn-look): the drawn look's first pass. The stroke pass writes the scene colour
+// in place while it reads other pixels of it, so it reads this copy instead: rgb the scene as it
+// is before the strokes, a the view depth in metres (0: sky), which the stroke pass takes to
+// tell whether another pixel lies on the same surface. The copy's smaller levels (paint_stats.comp,
+// paint_mips.comp) are averages of this one: a colour that is no number, or below 0, would
+// spread through them, so it is black here.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "paint_common.glsl"
+
+layout(binding = 0) uniform texture2D scene_tex; // RGBA16F, linear, before the game's exposure
+layout(binding = 1) uniform texture2D depth_tex; // depth 0..1 (D3D projection), 1: sky
+layout(binding = 2, rgba16f) uniform writeonly image2D prep_img;
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    const vec3 rgb = soundColour(texelFetch(scene_tex, pixel, 0).rgb);
+    imageStore(prep_img, pixel, vec4(rgb, depth >= 1.0 ? 0.0 : viewZ(depth)));
+}

@@ -193,6 +193,8 @@ Scheduler::~Scheduler() {
 }
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
+    // bbport (r21_draw-sort): ending and beginning render passes leaves every bind as it is.
+    R21Neutral r21_neutral{*this};
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -204,6 +206,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     is_rendering = true;
     render_state = new_state;
     ++passes_begun;
+    r21_fresh_passes += resume ? 0u : 1u; // bbport (r21_draw-sort): R21FreshPasses()
 
     std::array<vk::RenderingAttachmentInfo, 8> color_attachments;
     for (u32 i = 0; i < render_state.num_color_attachments; ++i) {
@@ -632,8 +635,10 @@ void Scheduler::MaybeSplit() {
     }
     // The next command buffer starts without dynamic state: the next draw sets all of it.
     // Everything else (pipeline, vertex and index buffers, descriptors, push constants) every
-    // draw and dispatch records itself.
+    // draw and dispatch records itself (bbport r21_draw-sort: vertex input, vertex and index
+    // buffer binds equal to those in force are left out while R21Epoch() is unchanged).
     dynamic_state.Invalidate();
+    ++r21_epoch;
 }
 
 void Scheduler::HandOver() {
@@ -797,6 +802,7 @@ void Scheduler::EnterDirectMode() {
         direct_mode = true;
         direct_segment = true;
         dynamic_state.Invalidate();
+        ++r21_epoch; // bbport (r21_draw-sort): another command buffer
         return;
     }
     SyncRecording();
@@ -824,6 +830,7 @@ void Scheduler::LeaveDirectSegment() {
     segment_bytes = 0;
     active_worker.store(current_segment % workers.size(), std::memory_order_relaxed);
     dynamic_state.Invalidate();
+    ++r21_epoch; // bbport (r21_draw-sort): another command buffer
 }
 
 void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
@@ -928,6 +935,170 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
     }
 }
 
+namespace {
+// bbport r8 (BbSubmitDiag): Scheduler::Wait calls that blocked, by caller and thread.
+struct DiagWaitSite {
+    void* caller;
+    u32 tid;
+    std::string thread;
+    u64 count;
+    u64 ns;
+};
+std::mutex diag_wait_mutex;
+std::vector<DiagWaitSite> diag_wait_sites;
+
+u64 DiagNowNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+                   .count());
+}
+
+void NoteBlockedWait(void* caller, u64 ns) {
+    const u32 tid = BbPlatform::CurrentThreadId();
+    std::scoped_lock lk{diag_wait_mutex};
+    for (auto& site : diag_wait_sites) {
+        if (site.caller == caller && site.tid == tid) {
+            ++site.count;
+            site.ns += ns;
+            return;
+        }
+    }
+    if (diag_wait_sites.size() < 64) {
+        diag_wait_sites.push_back({caller, tid, Common::GetCurrentThreadName(), 1, ns});
+    }
+}
+} // namespace
+
+void Scheduler::NoteSubmitDiag(u64 tick, u32 reason, bool dry, bool waits, u64 flush_ns,
+                               u64 since_ns) {
+    reason = std::min<u32>(reason, BbSubmitDiag::Reasons - 1);
+    BbSubmitDiag::submits[reason].fetch_add(1, std::memory_order_relaxed);
+    if (dry) {
+        BbSubmitDiag::dry_submits[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (waits) {
+        BbSubmitDiag::waited_submits[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+    BbSubmitDiag::since_ns[reason].fetch_add(since_ns, std::memory_order_relaxed);
+    const u64 queued = DiagNowNs() - flush_ns;
+    BbSubmitDiag::queue_ns[reason].fetch_add(queued, std::memory_order_relaxed);
+    u64 longest = BbSubmitDiag::queue_max_ns[reason].load(std::memory_order_relaxed);
+    while (queued > longest && !BbSubmitDiag::queue_max_ns[reason].compare_exchange_weak(
+                                   longest, queued, std::memory_order_relaxed)) {
+    }
+    submit_diag_ring[tick % SubmitDiagRing].store(
+        (tick << 8) | (u64(reason) << 1) | (dry ? 1u : 0u), std::memory_order_release);
+}
+
+void Scheduler::SubmitDiagFrame() {
+    if (!BbSubmitDiag::On()) {
+        return;
+    }
+    static u64 frames = 0; // the draw recording thread only
+    // A block never mixes two experiment masks (A/B phases): the counts so far are dropped when
+    // the mask changes.
+    static u64 mask = 0;
+    const u64 mask_now = __atomic_load_n(&runtime_experiment_bits, __ATOMIC_RELAXED);
+    const bool switched = mask_now != mask;
+    if (!switched && ++frames < 600) {
+        return;
+    }
+    mask = mask_now;
+    const double f = double(std::max<u64>(frames, 1));
+    frames = 0;
+    std::string out;
+    char line[640];
+    u64 all = 0, all_dry = 0;
+    std::array<u64, BbSubmitDiag::Reasons> n{}, dry{}, waited{}, since{}, queued{}, longest{};
+    for (u32 r = 0; r < BbSubmitDiag::Reasons; ++r) {
+        n[r] = BbSubmitDiag::submits[r].exchange(0, std::memory_order_relaxed);
+        dry[r] = BbSubmitDiag::dry_submits[r].exchange(0, std::memory_order_relaxed);
+        waited[r] = BbSubmitDiag::waited_submits[r].exchange(0, std::memory_order_relaxed);
+        since[r] = BbSubmitDiag::since_ns[r].exchange(0, std::memory_order_relaxed);
+        queued[r] = BbSubmitDiag::queue_ns[r].exchange(0, std::memory_order_relaxed);
+        longest[r] = BbSubmitDiag::queue_max_ns[r].exchange(0, std::memory_order_relaxed);
+        all += n[r];
+        all_dry += dry[r];
+    }
+    std::snprintf(line, sizeof(line),
+                  "Submit diag: over %.0f frames (experiment mask %llu), %.2f submissions/frame "
+                  "of the game's scheduler, %.2f/frame reached the queue after the GPU had "
+                  "finished the one before (dry: the GPU may have waited for it)\n",
+                  f, static_cast<unsigned long long>(mask), double(all) / f,
+                  double(all_dry) / f);
+    out += line;
+    for (u32 r = 0; r < BbSubmitDiag::Reasons; ++r) {
+        if (n[r] == 0) {
+            continue;
+        }
+        const double count = double(n[r]);
+        std::snprintf(line, sizeof(line),
+                      "Submit diag: %6.2f/frame, dry %5.1f%%, %6.3f ms after the previous, "
+                      "decision to queue %5.0f us (max %6.0f), %5.2f/frame with semaphore waits: "
+                      "%s\n",
+                      count / f, 100.0 * double(dry[r]) / count, double(since[r]) / count / 1e6,
+                      double(queued[r]) / count / 1e3, double(longest[r]) / 1e3,
+                      double(waited[r]) / f, BbSubmitDiag::ReasonNames[r]);
+        out += line;
+    }
+    const double ends = double(BbSubmitDiag::ends.exchange(0, std::memory_order_relaxed));
+    const double no_fences =
+        double(BbSubmitDiag::ends_no_fences.exchange(0, std::memory_order_relaxed));
+    const double held = double(BbSubmitDiag::ends_held.exchange(0, std::memory_order_relaxed));
+    const double held_dry =
+        double(BbSubmitDiag::ends_held_dry.exchange(0, std::memory_order_relaxed));
+    const double busy = double(BbSubmitDiag::near_dry_busy.exchange(0, std::memory_order_relaxed));
+    std::snprintf(line, sizeof(line),
+                  "Submit diag: guest submission ends %.1f/frame: %.1f without fences pending, "
+                  "%.1f held for the batch interval, %.2f of those although the GPU had finished "
+                  "everything submitted (64 KiB backlog rule); held ends with the near-dry rule "
+                  "off for want of stage B slack: %.1f/frame\n",
+                  ends / f, no_fences / f, held / f, held_dry / f, busy / f);
+    out += line;
+    const double waits = double(BbSubmitDiag::guest_waits.exchange(0, std::memory_order_relaxed));
+    const double wait_ns =
+        double(BbSubmitDiag::guest_wait_ns.exchange(0, std::memory_order_relaxed));
+    const double index =
+        double(BbSubmitDiag::guest_wait_index.exchange(0, std::memory_order_relaxed));
+    const double guest_submits =
+        double(BbSubmitDiag::guest_submits.exchange(0, std::memory_order_relaxed));
+    const double guest_frames =
+        double(BbSubmitDiag::guest_frames.exchange(0, std::memory_order_relaxed));
+    std::snprintf(line, sizeof(line),
+                  "Submit diag: game thread blocked on the GPU (sceGnm waits for the previous "
+                  "frame) %.2f/frame, %.3f ms/frame, after guest submission %.1f of %.1f a frame "
+                  "(BB_SUBMIT_AHEAD)\n",
+                  waits / f, wait_ns / 1e6 / f, waits > 0 ? index / waits : 0.0,
+                  guest_frames > 0 ? guest_submits / guest_frames : 0.0);
+    out += line;
+    std::vector<DiagWaitSite> sites;
+    {
+        std::scoped_lock lk{diag_wait_mutex};
+        sites.swap(diag_wait_sites);
+    }
+    std::ranges::sort(sites, [](const auto& a, const auto& b) { return a.ns > b.ns; });
+    if (sites.empty()) {
+        out += "Submit diag: GPU waits (Scheduler::Wait that blocked, any thread): none\n";
+    }
+    for (size_t i = 0; i < std::min<size_t>(sites.size(), 12); ++i) {
+        char where[400];
+#ifdef _WIN32
+        BbPlatform::DescribeAddress(sites[i].caller, where, sizeof(where));
+#else
+        std::snprintf(where, sizeof(where), "%p", sites[i].caller);
+#endif
+        std::snprintf(line, sizeof(line),
+                      "Submit diag: GPU wait %6.2f/frame %7.3f ms/frame on %s (thread %u) from "
+                      "%s\n",
+                      double(sites[i].count) / f, double(sites[i].ns) / 1e6 / f,
+                      sites[i].thread.c_str(), sites[i].tid, where);
+        out += line;
+    }
+    if (!switched) {
+        std::fputs(out.c_str(), stdout);
+    }
+}
+
 void Scheduler::Flush(SubmitInfo& info) {
     // When flushing, we only send data to the driver; no waiting is necessary.
     SubmitExecution(info);
@@ -940,45 +1111,209 @@ void Scheduler::Flush() {
 
 void Scheduler::Finish() {
     // When finishing, we need to wait for the submission to have executed on the device.
+    // bbport r8: its submission and its wait are counted under Finish and Finish's caller.
+    const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonFinish};
+    void* const diag_caller =
+        std::exchange(BbSubmitDiag::wait_caller, __builtin_return_address(0));
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
     Wait(presubmit_tick);
+    BbSubmitDiag::wait_caller = diag_caller;
 }
 
 void Scheduler::Wait(u64 tick) {
+    void* const diag_caller =
+        BbSubmitDiag::wait_caller ? BbSubmitDiag::wait_caller : __builtin_return_address(0);
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
+        const BbSubmitDiag::Scope diag_reason{BbSubmitDiag::ReasonTickWait};
         SubmitInfo info{};
         Flush(info);
     }
     BbWaitTrace::Scope trace;
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    // bbport r8: a wait that blocks, by caller and thread ("Submit diag: GPU wait").
+    if (BbSubmitDiag::On() && !IsFree(tick)) {
+        const u64 start = DiagNowNs();
+        work_semaphore.Wait(tick);
+        NoteBlockedWait(diag_caller, DiagNowNs() - start);
+        return;
+    }
     work_semaphore.Wait(tick);
 }
 
+namespace {
+// bbport (r35_pending-ops): one PopPendingOperations call. With BB_SPIKE_TRACE=1 every operation
+// is timed and added to its kind (BbSpike::pending_kinds); the call (its ns from its first
+// operation, so the calls that find none read no clock) is published when it is the longest since
+// the reader took it. Without the trace only the carryable frees are timed, with the budget on.
+constexpr const char* R35Untagged = "untagged (DeferOperation without a kind)";
+struct R35Call {
+    explicit R35Call(bool trace_) : trace{trace_} {}
+    void Start(u64 now) {
+        if (trace && start == 0) {
+            start = now;
+        }
+    }
+    /// Runs one operation and destroys it (its captures, as the pop did before): its ns when
+    /// timed (`clock`, or the trace), else 0.
+    u64 Run(Common::UniqueFunction<void>& callback, const char* kind, bool clock) {
+        const bool timed = clock || trace;
+        const u64 t0 = timed ? BbSpike::NowNs() : 0;
+        Start(t0);
+        callback();
+        callback = Common::UniqueFunction<void>{};
+        ++ops;
+        if (!timed) {
+            return 0;
+        }
+        const u64 ns = BbSpike::NowNs() - t0;
+        if (trace) {
+            Note(kind ? kind : R35Untagged, ns);
+        }
+        return ns;
+    }
+    void Note(const char* kind, u64 ns) {
+        auto& slot = BbSpike::pending_kinds[BbSpike::PendingKindSlot(kind)];
+        slot.count.fetch_add(1, std::memory_order_relaxed);
+        slot.ns.fetch_add(ns, std::memory_order_relaxed);
+        u32 i = 0;
+        while (i + 1 < kinds.size() && kinds[i] != nullptr && kinds[i] != kind) {
+            ++i;
+        }
+        if (kinds[i] == nullptr) {
+            kinds[i] = kind;
+        }
+        kind_ns[i] += ns;
+        ++kind_ops[i];
+        if (ns > longest_ns) {
+            longest_ns = ns;
+            longest_kind = kind;
+        }
+    }
+    static void StoreMax(std::atomic<u64>& to, u64 value) {
+        for (u64 seen = to.load(std::memory_order_relaxed);
+             value > seen &&
+             !to.compare_exchange_weak(seen, value, std::memory_order_relaxed);) {
+        }
+    }
+    /// `carries`: this Scheduler had or has carried frees (the presenter's, which never carries,
+    /// leaves the waiting count to the main one).
+    void Publish(u64 waiting, bool carries) {
+        if (!trace || (ops == 0 && carried == 0)) {
+            return;
+        }
+        constexpr auto relaxed = std::memory_order_relaxed;
+        BbSpike::pending_carried.fetch_add(carried, relaxed);
+        if (carries) {
+            BbSpike::pending_backlog.store(waiting, relaxed);
+        }
+        StoreMax(BbSpike::pending_backlog_max, waiting);
+        StoreMax(BbSpike::pending_wait_max, waited);
+        const u64 ns = BbSpike::NowNs() - start;
+        if (ns <= BbSpike::pending_call_ns.load(relaxed)) {
+            return;
+        }
+        u32 top = 0;
+        for (u32 i = 1; i < kinds.size(); ++i) {
+            top = kind_ns[i] > kind_ns[top] ? i : top;
+        }
+        BbSpike::pending_call_ops.store(ops, relaxed);
+        BbSpike::pending_call_carried.store(carried, relaxed);
+        BbSpike::pending_call_kind.store(kinds[top], relaxed);
+        BbSpike::pending_call_kind_ops.store(kind_ops[top], relaxed);
+        BbSpike::pending_call_kind_ns.store(kind_ns[top], relaxed);
+        BbSpike::pending_call_op_kind.store(longest_kind, relaxed);
+        BbSpike::pending_call_op_ns.store(longest_ns, relaxed);
+        BbSpike::pending_call_ns.store(ns, std::memory_order_release);
+    }
+    bool trace;
+    u64 start = 0;
+    u32 ops = 0, carried = 0;
+    u64 waited = 0, longest_ns = 0; ///< waited: frames, the longest a carried free ran after
+    const char* longest_kind = nullptr;
+    std::array<const char*, 8> kinds{}; ///< this call's kinds (a ninth shares the last slot)
+    std::array<u64, 8> kind_ns{};
+    std::array<u32, 8> kind_ops{};
+};
+} // namespace
+
 void Scheduler::PopPendingOperations() {
-    if (num_pending_ops.load(std::memory_order_acquire) == 0) {
+    // bbport (r35_pending-ops): frees carried from an earlier window also bring a call here,
+    // except while the window that spent its budget lasts (and experiment 576460752303423488 is
+    // clear: set, the next call runs them).
+    if (num_pending_ops.load(std::memory_order_acquire) == 0 &&
+        (r35_num_carried.load(std::memory_order_acquire) == 0 ||
+         (r35_closed_frame.load(std::memory_order_relaxed) ==
+              BbStats::gpu_frames.load(std::memory_order_relaxed) &&
+          CurrentTick() <
+              r35_closed_tick.load(std::memory_order_relaxed) + BbPendingOps::WindowTicks &&
+          !BbToggle::Experiment(BbPendingOps::OldBit)))) {
         return; // every draw comes here
     }
     std::unique_lock lk(pending_ops_mutex);
     // bbport: this runs on every draw and dispatch. Querying the timeline semaphore is an
     // ioctl, so it is skipped when nothing waits and done once per 32 calls (~0.3 ms; reading
     // the clock per draw instead was itself a hot spot).
-    if (pending_ops.empty()) {
+    bool poll = !pending_ops.empty();
+    if (poll && !work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        if ((++pending_polls & 31) != 0 && !BbToggle::Disabled(BbToggle::PendingPollLimit)) {
+            poll = false;
+        } else {
+            work_semaphore.Refresh();
+            poll = work_semaphore.IsFree(pending_ops.front().gpu_tick);
+        }
+    }
+    // bbport (r35_pending-ops): nothing the GPU is past and nothing carried: return here, as the
+    // old code did (the per-draw cost stays as before).
+    if (!poll && r35_carried.empty()) {
         return;
     }
-    if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        if ((++pending_polls & 31) != 0 && !BbToggle::Disabled(BbToggle::PendingPollLimit)) {
-            return;
-        }
-        work_semaphore.Refresh();
+    // bbport (r35_pending-ops): experiment 576460752303423488 set = every operation the GPU is
+    // past runs here, as before; clear = carryable frees for BbPendingOps::BudgetNs a window.
+    const bool budget = !BbToggle::Experiment(BbPendingOps::OldBit);
+    const u64 frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
+    r35_budget.Begin(frame, CurrentTick());
+    if (!poll && budget && !r35_budget.MayRunCarried(r35_carried.front().frame)) {
+        return; // only carried frees, and this window's budget is spent
     }
-    while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        pending_ops.front().callback();
+    R35Call call{BbSpike::on};
+    const bool had_carried = !r35_carried.empty();
+    // The frees carried from earlier windows first (the GPU is past them), oldest first.
+    while (!r35_carried.empty() &&
+           (!budget || r35_budget.MayRunCarried(r35_carried.front().frame))) {
+        R35Carried op = std::move(r35_carried.front());
+        r35_carried.pop_front();
+        r35_num_carried.fetch_sub(1, std::memory_order_release);
+        call.waited = std::max(call.waited, frame - op.frame);
+        r35_budget.Spend(call.Run(op.callback, op.kind, budget));
+    }
+    while (poll && !pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        PendingOp& op = pending_ops.front();
+        if (op.carry && budget && r35_budget.Spent()) {
+            // bbport (r35_pending-ops): a free past this window's budget: to a later one.
+            if (call.trace) {
+                call.Start(BbSpike::NowNs());
+            }
+            r35_carried.push_back({std::move(op.callback), op.kind, frame});
+            r35_num_carried.fetch_add(1, std::memory_order_release);
+            ++call.carried;
+        } else {
+            const u64 ns = call.Run(op.callback, op.kind, op.carry && budget);
+            if (op.carry) {
+                r35_budget.Spend(ns);
+            }
+        }
         pending_ops.pop();
         num_pending_ops.fetch_sub(1, std::memory_order_release);
     }
+    if (!r35_carried.empty()) {
+        // Frees left only when the budget is spent: calls return at once until the window ends.
+        r35_closed_tick.store(r35_budget.tick, std::memory_order_relaxed);
+        r35_closed_frame.store(frame, std::memory_order_relaxed);
+    }
+    call.Publish(r35_carried.size(), had_carried || !r35_carried.empty());
 }
 
 SubmissionBatch* Scheduler::AcquireBatch() {
@@ -1021,6 +1356,7 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    ++r21_epoch; // bbport (r21_draw-sort): another command buffer
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -1033,6 +1369,9 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    // bbport (r27_flush-split): this and SubmitAsync's own time, and its steps below (stage B's
+    // tasks only, BB_SPIKE_TRACE=1)
+    const BbSpike::SplitScope r27_split{BbSpike::SplitSubmit};
     ProducerScope producer{*this, "SubmitExecution"};
     if (async_submit) {
         SubmitAsync(info);
@@ -1055,8 +1394,19 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     EndRendering();
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
-        // Until the next submission's first timestamp: mostly the GPU waiting for it.
-        profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
+        // Until the next submission's first timestamp: mostly the GPU waiting for it (r8: a row
+        // per reason of the next submission).
+        profiler->MarkGap(signal_value + 1);
+    }
+    // bbport r8: why this submission goes out, and when (BbSubmitDiag; the game's scheduler).
+    const bool diag = BbSubmitDiag::On() && !workers.empty();
+    const u32 diag_reason = BbSubmitDiag::reason;
+    const bool diag_waits = info.num_wait_semas != 0;
+    const u64 diag_flush_ns = diag ? DiagNowNs() : 0;
+    const u64 diag_since_ns =
+        diag && submit_diag_last_ns ? diag_flush_ns - submit_diag_last_ns : 0;
+    if (diag) {
+        submit_diag_last_ns = diag_flush_ns;
     }
     SyncRecording();
     // Guest memory copies into staging read by this submission (copy threads).
@@ -1110,6 +1460,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         operation();
     }
     ImGui::Core::TextureManager::Submit();
+    bool diag_dry = false; // bbport r8: the GPU had finished the submission before this one
+    if (diag) {
+        work_semaphore.Refresh();
+        diag_dry = work_semaphore.IsFree(signal_value - 1);
+    }
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         Breadcrumbs::ReportDeviceLost("submit");
@@ -1117,10 +1472,17 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     submitted_tick.store(signal_value, std::memory_order_release);
     submitted_tick.notify_all();
+    if (diag) {
+        NoteSubmitDiag(signal_value, diag_reason, diag_dry, diag_waits, diag_flush_ns,
+                       diag_since_ns);
+    }
 
     // bbport: no semaphore query here (an ioctl per submission, ~3% of the recording thread):
     // PopPendingOperations asks when an operation waits, the GPU signal thread on every fence.
     AllocateWorkerCommandBuffers();
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
+        profiler->MarkSubmissionStart(); // r8: the gap ends here, not at the first pass
+    }
 
     // Apply pending operations
     PopPendingOperations();
@@ -1131,9 +1493,22 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
     if (on_submit) {
         on_submit(info);
     }
-    EndRendering();
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitEndRendering}; // r27_flush-split
+        EndRendering();
+    }
     if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
-        profiler->Mark(0x5B317ull, [] { return std::string{"(between submissions: GPU idle)"}; });
+        profiler->MarkGap(signal_value + 1); // r8: a row per reason of the next submission
+    }
+    // bbport r8: why this submission goes out, and when (BbSubmitDiag).
+    const bool diag = BbSubmitDiag::On();
+    const u32 diag_reason = BbSubmitDiag::reason;
+    const bool diag_waits = info.num_wait_semas != 0;
+    const u64 diag_flush_ns = diag ? DiagNowNs() : 0;
+    const u64 diag_since_ns =
+        diag && submit_diag_last_ns ? diag_flush_ns - submit_diag_last_ns : 0;
+    if (diag) {
+        submit_diag_last_ns = diag_flush_ns;
     }
     resume_rendering = false;
     // Every segment's command buffer is ended by its recording thread (the pool is its own);
@@ -1147,12 +1522,22 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
     }
     // Guest memory copies into staging this submission reads: on the copy threads by then.
-    BbCopy::FlushBatch();
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitCopyBatch}; // r27_flush-split
+        BbCopy::FlushBatch();
+    }
     info.AddSignal(work_semaphore.Handle(), signal_value);
     // Goes out once the commands handed over before it are recorded (an ordered task: in order
     // with the other submissions and after the copies and signals queued before it).
-    RecordOrdered([this, submitted = batch, info = std::move(info), signal_value]() mutable {
-        BbCopy::WaitAsync();
+    // bbport (r27_flush-split): pushing the submit closure (when it runs inline on this thread,
+    // its copy wait and queue submit are timed inside)
+    BbSpike::SplitScope r27_ordered{BbSpike::SplitRecordOrdered};
+    RecordOrdered([this, submitted = batch, info = std::move(info), signal_value, diag,
+                   diag_reason, diag_waits, diag_flush_ns, diag_since_ns]() mutable {
+        {
+            const BbSpike::SplitScope r27_step{BbSpike::SplitCopyWait}; // r27_flush-split
+            BbCopy::WaitAsync();
+        }
         std::array<vk::CommandBuffer, MaxSegments> cmdbufs;
         u32 num_cmdbufs = 0;
         for (u32 i = 0; i < MaxSegments; ++i) {
@@ -1184,7 +1569,13 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
             .signalSemaphoreCount = info.num_signal_semas,
             .pSignalSemaphores = info.signal_semas.data(),
         };
+        bool diag_dry = false; // bbport r8: the GPU had finished the submission before this one
+        if (diag) {
+            work_semaphore.Refresh();
+            diag_dry = work_semaphore.IsFree(signal_value - 1);
+        }
         {
+            const BbSpike::SplitScope r27_step{BbSpike::SplitQueueSubmit}; // r27_flush-split
             std::scoped_lock lk{submit_mutex};
             for (auto& operation : info.before_submit) {
                 operation();
@@ -1197,11 +1588,26 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         }
         submitted_tick.store(signal_value, std::memory_order_release);
         submitted_tick.notify_all();
+        if (diag) {
+            NoteSubmitDiag(signal_value, diag_reason, diag_dry, diag_waits, diag_flush_ns,
+                           diag_since_ns);
+        }
         std::scoped_lock lk{recorder_mutex};
         free_batches.push_back(submitted);
     });
-    KickRecording(true);
-    AllocateWorkerCommandBuffers();
+    r27_ordered.Stop(); // bbport (r27_flush-split): the steps below each timed
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitKick};
+        KickRecording(true);
+    }
+    {
+        const BbSpike::SplitScope r27_step{BbSpike::SplitAllocate};
+        AllocateWorkerCommandBuffers();
+    }
+    if (auto* profiler = GpuProfiler::Get(); profiler && profiler->Records(this)) {
+        profiler->MarkSubmissionStart(); // r8: the gap ends here, not at the first pass
+    }
+    const BbSpike::SplitScope r27_step{BbSpike::SplitPendingOps};
     PopPendingOperations();
 }
 

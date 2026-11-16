@@ -212,22 +212,139 @@ if [[ ${1:-} == --test ]]; then
     out/content-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_rtc.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-rtc-test
     out/sys-rtc-test
+    "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_engine_hooks.cpp gpu/shim/engine/engine_hooks.cpp -o out/engine-hooks-test
+    out/engine-hooks-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. -Igpu/shim tests/test_settings.cpp gpu/shim/bbport_settings.cpp gpu/shim/bbport_menu_i18n.cpp -o out/settings-test
+    out/settings-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_motion_history.cpp -o out/motion-history-test
+    out/motion-history-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_card_uv.cpp -o out/rt-card-uv-test
+    out/rt-card-uv-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_card_layers.cpp -o out/rt-card-layers-test
+    out/rt-card-layers-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_lamp_shadow_tune.cpp -o out/lamp-shadow-tune-test
+    out/lamp-shadow-tune-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_copy_turns.cpp -o out/rt-copy-turns-test
+    out/rt-copy-turns-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_lamp_cards.cpp -o out/rt-lamp-cards-test
+    out/rt-lamp-cards-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_still_check.cpp -o out/rt-still-check-test
+    out/rt-still-check-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_lamp_fog_shafts.cpp -o out/lamp-fog-shafts-test
+    out/lamp-fog-shafts-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_lamp_fog_shaft_cap.cpp -o out/lamp-fog-shaft-cap-test
+    out/lamp-fog-shaft-cap-test
+    # bbport (r106c_shaft-march-cheaper): the fast march's knob, counters and a mirror of its sampling
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_lamp_fog_shaft_fast.cpp -o out/lamp-fog-shaft-fast-test
+    out/lamp-fog-shaft-fast-test
+    # bbport (r80b_shafts-smooth-visible): the shafts' smoothing and gain knobs, the pushed word, a mirror of the bilinear taps
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_lamp_fog_shaft_smooth.cpp -o out/lamp-fog-shaft-smooth-test
+    out/lamp-fog-shaft-smooth-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_glass.cpp -o out/rt-glass-test
+    out/rt-glass-test
+    # bbport (r86b_glass-visible): the glass glint's knobs, lamps, gate and numbers
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_glass_glint.cpp -o out/glass-glint-test
+    out/glass-glint-test
+    # bbport (r107_caustics): the water caustics' knob, push words, drift and pattern
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_caustics.cpp -o out/caustics-test
+    out/caustics-test
+    # bbport (r97_heat-haze): the heat haze's knobs, flames, columns and atlas
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_heat_haze.cpp -o out/heat-haze-test
+    out/heat-haze-test
+    # bbport (r81_sun-fog-no-rt): the sun fog's area light gate (volumetric_area_gate.h)
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_volumetric_area_gate.cpp -o out/volumetric-area-gate-test
+    out/volumetric-area-gate-test
+    # bbport (r115b_sun-fog-out-of-sewer-library): the sun fog's roof rule (volumetric_roof.h)
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_volumetric_roof.cpp -o out/volumetric-roof-test
+    out/volumetric-roof-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Wno-deprecated-declarations -I. tests/test_toml_patch.cpp start/toml_patch.cpp start/xml.cpp start/common.cpp -lexpat -lz $([[ -n $windows ]] && echo -lbcrypt) -o out/toml-patch-test
     out/toml-patch-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_gx_records.cpp gpu/shim/engine/gx_bindings.cpp -o out/gx-records-test
     out/gx-records-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror -mgeneral-regs-only -I. -Isrc tests/test_isa_emulate.c src/isa_emulate.c -o out/isa-emulate-test
     out/isa-emulate-test
+    # bbport (r111_footprints): the footprints' knobs, walk, coat, fade and screen boxes
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_footprints.cpp -o out/footprints-test
+    out/footprints-test
+    # bbport (r111b_footprints-pickup): the blood rule
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_blood_albedo.cpp -o out/blood-albedo-test
+    out/blood-albedo-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_draw_tokens.cpp -o out/draw-tokens-test
     out/draw-tokens-test
+    # bbport (r99_interior-exposure): the interior exposure floor's knobs, rule and easing
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_interior_exposure.cpp -o out/interior-exposure-test
+    out/interior-exposure-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_frame_gen_cap.cpp -o out/frame-gen-cap-test
     out/frame-gen-cap-test
+    # bbport (r98_ambient-particles): the ambient motes' knobs, drift and push block
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_ambient_particles.cpp -o out/ambient-particles-test
+    out/ambient-particles-test
+    # bbport (r89_wind-foliage-sway): the plant sway's knob, word, layout, camera math and rule
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_sway.cpp -o out/wind-sway-test
+    out/wind-sway-test
+    # bbport (r89i_twigs-colour-pass): the colour-pass census and its knobs
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_census.cpp -o out/wind-census-test
+    out/wind-census-test
+    # bbport (r89j_twigs-pick-trees): the tree shape rule, the pick's points, patch and winner rule
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_trees.cpp -o out/wind-trees-test
+    out/wind-trees-test
+    # bbport (r112_wind-more-things): the hanging things' knob, push, rule, book, measure and texts
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang.cpp -o out/wind-hang-test
+    out/wind-hang-test
+    # bbport (r112d_hang-still-test): the hanging things' palette content test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang_still.cpp -o out/wind-hang-still-test
+    out/wind-hang-still-test
+    # bbport (r112h_hang-not-the-hunter): who may hang (the hunter's gear, figures, indoors, keyless)
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang_actors.cpp -o out/wind-hang-actors-test
+    out/wind-hang-actors-test
+    # bbport (r112i_hang-find-lanterns): static hanging things and the survey
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang_find.cpp -o out/wind-hang-find-test
+    out/wind-hang-find-test
+    # bbport (r112p_hang-gpu-palette-lanterns): skinned hanging things the CPU palette test refuses, judged by the GPU box
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang_gpu.cpp -o out/wind-hang-gpu-test
+    out/wind-hang-gpu-test
+    # bbport (r112q_hang-bracket-route): the route lines, BB_WIND_HANG_FORCE, BB_WIND_HANG_BOX_RETRY and the judge's DueSoft
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang_route.cpp -o out/wind-hang-route-test
+    out/wind-hang-route-test
+    # bbport (r82_wind-stage1): the shared wind state, the fog noise and the march step
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind.cpp -o out/wind-test
+    out/wind-test
+    # bbport (r117_wind-shelter): the wind shelter field's knob, layout, reader and model
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_shelter.cpp -o out/wind-shelter-test
+    out/wind-shelter-test
+    # bbport (r122_game-wind-drive): the game-wind cut's knob, level, bit and counters
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_game.cpp -o out/wind-game-test
+    out/wind-game-test
+    # bbport (r96_lamp-flicker-colour): the lamp flicker's knobs, wave, colour gains and tracker
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_lamp_flicker.cpp -o out/lamp-flicker-test
+    out/lamp-flicker-test
+    # bbport (r95_halation): the halation's knobs and push words
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_halation.cpp -o out/halation-test
+    out/halation-test
+    # bbport (r100_blood-sheen, r100d_blood-sheen-gbuffer): the blood sheen's knobs, draw key, albedo rule, wet film
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_blood_sheen.cpp -o out/blood-sheen-test
+    out/blood-sheen-test
+    # bbport (r94_fog-noise): the sun fog noise's knobs, shaping and drift
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_volumetric_fog_noise.cpp -o out/volumetric-fog-noise-test
+    out/volumetric-fog-noise-test
+    # bbport (r105_cloud-shadows): the cloud shadows' knobs, direction rule, drift and push words
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_cloud_shadows.cpp -o out/cloud-shadows-test
+    out/cloud-shadows-test
+    # bbport (r119_volumetric-clouds): the cloud layer's knobs, slab, cloud field and Params block
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_cloud_layer.cpp -o out/cloud-layer-test
+    out/cloud-layer-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_gx_sealed.cpp -o out/gx-sealed-test
     out/gx-sealed-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Wno-unused-parameter -I. -iquote gpu/bbnet/vendor/bbhost_shim tests/test_thd_signal.cpp gpu/bbnet/vendor/bbhost/np_signaling.cpp $([[ -n $windows ]] && echo -lws2_32) -o out/thd-signal-test
     out/thd-signal-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_online_gate.cpp -o out/online-gate-test
     out/online-gate-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_ui_composition.cpp -o out/ui-composition-test
+    out/ui-composition-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_camera_orbit.cpp -o out/camera-orbit-test
+    out/camera-orbit-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_camera_path.cpp -o out/camera-path-test
+    out/camera-path-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror -I. tests/test_gpu_cache_stamp.cpp -o out/gpu-cache-stamp-test
     out/gpu-cache-stamp-test
     "${CXX:-clang++}" -std=c++20 -O1 -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_scene_proxy_release.cpp "${test_link[@]}" -o out/scene-proxy-release-test
@@ -244,6 +361,14 @@ if [[ ${1:-} == --test ]]; then
     out/game-language-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_memory.c src/host.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-memory-test
     out/sys-memory-test
+    # bbport (r84_live-test-knobs): TOOL. The live knobs file (src/sys/live_knobs.c) and its reader
+    "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_live_knobs.c src/sys/live_knobs.c "${test_link[@]}" -o out/live-knobs-test
+    out/live-knobs-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_live_knobs_reader.cpp -o out/live-knobs-reader-test
+    out/live-knobs-reader-test
+    # bbport (r120_test-camera-lookat): TOOL. BB_TEST_CAMERA's text, arithmetic, controller, hold and gate (gpu/shim/bbport_test_camera.h)
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_test_camera.cpp -o out/test-camera-test
+    out/test-camera-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_video_out.c src/host.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-video-out-test
     out/sys-video-out-test
     "$CC" "${cstd[@]}" -O2 -g -Wall -Wextra -Werror "${threads[@]}" "${includes[@]}" -I. -Isrc tests/test_sys_av_player.c src/host.c "${sys_tests[@]}" out/libatrac9.a -lm "${libraries[@]}" "${test_link[@]}" -o out/sys-av-player-test

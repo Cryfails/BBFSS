@@ -24,6 +24,7 @@
 #include "trophy_sync.h"
 #include "widescreen.h"
 #include "../input/input.h"
+#include "../input/mouse_camera.h"
 #include "../face_shot.h"
 #include "bbport_settings.h"
 #include <array>
@@ -71,12 +72,14 @@ std::int64_t __attribute__((sysv_abi)) OnFrame(std::uint64_t, const std::uint64_
     Rebirth::Tick();
     Options::Tick();
     BbInput::Tick();
+    MouseCamera::OrbitFrame();
     Camera::Tick();
     Widescreen::Tick();
     Cheats::Tick();
     TrophySync::Tick();
     GameStatus::Tick();
     OnlineFixes::Tick();
+    OnlineFixes::TestGotoTick(); // bbport (r112n_hang-teleport-camera, TOOL): BB_TEST_GOTO (one relaxed load when off)
     return 0;
 }
 

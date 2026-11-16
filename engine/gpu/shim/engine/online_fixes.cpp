@@ -8,6 +8,7 @@
 #include "kept_travel.h"
 #include "world_copy.h"
 #include "bbport_platform.h"
+#include "bbport_test_goto_walk.h" // bbport (r112o_hang-safe-goto, TOOL)
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -3764,6 +3765,64 @@ std::vector<PartyRow> PartyRows() {
 void SetCameraYaw(float yaw) {
     g_camera_yaw = yaw;
     g_camera_known = true;
+}
+
+// bbport (r112o_hang-safe-goto, TOOL; r112n's one warp replaced): BB_TEST_GOTO. The render thread posts a request
+// (bbport_test_goto.h); here, on the game thread once a frame, the living hunter is WALKED there in hops (bbport_test_goto_walk.h:
+// BB_TEST_GOTO_HOP metres, each hop landing 2 m over the last place he was seen standing still, then a wait until his y keeps
+// still: the floor there is loaded). A hop is the call that brings a co-op guest to the host's side (MoveBodyToSafeSpot: the
+// engine's own body move; it also writes the position into the transition block's spot, as there), keeping the hunter's facing.
+// Nothing moves while a loading screen is up (the walk's settle count starts again), nobody stands in the world or the hunter is
+// dead (the request waits; a walk stops). The warp's entry bytes are checked against 1.09's first. Off: one relaxed load of a
+// false flag and one of the walking flag a frame.
+void TestGotoTick() {
+    if (!BbTestGoto::Pending() && !BbTestGoto::Walking()) return;
+    if (!g_image) return;
+    BbTestGoto::Walker& walker = BbTestGoto::TheWalker();
+    static std::uint32_t seq = 0;
+    const std::uint64_t local = LocalPlayer();
+    if (!local || Hp(local) <= 0) {
+        if (walker.Active()) {
+            walker.Abort();
+            BbTestGoto::SetWalking(false);
+            BbTestGoto::Done(seq, false);
+            std::printf("GLINT-PROOF hang goto (r112o): walk %u stopped: no living hunter in the world\n", seq);
+        }
+        return;
+    }
+    if (Loading()) {
+        walker.Pause();
+        return;
+    }
+    float at[3] = {};
+    const bool placed = Position(local, at);
+    if (!walker.Active()) {
+        BbTestGoto::Request r;
+        if (!BbTestGoto::Take(&r)) return;
+        seq = r.seq;
+        if (std::memcmp(g_image + kWarp, kWarpEntry, sizeof kWarpEntry) != 0) {
+            BbTestGoto::Done(seq, false);
+            std::printf("GLINT-PROOF hang goto (r112n): warp %u refused: the engine's warp entry is not 1.09's\n", seq);
+            return;
+        }
+        if (!placed) {
+            BbTestGoto::Done(seq, false);
+            std::printf("GLINT-PROOF hang goto (r112o): walk %u refused: the hunter's position is not read\n", seq);
+            return;
+        }
+        walker.Begin(r.pos);
+        BbTestGoto::SetWalking(true);
+    }
+    if (!placed) return;
+    const BbTestGoto::WalkOut out = walker.Tick(at);
+    if (out.say[0] != 0) std::printf("%s\n", out.say);
+    if (out.ev == BbTestGoto::WalkEv::Warp) {
+        const float facing[3] = {0.0f, Facing(local), 0.0f};
+        MoveBodyToSafeSpot(local, out.pos, facing);
+    } else if (out.ev == BbTestGoto::WalkEv::Arrived || out.ev == BbTestGoto::WalkEv::Failed) {
+        BbTestGoto::SetWalking(false);
+        BbTestGoto::Done(seq, out.ev == BbTestGoto::WalkEv::Arrived);
+    }
 }
 
 void StartSummon() {

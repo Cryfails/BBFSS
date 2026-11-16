@@ -1,0 +1,291 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r111_footprints): the hunter's footprints laid into the game's G-buffer, at the first light
+// draw after each G-buffer pass (renderer_vulkan/vk_footprints.cpp records it, footprints.h has the
+// rules), so the game's own sun or moon, its lamps and its reflections light them: a wet print is
+// darker and glossier than the ground, a blood print dark red and glossy, a mud print brown.
+// One build. It runs over the pixels of the boxes of this pass's prints and of the ground around the
+// hunter (dispatched with a base: gl_GlobalInvocationID is the pixel). For each pixel with depth:
+// its world point from the depth and this pass's camera, its up-facing share from the depth of its
+// right (or left) and lower (or upper) neighbours; around the hunter's position the up-facing ground
+// is counted (the sense: its height, gloss and albedo, before any print is laid on it); then each
+// print within FOOTPRINTS_PRINT_BAND_M of the point's height weighs the point by its sole's shape
+// and the print's strength (faded on the host), times the up-facing share, and the strongest print
+// of each kind changes the material.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+#include "footprints_layout.h"
+#include "blood_albedo_layout.h"
+
+layout(local_size_x = FOOTPRINTS_GROUP, local_size_y = FOOTPRINTS_GROUP, local_size_z = 1) in;
+
+// FootprintRules::Push, word for word (28 words, 112 bytes).
+layout(push_constant) uniform Push {
+    vec4 inv_view[3]; // this pass's view to world, rows
+    vec4 proj;        // x scale, y scale (signed: ndc +y down), z scale, z offset
+    vec2 size;        // pixels
+    vec2 jitter;      // render pixels
+    vec4 hunter;      // his position (x, y, z), (r111k) then the look (BB_FOOTPRINTS_LOOK: 1 on, 0 r111j's look)
+    uint print_count;
+    uint flags;       // FOOTPRINTS_FLAG_*
+    uint stamp;       // the host's frame + 1
+    float gain;       // BB_FOOTPRINTS_GAIN (r111c): a factor on every print's weight
+};
+
+layout(binding = 0) uniform texture2D depth_tex;         // the G-buffer pass's depth
+layout(binding = 1, rgba8) uniform image2D material_img; // G-buffer target 1: .r gloss
+layout(binding = 2, rgba8) uniform image2D albedo_img;   // G-buffer target 2: .rgb albedo
+                                                         // (sRGB bytes with FOOTPRINTS_FLAG_SRGB)
+layout(binding = 3, rgba8) uniform image2D specular_img; // G-buffer target 3: .rgb root of f0
+struct Print {
+    vec4 a; // x, y, z, strength
+    vec4 b; // dir x, dir z, side, kind
+};
+layout(binding = 4, std430) readonly buffer Prints {
+    Print prints[];
+};
+layout(binding = 5, std430) buffer Counters {
+    uint counts[];
+};
+
+// View depth (metres, in front: positive) from a depth value, as camera_motion.comp: depth =
+// zs + zo / z; 0 for the sky or no depth.
+float ViewZ(float depth) {
+    if (!(depth > 0.0) || depth >= 1.0) {
+        return 0.0;
+    }
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+// The world point of pixel `p` at view depth `z`.
+vec3 World(ivec2 p, float z) {
+    const vec2 uv = (vec2(p) + 0.5) / size - jitter / size;
+    const vec2 ndc = uv * 2.0 - 1.0;
+    const vec4 view = vec4(ndc.x * z / proj.x, ndc.y * z / proj.y, z, 1.0);
+    return vec3(dot(inv_view[0], view), dot(inv_view[1], view), dot(inv_view[2], view));
+}
+
+// The world point of a neighbour pixel; false for the sky.
+bool Neighbour(ivec2 q, out vec3 w) {
+    const float z = ViewZ(texelFetch(depth_tex, q, 0).x);
+    w = World(q, z);
+    return z > 0.0;
+}
+
+// 0..1: the sole's shape at (u along the step, v across it, outward positive).
+float Ellipse(vec2 d, vec2 r) {
+    return 1.0 - smoothstep(FOOTPRINTS_EDGE, 1.0, length(d / r));
+}
+float Sole(float u, float v) {
+    const float fore = Ellipse(vec2(u - FOOTPRINTS_FORE_U, v), vec2(FOOTPRINTS_FORE_RU, FOOTPRINTS_FORE_RV));
+    const float heel = Ellipse(vec2(u - FOOTPRINTS_HEEL_U, v), vec2(FOOTPRINTS_HEEL_RU, FOOTPRINTS_HEEL_RV));
+    // (r111d) the waist joins the heel block and the ball: a boot's sole, not two blobs
+    const float waist = Ellipse(vec2(u - FOOTPRINTS_WAIST_U, v), vec2(FOOTPRINTS_WAIST_RU, FOOTPRINTS_WAIST_RV));
+    return max(max(fore, heel), waist);
+}
+
+// The sRGB transfer (the albedo target is R8G8B8A8_SRGB, bound through a UNORM view): the colour
+// rules work on linear albedo, as the game's lighting reads it.
+vec3 ToLinear(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+}
+vec3 ToSrgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, greaterThan(c, vec3(0.0031308)));
+}
+
+// The ground is blood (r111b): a dark red albedo, in linear values. The numbers are
+// blood_albedo_layout.h's; the C++ twin is BloodAlbedo::IsBlood (renderer_vulkan/blood_albedo.h,
+// with its unit test). Any shader that needs the rule can copy this function.
+bool IsBloodAlbedo(vec3 a) {
+    return a.r >= BLOOD_ALBEDO_R_MIN && a.r <= BLOOD_ALBEDO_R_MAX &&
+           a.r >= BLOOD_ALBEDO_RED_OVER_GREEN * a.g && a.r >= BLOOD_ALBEDO_RED_OVER_BLUE * a.b;
+}
+
+// 0..1 from a world point's cell (2.5 cm): the uneven edge of a print.
+float Grain(vec2 xz) {
+    uvec2 c = uvec2(ivec2(floor(xz * 40.0)) + ivec2(32768));
+    uint h = c.x * 0x8da6b343u ^ c.y * 0xd8163841u;
+    h ^= h >> 13u;
+    h *= 0x5bd1e995u;
+    h ^= h >> 15u;
+    return float(h & 0xffffu) / 65535.0;
+}
+
+// The group's counts, then one atomic per word for the group: sums add, STAMP is a maximum.
+shared uint group_counts[FOOTPRINTS_SLOT_WORDS];
+void AddCounts(uint n[FOOTPRINTS_SLOT_WORDS]) {
+    if (gl_LocalInvocationIndex < FOOTPRINTS_SLOT_WORDS) {
+        group_counts[gl_LocalInvocationIndex] = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    for (uint i = 0u; i < FOOTPRINTS_SLOT_WORDS; ++i) {
+        if (n[i] != 0u) {
+            if (i == FOOTPRINTS_WORD_STAMP) {
+                atomicMax(group_counts[i], n[i]);
+            } else {
+                atomicAdd(group_counts[i], n[i]);
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    const uint w = gl_LocalInvocationIndex;
+    if (w < FOOTPRINTS_SLOT_WORDS && group_counts[w] != 0u) {
+        const uint at = ((flags & FOOTPRINTS_FLAG_SLOT) != 0u ? FOOTPRINTS_SLOT_WORDS : 0u) + w;
+        if (w == FOOTPRINTS_WORD_STAMP) {
+            atomicMax(counts[at], group_counts[w]);
+        } else {
+            atomicAdd(counts[at], group_counts[w]);
+        }
+    }
+}
+
+void main() {
+    uint n[FOOTPRINTS_SLOT_WORDS];
+    for (uint i = 0u; i < FOOTPRINTS_SLOT_WORDS; ++i) {
+        n[i] = 0u;
+    }
+    n[FOOTPRINTS_WORD_STAMP] = stamp;
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 last = ivec2(size) - 1;
+    const bool inside = p.x <= last.x && p.y <= last.y;
+    const float z = inside ? ViewZ(texelFetch(depth_tex, p, 0).x) : 0.0;
+    if (z > 0.0) {
+        n[FOOTPRINTS_WORD_SEEN_PX] = 1u;
+        const vec3 w = World(p, z);
+        // The up-facing share from two neighbours (the right or left one, the lower or upper one).
+        const ivec2 qx = ivec2(p.x < last.x ? p.x + 1 : p.x - 1, p.y);
+        const ivec2 qy = ivec2(p.x, p.y < last.y ? p.y + 1 : p.y - 1);
+        vec3 wx, wy;
+        float up = 0.0;
+        if (Neighbour(qx, wx) && Neighbour(qy, wy)) {
+            const vec3 c = cross(wx - w, wy - w);
+            const float l = length(c);
+            up = l > 1e-12 ? abs(c.y) / l : 0.0;
+        }
+        vec4 m = imageLoad(material_img, p);
+        vec4 a = imageLoad(albedo_img, p);
+        const bool srgb = (flags & FOOTPRINTS_FLAG_SRGB) != 0u;
+        if (srgb) {
+            a.rgb = ToLinear(a.rgb);
+        }
+        bool changed = false;
+        const bool show = (flags & FOOTPRINTS_FLAG_SHOW) != 0u;
+        // The sense around the hunter's position (before any print changes the pixel).
+        if ((flags & FOOTPRINTS_FLAG_HUNTER) != 0u) {
+            const vec2 h = w.xz - hunter.xz;
+            const float across = length(h);
+            const float dy = w.y - hunter.y;
+            if (across <= FOOTPRINTS_SENSE_RADIUS_M && abs(dy) <= FOOTPRINTS_SENSE_HEIGHT_M &&
+                up >= FOOTPRINTS_UP_MIN) {
+                n[FOOTPRINTS_WORD_SENSE_N] = 1u;
+                n[FOOTPRINTS_WORD_SENSE_DY_MM] = uint((dy + FOOTPRINTS_SENSE_HEIGHT_M) * 1000.0 + 0.5);
+                if (dy < -FOOTPRINTS_BIN_M) {
+                    n[FOOTPRINTS_WORD_BIN_LOW] = 1u;
+                } else if (dy < -FOOTPRINTS_GROUND_M) {
+                    n[FOOTPRINTS_WORD_BIN_BELOW] = 1u;
+                } else if (dy <= FOOTPRINTS_GROUND_M) {
+                    n[FOOTPRINTS_WORD_GROUND_N] = 1u;
+                    n[FOOTPRINTS_WORD_GLOSS_SUM] = uint(clamp(m.r, 0.0, 1.0) * 255.0 + 0.5);
+                    n[FOOTPRINTS_WORD_WET_N] = m.r >= FOOTPRINTS_PUDDLE_GLOSS ? 1u : 0u;
+                    n[FOOTPRINTS_WORD_ALBEDO_R] = uint(clamp(a.r, 0.0, 1.0) * 255.0 + 0.5);
+                    n[FOOTPRINTS_WORD_ALBEDO_G] = uint(clamp(a.g, 0.0, 1.0) * 255.0 + 0.5);
+                    n[FOOTPRINTS_WORD_ALBEDO_B] = uint(clamp(a.b, 0.0, 1.0) * 255.0 + 0.5);
+                    if (across <= FOOTPRINTS_PICK_RADIUS_M) { // r111b: the pickup disc under the feet
+                        n[FOOTPRINTS_WORD_PICK_N] = 1u;
+                        n[FOOTPRINTS_WORD_BLOOD_N] = IsBloodAlbedo(a.rgb) ? 1u : 0u;
+                    }
+                    if (show) {
+                        a.rgb = mix(a.rgb, vec3(1.0, 0.9, 0.1), 0.35);
+                        changed = true;
+                    }
+                } else if (dy <= FOOTPRINTS_BIN_M) {
+                    n[FOOTPRINTS_WORD_BIN_ABOVE] = 1u;
+                } else {
+                    n[FOOTPRINTS_WORD_BIN_HIGH] = 1u;
+                }
+            }
+            if (show && across >= FOOTPRINTS_RING_IN_M && across <= FOOTPRINTS_RING_OUT_M &&
+                abs(dy) <= FOOTPRINTS_SENSE_HEIGHT_M) {
+                a.rgb = vec3(1.0, 0.0, 1.0);
+                changed = true;
+                n[FOOTPRINTS_WORD_RING_PX] = 1u;
+            }
+        }
+        // The prints: the strongest of each kind here.
+        float weight[FOOTPRINTS_KINDS] = float[FOOTPRINTS_KINDS](0.0, 0.0, 0.0);
+        const uint count = min(print_count, FOOTPRINTS_MAX_PRINTS);
+        for (uint i = 0u; i < count; ++i) {
+            const Print pr = prints[i];
+            const vec3 l = w - pr.a.xyz;
+            if (abs(l.y) > FOOTPRINTS_PRINT_BAND_M) {
+                continue;
+            }
+            const vec2 dir = pr.b.xy;
+            const float u = dot(l.xz, dir);
+            const float v = dot(l.xz, vec2(-dir.y, dir.x)) * pr.b.z;
+            const float s = Sole(u / FOOTPRINTS_SOLE_SCALE, v / FOOTPRINTS_SOLE_SCALE) * pr.a.w;
+            const uint kind = min(uint(pr.b.w + 0.5), FOOTPRINTS_KINDS - 1u);
+            weight[kind] = max(weight[kind], s);
+        }
+        const float face = smoothstep(FOOTPRINTS_UP_MIN, FOOTPRINTS_UP_FULL, up);
+        const float grain = 0.8 + 0.2 * Grain(w.xz);
+        const float wet = clamp(weight[FOOTPRINTS_KIND_WET] * face * grain * gain, 0.0, 1.0);
+        const float mud = clamp(weight[FOOTPRINTS_KIND_MUD] * face * grain * gain, 0.0, 1.0);
+        const float blood = clamp(weight[FOOTPRINTS_KIND_BLOOD] * face * grain * gain, 0.0, 1.0);
+        if (max(wet, max(mud, blood)) > 1.0 / 64.0) {
+            n[FOOTPRINTS_WORD_PRINT_PX] = 1u;
+            vec4 s = imageLoad(specular_img, p);
+            const bool ground_blood = IsBloodAlbedo(a.rgb); // r111b: a print on blood keeps its colour
+            if (show) {
+                // Test view: each kind in its colour, over the albedo.
+                a.rgb = mix(a.rgb, vec3(0.0, 0.9, 1.0), 0.85 * wet);
+                a.rgb = mix(a.rgb, vec3(1.0, 0.55, 0.1), 0.85 * mud);
+                a.rgb = mix(a.rgb, vec3(1.0, 0.05, 0.05), 0.85 * blood);
+            } else {
+                if (wet > 0.0) {
+                    // (r111g) darkens the stone only: no gloss and no specular colour are added (on a glossy
+                    // floor they made the wet print a pale bright shape instead of a darker one)
+                    // (r111k) the look (hunter.w): darker (K_WET_DARKEN), and a dull ground's gloss raised toward K_WET_GLOSS
+                    // (never lowered; the specular colour stays as r111g left it, so no pale shape on a glossy floor)
+                    const bool look = hunter.w > 0.5;
+                    a.rgb *= 1.0 - (look ? FOOTPRINTS_K_WET_DARKEN : FOOTPRINTS_WET_DARKEN) * wet;
+                    if (look) {
+                        m.r = max(m.r, mix(m.r, FOOTPRINTS_K_WET_GLOSS, wet));
+                    }
+                }
+                if (mud > 0.0) {
+                    const vec3 mud_albedo = vec3(FOOTPRINTS_MUD_ALBEDO_R, FOOTPRINTS_MUD_ALBEDO_G,
+                                                 FOOTPRINTS_MUD_ALBEDO_B);
+                    a.rgb = mix(a.rgb, mud_albedo, FOOTPRINTS_MUD_COVER * mud);
+                    m.r = mix(m.r, FOOTPRINTS_MUD_GLOSS, mud);
+                }
+                if (blood > 0.0) {
+                    // (r111c) the red follows the stone's own red: a dark red patch on any ground
+                    const vec3 blood_albedo =
+                        vec3(clamp(a.r * FOOTPRINTS_BLOOD_RED_KEEP, FOOTPRINTS_BLOOD_RED_MIN,
+                                   FOOTPRINTS_BLOOD_RED_MAX),
+                             FOOTPRINTS_BLOOD_ALBEDO_G, FOOTPRINTS_BLOOD_ALBEDO_B);
+                    if (!ground_blood) {
+                        a.rgb = mix(a.rgb, blood_albedo, FOOTPRINTS_BLOOD_COVER * blood);
+                    }
+                    m.r = max(m.r, mix(m.r, FOOTPRINTS_BLOOD_GLOSS, blood));
+                    s.rgb = max(s.rgb, mix(s.rgb, vec3(FOOTPRINTS_WET_SPEC_ROOT), blood));
+                }
+                imageStore(material_img, p, m);
+                imageStore(specular_img, p, s);
+            }
+            changed = true;
+        }
+        if (changed) {
+            if (srgb) {
+                a.rgb = ToSrgb(a.rgb);
+            }
+            imageStore(albedo_img, p, a);
+        }
+    }
+    AddCounts(n);
+}

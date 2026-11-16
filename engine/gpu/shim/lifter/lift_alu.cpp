@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "lifter/lift_core.h"
+#include "bbport_wind_game.h" // bbport (r122_game-wind-drive)
 
 namespace Lifter {
 
@@ -875,6 +876,10 @@ void Lift_::LiftVop(const Inst& inst) {
     case Op::V_SQRT_F32:
         return SetDstF(inst, ext_f(GLSLstd450Sqrt, f(0)));
     case Op::V_SIN_F32:
+        if (in.vertex_game_cut) { // bbport (r122_game-wind-drive): the game's own foliage wave of a plant pipeline: its trough
+            BbWindGame::Count().sines.fetch_add(1, std::memory_order_relaxed);
+            return SetDstF(inst, CF(BbWindGame::CutLevel));
+        }
         return SetDstF(inst, ext_f(GLSLstd450Sin, Emit(O(spv::Op::OpFMul), t_f32, Ty::F32, {CF(6.2831853f), f(0)})));
     case Op::V_COS_F32:
         return SetDstF(inst, ext_f(GLSLstd450Cos, Emit(O(spv::Op::OpFMul), t_f32, Ty::F32, {CF(6.2831853f), f(0)})));

@@ -37,10 +37,16 @@ public:
         u32 frame_index = 0;
     };
 
-    void OnSsrDraw(VideoCore::ImageId target, const TraceInputs& inputs);
+    /// bbport: true when the game's half-size SSR draw itself can be left out (its target and
+    /// the half-size resolve are then not read: the composite takes the full-size result).
+    bool OnSsrDraw(VideoCore::ImageId target, const TraceInputs& inputs);
 
     vk::ImageView FullResult() const {
-        return full_ready ? *accum_full[(frame - 1) & 1].view : vk::ImageView{};
+        // With the half-size draw left out, a frame whose full trace did not run shows the last
+        // full result rather than the unwritten half-size target.
+        return full_ready || (skip_half && full_history_valid)
+                   ? *accum_full[(frame - 1) & 1].view
+                   : vk::ImageView{};
     }
 
     void Flush(std::array<float, 2> jitter);
@@ -91,6 +97,7 @@ private:
     TraceInputs trace_inputs;
     bool full_ready = false;
     bool full_history_valid = false;
+    bool skip_half = false; ///< this frame's SSR draw was left out (OnSsrDraw)
     std::array<float, 12> prev_view{};
     std::array<float, 2> prev_proj{};
     std::array<float, 2> prev_jitter{};

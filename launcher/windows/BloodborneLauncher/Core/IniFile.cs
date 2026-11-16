@@ -36,11 +36,33 @@ namespace BloodborneLauncher.Core
             ("effect_gtao", "1"),
             ("effect_ray_tracing", "0"),
             ("graphics_rt_point_shadows", "0"),
+            // Graphics > Lighting: how soft the ray traced lamp shadows are, the engine's default.
+            ("graphics_lamp_shadow_softness", "soft"),
             ("effect_gi", "1"),
             ("graphics_gi_probes", "1"),
             ("graphics_rt_sun", "0"),
             ("graphics_rt_bounce", "0"),
+            // Graphics > Performance: the engine's defaults (its faster modes off, the motion-vector
+            // store sized by the engine).
+            ("graphics_rt_sun_half", "0"),
+            ("graphics_lamp_shadow_half", "0"),
+            ("graphics_rt_far_refit", "0"),
+            ("graphics_gi_reflections_fewer_rays", "0"),
+            ("object_motion_store", "auto"),
+            ("graphics_sun_far_shadows", "game"),
+            // More > Engine: the troubleshooting switch back to the engine's earlier paths, off.
+            ("engine_previous_paths", "0"),
             ("graphics_point_fog_glow_size", "0.08"),
+            // Graphics > Lighting: the interior brightness, the engine's default
+            // (BbSettings::InteriorBrightnessDefault); the in-game menu has its slider.
+            ("graphics_interior_brightness", "0.75"),
+            // Graphics > Lighting: the halation and the lamp flicker strengths, the engine's defaults
+            // (BbSettings::HalationStrengthDefault, LampFlickerSteadyDefault, LampFlickerOnGameDefault).
+            ("graphics_halation_strength", "1.00"),
+            ("graphics_lamp_flicker_strength", "1.00"),
+            ("graphics_lamp_flicker_on_game_strength", "0.00"),
+            // r97e: the heat haze's strength, off by default (BbSettings::HeatHazeStrengthDefault).
+            ("graphics_heat_haze_strength", "0.00"),
             ("frame_gen_even_pacing", "0"),
             ("dlss_preset", "k"),
             ("fps_position", "0"),
@@ -106,6 +128,28 @@ namespace BloodborneLauncher.Core
             || (Flag("graphics_rt_bounce") && !(Flag("effect_gi") && Flag("graphics_gi_probes")));
 
         public void DeriveRayTracing() => Set("effect_ray_tracing", RayTracingNeeded() ? "1" : "0");
+
+        /// <summary>Reads the file again and keeps what the launcher changed and has not saved yet,
+        /// as Save does before it writes: the game's in-game menu edits the same file. A file that
+        /// cannot be opened now (the game is writing it) leaves the launcher's copy as it is.</summary>
+        public void Refresh()
+        {
+            try
+            {
+                using var open = File.Open(Paths.IniPath, FileMode.Open, FileAccess.Read, FileShare.Read);
+            }
+            catch
+            {
+                return;
+            }
+            var mine = _changed.ToDictionary(k => k, k => _values.TryGetValue(k, out var v) ? v : null, StringComparer.Ordinal);
+            Load();
+            foreach (var (key, value) in mine)
+            {
+                _values[key] = value;
+                _changed.Add(key);
+            }
+        }
 
         public void Save()
         {

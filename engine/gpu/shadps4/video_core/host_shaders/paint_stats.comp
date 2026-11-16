@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r45_drawn-look): the drawn look's second pass, at half the scene's size. From the
+// copy (paint_prep.comp) it makes the copy's level 1 (the mean of each 2x2 pixels) and the first
+// level of the "marks", from which the stroke pass tells plain surfaces from detail:
+//   r  the mean tone of the 2x2 pixels (toneOf: the cube root of the luminance)
+//   g  how much the tone varies inside the 2x2 pixels (its variance); paint_mips.comp adds
+//      what the means of a level's texels vary by, so every level holds the variance of all the
+//      pixels under a texel (kept as a variance, not as a mean of squares: the difference of
+//      two large numbers has no bits left in a half float)
+//   b, a  which way the tone's slopes run, as a vector that adds up over a block where they all
+//      run one way (an edge, a railing, a joint between stones) and cancels where they run every
+//      way (grit): (gx^2 - gy^2, 2 gx gy) of the slope (gx, gy)
+// One pass for both: they read the same 4x4 pixels.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "paint_common.glsl"
+
+layout(binding = 0) uniform texture2D prep_tex; // the copy's level 0
+layout(binding = 1, rgba16f) uniform writeonly image2D half_img;  // the copy's level 1
+layout(binding = 2, rgba16f) uniform writeonly image2D marks_img; // the marks' level 0
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(texel, imageSize(half_img)))) {
+        return;
+    }
+    const ivec2 last = ivec2(size) - 1;
+    float tone[16];
+    vec4 mean = vec4(0.0);
+    for (int i = 0; i < 16; ++i) {
+        const ivec2 at = ivec2(i & 3, i >> 2);
+        const vec4 c = texelFetch(prep_tex, clamp(texel * 2 - 1 + at, ivec2(0), last), 0);
+        tone[i] = toneOf(c.rgb);
+        if (at.x == 1 || at.x == 2) {
+            if (at.y == 1 || at.y == 2) {
+                mean += c;
+            }
+        }
+    }
+    imageStore(half_img, texel, mean * 0.25);
+    vec4 marks = vec4(0.0);
+    for (int i = 0; i < 4; ++i) {
+        const int k = 5 + (i & 1) + 4 * (i >> 1);
+        const vec2 slope = 0.5 * vec2(tone[k + 1] - tone[k - 1], tone[k + 4] - tone[k - 4]);
+        marks += vec4(tone[k], tone[k] * tone[k], slope.x * slope.x - slope.y * slope.y,
+                      2.0 * slope.x * slope.y);
+    }
+    marks *= 0.25;
+    marks.g = max(marks.g - marks.r * marks.r, 0.0);
+    imageStore(marks_img, texel, marks);
+}

@@ -1,0 +1,397 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r119_volumetric-clouds): FEATURE, BB_VOLUMETRIC_CLOUDS=1 only. A layer of ray marched
+// clouds in front of the painted sky dome, made by renderer_vulkan/vk_cloud_layer.cpp (the knobs,
+// the numbers and their rules are cloud_layer_params.h's) in two builds of this file:
+//  - MARCH: one invocation a pixel of an image 1 / CL_DIV of the scene a side. A pixel with at
+//    least one sky pixel under it (depth 1, or a view z beyond Params.dist.z when that is above 0)
+//    takes the mean colour of those sky pixels (the painted sky, with the game's own fog on it) as
+//    its tint and marches the view ray through the slab. Output: premultiplied cloud colour
+//    (rgb) and opacity (a); r < 0 marks a pixel with no sky under it.
+//  - COMPOSITE: one invocation a scene pixel. A sky pixel takes the four nearest march pixels that
+//    have sky under them (bilinear weights, renormalised over those: no cloud colour leaks from or
+//    onto geometry) and blends: scene = scene (1 - a) + premultiplied colour.
+// The density is the cloud shadows' field (cloud_shadow.comp: the same value noise on r94's
+// lattice with the same offsets, weights and edges): a point p of the layer reads the plane
+// coordinate q = p.xz - slope x Href (Href: the layer's reference height) and
+// c = smoothstep(low, high, n(q)), where cloud_shadow.comp reads q = p.xz - p.y slope at the
+// ground; for a layer point and the ground point along the light below it the two q are equal, so
+// the ground is shadowed exactly where this layer has cloud (at the reference height). The slab is
+// slab.x to slab.x + slab.y above the world's y = 0 (Params.slab); the cloud at a column fills
+// 0.35 + 0.65 c of it from the flat base up, with a rounded top.
+// bbport (r119c_clouds-gaps): the field is read at the layer's own size (Params.cloud_off0.w: 800 m for the biggest
+// octave by default; the cloud shadows' 100 m cells averaged out over a sky ray into one grey blanket and made
+// the lod rule below drop the finer octaves), with the layer's own edges and offsets (a drift of its own), so
+// it is no longer the shadows' field. Gaps of clear sky between masses, the base 0.3 of the ambient, a brighter
+// lit rim and a forward glow toward the light.
+// bbport (r119d_clouds-contrast): readable clouds. The coverage edge is a narrow smoothstep (Params.cloud_off1.w to
+// cloud_off2.w, 0.06 of n apart), the cores dense (opacity up to 0.92), the march keeps the shade (ambient, dark at
+// the base) and the lit light (bright rim, forward glow, a multi-scatter floor) apart and colours them differently:
+// the shade is the painted sky's tint desaturated and cooled, the lit light the sky's tint nearly as it is, at 3 x its
+// brightness at the most near the light. The counters 14 and 15 say how much of the visible cloud ends darker than
+// 0.7 or brighter than 1.4 of the sky behind it.
+// bbport (r119e_clouds-real-sky): a contrast (Params.dist.w, BB_VOLUMETRIC_CLOUDS_CONTRAST, 1 = the r119d look): the
+// shade colour is divided by it and the lit colour multiplied by its square root (darker undersides, brighter rims).
+// bbport (r119g_clouds-smear-and-cover): the dark angular smear (a dense cloud low over a bright horizon, lit by ONE
+// tap toward the light whose hard silhouette showed) is fixed by Params.extra: two jittered light taps, the shade at a
+// cloud's base 0.45 of its top's and a horizon glow floor (extra.y, .z, .w; the smear fix off gives the old arithmetic:
+// one tap at 0.5, base 0.25, no floor); extra.x is the tint (0: the sky's tint desaturated and cooled, 1: the sky's own).
+// bbport (r119i_clouds-behind-painted-sky): the clouds sit behind the painting (Params.paint, MARCH only): paint.x takes back
+// the share of a block's opacity where the painted sky has shapes of its own (painted_share: the block's brightness and view z
+// against 12 sky pixels on two rings round it); paint.w caps the cloud's colour at this times the sky's brightness behind it.
+// paint.x = 0 and paint.w = 0 give the r119h arithmetic.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "cloud_layer_layout.h"
+
+layout(local_size_x = CL_WG, local_size_y = CL_WG) in;
+
+#ifdef MARCH
+layout(binding = 0, rgba16f) uniform writeonly image2D cloud_img;
+layout(binding = 1, rgba16f) uniform readonly image2D scene_img;
+#else
+layout(binding = 0, rgba16f) uniform readonly image2D cloud_img;
+layout(binding = 1, rgba16f) uniform image2D scene_img;
+#endif
+layout(binding = 2) uniform texture2D depth_tex; // D32, depth 0..1 (D3D projection)
+
+// CloudLayerParams::Params, field for field (13 vec4, written by the engine each frame).
+layout(std430, binding = 3) readonly buffer Params {
+    vec4 row0, row1, row2; // view to world, 3x4 rows (the camera's pass); the camera at w
+    vec4 proj;             // x scale, y scale (signed: ndc +y down), z scale, z offset
+    vec4 cloud_off0;       // xyz: octave 0's offset in its lattice cells; w: 1 / size (1/m)
+    vec4 cloud_off1;       // xyz: octave 1's offset; w: low edge (n below it: no cloud)
+    vec4 cloud_off2;       // xyz: octave 2's offset; w: high edge (n above it: full cloud)
+    vec4 light;            // xyz: the direction toward the light (world); w: its share (0: none)
+    vec4 slab;             // base y (m), thickness (m), reference height (m), sigma (1/m)
+    vec4 plane;            // xy: L.xz / max(L.y, 0.1) (the cloud shadows' slope); zw: the jitter
+    vec4 look;             // steps, opacity cap, horizon fade from, to (|ray y|)
+    vec4 dist;             // distance fade from, to (m); sky view z (m, 0: depth 1 only); contrast (r119e)
+    vec4 tone;             // ambient, light, desaturation of the tint (tint knob applied), forward scatter
+#ifdef MARCH
+    vec4 extra;            // r119g: tint (0..1), light taps, shade base (at a cloud's base, of its top's), horizon glow
+    vec4 paint;            // r119i: painted share taken back (0: off), ring near / far (px at 1080 lines), glow cap (0: off)
+#endif
+};
+
+layout(push_constant) uniform Push {
+    uvec2 scene; // the scene's size in pixels
+    uint frame;  // for the march's jitter
+    uint flags;  // CL_FLAG_*
+};
+
+const float MAX_T = 12000.0;   // m: no cloud is marched beyond this distance
+const float MAX_CHORD = 3000.0; // m: the longest stretch of a ray marched in the slab
+// bbport (r119d_clouds-contrast): the look (the march's; the composite build leaves them out)
+#ifdef MARCH
+const vec3 LUMA_W = vec3(0.2126, 0.7152, 0.0722);
+// (r119g: the shade at a cloud's base, of its top's, is Params.extra.z: 0.45, or 0.25 with the smear fix off)
+const float LIGHT_TAU = 0.8;       // the optical depth toward the light is weighed exp(-LIGHT_TAU tau) ...
+const float MULTI_SCATTER = 0.25;  // ... plus this x exp(-0.2 tau): a dense core keeps a faint glow
+const float LUM_FLOOR = 0.015;     // a sky darker than this counts as this grey
+const vec3 SHADE_COOL = vec3(0.88, 0.94, 1.06); // the shade side is cooler than the sky
+// bbport (r119i): the painted sky's shapes: the 8 directions of the rings (the first 4, the axes, are also the far ring's)
+const ivec2 PAINT_DIRS[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1), ivec2(1, 1), ivec2(-1, 1),
+                                     ivec2(1, -1), ivec2(-1, -1));
+const float PAINT_LO = 0.08, PAINT_SPAN = 0.30; // |l - l0| / (l + l0): a shape starts at the first, is whole at the sum
+#endif
+
+// The view z (m) a depth gives (as heat_haze.comp).
+float view_z(float depth) {
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+bool is_sky(float depth) {
+    return depth >= 1.0 || (dist.z > 0.0 && view_z(depth) > dist.z);
+}
+
+// bbport (r119b_clouds-visible): the depth probe's counter word of a depth: CL_WORD_Z_SKY for depth 1, then
+// the view z bands (CL_Z_EDGE0 to CL_Z_EDGE4), CL_WORD_Z_LAST for the rest (and for no depth).
+uint z_word(float depth) {
+    if (depth >= 1.0) return CL_WORD_Z_SKY;
+    float z = view_z(depth);
+    if (!(z > 0.0)) return CL_WORD_Z_LAST;
+    if (z >= CL_Z_EDGE0) return CL_WORD_Z_SKY + 1u;
+    if (z >= CL_Z_EDGE1) return CL_WORD_Z_SKY + 2u;
+    if (z >= CL_Z_EDGE2) return CL_WORD_Z_SKY + 3u;
+    if (z >= CL_Z_EDGE3) return CL_WORD_Z_SKY + 4u;
+    if (z >= CL_Z_EDGE4) return CL_WORD_Z_SKY + 5u;
+    return CL_WORD_Z_LAST;
+}
+
+// The ray's distances (t0 < t1, t0 >= 0) inside the slab base < y < top for a camera at height cy
+// and a ray of y slope dy; false when it does not meet the slab.
+bool slab_range(float cy, float dy, float base, float top, out float t0, out float t1) {
+    t0 = 0.0;
+    t1 = 0.0;
+    if (abs(dy) < 1e-4) {
+        if (cy < base || cy > top) return false;
+        t1 = MAX_T;
+        return true;
+    }
+    float ta = (base - cy) / dy, tb = (top - cy) / dy;
+    t0 = max(min(ta, tb), 0.0);
+    t1 = max(ta, tb);
+    return t1 > t0;
+}
+
+// fog_noise.glsl's value noise and lattice turn only (as cloud_shadow.comp)
+#define FOG_NOISE_VALUE_ONLY
+#include "fog_noise.glsl"
+
+// n at the lattice coordinate x = (q.x, 0, q.y) / size: 0.5 plus the weighted octaves, each
+// (N - 0.5) of fog_noise_value on its turned lattice minus its offset; lod (0..1 an octave) fades
+// an octave out toward its mean when the march's step is longer than its cells (no aliasing).
+// The octaves' terms read as cloud_shadow.comp's cloud_light reads them (the patch's check).
+float cloud_n(vec3 x, vec3 lod) {
+    float n = 0.5;
+    n += float(FOG_NOISE_WEIGHT0) * lod.x *
+         (fog_noise_value(fog_noise_cells(x, float(FOG_NOISE_YAW_COS0), float(FOG_NOISE_YAW_SIN0),
+                                          float(FOG_NOISE_RATIO0)) - cloud_off0.xyz) - 0.5);
+    if (lod.y > 0.0) {
+        n += float(FOG_NOISE_WEIGHT1) * lod.y *
+             (fog_noise_value(fog_noise_cells(x, float(FOG_NOISE_YAW_COS1), float(FOG_NOISE_YAW_SIN1),
+                                              float(FOG_NOISE_RATIO1)) - cloud_off1.xyz) - 0.5);
+    }
+    if (lod.z > 0.0) {
+        n += float(FOG_NOISE_WEIGHT2) * lod.z *
+             (fog_noise_value(fog_noise_cells(x, float(FOG_NOISE_YAW_COS2), float(FOG_NOISE_YAW_SIN2),
+                                              float(FOG_NOISE_RATIO2)) - cloud_off2.xyz) - 0.5);
+    }
+    return n;
+}
+
+// The cloud's density (1/m) at world point p, and in v the height in the cloud (0 base, 1 top).
+float density_at(vec3 p, vec3 lod, out float v) {
+    v = 0.0;
+    float u = (p.y - slab.x) / slab.y;
+    if (u <= 0.0 || u >= 1.0) return 0.0;
+    vec2 q = p.xz - plane.xy * slab.z;
+    vec3 x = vec3(q.x, 0.0, q.y) * cloud_off0.w;
+    if (any(isnan(x)) || any(isinf(x))) return 0.0;
+    float c = smoothstep(cloud_off1.w, cloud_off2.w, cloud_n(x, lod));
+    if (c <= 0.0) return 0.0;
+    float top = 0.35 + 0.65 * c;
+    v = u / top;
+    if (v >= 1.0) return 0.0;
+    float h = smoothstep(0.0, 0.15, v) * (1.0 - smoothstep(0.55, 1.0, v));
+    return slab.w * c * h;
+}
+
+// Interleaved gradient noise, shifted each frame (the upscaler averages the frames).
+float ign(vec2 p) {
+    p += 5.588238 * float(frame & 63u);
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+// bbport (r119i): the composite does not count (its build keeps its old 16 words, so its SPIR-V does not change)
+#ifdef MARCH
+shared uint group_counts[CL_WORDS];
+#else
+shared uint group_counts[16];
+#endif
+
+#ifdef MARCH
+layout(std430, binding = 4) buffer Counters {
+    uint words[CL_WORDS];
+};
+
+// bbport (r119i_clouds-behind-painted-sky): the share (0..1) of a march block's cloud the painted sky takes back where it has shapes
+// of its own. The block's sky brightness (lum_c) and view z (z_c) are compared with the sky pixels on two rings round the block
+// (paint.y and paint.z pixels at a 1080 line scene, scaled with the scene's height; 8 samples near, the 4 axes far): a brightness that
+// differs (a painted ridge, a painted cloud's rim) or a view z that jumps (a ridge mesh before the dome, depth 1 against the dome)
+// counts, the worst of the 12 decides, times paint.x. A ring pixel that is not sky is skipped: the world's own edges take nothing back.
+float painted_share(ivec2 centre, float lum_c, float z_c) {
+    float worst = 0.0;
+    float k_scale = float(scene.y) / 1080.0;
+    int near_px = max(int(paint.y * k_scale + 0.5), 2);
+    int far_px = max(int(paint.z * k_scale + 0.5), 4);
+    for (int k = 0; k < 12; ++k) {
+        ivec2 q = centre + PAINT_DIRS[k & 7] * (k < 8 ? near_px : far_px);
+        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(scene)))) continue;
+        float d = texelFetch(depth_tex, q, 0).r;
+        if (!is_sky(d)) continue;
+        vec3 c = imageLoad(scene_img, q).rgb;
+        if (any(isnan(c)) || any(isinf(c))) continue;
+        float l = dot(clamp(c, vec3(0.0), vec3(10000.0)), LUMA_W);
+        float by_light = smoothstep(PAINT_LO, PAINT_LO + PAINT_SPAN, abs(l - lum_c) / max(l + lum_c, LUM_FLOOR));
+        float zq = d >= 1.0 ? 100000.0 : view_z(d);
+        float by_depth = smoothstep(0.15, 0.5, abs(log(max(zq, 1.0) / max(z_c, 1.0))));
+        worst = max(worst, max(by_light, by_depth));
+    }
+    return clamp(worst * paint.x, 0.0, 1.0);
+}
+
+vec4 march(ivec2 hp) {
+    ivec2 base = hp * CL_DIV;
+    // bbport (r119b_clouds-visible): the depth probe (one fetch, one shared atomic a march pixel)
+    atomicAdd(group_counts[z_word(texelFetch(depth_tex, base, 0).r)], 1u);
+    vec3 sky_sum = vec3(0.0);
+    float sky_n = 0.0;
+    float sky_z0 = 100000.0; // bbport (r119i): the view z of the block's first sky pixel
+    for (int j = 0; j < CL_DIV; ++j) {
+        for (int i = 0; i < CL_DIV; ++i) {
+            ivec2 p = base + ivec2(i, j);
+            if (any(greaterThanEqual(p, ivec2(scene)))) continue;
+            float dp = texelFetch(depth_tex, p, 0).r;
+            if (is_sky(dp)) {
+                if (sky_n == 0.0) sky_z0 = dp >= 1.0 ? 100000.0 : view_z(dp); // bbport (r119i)
+                vec3 c = imageLoad(scene_img, p).rgb;
+                if (any(isnan(c)) || any(isinf(c))) c = vec3(0.0);
+                sky_sum += clamp(c, vec3(0.0), vec3(10000.0));
+                sky_n += 1.0;
+            }
+        }
+    }
+    if (sky_n == 0.0) return vec4(-1.0, 0.0, 0.0, 0.0);
+    atomicAdd(group_counts[CL_WORD_SKY], 1u);
+    // the view ray through the block's centre (ToPixel's inverse: pixel = (ndc / 2 + 0.5) size +
+    // jitter)
+    vec2 centre = vec2(base) + 0.5 * float(CL_DIV);
+    vec2 ndc = (centre - plane.zw) / vec2(scene) * 2.0 - 1.0;
+    vec3 dv = vec3(ndc.x / proj.x, ndc.y / proj.y, 1.0);
+    vec3 dw = normalize(vec3(dot(row0.xyz, dv), dot(row1.xyz, dv), dot(row2.xyz, dv)));
+    vec3 cam = vec3(row0.w, row1.w, row2.w);
+    float top_y = slab.x + slab.y;
+    float t0, t1;
+    if (!slab_range(cam.y, dw.y, slab.x, top_y, t0, t1) || t0 > MAX_T) return vec4(0.0);
+    float fade = smoothstep(look.z, look.w, abs(dw.y)) * (1.0 - smoothstep(dist.x, dist.y, t0));
+    if (fade <= 0.0) return vec4(0.0);
+    t1 = min(t1, t0 + MAX_CHORD);
+    int steps = int(look.x);
+    float dt = (t1 - t0) / float(steps);
+    // the longest move of the plane coordinate in a step, in lattice cells of each octave
+    float sh = length(dw.xz - plane.xy * dw.y) * dt * cloud_off0.w;
+    vec3 lod = clamp(vec3(1.6) - vec3(sh) / vec3(float(FOG_NOISE_RATIO0), float(FOG_NOISE_RATIO1),
+                                                 float(FOG_NOISE_RATIO2)),
+                     vec3(0.0), vec3(1.0));
+    float cos_l = dot(dw, light.xyz);
+    float cl = max(cos_l, 0.0); // bbport (r119c_clouds-gaps): a broad glow and a bright core toward the light
+    float forward = 0.7 * pow(cl, 4.0) + 0.3 * pow(cl, 32.0);
+    float jitter = ign(vec2(hp));
+    float T = 1.0, acc_amb = 0.0, acc_lit = 0.0; // bbport (r119d): the shade and the lit light kept apart
+    uint taken = 0u;
+    for (int i = 0; i < steps; ++i) {
+        ++taken;
+        vec3 p = cam + dw * (t0 + (float(i) + jitter) * dt);
+        float v;
+        float dens = density_at(p, lod, v);
+        if (dens <= 0.0) continue;
+        float a = 1.0 - exp(-dens * dt);
+        acc_amb += T * a * tone.x * mix(extra.z, 1.0, v);
+        if (light.w > 0.0 && a > 0.004) {
+            float lp = min((top_y - p.y) / max(light.y, 0.15), 2.0 * slab.y);
+            float unused;
+            // bbport (r119g_clouds-smear-and-cover): extra.y taps along the path toward the light, each at
+            // (k + jitter) / taps of it (one tap: the middle, as before), averaged: the cloud's own silhouette
+            // along the light no longer shows as a hard edged dark shape
+            int taps = max(int(extra.y), 1);
+            float dsum = 0.0;
+            for (int k = 0; k < taps; ++k) {
+                float where_at = taps > 1 ? (float(k) + jitter) / float(taps) : 0.5;
+                dsum += density_at(p + light.xyz * (where_at * lp), lod, unused);
+            }
+            float dl = dsum / float(taps);
+            float tau = dl * lp * LIGHT_TAU;
+            float open_to_light = exp(-tau) + MULTI_SCATTER * exp(-0.2 * tau);
+            acc_lit += T * a * tone.y * light.w * open_to_light * (0.45 + tone.w * forward);
+        }
+        T *= 1.0 - a;
+        if (T < 0.03) break;
+    }
+    // bbport (r119g): a horizon glow floor: low over the horizon the underside of a cloud is lit by it (extra.w = 0: off)
+    acc_amb = max(acc_amb, (1.0 - T) * extra.w * (1.0 - smoothstep(0.10, 0.50, dw.y)));
+    vec3 tint = sky_sum / sky_n;
+    float sky_lum = dot(tint, LUMA_W);
+    if (sky_lum < LUM_FLOOR) {
+        tint = vec3(LUM_FLOOR);
+        sky_lum = LUM_FLOOR;
+    }
+    vec3 grey = vec3(sky_lum);
+    float contrast = dist.w > 0.0 ? dist.w : 1.0; // bbport (r119e_clouds-real-sky)
+    vec3 shade_col = mix(tint, grey, tone.z) * mix(SHADE_COOL, vec3(1.0), extra.x) / contrast; // bbport (r119g): tint
+    vec3 lit_col = mix(tint, grey, 0.5 * tone.z) * sqrt(contrast);
+    // bbport (r119i_clouds-behind-painted-sky): the painted sky takes back its shapes (paint.x = 0: nothing)
+    float taken_back = paint.x > 0.0 ? painted_share(base + ivec2(CL_DIV / 2), sky_lum, sky_z0) : 0.0;
+    float scale = fade * look.y * (1.0 - taken_back);
+    float alpha = (1.0 - T) * scale;
+    vec3 rgb = (shade_col * acc_amb + lit_col * acc_lit) * scale;
+    if (paint.w > 0.0 && alpha > 1.0 / 4096.0) {
+        // the cloud's own colour (rgb / alpha) is at most paint.w times the brightness of the sky behind it
+        float own = dot(rgb, LUMA_W) / alpha;
+        float cap = paint.w * sky_lum;
+        if (own > cap) rgb *= cap / own;
+    }
+    atomicAdd(group_counts[CL_WORD_HIT], 1u);
+    if (taken_back >= float(CL_PAINTED_SHARE)) atomicAdd(group_counts[CL_WORD_PAINTED], 1u); // bbport (r119i)
+    atomicAdd(group_counts[CL_WORD_STEPS], taken);
+    atomicAdd(group_counts[CL_WORD_OPACITY], uint(alpha * 256.0 + 0.5));
+    if (alpha >= 1.0 / 64.0) atomicAdd(group_counts[CL_WORD_COVERED], 1u);
+    if (alpha >= float(CL_VISIBLE_ALPHA)) atomicAdd(group_counts[CL_WORD_VISIBLE], 1u); // bbport (r119c)
+    if (alpha >= float(CL_VISIBLE_ALPHA)) {
+        // bbport (r119d): the picture's brightness over this sky against the sky alone (the mean of the block)
+        float ratio = (1.0 - alpha) + dot(rgb, LUMA_W) / sky_lum;
+        if (ratio < float(CL_DARK_RATIO)) {
+            atomicAdd(group_counts[CL_WORD_DARK], 1u);
+        } else if (ratio > float(CL_BRIGHT_RATIO)) {
+            atomicAdd(group_counts[CL_WORD_BRIGHT], 1u);
+        }
+    }
+    return vec4(rgb, alpha);
+}
+
+void main() {
+    if (gl_LocalInvocationIndex < CL_WORDS) {
+        group_counts[gl_LocalInvocationIndex] = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    ivec2 hp = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(hp, imageSize(cloud_img)))) {
+        atomicAdd(group_counts[CL_WORD_TOTAL], 1u);
+        imageStore(cloud_img, hp, march(hp));
+    }
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex < CL_WORDS) {
+        uint n = group_counts[gl_LocalInvocationIndex];
+        if (n != 0u) {
+            atomicAdd(words[gl_LocalInvocationIndex], n);
+        }
+    }
+}
+#else
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, ivec2(scene)))) return;
+    if (!is_sky(texelFetch(depth_tex, p, 0).r)) return;
+    vec2 h = (vec2(p) + 0.5) / float(CL_DIV) - 0.5;
+    ivec2 b = ivec2(floor(h));
+    vec2 f = h - vec2(b);
+    ivec2 hs = imageSize(cloud_img);
+    vec4 sum = vec4(0.0);
+    float weights = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            vec4 c = imageLoad(cloud_img, clamp(b + ivec2(i, j), ivec2(0), hs - 1));
+            if (c.r < 0.0) continue;
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            sum += w * c;
+            weights += w;
+        }
+    }
+    vec4 clouds = weights > 0.0 ? sum / weights : vec4(0.0);
+    vec4 px = imageLoad(scene_img, p);
+    if ((flags & CL_FLAG_SHOW) != 0u) {
+        // test view: the sky dim green where the layer has no cloud, magenta with the opacity
+        float shown = clamp(clouds.a * 1.5, 0.0, 1.0);
+        imageStore(scene_img, p, vec4(mix(vec3(0.02, 0.25, 0.06), vec3(2.0, 0.15, 1.6), shown), px.a));
+        return;
+    }
+    if (clouds.a < 1.0 / 1024.0) return;
+    vec3 rgb = px.rgb;
+    if (any(isnan(rgb)) || any(isinf(rgb))) return;
+    imageStore(scene_img, p, vec4(rgb * (1.0 - clouds.a) + clouds.rgb, px.a));
+}
+#endif

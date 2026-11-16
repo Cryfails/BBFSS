@@ -220,6 +220,7 @@ private:
     void Finish();
     void DeclareStageModes();
     void MotionBlock(bool outputs);
+    void VertexSway(); ///< bbport (r89_wind-foliage-sway)
     void VertexMotion();
     void VertexCapture();
     void FragmentMotion();

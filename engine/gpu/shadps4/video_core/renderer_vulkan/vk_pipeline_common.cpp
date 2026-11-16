@@ -13,6 +13,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include "bbport_settings.h"
+#include "bbport_interior_exposure.h" // bbport (r99_interior-exposure)
 #include "shader_recompiler/native/froyok_composite.h"
 #include "shader_recompiler/native/gt7_tonemap.h"
 #include "shader_recompiler/native/tone_curve.h"
@@ -165,7 +166,10 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
         const auto& settings = BbSettings::Get();
         const Shader::Native::Gt7Push tone_map{
             .mode = float(settings.graphics_tonemapper.load(std::memory_order_relaxed)),
-            .exposure = settings.graphics_gt7_exposure.load(std::memory_order_relaxed),
+            // bbport (r99_interior-exposure): times the interior lift, exactly 1 unless
+            // BB_INTERIOR_EXPOSURE is on (gpu/shim/bbport_interior_exposure.h)
+            .exposure = settings.graphics_gt7_exposure.load(std::memory_order_relaxed) *
+                        BbInteriorExposure::Scale(),
             .unused = {},
         };
         scheduler.Record([layout, stage_flags, tone_map](vk::CommandBuffer cmdbuf) {

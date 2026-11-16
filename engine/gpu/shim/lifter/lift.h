@@ -199,7 +199,16 @@ struct Input {
     bool tone_apply{};
     s32 clip_plane_slot = -1;
     bool vertex_motion{};
+    bool vertex_sway{}; // bbport (r89_wind-foliage-sway): MotionVectors::Sway, VertexSway
+    bool vertex_game_cut{}; // bbport (r122_game-wind-drive): MotionVectors::GameCut, V_SIN_F32 gives BbWindGame::CutLevel
     bool vertex_capture{};
+    // bbport (r62c_leaf-stage3-fix): the capture also stores the card UVs (MotionVectors::CaptureUv,
+    // BB_RT_CARD_ALPHA on): capture_uv_stride bytes a vertex (12: u, v, the alpha factor; 16:
+    // and another component of the factor's output, r62b), capture_uv_unset (a NaN's bits) for
+    // a value the selector cannot name. The ring's address is the address block's last member.
+    bool capture_uv{};
+    u32 capture_uv_stride{};
+    u32 capture_uv_unset{};
 
     PsVgprs ps_addr;
     PsVgprs ps_en;

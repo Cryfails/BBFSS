@@ -35,6 +35,9 @@ int runtime_setjmp(RuntimeRecoverBuf*) { return 0; }
 [[noreturn]] void runtime_longjmp(RuntimeRecoverBuf*) { std::abort(); }
 uint32_t runtime_disabled_optimizations = 0;
 uint64_t runtime_experiment_bits = 0;
+void runtime_experiment_force(uint64_t bits) { runtime_experiment_bits = bits; } // bbport (r39_master-debug)
+uint32_t runtime_live_knobs_generation = 0; // bbport (r84_live-test-knobs): no live knobs file
+int runtime_live_knob(const char*, char*, size_t) { return 0; } // bbport (r84_live-test-knobs)
 uint64_t runtime_tsc_frequency() { return 1000000000; }
 int sys_file_translate(const char*, char*, size_t) { std::abort(); }
 uint64_t runtime_memory_clamp(uintptr_t, uint64_t) { std::abort(); }
@@ -47,6 +50,10 @@ int32_t runtime_thread_spawn(void**, void* (*)(void*), void*, uint64_t, const ch
 int32_t runtime_thread_join_spawned(void*, void**) { std::abort(); }
 void runtime_memory_gpu_protect(uintptr_t, uint64_t, int, int) { std::abort(); }
 void runtime_restart() { std::abort(); }
+void runtime_blocked_report(void) {}
+[[noreturn]] void runtime_thread_exit(void*) { std::abort(); }
+int sys_pad_type(void) { return 0; }
+int sys_pad_button(uint32_t, int) { return 0; }
 uint64_t runtime_process_time_counter() { return runtime_process_time_us() * 1000; }
 int32_t* runtime_errno() { std::abort(); }
 int runtime_memory_write_backing(uintptr_t, const void*, uint64_t) { std::abort(); }

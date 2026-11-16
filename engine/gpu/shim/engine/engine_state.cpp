@@ -197,6 +197,25 @@ bool world_player_block(std::uint32_t* block) {
     return true;
 }
 
+// bbport (r111_footprints): the hunter's position (x, y, z; y up) as the game's physics keeps it:
+// the player character (WorldChrMan +0x60), then +0x58, +0x8, +0x3b0 and +0x68 (each a pointer),
+// then three floats at +0x1e0: the chain online_fixes.cpp's Position reads. False while a link is
+// null or unreadable. Six pointer reads and one 12-byte read; only BB_FOOTPRINTS calls it (once a
+// frame, on the render thread; the floats may be from two game steps, which does not matter).
+bool world_player_position(float pos[3]) {
+    static constexpr std::array<std::size_t, 4> kChain{0x58, 0x8, 0x3b0, 0x68};
+    constexpr std::size_t kPosition = 0x1e0;
+    const std::uint64_t man = Singleton(kWorldChrMan);
+    std::uint64_t at = man ? Follow(man + kPlayerChr) : 0;
+    for (const std::size_t link : kChain) at = at ? Follow(at + link) : 0;
+    float v[3] = {};
+    if (!at || !Peek(at + kPosition, &v)) return false;
+    pos[0] = v[0];
+    pos[1] = v[1];
+    pos[2] = v[2];
+    return true;
+}
+
 bool event_flag_get(std::uint32_t id, bool* value) {
     std::uint64_t byte = 0;
     std::uint8_t mask = 0, v = 0;

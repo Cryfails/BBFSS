@@ -1,0 +1,240 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+// bbport (r81_sun-fog-no-rt): the sun fog's area light gate, for marches without the ray traced
+// gate (bbport (r85_area-with-rt-gate): and with it, whose AREA+GATE builds keep in r and g only
+// the samples it lets through; these two passes are the same for both)
+// (BB_VOLUMETRIC_AREA_GATE=1; VolumetricLight::AreaGate, right after the fog's tint at the
+// game's directional light draw d92266b9). The AREA builds of volumetric_light.comp's march keep
+// in the fog image r: the energy of the samples nearer the camera, g: of those in the march's last
+// AREA_FAR_METRES (it ends at the surface, the reach or the shadow distance), b: the mean atlas
+// visibility along the ray
+// (the share of its samples in sun), a: 1 - depth as always. The game lights each pixel with one
+// record of that draw's table, the alpha byte of its texture 0 (engine/tools/re/
+// ggx_directional_controls.py: `profiles = table[textures[0][..., 3]]`). An interior's records
+// are expected to carry little or no sun, an outdoor record the sun; that is what the gate
+// relies on and what BB_VOLUMETRIC_AREA_GATE's probe line shows.
+//   CAMERA (one workgroup): each record's weight, smoothstep(AREA_SUN_LO, AREA_SUN_HI, its light
+//     0 luminance over the brightest record's) (the built-in white record left out and weighed
+//     1); the camera's weight, the mean weight of a 16x16 grid's surfaces weighed by 1 - depth
+//     (about 1 / distance; no surface: 1), faded as the tint is; with the probe also the grid's
+//     records, fog before and after, and rows 0-7 of every record.
+//   APPLY (each pixel of the half resolution fog and of the full resolution repair image): the
+//     beam keep k = 1 - smoothstep(AREA_BEAM_LO, AREA_BEAM_HI, b); fog = r (w_cam + (1 - w_cam) k)
+//     + g (w_end + (1 - w_end) k), w_end the weight of the pixel's own record (the camera's at the
+//     sky). A weight of 1 gives r + g: the fog as without the gate. Missing records weigh 1.
+#include "volumetric_area_layout.h"
+
+// The camera pass takes one grid point and one record a thread: AREA_GRID_X * AREA_GRID_Y and
+// AREA_RECORDS equal AREA_GROUP, its workgroup size (static_asserts in volumetric_area_gate.h).
+
+#ifdef CAMERA
+layout(local_size_x = AREA_GROUP, local_size_y = 1) in;
+#else
+layout(local_size_x = 8, local_size_y = 8) in;
+#endif
+
+layout(push_constant) uniform AreaParams {
+    uint offset_bytes;
+    uint record_count;
+    float blend;
+    uint flags;
+};
+
+float BeamKeep(float lit) {
+    return 1.0 - smoothstep(AREA_BEAM_LO, AREA_BEAM_HI, lit);
+}
+
+float Segment(float weight, float keep) {
+    return weight + (1.0 - weight) * keep;
+}
+
+// The alpha byte of texture 0 at uv: the record that lights the pixel.
+uint RecordAt(sampler2D records, vec2 uv) {
+    ivec2 size = textureSize(records, 0);
+    ivec2 p = clamp(ivec2(uv * vec2(size)), ivec2(0), size - 1);
+    return min(uint(texelFetch(records, p, 0).a * 255.0 + 0.5), AREA_RECORDS - 1u);
+}
+
+#ifdef CAMERA
+layout(scalar, binding = 0) readonly buffer Lighting { uint d[]; } lighting;
+layout(scalar, binding = 1) buffer AreaState { uint w[]; } state;
+layout(binding = 2) uniform sampler2D record_tex;
+layout(binding = 3) uniform sampler2D fog_tex;
+
+// As volumetric_light.comp's TINT build reads a record's colour, the light 0 colour clamped to 0
+// and scaled to at most 1 per channel, and its test for the built-in white record.
+vec3 record_vec3(uint id, uint field) {
+    uint at = (offset_bytes >> 2) + id * AREA_RECORD_FLOATS + field;
+    return vec3(uintBitsToFloat(lighting.d[at]), uintBitsToFloat(lighting.d[at + 1u]),
+                uintBitsToFloat(lighting.d[at + 2u]));
+}
+
+bool is_fallback(uint id) {
+    return record_vec3(id, 16u) == vec3(1.0) && record_vec3(id, 20u) == vec3(0.0) &&
+           all(lessThan(abs(record_vec3(id, 0u) - vec3(0.70710678, 0.70710678, 0.0)), vec3(1e-3)));
+}
+
+float sun_luminance(uint id) {
+    vec3 rgb = record_vec3(id, AREA_RECORD_COLOUR);
+    if (any(isnan(rgb)) || any(isinf(rgb))) return 0.0;
+    rgb = max(rgb, vec3(0.0));
+    rgb /= max(1.0, max(rgb.r, max(rgb.g, rgb.b)));
+    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+}
+
+shared float s_a[AREA_GROUP];
+shared float s_b[AREA_GROUP];
+shared vec4 s_v[AREA_GROUP];
+shared float s_weight[AREA_RECORDS];
+shared uint s_count[AREA_RECORDS];
+shared float s_camera;
+
+void main() {
+    const uint id = gl_LocalInvocationIndex;
+    const bool records = (flags & AREA_FLAG_RECORDS) != 0u;
+    const bool probe = (flags & AREA_FLAG_PROBE) != 0u;
+
+    // 1. Each thread its record's light 0 luminance; the brightest of them (not the white one).
+    float lum = 0.0;
+    bool fallback = false;
+    if (records && id < record_count) {
+        fallback = is_fallback(id);
+        lum = sun_luminance(id);
+    }
+    s_a[id] = fallback ? 0.0 : lum;
+    s_count[id] = 0u;
+    for (uint stride = AREA_GROUP / 2u; stride > 0u; stride >>= 1u) {
+        barrier();
+        if (id < stride) s_a[id] = max(s_a[id], s_a[id + stride]);
+    }
+    barrier();
+    const float best = s_a[0];
+    float weight = 1.0;
+    if (records && id < record_count && !fallback && best > 0.0) {
+        weight = smoothstep(AREA_SUN_LO, AREA_SUN_HI, lum / best);
+    }
+    s_weight[id] = weight;
+    state.w[AREA_STATE_WEIGHTS + id] = floatBitsToUint(weight);
+    barrier();
+
+    // 2. The camera's weight: the grid's surfaces, nearer ones more (1 - depth, about 1 / distance).
+    const vec2 uv = (vec2(float(id % AREA_GRID_X), float(id / AREA_GRID_X)) + 0.5) /
+                    vec2(float(AREA_GRID_X), float(AREA_GRID_Y));
+    const ivec2 fog_size = textureSize(fog_tex, 0);
+    const vec4 fog = texelFetch(fog_tex, clamp(ivec2(uv * vec2(fog_size)), ivec2(0), fog_size - 1), 0);
+    const bool surface = fog.a > 0.0 && fog.a < 1.0;
+    const uint record = records ? RecordAt(record_tex, uv) : 0u;
+    const float here = records ? s_weight[record] : 1.0;
+    // bbport (r115_sun-fog-indoors): with AREA_FLAG_NEAR a point the march marked as near (b < 0:
+    // the hunter, the ground at his feet) is left out; s_v keeps the sums over every surface (taken
+    // when every point is near) and the near points' count. Without the flag nothing is left out and
+    // s_v's sums equal s_a's and s_b's, so the weight is the one before.
+    const bool near = (flags & AREA_FLAG_NEAR) != 0u && fog.b < 0.0;
+    s_a[id] = surface && !near ? fog.a * here : 0.0;
+    s_b[id] = surface && !near ? fog.a : 0.0;
+    s_v[id] = vec4(surface ? fog.a * here : 0.0, surface ? fog.a : 0.0, surface && near ? 1.0 : 0.0,
+                   0.0);
+    if (probe && records && surface) atomicAdd(s_count[record], 1u);
+    for (uint stride = AREA_GROUP / 2u; stride > 0u; stride >>= 1u) {
+        barrier();
+        if (id < stride) {
+            s_a[id] += s_a[id + stride];
+            s_b[id] += s_b[id + stride];
+            s_v[id] += s_v[id + stride];
+        }
+    }
+    barrier();
+    if (id == 0u) {
+        const float now = s_b[0] > AREA_CAMERA_EPS      ? clamp(s_a[0] / s_b[0], 0.0, 1.0)
+                          : s_v[0].y > AREA_CAMERA_EPS ? clamp(s_v[0].x / s_v[0].y, 0.0, 1.0)
+                                                       : 1.0;
+        const float before = uintBitsToFloat(state.w[AREA_STATE_CAMERA]);
+        // At blend 1 (the first gate, after a gap) or when the buffer holds no weight yet: now.
+        const float faded = blend >= 1.0 || !(before >= 0.0 && before <= 1.0)
+                                ? now
+                                : mix(before, now, blend);
+        s_camera = faded;
+        state.w[AREA_STATE_CAMERA] = floatBitsToUint(faded);
+        state.w[AREA_STATE_CAMERA_NOW] = floatBitsToUint(now);
+        state.w[AREA_STATE_BEST] = floatBitsToUint(best);
+        state.w[AREA_STATE_RECORD_COUNT] = records ? record_count : 0u;
+        state.w[AREA_STATE_NEAR] = uint(s_v[0].z + 0.5); // bbport (r115_sun-fog-indoors)
+    }
+    if (!probe) return;
+
+    // 3. The probe (uniform: a push constant): the grid's fog before and after the gate, the
+    // records it saw and rows 0-7 of every record.
+    barrier();
+    const float camera = s_camera;
+    // bbport (r115_sun-fog-indoors): b without the near mark; after a DUAL march b is the energy the
+    // wider answer keeps (counted before and after, and the lit share is then its share of the fog)
+    const float lit_b = fog.b < 0.0 ? max(-fog.b - float(AREA_NEAR_FLOOR), 0.0) : fog.b;
+    const bool dual = (flags & AREA_FLAG_DUAL) != 0u;
+    const float keep = BeamKeep(lit_b);
+    const float end = fog.a == 0.0 || near ? camera : here;
+    const float before = fog.r + fog.g + (dual ? lit_b : 0.0);
+    const float after = dual ? lit_b + fog.r * camera + fog.g * end
+                             : fog.r * Segment(camera, keep) + fog.g * Segment(end, keep);
+    s_v[id] = vec4(before, after, dual ? lit_b : lit_b * before, fog.a == 0.0 ? 1.0 : 0.0);
+    s_a[id] = surface ? 1.0 : 0.0;
+    for (uint stride = AREA_GROUP / 2u; stride > 0u; stride >>= 1u) {
+        barrier();
+        if (id < stride) {
+            s_v[id] += s_v[id + stride];
+            s_a[id] += s_a[id + stride];
+        }
+    }
+    barrier();
+    if (id == 0u) {
+        state.w[AREA_STATE_SURFACE] = uint(s_a[0] + 0.5);
+        state.w[AREA_STATE_SKY] = uint(s_v[0].w + 0.5);
+        state.w[AREA_STATE_BEFORE] = floatBitsToUint(s_v[0].x);
+        state.w[AREA_STATE_AFTER] = floatBitsToUint(s_v[0].y);
+        state.w[AREA_STATE_LIT] = floatBitsToUint(s_v[0].x > 0.0 ? s_v[0].z / s_v[0].x : 0.0);
+    }
+    state.w[AREA_STATE_COUNTS + id] = s_count[id];
+    for (uint i = 0u; i < AREA_PROBE_ROW_FLOATS; ++i) {
+        state.w[AREA_STATE_ROWS + id * AREA_PROBE_ROW_FLOATS + i] =
+            records && id < record_count
+                ? lighting.d[(offset_bytes >> 2) + id * AREA_RECORD_FLOATS + i]
+                : 0u;
+    }
+}
+#elif defined(APPLY)
+layout(scalar, binding = 0) readonly buffer AreaState { uint w[]; } state;
+layout(binding = 1) uniform sampler2D record_tex;
+layout(binding = 2, rgba16f) uniform image2D fog_img;
+
+void main() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(fog_img);
+    if (any(greaterThanEqual(px, size))) return;
+    const vec4 v = imageLoad(fog_img, px);
+    // Not marched, or no light: (0, 0, 0, 1 - depth), the same in both layouts.
+    if (v.r == 0.0 && v.g == 0.0 && v.b == 0.0) return;
+    float camera = uintBitsToFloat(state.w[AREA_STATE_CAMERA]);
+    if (!(camera >= 0.0 && camera <= 1.0)) camera = 1.0;
+    float end = camera;
+    // bbport (r115_sun-fog-indoors): with AREA_FLAG_NEAR the ray to a near surface (b < 0: the
+    // hunter, the ground at his feet) is weighed by the camera's light sets, not its own; b without
+    // the mark (a b >= 0 is as it was)
+    const bool near = (flags & AREA_FLAG_NEAR) != 0u && v.b < 0.0;
+    const float b = v.b < 0.0 ? max(-v.b - float(AREA_NEAR_FLOOR), 0.0) : v.b;
+    if (v.a != 0.0 && (flags & AREA_FLAG_RECORDS) != 0u && !near) {
+        end = uintBitsToFloat(state.w[AREA_STATE_WEIGHTS +
+                                      RecordAt(record_tex, (vec2(px) + 0.5) / vec2(size))]);
+    }
+    const float keep = BeamKeep(b);
+    // bbport (r115_sun-fog-indoors): after a DUAL march b is the energy the ray traced gate's wider
+    // answer lets through, kept whole, and the light sets weigh the rest without the beam test
+    const float fog = (flags & AREA_FLAG_DUAL) != 0u
+                          ? b + v.r * camera + v.g * end
+                          : v.r * Segment(camera, keep) + v.g * Segment(end, keep);
+    imageStore(fog_img, px, vec4(vec3(fog), v.a));
+}
+#else
+#error build CAMERA or APPLY
+#endif

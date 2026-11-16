@@ -24,7 +24,10 @@ bool StorageFormat(const Instance& instance, vk::Format format);
 
 bool HasRoom(const Instance& instance, vk::DeviceSize bytes);
 
-void Mark(u64 key, const char* name);
+/// A GPU profile row "Lighting: <name>" from here on (BB_GPU_PROFILE=1). bbport
+/// (r76_sun-fog-outdoors): `pinned` prints the row in every block it has time in, also below the
+/// BB_GPU_PROFILE_ROWS cut (GpuProfiler::Pin).
+void Mark(u64 key, const char* name, bool pinned = false);
 
 inline void MemoryBarrier(vk::CommandBuffer cmd, vk::PipelineStageFlags2 src_stage,
                           vk::AccessFlags2 src_access, vk::PipelineStageFlags2 dst_stage,

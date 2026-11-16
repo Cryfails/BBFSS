@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <memory>
+#include <functional> // bbport (r98_ambient-particles): TemporalUpscaler::after_upscale
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -63,6 +64,33 @@ public:
     void SetFrameGenerator(FrameGenerator* generator) noexcept {
         frame_gen = generator;
     }
+
+    /// bbport (r98_ambient-particles): the upscaled frame before its UI, for a pass drawn
+    /// after the upscale (vk_ambient_particles.h). `view`: the output-size UI image's
+    /// R8G8B8A8 UNORM view (General layout, its last barrier ends at colour attachment use);
+    /// `depth` and `scene`: the scene depth (depth aspect) and the frame before the UI the
+    /// upscaler read (General), the scene in their top-left render_width x render_height;
+    /// `scene_format`: that frame's format (the UI image's too); `jitter`: the depth's
+    /// sub-pixel shift in render pixels (Jitter()'s convention).
+    struct UpscaledFrame {
+        vk::ImageView view, depth, scene;
+        vk::Format scene_format{};
+        u32 width = 0, height = 0, render_width = 0, render_height = 0;
+        std::array<float, 2> jitter{};
+        /// bbport (r98b_particles-reduced-scene): `scene` is the game's finished frame at the
+        /// output size, without jitter (the upscale ran before the game's post: Run), not the
+        /// render-size frame the upscaler read; its light is read at output pixels.
+        bool scene_at_output = false;
+        /// Where the frame comes from, for the log (a string literal).
+        const char* path = "";
+    };
+    /// Called after a successful upscale, before any UI pixel: by RunScaled (the upscale of the
+    /// game's finished frame, outputs other than 1920x1080) and, with the upscale before the
+    /// game's post (Run; upscale_before_post=1, BB_UPSCALE_EARLY=1), by RunUiOnly after its
+    /// output-size copy of the game's finished frame, for a frame of the world Run upscaled (at
+    /// the first UI draw, or at the display pass of a frame without UI). Empty unless a pass set
+    /// it (the Rasterizer, BB_PARTICLES above 0 only).
+    std::function<void(const UpscaledFrame&)> after_upscale;
 
     /// A draw into a full-size RGBA16F target with the scene depth: the scene color.
     void OnSceneColor(VideoCore::ImageId color);
@@ -145,7 +173,9 @@ public:
         vk::Format format;
         u32 width, height;
     };
-    bool DisplayOverride(VAddr address, Display& display);
+    /// `view_format`: the format the presenter reads that buffer through; it names the byte
+    /// order of a BB_PRESENT_DUMP_TRIGGER dump (bbport r75_present-dump-label).
+    bool DisplayOverride(VAddr address, Display& display, vk::Format view_format);
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
     bool PresentDumpDue();
     /// Saves `image` (General layout, 4 bytes a pixel) as present_<w>x<h> in BB_DUMP_DIR.

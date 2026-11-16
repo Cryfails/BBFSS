@@ -3,13 +3,34 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_ray_query : require
+#ifdef GLASS_LIGHT
+// bbport (r86_glass-light-stage2a): BB_RT_GLASS_LIGHT (renderer_vulkan/rt_glass_light.h): the
+// builds whose sun-lit pixels also ask the window panes (r83's instance mask RT_GLASS_MASK).
+#extension GL_GOOGLE_include_directive : require
+#include "rt_glass_layout.h"
+#include "rt_glass_light_layout.h"
+#ifndef COVERAGE_SKIP
+#error "GLASS_LIGHT needs COVERAGE_SKIP (its r25_flags and counters)"
+#endif
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(scalar, set = 0, binding = 0) readonly buffer Cb { uint d[]; } cbuf;
 layout(set = 0, binding = 1) uniform sampler2D depth_tex;
+#ifdef HALF
+// bbport (r25_rt-sun-trace): read back by the BB_RT_SUN_HALF=1 second pass (HalfAnswer).
+layout(set = 0, binding = 2, r8) uniform image2D raw_img;
+#else
 layout(set = 0, binding = 2, r8) uniform writeonly image2D raw_img;
+#endif
 layout(set = 0, binding = 3) uniform accelerationStructureEXT scene;
+#ifdef COVERAGE_SKIP
+// The game's shadow uniforms, as rt_shadow_filter.comp binds them (words 72 and 73: coverage).
+layout(scalar, set = 0, binding = 4) readonly buffer Ub { uint d[]; } ubuf;
+// bbport (r25_rt-sun-trace): counters (R25Count; RtShadow::Record prints them).
+layout(scalar, set = 0, binding = 5) buffer R25Counts { uint n[]; } r25_buf;
+#endif
 
 layout(push_constant) uniform Constants {
     uint buf_off;
@@ -19,6 +40,10 @@ layout(push_constant) uniform Constants {
     float light_tan;
     float bias_m;
     float max_distance;
+#ifdef COVERAGE_SKIP
+    int far_radius; // the filter's radius; < 0: every pixel is traced (the old behaviour)
+    uint r25_flags; // bbport (r25_rt-sun-trace): R25_* below
+#endif
 };
 
 uint base;
@@ -70,6 +95,296 @@ float noise(vec2 pixel) {
     return fract(52.9829189 * fract(dot(pixel + 5.588238 * k, vec2(0.06711056, 0.00583715))));
 }
 
+#ifdef COVERAGE_SKIP
+// bbport: rt_shadow_filter.comp stores lit = 1 - fade * (1 - vis) with fade the game's shadow
+// coverage clamp(u[73] * (u[72] - distance), 0, 1), and reads this pass's result only for pixels
+// within its radius. Where fade is 0 for every non-sky pixel within that radius the ray cannot
+// change the picture, so it is not traced. The margins keep a pixel on the traced side when this
+// pass and the filter round differently: COVERAGE_MARGIN for the ramp itself, DISTANCE_MARGIN
+// (relative) for the distance rebuilt from depth, whose w term cancels far from the camera and
+// may be fused differently in the two shaders (about 1e-4 relative at 200 m with a 0.1 m near
+// plane). The target is 8-bit, so a fade below 1/510 would not change it anyway.
+const float COVERAGE_MARGIN = 1e-3;
+const float DISTANCE_MARGIN = 1e-3;
+
+bool Covered(vec3 p) {
+    const uint ub = ((buf_off >> 8) & 0xffu) >> 2;
+    const float per_m = uintBitsToFloat(ubuf.d[ub + 73u]);
+    const float dist = length(p);
+    const float ramp = per_m * (uintBitsToFloat(ubuf.d[ub + 72u]) - dist);
+    // NaN counts as covered.
+    return !(ramp <= -(COVERAGE_MARGIN + abs(per_m) * dist * DISTANCE_MARGIN));
+}
+
+// bbport (r25_rt-sun-trace): the radius is a parameter (far_radius, or more for the
+// BB_RT_SUN_HALF=1 first pass).
+bool RayIsSeen(ivec2 pixel, vec3 P, int radius) {
+    if (radius < 0 || Covered(P)) {
+        return true;
+    }
+    const ivec2 lim = ivec2(size) - 1;
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            const ivec2 q = pixel + ivec2(x, y);
+            if ((x == 0 && y == 0) || any(lessThan(q, ivec2(0))) || any(greaterThan(q, lim))) {
+                continue;
+            }
+            const vec2 quv = (vec2(q) + 0.5) / size;
+            const float d = textureLod(depth_tex, quv, 0.0).x;
+            // Sky pixels are left alone by the filter.
+            if (d < 1.0 && d > 0.0 && Covered(viewPosAt(quv, d))) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
+#ifdef COVERAGE_SKIP
+// bbport (r25_rt-sun-trace): r25_flags (RtShadow::Record).
+const uint R25_EXACT = 1u;      // experiment 1125899906842624 clear: the exact saving in Shade
+const uint R25_COUNT = 2u;      // count what each pixel needed (R25Count), 1 sun trace in 8
+const uint R25_HALF_FIRST = 4u; // BB_RT_SUN_HALF=1, first pass: pixel (2x, 2y) of each 2x2 block
+const uint R25_HALF_FILL = 8u;  // BB_RT_SUN_HALF=1, second pass: the other three of each block
+// What a pixel needed (Shade's answer).
+const uint CLS_NONE = 0u, CLS_SKY = 1u, CLS_UNSEEN = 2u, CLS_AWAY = 3u, CLS_RAY = 4u,
+           CLS_FILL_RAY = 5u, CLS_FILL_TAKEN = 6u, CLS_FIRST_PASS = 7u;
+
+#ifdef GLASS_LIGHT
+// bbport (r86_glass-light-stage2a): BB_RT_GLASS_LIGHT, with BB_RT_GLASS's panes in the scene
+// (r83: RT_GLASS_MASK alone). r25_flags bits (rt_glass_light_layout.h): RT_GLASS_LIGHT_PANES,
+// panes are in this frame's scene, so a pixel whose ray(s) reached the sun asks them along the
+// sun's direction (one more ray query, only there); RT_GLASS_LIGHT_VIEW, such a pixel keeps half
+// its sun per pane candidate (a debug look of the patch of light a window lets through: shape
+// only, no colour yet); RT_GLASS_LIGHT_PROBE, on the counted frames a pixel whose ray was blocked
+// asks whether a pane lies where its nearest blocker is (the pane's own copy in the sun's scene).
+// Counters (counted frames only, r25_buf words RT_GLASS_LIGHT_FIRST_WORD + 0 to 5): sun-lit pixels
+// asked, of them crossing a pane, pane candidates, rays stopped at the cap, blocked pixels tested,
+// of them blocked at a pane.
+shared uint r86_n[RT_GLASS_LIGHT_WORDS];
+
+// The pane candidates along a ray, at most RT_GLASS_LIGHT_CAP (then the query ends). Not sorted:
+// transmissions multiply, so the order does not count below the cap. The panes' BLAS are built
+// opaque; the ray flag makes each triangle a candidate, none is confirmed.
+uint r86Panes(vec3 origin, float tmin, vec3 dir, float tmax) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, RT_GLASS_MASK, origin, tmin, dir, tmax);
+    uint n = 0u;
+    while (rayQueryProceedEXT(query)) {
+        if (rayQueryGetIntersectionTypeEXT(query, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+            ++n >= RT_GLASS_LIGHT_CAP) {
+            rayQueryTerminateEXT(query);
+        }
+    }
+    return n;
+}
+
+// RT_GLASS_LIGHT_PROBE: whether a pane lies where the nearest sun caster (mask 0x01) on the way
+// is, within 2 cm plus 0.2 % of its distance.
+bool r86BlockedAtPane(vec3 origin, float tmin, vec3 dir, float tmax) {
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0x01u, origin, tmin, dir, tmax);
+    rayQueryProceedEXT(query);
+    if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        return false;
+    }
+    const float t = rayQueryGetIntersectionTEXT(query, true);
+    const float eps = 0.02 + 0.002 * t;
+    return r86Panes(origin, max(tmin, t - eps), dir, t + eps) != 0u;
+}
+#endif
+
+#ifdef HALF
+// BB_RT_SUN_HALF=1 (the rt_shadow_half_comp build only), second pass: the first pass's answer when the nine first-pass answers around
+// this pixel's 2x2 block are one value and the block's own first-pass pixel lies on the same
+// surface (the filter's depth tolerance). Not exact: a caster thinner than two pixels that falls
+// between the first-pass pixels of a uniform neighbourhood is missed. Every first-pass pixel read
+// here was traced or classed exactly (the first pass's coverage radius is far_radius + 3).
+bool HalfAnswer(ivec2 pixel, vec3 P, out float v) {
+    const ivec2 block = pixel >> 1;
+    const ivec2 last = ((ivec2(size) - 1) >> 1) << 1;
+    const ivec2 own = block << 1;
+    v = imageLoad(raw_img, own).x;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const ivec2 q = clamp((block + ivec2(x, y)) << 1, ivec2(0), last);
+            if (imageLoad(raw_img, q).x != v) {
+                return false;
+            }
+        }
+    }
+    const vec2 own_uv = (vec2(own) + 0.5) / size;
+    const float d = textureLod(depth_tex, own_uv, 0.0).x;
+    if (!(d < 1.0) || !(d > 0.0)) {
+        return false;
+    }
+    return abs(viewPosAt(own_uv, d).z - P.z) <= 0.03 + 0.012 * P.z;
+}
+#endif
+
+// The pass for one pixel, as before; each early return now gives what the pixel needed.
+uint Shade(ivec2 pixel, int radius, bool fill) {
+    if (any(greaterThanEqual(pixel, ivec2(size)))) {
+        return CLS_NONE;
+    }
+#ifdef HALF
+    if (fill && ((pixel.x | pixel.y) & 1) == 0) {
+        return CLS_FIRST_PASS; // done by the first pass
+    }
+#endif
+    const vec2 uv = (vec2(pixel) + 0.5) / size;
+    const float d0 = textureLod(depth_tex, uv, 0.0).x;
+    if (!(d0 < 1.0) || !(d0 > 0.0)) {
+        imageStore(raw_img, pixel, vec4(1.0));
+        return CLS_SKY;
+    }
+    const vec3 P = viewPosAt(uv, d0);
+    if (!RayIsSeen(pixel, P, radius)) {
+        // r25 exact saving (R25_EXACT): nothing is stored. Every non-sky pixel within the
+        // filter's radius has fade 0 here (none is Covered), and rt_shadow_filter.comp (R25)
+        // reads no ray result for a fade-0 pixel; a pixel with fade > 0 is Covered, so it is
+        // never within the radius of this one. Old: 1, never shown.
+        if ((r25_flags & R25_EXACT) == 0u) {
+            imageStore(raw_img, pixel, vec4(1.0)); // never shown: the filter writes lit = 1 there
+        }
+        return CLS_UNSEEN;
+    }
+    const vec3 dir = shared_sun;
+    const vec3 n = surfaceNormal(uv, P, 1.0 / size);
+    const float reach = bias_m + 0.0015 * P.z;
+    if (dot(n, dir) <= 0.0 && n != vec3(0.0)) {
+        imageStore(raw_img, pixel, vec4(0.0));
+        return CLS_AWAY;
+    }
+#ifdef HALF
+    float half_v;
+    if (fill && HalfAnswer(pixel, P, half_v)) {
+        imageStore(raw_img, pixel, vec4(half_v));
+        return CLS_FILL_TAKEN;
+    }
+#endif
+    const vec3 origin = P + n * reach;
+    const vec3 tangent = normalize(abs(dir.y) < 0.9 ? cross(dir, vec3(0.0, 1.0, 0.0))
+                                                    : cross(dir, vec3(1.0, 0.0, 0.0)));
+    const vec3 bitangent = cross(dir, tangent);
+    const float phi = 6.2831853 * noise(vec2(pixel));
+    const float radius_scale = 1.0 / float(rays);
+    uint lit = 0u;
+    for (uint i = 0u; i < rays; ++i) {
+        float r = sqrt((float(i) + 0.5) * radius_scale) * light_tan;
+        float a = float(i) * 2.399963 + phi;
+        vec3 ray = normalize(dir + (cos(a) * tangent + sin(a) * bitangent) * r);
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, scene,
+                              gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0x01u,
+                              origin, reach * 0.5, ray, max_distance);
+        rayQueryProceedEXT(query);
+        if (rayQueryGetIntersectionTypeEXT(query, true) ==
+            gl_RayQueryCommittedIntersectionNoneEXT) {
+            ++lit;
+        }
+    }
+#ifdef GLASS_LIGHT
+    // bbport (r86_glass-light-stage2a): the panes along the sun's direction, where it was reached
+    float vis = float(lit) * radius_scale;
+    if ((r25_flags & RT_GLASS_LIGHT_PANES) != 0u) {
+        const bool counted = (r25_flags & R25_COUNT) != 0u;
+        if (lit != 0u) {
+            const uint panes = r86Panes(origin, reach * 0.5, dir, max_distance);
+            if (counted) {
+                atomicAdd(r86_n[0], 1u);
+                if (panes != 0u) {
+                    atomicAdd(r86_n[1], 1u);
+                    atomicAdd(r86_n[2], panes);
+                }
+                if (panes >= RT_GLASS_LIGHT_CAP) {
+                    atomicAdd(r86_n[3], 1u);
+                }
+            }
+            if ((r25_flags & RT_GLASS_LIGHT_VIEW) != 0u) {
+                vis *= exp2(-float(panes));
+            }
+        } else if (counted && (r25_flags & RT_GLASS_LIGHT_PROBE) != 0u) {
+            atomicAdd(r86_n[4], 1u);
+            if (r86BlockedAtPane(origin, reach * 0.5, dir, max_distance)) {
+                atomicAdd(r86_n[5], 1u);
+            }
+        }
+    }
+    imageStore(raw_img, pixel, vec4(vis));
+#else
+    imageStore(raw_img, pixel, vec4(float(lit) * radius_scale));
+#endif
+    return fill ? CLS_FILL_RAY : CLS_RAY;
+}
+
+// r25 counters, r25_buf words: 1 sky, 2 beyond the shadow distance, 3 facing away, 4 rays (full
+// resolution or the first pass), 5 rays of the second pass, 6 taken from the first pass, 7
+// workgroups that cast no ray, 8 workgroups with a pixel of the image. Word 0 and 9-13: the filter.
+shared uint r25_n[7];
+
+void R25Count(uint cls) {
+    const uint me = gl_LocalInvocationIndex;
+    if (cls >= CLS_SKY && cls <= CLS_FILL_TAKEN) {
+        atomicAdd(r25_n[cls - 1u], 1u);
+    }
+    if (cls != CLS_NONE) {
+        atomicOr(r25_n[6], 1u);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (me < 6u && r25_n[me] != 0u) {
+        atomicAdd(r25_buf.n[me + 1u], r25_n[me]);
+    }
+    if (me == 6u && r25_n[6] != 0u) {
+        atomicAdd(r25_buf.n[8], 1u);
+        if (r25_n[CLS_RAY - 1u] + r25_n[CLS_FILL_RAY - 1u] == 0u) {
+            atomicAdd(r25_buf.n[7], 1u);
+        }
+    }
+}
+
+void main() {
+    base = (buf_off & 0xffu) >> 2;
+    const bool count = (r25_flags & R25_COUNT) != 0u;
+    if (gl_LocalInvocationIndex == 0u) {
+        invMat = transpose(mat4(row(0), row(4), row(8), row(12)));
+        shared_inverse = invMat;
+        shared_sun = sunDirection();
+    }
+    if (count && gl_LocalInvocationIndex < 7u) {
+        r25_n[gl_LocalInvocationIndex] = 0u;
+    }
+#ifdef GLASS_LIGHT
+    if (count && gl_LocalInvocationIndex < RT_GLASS_LIGHT_WORDS) { // bbport (r86_glass-light-stage2a)
+        r86_n[gl_LocalInvocationIndex] = 0u;
+    }
+#endif
+    barrier();
+    invMat = shared_inverse;
+#ifdef HALF
+    const bool first = (r25_flags & R25_HALF_FIRST) != 0u;
+    const bool fill = (r25_flags & R25_HALF_FILL) != 0u;
+#else
+    const bool first = false, fill = false;
+#endif
+    // A second-pass pixel the filter can show (RayIsSeen with far_radius) reads first-pass
+    // pixels up to 3 away: the first pass treats those as seen too.
+    const int radius = first && far_radius >= 0 ? far_radius + 3 : far_radius;
+    const uint cls = Shade(ivec2(gl_GlobalInvocationID.xy) * (first ? 2 : 1), radius, fill);
+    if (count) {
+        R25Count(cls);
+#ifdef GLASS_LIGHT
+        // bbport (r86_glass-light-stage2a): R25Count's barrier made the group's counts whole
+        if (gl_LocalInvocationIndex < RT_GLASS_LIGHT_WORDS && r86_n[gl_LocalInvocationIndex] != 0u) {
+            atomicAdd(r25_buf.n[RT_GLASS_LIGHT_FIRST_WORD + gl_LocalInvocationIndex],
+                      r86_n[gl_LocalInvocationIndex]);
+        }
+#endif
+    }
+}
+#else
 void main() {
     base = (buf_off & 0xffu) >> 2;
     if (gl_LocalInvocationIndex == 0u) {
@@ -90,6 +405,12 @@ void main() {
         return;
     }
     const vec3 P = viewPosAt(uv, d0);
+#ifdef COVERAGE_SKIP
+    if (!RayIsSeen(pixel, P)) {
+        imageStore(raw_img, pixel, vec4(1.0)); // never shown: the filter writes lit = 1 there
+        return;
+    }
+#endif
     const vec3 dir = shared_sun;
     const vec3 n = surfaceNormal(uv, P, 1.0 / size);
     const float reach = bias_m + 0.0015 * P.z;
@@ -120,3 +441,4 @@ void main() {
     }
     imageStore(raw_img, pixel, vec4(float(lit) * radius_scale));
 }
+#endif

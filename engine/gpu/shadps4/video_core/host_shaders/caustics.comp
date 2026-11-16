@@ -1,0 +1,617 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r107_caustics): water caustics from the sun or moon (BB_CAUSTICS; vk_caustics.cpp, the
+// numbers in caustics_layout.h). One dispatch over the scene at its render size, at the first
+// blended draw after the opaque scene (after the indirect light; before the transparents and the
+// fog).
+//
+// Where: only in frames whose G-buffer passes are the world and its mirror image in a water plane
+// (the game's planar reflection: the sewers, Gascoigne's arena); the plane's height comes from the
+// two cameras (CameraMotion::MirrorPlane). A pixel P from CAUSTICS_MIN_HEIGHT to MAX_HEIGHT above
+// the plane takes light the water reflects: the sun's light reflected off a flat plane travels
+// along r = (-s.x, s.y, -s.z) (s toward the sun), so P's water point is Q = P - r * height / r.y.
+// P is drawn when it faces r (normal from the depth), Q lies on the screen, Q is water (Water():
+// nothing in front of it, and the surface there is not above the plane: the water, or the ground
+// under it seen through it), Q's light set has the sun (bbport (r107b_caustics-visible): the
+// game lights a roofed place with a light set without sun, while its sun shadow there says lit:
+// the roof is no sun caster), and the game's screen shadow target (its alpha, the sun's
+// visibility the game's sun light reads) says Q is lit.
+// What: P's colour times 1 + gain * w * (c - 1): c the caustic pattern at Q (two layers of ridged
+// value noise on the water, drifting, mean 1, so light is moved, not added), w = facing * lit at
+// Q * exp(-path / falloff), faded out with distance.
+// bbport (r107b_caustics-visible): lamps (CAUSTICS_FLAG_LAMPS, up to CAUSTICS_MAX_LAMPS a frame
+// from the game's light grid): a lamp's light reflected off the plane arrives at P as from the lamp
+// mirrored in the plane; where that path crosses the plane (X) is water, light is ADDED: albedo x
+// colour x (1 - d / reach)^2 x facing x Schlick reflectance x the pattern at X x gain.
+// Test view (CAUSTICS_FLAG_SHOW): sun-drawn pixels tinted cyan, band pixels whose Q is not water
+// orange, those whose Q is in shadow or has no sun in its light set blue, puddle candidates
+// magenta, pixels lit by lamp caustics green; pixels a lamp's reflected light reaches but whose
+// crossings are not water (none lit) orange too.
+// bbport (r107c_caustics-lamp-gain): a lamp's light added is its own direct light at the reflected
+// path's length and angle (the game's lamp curve, CAUSTICS_DATA_CORE2) x the water's share
+// 1 - exp(-gain x Schlick x pattern), below 1. Orange only where the water point or crossing is on
+// dry ground; off the screen or hidden behind something nearer: grey (the screen cannot tell).
+// bbport (r107d_caustics-lamp-look): the look (CAUSTICS_DATA_LOOK, BB_CAUSTICS_LAMPS above 1)
+// multiplies all the light a receiver near lit water has by the pattern's contrast (mean 1;
+// caustics_layout.h); the log's bins of the modelled lamp light over the pixel's own.
+// bbport (r107e_caustics-puddles): puddles (CAUSTICS_FLAG_PUDDLE: frames without a mirrored water
+// pass, BB_CAUSTICS_LAMPS on): every pixel facing up (world normal y from CAUSTICS_PUDDLE_UP) with
+// the G-buffer's gloss from CAUSTICS_PUDDLE_GLOSS is a puddle candidate, counted by its height
+// under the camera; the host takes the puddle plane from those counts (caustics_params.h
+// EstimatePuddle) and gives it as sun.w (CAUSTICS_FLAG_PUDDLE_PLANE), with the up-facing pixels on
+// it and the candidates among them counted (the guard against a glossy dry floor). A lamp's
+// crossing is water only where its pixel is a candidate on the plane; the pattern there drifts
+// CAUSTICS_PUDDLE_SPEED as fast and has CAUSTICS_PUDDLE_CONTRAST of its contrast (still water).
+// bbport (r107f_caustics-world-anchored): BB_CAUSTICS_WORLD (CAUSTICS_FLAG_WORLD): a world map of what
+// the water is (binding 7; caustics_layout.h): the up-facing pixels on the plane write their cell, a
+// lamp's crossing the screen cannot see (off it, hidden) reads it, so the net has no holes where the
+// hunter or the screen's edge hides the water. Water pixels of a mirrored plane get the lamps' light
+// on the bed under them, a puddle's pixels the ripple (CAUSTICS_RIPPLE_*).
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#include "caustics_layout.h"
+
+layout(local_size_x = CAUSTICS_GROUP, local_size_y = CAUSTICS_GROUP) in;
+
+layout(binding = 0, rgba16f) uniform image2D scene_img;
+layout(binding = 1) uniform texture2D depth_tex;    // D32, depth 0..1
+layout(binding = 2) uniform texture2D shadow_tex;   // the game's screen shadow target (.a: lit)
+layout(binding = 3) uniform texture2D material_tex; // G-buffer cb1 (.r: gloss)
+layout(binding = 4, std430) buffer Counters {
+    uint counts[];
+};
+layout(binding = 5) uniform texture2D albedo_tex;  // G-buffer cb2 (.rgb: albedo)
+layout(binding = 6) uniform texture2D records_tex; // G-buffer cb3 (.a: the pixel's light set)
+// bbport (r107f_caustics-world-anchored): the world map, one word a cell (the generation x 4 + state).
+layout(binding = 7, std430) buffer WorldMap {
+    uint world_map[];
+};
+
+// caustics_params.h Push, field for field (128 bytes).
+layout(push_constant) uniform Push {
+    vec4 proj;  // x scale, y scale, z scale, z offset
+    vec4 frame; // width, height, jitter x, jitter y (pixels)
+    vec4 inv0;  // view to world, 3x4 rows
+    vec4 inv1;
+    vec4 inv2;
+    vec4 sun;   // xyz: world direction toward the sun or moon (unit); w: the water plane's world y
+    vec4 drift; // layer 1 offset x, z; layer 2 offset x, z (m)
+    float gain;
+    float evolve; // the pattern's time axis, cells
+    uint flags;
+    uint slot;
+};
+
+shared uint group_counts[CAUSTICS_SLOT_WORDS];
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+const vec3 TINT_DRAWN = vec3(0.15, 0.85, 1.0);
+const vec3 TINT_DRY = vec3(1.0, 0.55, 0.1);
+const vec3 TINT_SHADE = vec3(0.2, 0.3, 1.0);
+const vec3 TINT_PUDDLE = vec3(1.0, 0.2, 0.9);
+const vec3 TINT_LAMP = vec3(0.2, 1.0, 0.15);
+const vec3 TINT_UNSEEN = vec3(0.5); // r107c: grey (Tinted keeps the brightness)
+// Water(): what the screen shows at a point of the plane.
+const int AT_WATER = 0, AT_BELOW = 1, AT_OFF = 2, AT_HIDDEN = 3, AT_DRY = 4;
+
+// As heat_haze.comp's (and caustics_params.h's C++ twin).
+uint Hash(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    return v.x;
+}
+
+float Corner(ivec3 c) {
+    return float(Hash(uvec3(c & 1023)) >> 8u) * (1.0 / 16777216.0);
+}
+
+// Value noise in [0, 1), smooth (quintic) between the lattice's corners.
+float Noise(vec3 p) {
+    const vec3 f = floor(p);
+    const ivec3 i = ivec3(f);
+    const vec3 u = p - f;
+    const vec3 s = u * u * u * (u * (u * 6.0 - 15.0) + 10.0);
+    const float x00 = mix(Corner(i), Corner(i + ivec3(1, 0, 0)), s.x);
+    const float x10 = mix(Corner(i + ivec3(0, 1, 0)), Corner(i + ivec3(1, 1, 0)), s.x);
+    const float x01 = mix(Corner(i + ivec3(0, 0, 1)), Corner(i + ivec3(1, 0, 1)), s.x);
+    const float x11 = mix(Corner(i + ivec3(0, 1, 1)), Corner(i + ivec3(1, 1, 1)), s.x);
+    return mix(mix(x00, x10, s.y), mix(x01, x11, s.y), s.z);
+}
+
+// 1 on the noise's 0.5 contour, 0 at its extremes: thin bright lines where it is sharpened.
+float Ridge(vec3 p) {
+    return 1.0 - abs(2.0 * Noise(p) - 1.0);
+}
+
+// The caustic pattern at a point of the water (world x, z), mean 1 (CAUSTICS_PATTERN_MEAN).
+// r107e: `speed` scales its drift and its change over time (1: as before).
+float Pattern(vec2 xz, float speed) {
+    const vec2 a = (xz + drift.xy * speed) * (1.0 / CAUSTICS_LAMBDA1);
+    const vec2 m = xz + drift.zw * speed;
+    const vec2 b = vec2(CAUSTICS_COS2 * m.x - CAUSTICS_SIN2 * m.y,
+                        CAUSTICS_SIN2 * m.x + CAUSTICS_COS2 * m.y) *
+                   (1.0 / CAUSTICS_LAMBDA2);
+    const float r1 = Ridge(vec3(a, evolve * speed));
+    const float r2 = Ridge(vec3(b, evolve * speed * CAUSTICS_EVOLVE2 + CAUSTICS_EVOLVE2_SHIFT));
+    return 0.5 * (pow(r1, CAUSTICS_SHARP) + pow(r2, CAUSTICS_SHARP)) * (1.0 / CAUSTICS_PATTERN_MEAN);
+}
+
+float ViewZ(float depth) {
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+// The view position seen at `pixel` (its centre: + 0.5) at view depth z; the jitter taken out.
+vec3 ViewPos(vec2 pixel, float z) {
+    const vec2 ndc = (pixel - frame.zw) / frame.xy * 2.0 - 1.0;
+    return vec3(ndc.x * z / proj.x, ndc.y * z / proj.y, z);
+}
+
+vec3 ViewAt(ivec2 p) {
+    return ViewPos(vec2(p) + 0.5, ViewZ(texelFetch(depth_tex, p, 0).r));
+}
+
+vec3 ToWorld(vec3 v) {
+    const vec4 h = vec4(v, 1.0);
+    return vec3(dot(inv0, h), dot(inv1, h), dot(inv2, h));
+}
+
+vec3 DirToWorld(vec3 v) {
+    return vec3(dot(inv0.xyz, v), dot(inv1.xyz, v), dot(inv2.xyz, v));
+}
+
+// World to view: the view to world rotation's transpose (a camera turns and moves, it does not
+// scale), after taking off the camera's position.
+vec3 ToView(vec3 w) {
+    const vec3 d = w - vec3(inv0.w, inv1.w, inv2.w);
+    return vec3(dot(vec3(inv0.x, inv1.x, inv2.x), d), dot(vec3(inv0.y, inv1.y, inv2.y), d),
+                dot(vec3(inv0.z, inv1.z, inv2.z), d));
+}
+
+// The surface's view normal from the depth, facing the camera: on each axis the neighbour whose
+// depth is nearer the pixel's (an edge does not bend it). Zero at the screen's border.
+vec3 NormalAt(ivec2 p, vec3 P) {
+    const ivec2 last = ivec2(frame.xy) - 1;
+    if (any(lessThanEqual(p, ivec2(0))) || any(greaterThanEqual(p, last))) {
+        return vec3(0.0);
+    }
+    const vec3 r = ViewAt(p + ivec2(1, 0)), l = ViewAt(p - ivec2(1, 0));
+    const vec3 d = ViewAt(p + ivec2(0, 1)), u = ViewAt(p - ivec2(0, 1));
+    const vec3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;
+    const vec3 dy = abs(d.z - P.z) < abs(P.z - u.z) ? d - P : P - u;
+    const vec3 n = cross(dy, dx);
+    const float len = length(n);
+    if (!(len > 1e-12)) {
+        return vec3(0.0);
+    }
+    return dot(n, P) > 0.0 ? -n / len : n / len;
+}
+
+vec3 Tinted(vec3 rgb, vec3 tint, float k) {
+    const float luma = max(dot(max(rgb, vec3(0.0)), LUMA), 0.05);
+    return mix(rgb, tint * (luma / dot(tint, LUMA)), k);
+}
+
+// bbport (r107b_caustics-visible): what the screen shows at the plane's point W (world): AT_WATER
+// the depth lies on the plane there (the water is in the depth), AT_BELOW below it (the ground
+// under the water, seen through it: the water is not in the depth yet), AT_OFF off the screen or
+// the sky, AT_HIDDEN something nearer stands in front of it, AT_DRY a surface above the plane
+// (dry ground). `qi`, `q`: W's pixel.
+int Water(vec3 W, out ivec2 qi, out vec2 q) {
+    const vec3 Wv = ToView(W);
+    q = (Wv.xy * proj.xy / max(Wv.z, 1e-4) + 1.0) * 0.5 * frame.xy + frame.zw;
+    qi = ivec2(0);
+    if (!(Wv.z > 0.05) || any(lessThan(q, vec2(0.0))) || any(greaterThanEqual(q, frame.xy))) {
+        return AT_OFF;
+    }
+    qi = ivec2(q);
+    const float dq = texelFetch(depth_tex, qi, 0).r;
+    if (dq >= 1.0) {
+        return AT_OFF;
+    }
+    const float zq = ViewZ(dq);
+    const float above = ToWorld(ViewPos(vec2(qi) + 0.5, zq)).y - sun.w;
+    const float tolerance = CAUSTICS_WATER_M + CAUSTICS_WATER_REL * zq;
+    // r107c: a nearer surface on the plane is the water itself (nearer only by the plane's error).
+    if (zq < Wv.z - (CAUSTICS_SEEN_M + CAUSTICS_SEEN_REL * Wv.z) && abs(above) > tolerance) {
+        return AT_HIDDEN;
+    }
+    return above > tolerance ? AT_DRY : above >= -tolerance ? AT_WATER : AT_BELOW;
+}
+
+// A texel of `tex` at the scene's pixel `qi` (`q` its position), at the texture's own size when it
+// is not the scene's.
+ivec2 TexelOf(texture2D tex, ivec2 qi, vec2 q) {
+    const ivec2 size = textureSize(tex, 0);
+    ivec2 t = qi;
+    if (any(greaterThanEqual(t, size))) {
+        t = ivec2(q / frame.xy * vec2(size));
+    }
+    return min(t, size - 1);
+}
+
+// bbport (r107e_caustics-puddles): a puddle candidate at the scene's pixel `q`: facing up and glossy.
+bool PuddleAt(ivec2 q) {
+    if (texelFetch(material_tex, TexelOf(material_tex, q, vec2(q) + 0.5), 0).r < CAUSTICS_PUDDLE_GLOSS) {
+        return false;
+    }
+    return DirToWorld(NormalAt(q, ViewAt(q))).y >= CAUSTICS_PUDDLE_UP;
+}
+
+uint Data(uint i) {
+    return counts[CAUSTICS_SLOTS * CAUSTICS_SLOT_WORDS + slot * CAUSTICS_DATA_WORDS + i];
+}
+
+// bbport (r107c_caustics-lamp-gain): the game's lamp curve at x = d / reach (below 1): the
+// inverse-square curve its lamp shaders are patched to, or its own (1 - x)^2 (core squared < 0).
+float LampCurve(float x) {
+    const float core2 = uintBitsToFloat(Data(CAUSTICS_DATA_CORE2));
+    if (core2 < 0.0) {
+        return (1.0 - x) * (1.0 - x);
+    }
+    return uintBitsToFloat(Data(CAUSTICS_DATA_ENERGY)) *
+           max(1.0 / max(x * x + core2, 1e-6) - 1.0 / (1.0 + core2), 0.0);
+}
+
+// bbport (r107f_caustics-world-anchored): the world map's cell of the world point (x, z), wrapped.
+uint MapIndex(vec2 xz) {
+    const ivec2 c = ivec2(floor(xz * CAUSTICS_MAP_CELLS_PER_M)) & (CAUSTICS_MAP_SIZE - 1);
+    return uint(c.y * CAUSTICS_MAP_SIZE + c.x);
+}
+
+// What the cell holds in this plane's generation (CAUSTICS_MAP_UNKNOWN, _WATER or _DRY).
+uint MapState(vec2 xz) {
+    const uint v = world_map[MapIndex(xz)];
+    return (v >> 2u) == Data(CAUSTICS_DATA_WORLD_GEN) ? (v & 3u) : CAUSTICS_MAP_UNKNOWN;
+}
+
+void MapSet(vec2 xz, uint state) {
+    world_map[MapIndex(xz)] = (Data(CAUSTICS_DATA_WORLD_GEN) << 2u) | state;
+}
+
+void Shade(ivec2 p) {
+    const float depth = texelFetch(depth_tex, p, 0).r;
+    if (depth >= 1.0) {
+        return;
+    }
+    const vec3 P = ViewPos(vec2(p) + 0.5, ViewZ(depth));
+    const vec3 Pw = ToWorld(P);
+    const bool show = (flags & CAUSTICS_FLAG_SHOW) != 0u;
+    float factor = 1.0;
+    vec3 tint = vec3(0.0);
+    float tint_k = 0.0;
+    vec3 n = vec3(0.0);
+    bool have_n = false;
+    const bool puddle = (flags & CAUSTICS_FLAG_PUDDLE) != 0u; // r107e
+    if (puddle) {
+        // r107e: the puddle candidates by height under the camera; on the plane given (if any),
+        // the up-facing pixels and the candidates among them.
+        const bool wet =
+            texelFetch(material_tex, TexelOf(material_tex, p, vec2(p) + 0.5), 0).r >= CAUSTICS_PUDDLE_GLOSS;
+        const bool on_plane = (flags & CAUSTICS_FLAG_PUDDLE_PLANE) != 0u &&
+                              abs(Pw.y - sun.w) <= CAUSTICS_WATER_M + CAUSTICS_WATER_REL * P.z;
+        if (wet || on_plane) {
+            n = NormalAt(p, P);
+            have_n = true;
+            if (DirToWorld(n).y >= CAUSTICS_PUDDLE_UP) {
+                const int bin = int(floor((Pw.y - inv1.w + CAUSTICS_HEIGHT_RANGE) / CAUSTICS_HEIGHT_STEP));
+                if (wet && bin >= 0 && bin < CAUSTICS_HEIGHT_BINS) {
+                    atomicAdd(group_counts[CAUSTICS_W_HEIGHTS + bin], 1u);
+                }
+                if (on_plane) {
+                    atomicAdd(group_counts[CAUSTICS_W_PUDDLE_GROUND], 1u);
+                    if (wet) {
+                        atomicAdd(group_counts[CAUSTICS_W_PUDDLE_WET], 1u);
+                    }
+                }
+            }
+        }
+    }
+    if (show && (flags & CAUSTICS_FLAG_MATERIAL) != 0u) {
+        // Puddle candidates: surfaces facing up, by their gloss (0.5 none, 0.95 full).
+        n = NormalAt(p, P);
+        have_n = true;
+        const float up = DirToWorld(n).y;
+        const float gloss = texelFetch(material_tex, p, 0).r;
+        const float k = smoothstep(0.5, 0.95, gloss) * smoothstep(0.85, 0.95, up);
+        if (k > 0.0) {
+            tint = TINT_PUDDLE;
+            tint_k = 0.5 * k;
+            atomicAdd(group_counts[3], 1u);
+        }
+    }
+    const float height = Pw.y - sun.w;
+    if ((flags & CAUSTICS_FLAG_PLANE) != 0u && height > CAUSTICS_MIN_HEIGHT &&
+        height < CAUSTICS_MAX_HEIGHT) {
+        // The sun's light reflected off the water travels along r (up: sun.y > 0, the host's test).
+        const vec3 r = vec3(-sun.x, sun.y, -sun.z);
+        if (!have_n) {
+            n = NormalAt(p, P);
+            have_n = true;
+        }
+        const float facing = dot(DirToWorld(n), -r);
+        const float path = height / r.y;
+        if (facing > CAUSTICS_MIN_FACING && path < CAUSTICS_MAX_PATH) {
+            atomicAdd(group_counts[0], 1u);
+            const vec3 Qw = Pw - r * path;
+            ivec2 qi;
+            vec2 q;
+            const int at = Water(Qw, qi, q);
+            if (at > AT_BELOW) {
+                atomicAdd(group_counts[at == AT_OFF ? CAUSTICS_W_OFF
+                                       : at == AT_HIDDEN ? CAUSTICS_W_HIDDEN
+                                                         : CAUSTICS_W_DRY], 1u);
+                if (show) {
+                    tint = at == AT_DRY ? TINT_DRY : TINT_UNSEEN; // r107c
+                    tint_k = 0.25;
+                }
+            } else {
+                atomicAdd(group_counts[1], 1u);
+                atomicAdd(group_counts[at == AT_WATER ? CAUSTICS_W_ON_PLANE : CAUSTICS_W_BELOW], 1u);
+                // The light set at Q: its bit in the slot's sun mask (the host sets the flag only
+                // with the mask and the target).
+                const uint set = min(uint(texelFetch(records_tex, TexelOf(records_tex, qi, q), 0).a *
+                                              255.0 + 0.5),
+                                     255u);
+                const bool sunny = (flags & CAUSTICS_FLAG_RECORDS) != 0u &&
+                                   ((Data(set >> 5u) >> (set & 31u)) & 1u) != 0u;
+                const float lit =
+                    sunny ? clamp(texelFetch(shadow_tex, TexelOf(shadow_tex, qi, q), 0).a, 0.0, 1.0)
+                          : 0.0;
+                if (!sunny) {
+                    atomicAdd(group_counts[CAUSTICS_W_NO_SUN_SET], 1u);
+                }
+                if (lit <= 0.01) {
+                    if (show) {
+                        tint = TINT_SHADE;
+                        tint_k = 0.25;
+                    }
+                } else {
+                    atomicAdd(group_counts[2], 1u);
+                    const float w = facing * lit * exp(-path / CAUSTICS_PATH_FALLOFF) *
+                                    (1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z));
+                    factor = max(1.0 + gain * w * (Pattern(Qw.xz, 1.0) - 1.0), 0.0);
+                    if (show) {
+                        tint = TINT_DRAWN;
+                        tint_k = 0.5;
+                    }
+                }
+            }
+        }
+    }
+    // bbport (r107f_caustics-world-anchored): the world map and the light seen through the water. An
+    // up-facing pixel on the plane (or up to CAUSTICS_MAP_LEDGE above it) writes what it is; a water
+    // pixel gets the lamps' unshadowed light on a horizontal surface, as the bed's (a mirrored
+    // plane) or as the ripple that moves its own lamp light (a puddle).
+    const bool world = (flags & CAUSTICS_FLAG_WORLD) != 0u;
+    vec3 bed_add = vec3(0.0); // light seen through a mirrored plane's water, added
+    vec3 bed_lit = vec3(0.0); // a puddle pixel's own lamp light (modelled)
+    float bed_c = 1.0;        // the ripple's pattern there (1: none)
+    if (world && height > -(CAUSTICS_WATER_M + CAUSTICS_WATER_REL * P.z) && height < CAUSTICS_MAP_LEDGE) {
+        if (!have_n) {
+            n = NormalAt(p, P);
+            have_n = true;
+        }
+        if (DirToWorld(n).y >= CAUSTICS_PUDDLE_UP) {
+            const bool on_plane = height <= CAUSTICS_WATER_M + CAUSTICS_WATER_REL * P.z;
+            bool wet = on_plane;
+            if (on_plane && puddle) {
+                wet = (flags & CAUSTICS_FLAG_MATERIAL) != 0u &&
+                      texelFetch(material_tex, TexelOf(material_tex, p, vec2(p) + 0.5), 0).r >= CAUSTICS_PUDDLE_GLOSS;
+            }
+            if (wet) {
+                MapSet(Pw.xz, CAUSTICS_MAP_WATER);
+                atomicAdd(group_counts[CAUSTICS_W_MAP_WATER], 1u);
+                const uint lamps_here = min(Data(CAUSTICS_DATA_COUNT), uint(CAUSTICS_MAX_LAMPS));
+                vec3 bed = vec3(0.0);
+                for (uint k = 0u; k < lamps_here; ++k) {
+                    const uint at = CAUSTICS_DATA_LAMPS + k * CAUSTICS_LAMP_WORDS;
+                    const vec3 L = uintBitsToFloat(uvec3(Data(at), Data(at + 1u), Data(at + 2u)));
+                    const float reach = uintBitsToFloat(Data(at + 3u));
+                    const vec3 colour = uintBitsToFloat(uvec3(Data(at + 4u), Data(at + 5u), Data(at + 6u)));
+                    const vec3 d = L - Pw;
+                    const float dl = length(d);
+                    if (dl < reach && dl > 1e-3) {
+                        bed += colour * (LampCurve(dl / reach) * max(d.y / dl, 0.0));
+                    }
+                }
+                const vec3 bed_albedo =
+                    (flags & CAUSTICS_FLAG_ALBEDO) != 0u
+                        ? texelFetch(albedo_tex, TexelOf(albedo_tex, p, vec2(p) + 0.5), 0).rgb
+                        : vec3(0.5);
+                const float bed_fade = 1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z);
+                if (puddle) {
+                    bed_lit = bed * bed_albedo * bed_fade;
+                    bed_c = clamp(mix(1.0, Pattern(Pw.xz, CAUSTICS_RIPPLE_SPEED), CAUSTICS_RIPPLE_CONTRAST), 0.0, 3.0);
+                } else {
+                    bed_add = bed * bed_albedo *
+                              (CAUSTICS_BED_T * uintBitsToFloat(Data(CAUSTICS_DATA_BED)) * bed_fade *
+                               Pattern(Pw.xz, 1.0));
+                }
+            } else if (MapState(Pw.xz) != CAUSTICS_MAP_WATER) {
+                MapSet(Pw.xz, CAUSTICS_MAP_DRY);
+                atomicAdd(group_counts[CAUSTICS_W_MAP_DRY], 1u);
+            }
+        }
+    }
+    vec3 added = vec3(0.0), direct = vec3(0.0); // r107c: direct, the lamps' own light (the model)
+    if ((flags & CAUSTICS_FLAG_LAMPS) != 0u && height > CAUSTICS_MIN_HEIGHT &&
+        height < CAUSTICS_LAMP_MAX_HEIGHT) {
+        if (!have_n) {
+            n = NormalAt(p, P);
+        }
+        const vec3 nw = DirToWorld(n);
+        const uint lamps = min(Data(CAUSTICS_DATA_COUNT), uint(CAUSTICS_MAX_LAMPS));
+        bool tried = false, dry = false, unseen = false;
+        const float lamp_gain = uintBitsToFloat(Data(CAUSTICS_DATA_GAIN)); // r107c
+        const float look = uintBitsToFloat(Data(CAUSTICS_DATA_LOOK));     // r107d
+        float look_w = 0.0, look_c = 0.0;
+        for (uint k = 0u; k < lamps; ++k) {
+            const uint at = CAUSTICS_DATA_LAMPS + k * CAUSTICS_LAMP_WORDS;
+            const vec3 L = uintBitsToFloat(uvec3(Data(at), Data(at + 1u), Data(at + 2u)));
+            const float reach = uintBitsToFloat(Data(at + 3u));
+            const vec3 colour = uintBitsToFloat(uvec3(Data(at + 4u), Data(at + 5u), Data(at + 6u)));
+            // r107c: the lamp's own direct light here (no shadow), for the log's model.
+            const float dl = length(L - Pw);
+            if (!(dl < reach)) {
+                continue; // the reflected path is longer still
+            }
+            direct += colour * (LampCurve(dl / reach) * max(dot(nw, L - Pw) / max(dl, 1e-4), 0.0));
+            const float lamp_height = L.y - sun.w; // above the plane (the host's test)
+            // The lamp mirrored in the plane: the water's light comes from there.
+            const vec3 to_image = vec3(L.x, sun.w - lamp_height, L.z) - Pw;
+            const float d = length(to_image);
+            if (!(d < reach)) {
+                continue;
+            }
+            const float facing = dot(nw, to_image) / d;
+            if (facing <= CAUSTICS_MIN_FACING) {
+                continue;
+            }
+            tried = true;
+            // Where the path crosses the plane: lamp_height / (lamp_height + height) of the way
+            // from the mirrored lamp to P.
+            const vec3 X = Pw + to_image * (height / (lamp_height + height));
+            ivec2 xi;
+            vec2 xq;
+            int crossing = Water(X, xi, xq);
+            bool mapped = false; // r107f
+            if (world && (crossing == AT_OFF || crossing == AT_HIDDEN)) {
+                // r107f: the screen cannot see this crossing: the world map says what it was.
+                const uint known = MapState(X.xz);
+                if (known != CAUSTICS_MAP_UNKNOWN) {
+                    atomicAdd(group_counts[known == CAUSTICS_MAP_WATER ? CAUSTICS_W_MAP_RESCUED_WATER
+                                                                         : CAUSTICS_W_MAP_RESCUED_DRY], 1u);
+                    crossing = known == CAUSTICS_MAP_WATER ? AT_WATER : AT_DRY;
+                    mapped = true;
+                }
+            }
+            if (puddle && crossing <= AT_BELOW && !mapped) {
+                // r107e: on a puddle only: on the plane and a candidate there (else dry ground)
+                crossing = crossing == AT_WATER && PuddleAt(xi) ? AT_WATER : AT_DRY;
+            }
+            if (crossing > AT_BELOW) {
+                atomicAdd(group_counts[crossing == AT_DRY ? CAUSTICS_W_LAMP_DRY : CAUSTICS_W_LAMP_UNSEEN], 1u);
+                dry = dry || crossing == AT_DRY;
+                unseen = unseen || crossing != AT_DRY;
+                if (!(look > 0.0 && crossing == AT_HIDDEN && !puddle)) { // r107e: not on puddles
+                    continue;
+                }
+            }
+            // r107e: a puddle's still water: slower, with less contrast.
+            // r107f: with the world map puddles ripple like water.
+            const float pattern =
+                puddle ? (world ? mix(1.0, Pattern(X.xz, CAUSTICS_RIPPLE_SPEED), CAUSTICS_RIPPLE_CONTRAST)
+                                : mix(1.0, Pattern(X.xz, CAUSTICS_PUDDLE_SPEED), CAUSTICS_PUDDLE_CONTRAST))
+                       : Pattern(X.xz, 1.0);
+            if (look > 0.0) {
+                // r107d: the look's weight and the pattern's contrast of this lamp's crossing.
+                const float w = facing * exp(-length(X - Pw) / CAUSTICS_PATH_FALLOFF);
+                look_w += w;
+                look_c += w * (1.0 - exp(-CAUSTICS_LAMP_GAIN * CAUSTICS_WATER_F0 * pattern));
+            }
+            if (crossing > AT_BELOW) {
+                continue; // hidden: the look only
+            }
+            // The cosine of the path's angle to the plane's normal at X: the real incidence.
+            const float cosine = (lamp_height + height) / d;
+            const float reflectance =
+                CAUSTICS_WATER_F0 + (1.0 - CAUSTICS_WATER_F0) * pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0);
+            // r107c: the lamp's own light at d and this facing, times the water's share (below 1).
+            added += colour * (LampCurve(d / reach) * facing *
+                               (1.0 - exp(-lamp_gain * reflectance * pattern)));
+        }
+        if (look_w > 0.0) {
+            // r107d: all the light here, moved by the pattern (mean 1, capped by its range).
+            factor *= 1.0 + look * min(look_w, 1.0) *
+                                (1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z)) *
+                                (look_c / (look_w * CAUSTICS_LOOK_MEAN) - 1.0);
+            atomicAdd(group_counts[CAUSTICS_W_LOOK], 1u);
+        }
+        if (tried) {
+            atomicAdd(group_counts[CAUSTICS_W_LAMP_TRIED], 1u);
+        }
+        const vec3 albedo =
+            (flags & CAUSTICS_FLAG_ALBEDO) != 0u ? texelFetch(albedo_tex, TexelOf(albedo_tex, p, vec2(p) + 0.5), 0).rgb
+                                                 : vec3(0.5);
+        added *= albedo * (1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z));
+        direct *= albedo; // r107c
+        if (dot(added, LUMA) > 0.0) {
+            atomicAdd(group_counts[CAUSTICS_W_LAMP_LIT], 1u);
+            if (show) {
+                tint = TINT_LAMP;
+                tint_k = 0.5;
+            }
+        } else {
+            added = vec3(0.0);
+            if (show && (dry || unseen) && tint_k <= 0.0) {
+                // a lamp's light reaches it, but not across water: dry ground orange, else grey (r107c)
+                tint = dry ? TINT_DRY : TINT_UNSEEN;
+                tint_k = 0.25;
+            }
+        }
+    }
+    const bool measure = dot(direct, LUMA) > 0.0; // r107d: the bins
+    const bool bed_on = dot(bed_add, LUMA) > 0.0 || bed_c != 1.0; // r107f
+    if (factor == 1.0 && tint_k <= 0.0 && !(dot(added, LUMA) > 0.0) && !measure && !bed_on) {
+        return;
+    }
+    const vec4 s = imageLoad(scene_img, p);
+    if (measure) {
+        const float model = dot(direct, LUMA);
+        const int bin = clamp(int(floor(0.5 * log2(model))) + 6, 0, CAUSTICS_BINS - 1);
+        atomicAdd(group_counts[CAUSTICS_W_BIN_COUNT + bin], 1u);
+        atomicAdd(group_counts[CAUSTICS_W_BIN_RATIO + bin],
+                  uint(min(model / max(dot(max(s.rgb, vec3(0.0)), LUMA), 1e-4), CAUSTICS_MODEL_MAX) *
+                           CAUSTICS_MODEL_SCALE + 0.5));
+        if (factor == 1.0 && tint_k <= 0.0 && !(dot(added, LUMA) > 0.0) && !bed_on) {
+            return;
+        }
+    }
+    vec3 rgb = s.rgb * factor;
+    if (dot(added, LUMA) > 0.0) {
+        const float own = max(dot(max(rgb, vec3(0.0)), LUMA), 1e-4);
+        atomicAdd(group_counts[CAUSTICS_W_LAMP_RATIO],
+                  uint(min(dot(added, LUMA) / own, CAUSTICS_RATIO_MAX) * CAUSTICS_RATIO_SCALE + 0.5));
+        atomicAdd(group_counts[CAUSTICS_W_LAMP_MODEL],
+                  uint(min(dot(direct, LUMA) / own, CAUSTICS_MODEL_MAX) * CAUSTICS_MODEL_SCALE + 0.5));
+        rgb += added;
+    }
+    if (bed_c != 1.0) {
+        // r107f: a puddle's own lamp light moved by the ripple (its share of the pixel's light).
+        const float own_bed = max(dot(max(rgb, vec3(0.0)), LUMA), 1e-4);
+        rgb *= 1.0 + CAUSTICS_BED_PUDDLE * clamp(dot(bed_lit, LUMA) / own_bed, 0.0, 1.0) * (bed_c - 1.0);
+        atomicAdd(group_counts[CAUSTICS_W_BED_PUDDLE], 1u);
+    }
+    if (dot(bed_add, LUMA) > 0.0) {
+        rgb += bed_add; // r107f: the lamps' light on the bed under a mirrored plane's water
+        atomicAdd(group_counts[CAUSTICS_W_BED], 1u);
+    }
+    if (tint_k > 0.0) {
+        rgb = Tinted(rgb, tint, tint_k);
+    }
+    imageStore(scene_img, p, vec4(rgb, s.a));
+}
+
+void main() {
+    // r107e: more words than threads: each thread clears and adds every 64th.
+    for (uint i = gl_LocalInvocationIndex; i < CAUSTICS_SLOT_WORDS; i += CAUSTICS_GROUP * CAUSTICS_GROUP) {
+        group_counts[i] = 0u;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (all(lessThan(p, ivec2(frame.xy)))) {
+        Shade(p);
+    }
+    barrier();
+    for (uint i = gl_LocalInvocationIndex; i < CAUSTICS_SLOT_WORDS; i += CAUSTICS_GROUP * CAUSTICS_GROUP) {
+        const uint v = group_counts[i];
+        if (v != 0u) {
+            atomicAdd(counts[slot * CAUSTICS_SLOT_WORDS + i], v);
+        }
+    }
+}

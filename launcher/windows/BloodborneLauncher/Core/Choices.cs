@@ -244,6 +244,41 @@ namespace BloodborneLauncher.Core
             new(L.T("Lowest (2)"), "2"),
         };
 
+        /// <summary>object_motion_store: how many animated vertices the engine keeps each frame for
+        /// motion vectors (8388608 or 4194304; made when the game starts). Auto is large, and small
+        /// on an AMD card with 8.5 GB or less.</summary>
+        public static readonly Choice[] MotionStore =
+        {
+            new(L.T("Auto (large; small on AMD cards with 8 GB or less)"), "auto"),
+            new(L.T("Large (8,388,608 vertices)"), "large", L.T("256 MiB of video memory. At one heavy spot it stored every moving draw, for about 0.05-0.1 ms a frame")),
+            new(L.T("Small (4,194,304 vertices)"), "small", L.T("128 MiB of video memory. At one heavy spot about 315 of 701 moving draws a frame did not fit")),
+        };
+
+        /// <summary>graphics_sun_far_shadows: how often the game draws the two far bands of the
+        /// sun's shadow (the engine hooks the game's loop when the game starts). The game's own is
+        /// every frame; a value the engine does not know is that too.</summary>
+        public static readonly Choice[] SunFarShadows =
+        {
+            new(L.T("Every frame (the game's own)"), "game"),
+            new(L.T("In turn (each every 2nd frame)"), "alternate", L.T("About +7% FPS at one heavy spot with ray tracing off, +5% with it on")),
+            new(L.T("Every 8th frame"), "rare", L.T("About +10% FPS at one heavy spot with ray tracing off, +11% with it on")),
+        };
+
+        /// <summary>graphics_lamp_shadow_softness: how soft the ray traced lamp shadows are (the
+        /// lamp's radius: sharp a point, soft 0.1 m, softer 0.2 m; the in-game menu switches it
+        /// live). Soft is the engine's default and what it reads for a value it does not know.</summary>
+        public static readonly Choice[] LampShadowSoftness =
+        {
+            new(L.T("Sharp"), "sharp", L.T("Hard edges, no noise; more rays where three or more lamps light one spot")),
+            new(L.T("Soft (default)"), "soft"),
+            new(L.T("Softer"), "softer", L.T("Edges twice as wide; a torch's stick and other thin things near a lamp cast fainter shadows")),
+        };
+
+        /// <summary>The choice a saved graphics_lamp_shadow_softness text stands for: the engine
+        /// reads a value it does not know as soft (bbport_settings.cpp), so the row shows soft.</summary>
+        public static string LampShadowSoftnessValue(string? saved) =>
+            Array.Exists(LampShadowSoftness, c => c.Value == saved) ? saved! : "soft";
+
         public static readonly Choice[] FpsModes =
         {
             new("60 FPS", "60"),

@@ -2,6 +2,8 @@
 
 #include "video_core/renderer_vulkan/vk_ssr_temporal.h"
 
+#include "bbport_toggles.h"
+
 #include <algorithm>
 #include <bit>
 #include <cstdio>
@@ -200,17 +202,28 @@ vk::ImageView SsrTemporal::CachedView(const VideoCore::Image& image, vk::Format 
     return oldest->view;
 }
 
-void SsrTemporal::OnSsrDraw(VideoCore::ImageId target, const TraceInputs& inputs) {
+bool SsrTemporal::OnSsrDraw(VideoCore::ImageId target, const TraceInputs& inputs) {
     if (failed || done_this_frame || !Ready()) {
-        return;
+        return false;
     }
     pending = target;
     trace_inputs = inputs;
+    // bbport (experiment mask 1024 = the old behaviour): the game's SSR pass (ssr.frag at half
+    // size, 0.6 ms at 4K) is traced again at full size (ssr_trace.comp) and the composite reads
+    // only that. Once the full trace has a history, everything Flush needs is known here, so the
+    // half-size draw and its resolve are left out.
+    const auto proj = camera_motion.PassProjection();
+    skip_half = !BbToggle::Experiment(1024) && EffectShaders::SsrCompositeActive() &&
+                inputs.constants && inputs.normals_view && inputs.color_view &&
+                camera_motion.Depth() && proj[0] != 0.0f && proj[1] != 0.0f &&
+                full_history_valid && trace_image.image;
+    return skip_half;
 }
 
 void SsrTemporal::OnFrameEnd() {
     done_this_frame = false;
     full_ready = false;
+    skip_half = false;
     pending = {};
 }
 
@@ -326,6 +339,7 @@ void SsrTemporal::Flush(std::array<float, 2> jitter) {
         .blend = blend,
     };
     const u32 current = frame & 1;
+    if (!skip_half) { // bbport: OnSsrDraw
     EffectPass::Mark(2, "SSR temporal");
     scheduler.RecordCrumb(
         {.name = "SSR temporal"},
@@ -373,6 +387,7 @@ void SsrTemporal::Flush(std::array<float, 2> jitter) {
             MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite, AllCommands,
                           vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
         });
+    }
     if (EffectShaders::SsrCompositeActive() && trace_inputs.constants && trace_inputs.normals_view &&
         trace_inputs.color_view) {
         const auto normals_view = trace_inputs.normals_view;
@@ -478,7 +493,7 @@ void SsrTemporal::Flush(std::array<float, 2> jitter) {
         full_history_valid = true;
         full_ready = true;
     }
-    history_valid = true;
+    history_valid = !skip_half; // the half-size history was not kept up
     prev_view = camera.view;
     prev_proj = {proj[0], proj[1]};
     prev_jitter = jitter;

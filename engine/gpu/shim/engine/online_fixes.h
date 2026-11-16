@@ -25,6 +25,7 @@ bool Summoning();
 int PartyRole();
 void AnswerLampAsk(bool yes);
 std::string LampPlace(std::uint32_t lamp);
+void TestGotoTick(); // bbport (r112n_hang-teleport-camera, TOOL): BB_TEST_GOTO, once a frame on the game thread
 bool Spectating();
 void SpectateNext();
 bool SpectatedName(std::string& name, int& choices);

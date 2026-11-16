@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r62d_card-uv-diag): a diagnosis only (BB_RT_CARD_UV_DIAG not 0, or
+// BB_RT_GEOMETRY_CHECK=1; never recorded otherwise). What one BLAS build of RtShadow::RecordBuilds
+// is about to read, after rt_unproject.comp put its vertices in world space: one invocation a
+// triangle of the entry's own list (the indices the build reads). Counted: an index past the
+// entry's vertices (the build would read another entry's positions), a corner that is not a
+// finite number, the longest edge over `huge` metres and over `big` metres, and the longest
+// finite edge of all. Nothing here writes the positions; the counts go to `counts`, which the
+// host reads once a window (RtShadow::GeoCheckFrameEnd). A workgroup with a bad triangle also
+// writes one record naming its build (serial, the host's list of this window's builds).
+
+#version 460
+#extension GL_EXT_buffer_reference : require
+
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Indices { uint i[]; };
+
+layout(std430, set = 0, binding = 0) readonly buffer Positions { vec4 p[]; } positions;
+layout(std430, set = 0, binding = 1) buffer Counts { uint w[]; } counts;
+
+layout(push_constant) uniform Constants {
+    Indices indices;   // the entry's triangle list, relative to `store`
+    uint store;        // its first vertex in `positions`
+    uint triangles;    // triangles in the list
+    uint vertex_count; // vertices it may name (the build's maxVertex + 1)
+    uint serial;       // its place in the host's list of this window's builds
+    float huge;        // metres
+    float big;         // metres
+};
+
+// The words of `counts` (RtShadow::GeoCheck* in vk_rt_shadow.cpp says the same).
+const uint W_TRIANGLES = 0u;
+const uint W_OUT = 1u;
+const uint W_NOT_FINITE = 2u;
+const uint W_HUGE = 3u;
+const uint W_BIG = 4u;
+const uint W_LONGEST = 5u;
+const uint W_RECORDS = 6u;
+const uint W_FIRST_RECORD = 8u;
+const uint RECORDS_MOST = 32u;
+
+shared uint g_live, g_out, g_not_finite, g_huge, g_big, g_longest;
+
+bool Finite(vec3 v) {
+    return !any(equal(floatBitsToUint(v) & uvec3(0x7f800000u), uvec3(0x7f800000u)));
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        g_live = 0u;
+        g_out = 0u;
+        g_not_finite = 0u;
+        g_huge = 0u;
+        g_big = 0u;
+        g_longest = 0u;
+    }
+    barrier();
+    const uint t = gl_GlobalInvocationID.x;
+    if (t < triangles) {
+        atomicAdd(g_live, 1u);
+        const uint a = indices.i[3u * t];
+        const uint b = indices.i[3u * t + 1u];
+        const uint c = indices.i[3u * t + 2u];
+        if (a >= vertex_count || b >= vertex_count || c >= vertex_count) {
+            atomicAdd(g_out, 1u);
+        } else {
+            const vec3 pa = positions.p[store + a].xyz;
+            const vec3 pb = positions.p[store + b].xyz;
+            const vec3 pc = positions.p[store + c].xyz;
+            if (!Finite(pa) || !Finite(pb) || !Finite(pc)) {
+                atomicAdd(g_not_finite, 1u);
+            } else {
+                const float edge = max(distance(pa, pb), max(distance(pb, pc), distance(pc, pa)));
+                if (edge > huge) {
+                    atomicAdd(g_huge, 1u);
+                } else if (edge > big) {
+                    atomicAdd(g_big, 1u);
+                }
+                // A finite length that overflowed to infinity is kept as the largest float.
+                atomicMax(g_longest, floatBitsToUint(min(edge, 3.4028235e38)));
+            }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex != 0u || g_live == 0u) {
+        return;
+    }
+    atomicAdd(counts.w[W_TRIANGLES], g_live);
+    if (g_out != 0u) {
+        atomicAdd(counts.w[W_OUT], g_out);
+    }
+    if (g_not_finite != 0u) {
+        atomicAdd(counts.w[W_NOT_FINITE], g_not_finite);
+    }
+    if (g_huge != 0u) {
+        atomicAdd(counts.w[W_HUGE], g_huge);
+    }
+    if (g_big != 0u) {
+        atomicAdd(counts.w[W_BIG], g_big);
+    }
+    atomicMax(counts.w[W_LONGEST], g_longest);
+    if (g_out + g_not_finite + g_huge != 0u) {
+        const uint at = atomicAdd(counts.w[W_RECORDS], 1u);
+        if (at < RECORDS_MOST) {
+            const uint r = W_FIRST_RECORD + 4u * at;
+            counts.w[r] = serial;
+            counts.w[r + 1u] = g_out + g_not_finite;
+            counts.w[r + 2u] = g_huge;
+            counts.w[r + 3u] = g_longest;
+        }
+    }
+}

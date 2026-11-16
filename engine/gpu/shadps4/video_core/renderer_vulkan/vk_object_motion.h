@@ -12,6 +12,8 @@
 #include <memory>
 #include <thread>
 #include "video_core/renderer_vulkan/motion_history.h"
+#include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
+#include "bbport_wind_shelter.h" // bbport (r117_wind-shelter)
 
 #include "common/types.h"
 #include "shader_recompiler/runtime_info.h"
@@ -37,6 +39,18 @@ public:
     [[nodiscard]] Shader::MotionVectors::Addresses AddressTable() const noexcept {
         return address_table;
     }
+    /// bbport (r89_wind-foliage-sway): the plant sway's words right after the params' ring in its
+    /// buffer (bbport_wind_sway.h; null unless BB_WIND=1 with BB_WIND_SWAY above 0 and the buffer
+    /// was made), the frame and its slot of the ring (the views of this frame are written there).
+    [[nodiscard]] u32* SwayWords() const noexcept {
+        return sway_words;
+    }
+    [[nodiscard]] u64 Frame() const noexcept {
+        return frame;
+    }
+    [[nodiscard]] u32 FrameSlot() const noexcept {
+        return u32(frame % FrameSlots);
+    }
 
     struct DrawJob {
         Motion::Draw draw;
@@ -48,6 +62,12 @@ public:
         bool gated = false;
         bool restart = false;
         bool indices_valid = false;
+        /// bbport (r34_motion-store): Skinned, GpuPalette or Other; a gated draw's kind (Moved
+        /// or Held) is set by Evaluate.
+        Motion::Kind kind = Motion::Kind::Other;
+        /// bbport (r89_wind-foliage-sway): the param's word 7, the sway word
+        /// (BbWindSway::PackWord; 0: no sway, as for every draw before)
+        u32 sway = 0;
     };
     u32 Draw(const DrawJob& job);
     void Sync();
@@ -106,7 +126,7 @@ private:
     };
     static constexpr u32 JobCapacity = 4096;
     Motion::History::Allocation Evaluate(const DrawJob& job);
-    void WriteParam(u32 index, const Motion::History::Allocation& allocation);
+    void WriteParam(u32 index, const Motion::History::Allocation& allocation, u32 sway);
     void AdvanceHistory();
     void Run(const Job& job);
     void Post(const Job& job);
@@ -122,14 +142,25 @@ private:
     static constexpr u32 FrameSlots = 4;
     static constexpr u32 ParamsPerFrame = 8192;
     static_assert(1 + FrameSlots * ParamsPerFrame == Shader::MotionVectors::ParamsCapacity);
+    // bbport (r89_wind-foliage-sway): the sway words' views are per slot of this ring, and they
+    // start at a 16-byte boundary (ParamsCapacity * 32 bytes in, as both emitters read them)
+    static_assert(BbWindSway::FrameSlots == FrameSlots);
+    static_assert((Shader::MotionVectors::ParamsCapacity * 32u) % 16u == 0);
     // Positions (device local): two halves (current/previous frame) of vec4; element 0 is reserved.
+    /// bbport (r34_motion-store, r37_menu-options): the small store (object_motion_store=small,
+    /// and the fallback when the large one cannot be made) and the large one (the default, and
+    /// what an unreadable BB_OBJECT_MOTION_VERTICES gives).
     static constexpr u32 PositionsPerFrame = 4u << 20;
+    static constexpr u32 PositionsPerFrameLarge = 8u << 20;
+    u32 positions_per_frame = PositionsPerFrame;      ///< bbport (r34_motion-store)
     Motion::History history{PositionsPerFrame};
+    std::vector<u64> used_bits; ///< bbport (r34_motion-store): Motion::UsedVertices scratch
     Motion::IndexRangeCache index_ranges;
     std::array<u64, FrameSlots> params_ticks{};
     vk::Buffer params_buffer{};
     VmaAllocation params_allocation{};
     u32* params_mapped{};
+    u32* sway_words{}; ///< bbport (r89_wind-foliage-sway): SwayWords
     vk::Buffer positions_buffer{};
     VmaAllocation positions_allocation{};
     Shader::MotionVectors::Addresses address_table{};

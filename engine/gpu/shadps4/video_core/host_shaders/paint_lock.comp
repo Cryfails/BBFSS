@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r45_drawn-look): the drawn look's colour lock, after the stroke pass. A stroke takes
+// the mean colour of what lies under it, but the pixels that keep their own colour (the dark
+// joints between stones, a glint) are in that mean too and are then counted twice: a wall with
+// dark joints would come out a little darker than it was, one with glints lighter. So every
+// place of the picture is scaled back to the mean colour it had before the strokes, measured
+// over about a bold stroke's width: narrow enough that a block of 64 pixels keeps its brightness
+// (twice as wide left blocks up to 8% off on the tuning picture, this 4%), and each stroke still
+// reads as the one colour it is.
+// Three passes of this file:
+//   FIRST  the painted scene's means, a quarter of the scene's size: what the copy's level 2
+//          is of the scene before the strokes, texel for texel
+//   DOWN   one more level of those means, as paint_mips.comp makes the copy's; down to one texel
+//   (neither) the scene scaled by the copy's mean over the painted scene's mean
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "paint_common.glsl"
+
+#if defined(FIRST)
+
+layout(binding = 0) uniform texture2D scene_tex; // the scene colour with the strokes in
+layout(binding = 1, rgba16f) uniform writeonly image2D to_img;
+
+// The mean of 2x2 pixels: a texel of the copy's level 1 (paint_stats.comp).
+vec3 halfTexel(ivec2 at) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        sum += soundColour(texelFetch(scene_tex, at * 2 + ivec2(i & 1, i >> 1), 0).rgb);
+    }
+    return sum * 0.25;
+}
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 to_size = imageSize(to_img);
+    if (any(greaterThanEqual(texel, to_size))) {
+        return;
+    }
+    // Where paint_mips.comp reads level 1 for this texel of level 2, and the four texels a
+    // linear read mixes there (on an even size: the 4x4 pixels, each counted the same).
+    const ivec2 half_size = max(ivec2(size) / 2, ivec2(1));
+    const vec2 p = (vec2(texel) + 0.5) / vec2(to_size) * vec2(half_size) - 0.5;
+    const ivec2 base = ivec2(floor(p));
+    const vec2 f = p - vec2(base);
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        const ivec2 corner = ivec2(i & 1, i >> 1);
+        const vec2 w = mix(1.0 - f, f, vec2(corner));
+        sum += halfTexel(clamp(base + corner, ivec2(0), half_size - 1)) * (w.x * w.y);
+    }
+    imageStore(to_img, texel, vec4(sum, 1.0));
+}
+
+#elif defined(DOWN)
+
+layout(binding = 0) uniform sampler2D from_tex; // a level of the means (linear, clamped)
+layout(binding = 1, rgba16f) uniform writeonly image2D to_img;
+
+void main() {
+    const ivec2 texel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 to_size = imageSize(to_img);
+    if (any(greaterThanEqual(texel, to_size))) {
+        return;
+    }
+    imageStore(to_img, texel, textureLod(from_tex, (vec2(texel) + 0.5) / vec2(to_size), 0.0));
+}
+
+#else
+
+// The copy of the scene before the strokes, all its levels (paint_prep.comp).
+layout(binding = 0) uniform sampler2D prep_tex;
+layout(binding = 1) uniform texture2D depth_tex;  // depth 0..1, 1: sky
+layout(binding = 2) uniform texture2D motion_tex; // FLAG_MOTION: this frame's object motion
+layout(binding = 3, rgba16f) uniform image2D scene_img;
+// The painted scene's means, all levels; level 0 is a quarter of the scene's size.
+layout(binding = 4) uniform sampler2D lock_tex;
+
+// A place is never scaled by more than this: the lock is there for a few per cent.
+const float MOST = 1.25;
+// The means are read from the level whose texels are a bold cell wide, plus this many levels.
+// One level more (texels two cells wide) leaves the strokes a little flatter and the picture's
+// blocks further from the brightness they had.
+const float LOCK_LEVEL = 0.0;
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    // What the stroke pass did not touch stays untouched: the sky, and what moves by itself
+    // when it gets no share of the look.
+    const float depth = texelFetch(depth_tex, pixel, 0).r;
+    if (depth >= 1.0) {
+        return;
+    }
+    if (characters <= 0.0 && (flags & FLAG_MOTION) != 0u &&
+        movesItself(texelFetch(motion_tex, pixel, 0), depth, vec2(pixel) + 0.5) >= 1.0) {
+        return;
+    }
+    const vec2 uv = (vec2(pixel) + 0.5) / size;
+    // Texels a bold cell wide; the means' level 0 is the copy's level 2.
+    const float level = max(log2(cell_bold) + LOCK_LEVEL, 2.0);
+    // The copy's last level is one texel: the frame's key (paint_key.comp).
+    const float black = blackLevel(textureLod(prep_tex, vec2(0.5), 99.0).r);
+    const vec3 before = textureLod(prep_tex, uv, level).rgb;
+    const vec3 after = textureLod(lock_tex, uv, level - 2.0).rgb;
+    const vec3 scale = clamp((before + black) / (after + black), 1.0 / MOST, MOST);
+    const vec4 scene = imageLoad(scene_img, pixel);
+    imageStore(scene_img, pixel, vec4(scene.rgb * scale, scene.a));
+}
+
+#endif

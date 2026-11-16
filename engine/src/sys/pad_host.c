@@ -424,11 +424,36 @@ static void apply_gyro(SDL_Gamepad *g, PadData *pad) {
     pad->right_y = offset_byte(pad->right_y, (invert_look_y ? -pitch : pitch) * k);
 }
 
+// bbport: L3 + a D-pad direction is a chord of the overlay (BbOverlay::HandleEvent: Up the co-op
+// panel, Down scout mode's panel while scout mode is on, Left camera mode's clean shot, Right its
+// orbit). A D-pad press that fired a chord is not the game's until it is released, so a chord
+// never reaches the game (D-pad Left and Right switch the hunter's items). The overlay decides,
+// from SDL events (bbgpu_overlay_pad_chords); this pad reads the SDL state, which can show a press
+// before the overlay has handled its event. Such a press is held back, until the overlay has seen
+// it, when L3 is down and the press is new since the last sample. Read once per sample
+// (note_l3_chords). Bits are SDL gamepad button numbers.
+static uint32_t dpad_chord, dpad_held;
+
+static void note_l3_chords(SDL_Gamepad *g) {
+    static const SDL_GamepadButton dpad[] = {SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_DOWN,
+                                             SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_RIGHT};
+    uint32_t down = 0;
+    for (int i = 0; i < 4; ++i)
+        if (SDL_GetGamepadButton(g, dpad[i])) down |= 1u << dpad[i];
+    const uint32_t overlay = bbgpu_overlay_pad_chords();
+    const uint32_t seen = overlay & 0xffffu, chord = overlay >> 16;
+    const int l3 = SDL_GetGamepadButton(g, SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    const uint32_t unseen = down & ~seen;
+    dpad_chord = (down & seen & chord) | (unseen & dpad_chord) | (l3 ? unseen & ~dpad_held : 0);
+    dpad_held = down;
+}
+
 static int gamepad_value(SDL_Gamepad *g, int input, int skip_menu_buttons) {
     int value = 0;
     for (int i = 0; i < bindings[input].pad_count; ++i) {
         int b = bindings[input].pad[i];
         if (skip_menu_buttons && menu_owns(b)) continue;
+        if (dpad_chord && b >= 0 && b < 32 && (dpad_chord >> b & 1u)) continue;
         int v = b >= LEFT_PAD_UP     ? track_button(b)
                 : b == LEFT_TRIGGER  ? trigger_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER))
                 : b == RIGHT_TRIGGER ? trigger_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER))
@@ -508,6 +533,7 @@ static void read_gamepad(SDL_Gamepad *g, PadData *pad) {
     uint32_t menu_confirm = 0, menu_back = 0;
     int in_menu = 0, menu_down = 0, touch_right = 0;
     update_trackpads(g);
+    note_l3_chords(g);
     if (bindings[IN_MENU_CONFIRM].pad_count || bindings[IN_MENU_BACK].pad_count) {
         in_menu = bbgpu_menu_buttons(&menu_confirm, &menu_back);
         menu_down = (gamepad_value(g, IN_MENU_CONFIRM, 0) > PRESSED ? 1 : 0) |

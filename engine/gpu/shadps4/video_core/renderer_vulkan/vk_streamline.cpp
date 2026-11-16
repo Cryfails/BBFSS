@@ -14,6 +14,7 @@
 #include <type_traits>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -26,7 +27,9 @@
 
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
+#include "bbport_toggles.h"
 #include "video_core/host_shaders/dlss_ui_alpha_comp.h"
+#include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_optiscaler.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -137,6 +140,100 @@ void Marker(sl::PCLMarker marker, u32 index) {
             sl_pcl_set_marker(marker, *token);
         }
     }
+}
+
+// bbport: Reflex frame numbers, and where the Reflex sleep runs. A game frame is numbered as the
+// game hands it over for display (Streamline::OnGameFlip, on the game's thread): flip k is frame
+// k, so the GPU command thread (SetFlipFrame, CurrentFrame) and the swap thread get the numbers
+// in order. The sleep runs on the game's thread before it reads the pad (BeforeGameInput, where
+// AMD Anti-Lag 2 waits), for the frame that input goes into: the next flip when the thread that
+// reads the pad also flips, the flip after it when another thread flips (the game simulates a
+// frame while its render thread submits the one before; BB_REFLEX_AHEAD=0/1 forces). Reflex then
+// holds back the game's input and simulation instead of the GPU command thread: in the flip step
+// it slept about 7 ms a frame there with frame generation on (50 instead of 60 game FPS, GPU 90%
+// busy). Experiment mask 512: the sleep in the flip step as before (OnFrameSubmitted); 8388608:
+// no sleep. A frame's start markers (simulation start and end, render submit start) go out once,
+// from whoever starts the frame first; simulation start follows the frame's sleep.
+constexpr u64 ReflexInFlipStep = 512;
+constexpr u64 ReflexNoSleep = 8388608;
+
+enum class SleepPlace { Input, FlipStep, None };
+
+SleepPlace ReflexSleepPlace() {
+    if (BbToggle::Experiment(ReflexInFlipStep)) {
+        return SleepPlace::FlipStep;
+    }
+    return BbToggle::Experiment(ReflexNoSleep) ? SleepPlace::None : SleepPlace::Input;
+}
+
+bool FrameStats() {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_FRAME_STATS");
+        return env && env[0] == '1';
+    }();
+    return on;
+}
+
+/// Who started a frame: its sleep at the input read (Sleeping until the sleep returns, then
+/// Input), its flip, or the GPU command thread.
+enum class Starter : u8 { None, Sleeping, Input, Flip, Command };
+
+struct ReflexFrames {
+    std::mutex mutex;
+    std::atomic<bool> ready{false}; ///< Streamline is up: frames are numbered
+    std::atomic<u32> in_use{0};     ///< game threads in BeforeGameInput / OnGameFlip (Shutdown)
+    u32 flips = 0;                  ///< the last flip's number
+    std::array<u32, 16> number{};
+    std::array<Starter, 16> starter{};
+    std::thread::id flip_thread{};
+    std::chrono::steady_clock::time_point last_flip{}; ///< when the last flip was numbered
+    /// No sleeps at the input read before this: one took over 100 ms (a loading screen or a
+    /// stall, where Reflex waits for frames that do not come).
+    std::chrono::steady_clock::time_point pause_until{};
+    int strikes = 0; ///< how many of those were logged
+    // BB_FRAME_STATS: the sleep at the input read, printed every 300 flips.
+    u64 sleep_ns = 0;
+    u32 frames = 0, slept = 0, late = 0, reads = 0;
+    bool ahead = false;
+};
+ReflexFrames reflex_frames;
+/// GPU command thread: the number of the flip being prepared (SetFlipFrame, CurrentFrame).
+std::atomic<u32> flip_frame{0};
+
+/// A game thread's use of Streamline: counted first, then checked (Shutdown clears `ready`, then
+/// waits for the count).
+struct ReflexUse {
+    bool ok;
+    ReflexUse() {
+        reflex_frames.in_use.fetch_add(1);
+        ok = reflex_frames.ready.load();
+    }
+    ~ReflexUse() {
+        reflex_frames.in_use.fetch_sub(1);
+    }
+};
+
+/// Under reflex_frames.mutex.
+Starter StarterOf(u32 index) {
+    const u32 slot = index % u32(reflex_frames.number.size());
+    return reflex_frames.number[slot] == index ? reflex_frames.starter[slot] : Starter::None;
+}
+
+/// Under reflex_frames.mutex.
+void SetStarter(u32 index, Starter who) {
+    const u32 slot = index % u32(reflex_frames.number.size());
+    reflex_frames.number[slot] = index;
+    reflex_frames.starter[slot] = who;
+}
+
+/// GPU command thread: true when frame `index` was not started yet; it is the caller's now.
+bool StartFrame(u32 index) {
+    std::scoped_lock lock{reflex_frames.mutex};
+    if (StarterOf(index) != Starter::None) {
+        return false;
+    }
+    SetStarter(index, Starter::Command);
+    return true;
 }
 
 std::wstring EngineDir() {
@@ -377,6 +474,7 @@ void OnDeviceCreated(vk::PhysicalDevice physical) {
     Feature(sl::kFeatureReflex, "slReflexSetOptions", sl_reflex_set_options);
     Feature(sl::kFeatureReflex, "slReflexSleep", sl_reflex_sleep);
     Feature(sl::kFeaturePCL, "slPCLSetMarker", sl_pcl_set_marker);
+    reflex_frames.ready.store(true); // bbport: the game's flips are numbered from here (OnGameFlip)
     if (!device_ready) {
         return;
     }
@@ -410,9 +508,149 @@ void Shutdown() {
     }
     initialized = false;
     device_ready = false;
+    // bbport: no game thread may be in the Reflex sleep or the markers when Streamline goes
+    // (waits up to 0.5 s).
+    reflex_frames.ready.store(false);
+    for (int i = 0; i < 500 && reflex_frames.in_use.load() != 0; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     BbSettings::Get().dlss_fg_supported = false;
     BbSettings::Get().streamline_loaded = false;
     sl_shutdown();
+#endif
+}
+
+void BeforeGameInput() {
+#ifdef _WIN32
+    if (ReflexSleepPlace() != SleepPlace::Input) {
+        return;
+    }
+    const ReflexUse use;
+    if (!use.ok || !sl_reflex_sleep) {
+        return;
+    }
+    u32 index = 0;
+    bool ahead = false;
+    {
+        std::scoped_lock lock{reflex_frames.mutex};
+        // No sleep while the game does not flip (none yet, or none for 100 ms: loading, a
+        // stall): those frames start at their flips (OnGameFlip), as AMD Anti-Lag 2 skips its
+        // wait after a 100 ms hitch.
+        ++reflex_frames.reads;
+        const auto read_time = std::chrono::steady_clock::now();
+        if (reflex_frames.flips == 0 || read_time < reflex_frames.pause_until ||
+            read_time - reflex_frames.last_flip > std::chrono::milliseconds(100)) {
+            return;
+        }
+        static const int forced = [] {
+            const char* env = std::getenv("BB_REFLEX_AHEAD");
+            return env && (env[0] == '0' || env[0] == '1') ? env[0] - '0' : -1;
+        }();
+        ahead = forced < 0 ? reflex_frames.flip_thread != std::this_thread::get_id() : forced == 1;
+        index = reflex_frames.flips + (ahead ? 2u : 1u);
+        if (StarterOf(index) != Starter::None) {
+            return; // this frame's sleep ran (the pad is read more than once a frame)
+        }
+        if (ahead && StarterOf(index - 1) == Starter::None) {
+            // The frame before had no input read (after a gap): its simulation start goes out
+            // now, without a sleep, so the frames' simulation starts stay in order.
+            Marker(sl::PCLMarker::eSimulationStart, index - 1);
+            SetStarter(index - 1, Starter::Input);
+        }
+        SetStarter(index, Starter::Sleeping);
+    }
+    const auto start = std::chrono::steady_clock::now();
+    if (sl::FrameToken* token = Token(index)) {
+        sl_reflex_sleep(*token);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    std::scoped_lock lock{reflex_frames.mutex};
+    if (StarterOf(index) == Starter::Sleeping) {
+        Marker(sl::PCLMarker::eSimulationStart, index);
+        SetStarter(index, Starter::Input);
+    } else {
+        ++reflex_frames.late; // its flip came first and started it
+    }
+    reflex_frames.sleep_ns +=
+        u64(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+    ++reflex_frames.slept;
+    reflex_frames.ahead = ahead;
+    if (now - start > std::chrono::milliseconds(100)) {
+        // Not pacing: no sleeps here for 3 s, then again (never off for the whole session).
+        reflex_frames.pause_until = now + std::chrono::seconds(3);
+        if (++reflex_frames.strikes <= 20) {
+            std::printf("Reflex: the sleep at the game's input read took %.0f ms; none there for "
+                        "3 s\n",
+                        std::chrono::duration<double, std::milli>(now - start).count());
+            std::fflush(stdout);
+        }
+    }
+#endif
+}
+
+u32 OnGameFlip() {
+#ifdef _WIN32
+    const ReflexUse use;
+    if (!use.ok) {
+        return 0;
+    }
+    const bool here = sl_reflex_sleep && ReflexSleepPlace() == SleepPlace::Input;
+    u32 index = 0;
+    Starter starter = Starter::None;
+    bool report = false;
+    u64 sleep_ns = 0;
+    u32 frames = 0, slept = 0, late = 0, reads = 0;
+    bool ahead = false;
+    {
+        std::scoped_lock lock{reflex_frames.mutex};
+        index = ++reflex_frames.flips;
+        reflex_frames.flip_thread = std::this_thread::get_id();
+        reflex_frames.last_flip = std::chrono::steady_clock::now();
+        starter = StarterOf(index);
+        if (starter == Starter::Sleeping || (starter == Starter::None && here)) {
+            SetStarter(index, Starter::Flip); // still asleep, or no sleep for it: starts here
+        }
+        if (here && FrameStats() && ++reflex_frames.frames == 300) {
+            report = true;
+            sleep_ns = reflex_frames.sleep_ns;
+            frames = reflex_frames.frames;
+            slept = reflex_frames.slept;
+            late = reflex_frames.late;
+            reads = reflex_frames.reads;
+            ahead = reflex_frames.ahead;
+            reflex_frames.sleep_ns = 0;
+            reflex_frames.frames = reflex_frames.slept = reflex_frames.late = reflex_frames.reads = 0;
+        }
+    }
+    if (starter == Starter::Input) {
+        Marker(sl::PCLMarker::eSimulationEnd, index);
+        Marker(sl::PCLMarker::eRenderSubmitStart, index);
+    } else if (starter == Starter::Sleeping || (starter == Starter::None && here)) {
+        Marker(sl::PCLMarker::eSimulationStart, index);
+        Marker(sl::PCLMarker::eSimulationEnd, index);
+        Marker(sl::PCLMarker::eRenderSubmitStart, index);
+    }
+    if (report) {
+        std::printf("Reflex: the sleep took %.2f ms a frame over the last %u frames (at the game's "
+                    "input read; %u of them slept there, %.2f ms a sleep, %u too late for their "
+                    "frame; %u pad reads; the pad is read on %s)\n",
+                    double(sleep_ns) / frames / 1e6, frames, slept,
+                    slept ? double(sleep_ns) / slept / 1e6 : 0.0, late, reads,
+                    ahead ? "another thread than the flips: the sleep is for the flip after next"
+                          : "the thread that flips");
+        std::fflush(stdout);
+    }
+    return index;
+#else
+    return 0;
+#endif
+}
+
+void SetFlipFrame(u32 index) {
+#ifdef _WIN32
+    flip_frame.store(index, std::memory_order_relaxed);
+#else
+    (void)index;
 #endif
 }
 
@@ -437,14 +675,26 @@ u32 DlssFrameGen::CurrentFrame() {
     if (!Streamline::Loaded()) {
         return 0;
     }
-    if (current_frame == 0) {
-        current_frame = 1;
-        if (sl_reflex_sleep) {
-            if (sl::FrameToken* token = Token(current_frame)) sl_reflex_sleep(*token);
+    // bbport: the number the game gave this flip (Streamline::OnGameFlip). Nobody started the
+    // frame yet (its flip came while the sleep had another place): its start markers go here.
+    const u32 index = flip_frame.exchange(0, std::memory_order_relaxed);
+    if (index == 0 || index <= last_frame) {
+        static u32 said = 0;
+        if (said < 5) {
+            ++said;
+            std::printf("DLSS Frame Generation: a flip without a new Reflex frame number (%u after "
+                        "%u): no markers for it\n",
+                        index, last_frame);
+            std::fflush(stdout);
         }
-        Marker(sl::PCLMarker::eSimulationStart, current_frame);
-        Marker(sl::PCLMarker::eSimulationEnd, current_frame);
-        Marker(sl::PCLMarker::eRenderSubmitStart, current_frame);
+        current_frame = 0;
+        return 0;
+    }
+    current_frame = last_frame = index;
+    if (StartFrame(index)) {
+        Marker(sl::PCLMarker::eSimulationStart, index);
+        Marker(sl::PCLMarker::eSimulationEnd, index);
+        Marker(sl::PCLMarker::eRenderSubmitStart, index);
     }
     return current_frame;
 #else
@@ -458,17 +708,43 @@ void DlssFrameGen::OnFrameSubmitted() {
         return;
     }
     Marker(sl::PCLMarker::eRenderSubmitEnd, current_frame);
-    // The next game frame starts here on this thread: Reflex holds it back until the GPU is
-    // about to need it (its sleep), then its simulation and render submission begin. The
-    // guest's own simulation runs ahead in the command queue; these mark where its commands are
-    // taken up.
-    ++current_frame;
-    if (sl_reflex_sleep) {
-        if (sl::FrameToken* token = Token(current_frame)) sl_reflex_sleep(*token);
+    const u32 next = current_frame + 1;
+    current_frame = 0;
+    // bbport: by default the next frame starts on the game's thread: its Reflex sleep before the
+    // pad read, its markers there and at its flip (ReflexFrames). Experiment mask 512 (the old
+    // behaviour): it starts here, in the flip step on the GPU command thread, after the sleep;
+    // while Reflex sleeps the next frame's commands wait (with frame generation on about 7 ms a
+    // frame: 50 instead of 60 game FPS, GPU 90% busy). 8388608: here, without a sleep.
+    const SleepPlace place = ReflexSleepPlace();
+    if (place == SleepPlace::Input || !StartFrame(next)) {
+        return;
     }
-    Marker(sl::PCLMarker::eSimulationStart, current_frame);
-    Marker(sl::PCLMarker::eSimulationEnd, current_frame);
-    Marker(sl::PCLMarker::eRenderSubmitStart, current_frame);
+    if (sl_reflex_sleep) {
+        const auto start = std::chrono::steady_clock::now();
+        if (place == SleepPlace::FlipStep) {
+            if (sl::FrameToken* token = Token(next)) {
+                sl_reflex_sleep(*token);
+            }
+        }
+        if (FrameStats()) {
+            sleep_ns += u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - start)
+                                .count());
+            if (++sleeps == 300) {
+                std::printf("Reflex: the sleep took %.2f ms a frame over the last %u frames (%s)\n",
+                            double(sleep_ns) / sleeps / 1e6, sleeps,
+                            place == SleepPlace::FlipStep
+                                ? "in the flip step on the GPU command thread, experiment mask 512"
+                                : "no sleep, experiment mask 8388608");
+                std::fflush(stdout);
+                sleep_ns = 0;
+                sleeps = 0;
+            }
+        }
+    }
+    Marker(sl::PCLMarker::eSimulationStart, next);
+    Marker(sl::PCLMarker::eSimulationEnd, next);
+    Marker(sl::PCLMarker::eRenderSubmitStart, next);
 #endif
 }
 
@@ -651,7 +927,8 @@ void DlssFrameGen::RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& 
                                  vk::Image hudless, vk::ImageView hudless_frame_view,
                                  vk::Extent2D frame_extent,
                                  vk::Image backbuffer, vk::Format format, vk::Extent2D extent,
-                                 vk::Rect2D fit) {
+                                 vk::Rect2D fit, vk::ImageView compare_final,
+                                 vk::ImageView compare_hudless) {
     tag_hudless = nullptr;
     tag_hudless_view = nullptr;
     tag_ui = false;
@@ -659,6 +936,10 @@ void DlssFrameGen::RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& 
         return;
     }
     EnsurePresentImages(format, extent);
+    GpuProfiler* const profiler = GpuProfiler::Get(); // bbport: BB_GPU_PROFILE
+    if (profiler) {
+        profiler->PresentMark(cmdbuf, GpuProfiler::PresentPart::UiInputs);
+    }
     const auto all = vk::PipelineStageFlagBits2::eAllCommands;
     const auto barrier = [&](vk::Image image, vk::ImageLayout old_layout,
                              vk::ImageLayout new_layout, vk::AccessFlags2 src,
@@ -679,7 +960,10 @@ void DlssFrameGen::RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& 
     // The HUD-less frame as the back buffer holds the frame: the same fit and black bars.
     const bool covers = fit.offset.x == 0 && fit.offset.y == 0 && fit.extent == extent &&
                         frame_extent == extent;
-    {
+    // bbport: the UI alpha from the presenter's images (compare_*): no back buffer copy.
+    // Experiment bit 1048576 (in the presenter): the copy as before.
+    const bool direct = covers && compare_final && compare_hudless;
+    if (!direct) {
         std::array<vk::ImageMemoryBarrier2, 4> before{
             barrier(backbuffer, vk::ImageLayout::ePresentSrcKHR,
                     vk::ImageLayout::eTransferSrcOptimal, write, read),
@@ -698,8 +982,10 @@ void DlssFrameGen::RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& 
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .extent = {extent.width, extent.height, 1},
     };
-    cmdbuf.copyImage(backbuffer, vk::ImageLayout::eTransferSrcOptimal, vk::Image(final_image),
-                     vk::ImageLayout::eTransferDstOptimal, whole);
+    if (!direct) {
+        cmdbuf.copyImage(backbuffer, vk::ImageLayout::eTransferSrcOptimal,
+                         vk::Image(final_image), vk::ImageLayout::eTransferDstOptimal, whole);
+    }
     if (!covers) {
         const vk::ClearColorValue black{std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}};
         const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
@@ -734,16 +1020,30 @@ void DlssFrameGen::RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& 
             barrier(vk::Image(hudless_image), vk::ImageLayout::eTransferDstOptimal,
                     vk::ImageLayout::eGeneral, write, read),
         };
-        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = covers ? 3u : 5u,
-                                 .pImageMemoryBarriers = after.data()});
+        if (direct) {
+            // The back buffer and final_image are untouched; the compared images' writes (the
+            // post process's, the presenter's layout changes) before the UI alpha reads them.
+            const vk::MemoryBarrier2 written{.srcStageMask = all,
+                                             .srcAccessMask = write,
+                                             .dstStageMask = all,
+                                             .dstAccessMask = read};
+            cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1,
+                                     .pMemoryBarriers = &written,
+                                     .imageMemoryBarrierCount = 1,
+                                     .pImageMemoryBarriers = &after[2]});
+        } else {
+            cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = covers ? 3u : 5u,
+                                     .pImageMemoryBarriers = after.data()});
+        }
     }
     // Where the back buffer differs from the HUD-less frame: the UI. A frame that fills the
     // back buffer gives its own HUD-less image; a letterboxed one the copy made above.
     tag_hudless = covers ? hudless : vk::Image(hudless_image);
     tag_hudless_view = covers ? hudless_frame_view : *hudless_view;
-    const vk::DescriptorImageInfo final_info{.imageView = *final_view,
+    const vk::DescriptorImageInfo final_info{.imageView = direct ? compare_final : *final_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
-    const vk::DescriptorImageInfo hudless_info{.imageView = tag_hudless_view,
+    const vk::DescriptorImageInfo hudless_info{.imageView = direct ? compare_hudless
+                                                                   : tag_hudless_view,
                                                .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo ui_info{.imageView = *ui_view,
                                           .imageLayout = vk::ImageLayout::eGeneral};
@@ -756,6 +1056,9 @@ void DlssFrameGen::RecordPresent(vk::CommandBuffer cmdbuf, const DlssFrameInfo& 
          .pImageInfo = &ui_info},
     }};
     const float threshold = UiThreshold;
+    if (profiler) {
+        profiler->PresentMark(cmdbuf, GpuProfiler::PresentPart::UiAlpha);
+    }
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *ui_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, writes);
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(threshold),

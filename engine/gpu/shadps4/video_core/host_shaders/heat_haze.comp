@@ -1,0 +1,251 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r97_heat-haze): the heat haze above flames (BB_HEAT_HAZE; vk_heat_haze.cpp, the column's
+// numbers from heat_haze.h). One dispatch a column and pass, over the column's rectangle:
+//  - pass 0 (copy): the scene under the rectangle into the column's place in the atlas;
+//  - pass 1 (haze): inside the column (from the flame up to its top, widening, fading in just
+//    above the flame and out towards the top and the sides), each pixel takes the atlas's colour
+//    a little beside it, moved by a noise that rises with time: a shimmer of a few pixels.
+//    What is nearer the camera than the flame (by more than the column's radius and a margin)
+//    is neither moved nor moved into a pixel behind the column. Alpha stays the pixel's own.
+// The scene is written only where a pixel moves; the copy is read, so no pixel reads another
+// one this pass has already written.
+// bbport (r97b_heat-haze-paths): the haze pass counts what becomes of its pixels (outside the
+// column's shape, dropped by either depth test, written) and where the depth puts them against
+// the flame, into a small buffer the engine reads back for its log line (heat_haze_layout.h); the
+// frame's nearest column keeps its flame pixel's depth there too. With HH_FLAG_NO_DEPTH the depth
+// tests are counted but not applied; with HH_FLAG_OUTLINE the column's rectangle is framed.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "heat_haze_layout.h"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform image2D scene_img;
+layout(binding = 1, rgba16f) uniform image2D atlas_img;
+layout(binding = 2) uniform texture2D depth_tex; // D32, depth 0..1 (D3D projection)
+layout(std430, binding = 3) buffer Counters {
+    uint words[HH_WORDS];
+};
+
+// heat_haze.h Push, field for field.
+layout(push_constant) uniform Push {
+    ivec4 rect;  // x, y, width, height in the scene
+    ivec4 atlas; // x, y in the atlas; pass (0 copy, 1 haze); flags (HH_FLAG_*)
+    vec4 axis;   // the flame's x, y and the top's x, y (pixels)
+    vec4 shape;  // half width at the flame (px), widening to the top, reach (px), flame's view z
+    vec4 field;  // pixels a metre at the flame, depth margin (m), fade, seed
+    vec4 clock;  // projection z scale, z offset, time (s), rise (m/s)
+};
+
+shared uint group_counts[HH_SHARED]; // (r97d: HH_COUNTED before)
+shared uint group_max;
+
+uint Hash(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z;
+    v.y += v.z * v.x;
+    v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z;
+    return v.x;
+}
+
+float Corner(ivec3 c) {
+    return float(Hash(uvec3(c & 1023)) >> 8u) * (1.0 / 16777216.0);
+}
+
+// Value noise in [0, 1), smooth (quintic) between the lattice's corners.
+float Noise(vec3 p) {
+    const vec3 f = floor(p);
+    const ivec3 i = ivec3(f);
+    const vec3 u = p - f;
+    const vec3 s = u * u * u * (u * (u * 6.0 - 15.0) + 10.0);
+    const float x00 = mix(Corner(i), Corner(i + ivec3(1, 0, 0)), s.x);
+    const float x10 = mix(Corner(i + ivec3(0, 1, 0)), Corner(i + ivec3(1, 1, 0)), s.x);
+    const float x01 = mix(Corner(i + ivec3(0, 0, 1)), Corner(i + ivec3(1, 0, 1)), s.x);
+    const float x11 = mix(Corner(i + ivec3(0, 1, 1)), Corner(i + ivec3(1, 1, 1)), s.x);
+    return mix(mix(x00, x10, s.y), mix(x01, x11, s.y), s.z);
+}
+
+// The view z (m) a depth gives; the sky is far behind every flame.
+float ViewZOf(float depth) {
+    if (depth >= 1.0) {
+        return 1e9;
+    }
+    return clock.y / min(depth - clock.x, -1e-8);
+}
+
+float ViewZ(ivec2 p) {
+    return ViewZOf(texelFetch(depth_tex, p, 0).r);
+}
+
+vec4 Atlas(ivec2 t) {
+    return imageLoad(atlas_img, clamp(t, atlas.xy, atlas.xy + rect.zw - 1));
+}
+
+void Count(uint word) {
+    atomicAdd(group_counts[word], 1u);
+}
+
+const vec3 luma_weights = vec3(0.2126, 0.7152, 0.0722);
+
+// One pixel of the haze pass, inside the column's rectangle.
+void Haze(ivec2 local) {
+    const ivec2 p = rect.xy + local;
+    const ivec2 own = atlas.xy + local;
+    const bool depth_tests = (atlas.w & HH_FLAG_NO_DEPTH) == 0;
+    const float front = shape.w - field.y;
+    Count(HH_WORD_RECT);
+    // The frame's nearest column: its flame pixel's depth, before any test (the log's numbers).
+    if ((atlas.w & HH_FLAG_PROBE) != 0 && p == ivec2(floor(axis.xy))) {
+        const float depth = texelFetch(depth_tex, p, 0).r;
+        words[HH_WORD_FLAME_DEPTH] = floatBitsToUint(depth);
+        words[HH_WORD_FLAME_Z] = floatBitsToUint(ViewZOf(depth));
+        words[HH_WORD_FLAME_FRONT] = floatBitsToUint(front);
+        words[HH_WORD_FLAME_EXPECT] = floatBitsToUint(clock.x + clock.y / max(shape.w, 1e-3));
+        words[HH_WORD_FLAME_LAMP_Z] = floatBitsToUint(shape.w);
+        atomicAdd(words[HH_WORD_FLAME_SEEN], 1u);
+    }
+    // Test view 2: the rectangle's edge, 2 pixels wide (a temporal upscaler keeps it), magenta
+    // (at least as bright as the flame's pixel).
+    if ((atlas.w & HH_FLAG_OUTLINE) != 0 &&
+        (any(lessThan(local, ivec2(2))) || any(greaterThanEqual(local, rect.zw - 2)))) {
+        const vec3 flame = Atlas(atlas.xy + ivec2(floor(axis.xy)) - rect.xy).rgb;
+        const float bright = max(dot(max(flame, vec3(0.0)), luma_weights), 1.0);
+        imageStore(scene_img, p, vec4(bright * vec3(1.0, 0.0, 1.0), imageLoad(atlas_img, own).a));
+    }
+    const vec2 base = axis.xy;
+    const vec2 along = axis.zw - base;
+    const float len = max(length(along), 1.0);
+    const vec2 dir = along / len;
+    const vec2 across_dir = vec2(-dir.y, dir.x);
+    const vec2 rel = vec2(p) + 0.5 - base;
+    const float t = dot(rel, dir) / len;
+    if (t <= 0.0 || t >= 1.0) {
+        Count(HH_WORD_SHAPE);
+        return;
+    }
+    const float half_width = shape.x * (1.0 + shape.y * t);
+    const float across = dot(rel, across_dir);
+    const float x = across / max(half_width, 0.5);
+    if (abs(x) >= 1.0) {
+        Count(HH_WORD_SHAPE);
+        return;
+    }
+    const float side = 1.0 - x * x;
+    // (r97c) fading in over the first 6% of the column and out linearly: the shimmer starts at the
+    // flame's glow, which is what shows a move, and reaches the top
+    const float weight = smoothstep(0.0, 0.06, t) * (1.0 - t) * side * side * field.z;
+    if (weight < 1.0 / 256.0) {
+        Count(HH_WORD_SHAPE);
+        return;
+    }
+    const float depth = texelFetch(depth_tex, p, 0).r;
+    const float z = ViewZOf(depth);
+    if (depth >= 1.0) {
+        Count(HH_WORD_Z_SKY);
+    } else if (!(z > 0.0) || isinf(z) || isnan(z)) {
+        Count(HH_WORD_Z_BAD);
+    } else if (z < 0.5 * shape.w) {
+        Count(HH_WORD_Z_CLOSE);
+    } else if (z < front) {
+        Count(HH_WORD_Z_FRONT);
+    } else {
+        Count(HH_WORD_Z_BEHIND);
+    }
+    if (z < front) {
+        Count(HH_WORD_NEAR);
+        if (depth_tests) {
+            return;
+        }
+    }
+    // The pattern in metres around the column (eddies of about 11 and 5 cm across, 17 and 7 cm
+    // along it), rising at clock.w m/s and changing slowly as it goes.
+    const float per_metre = max(field.x, 1e-3);
+    const float time = clock.z;
+    const vec3 q = vec3(across / per_metre * 9.0, (t * len / per_metre - time * clock.w) * 6.0,
+                        field.w + time * 0.35);
+    const float n1 = Noise(q) + 0.5 * Noise(q * 2.3 + vec3(7.1, 3.7, 1.3));
+    const float n2 = Noise(q + vec3(19.7, 5.3, 11.1)) + 0.5 * Noise(q * 2.3 + vec3(2.9, 13.1, 4.7));
+    // (r97c) scaled by 1/0.45 and clamped: the noise's rms across is 0.49 of the amplitude, the largest move
+    // the amplitude itself (r97: 1/0.75, rms 0.30)
+    const vec2 d = clamp(vec2(n1 - 0.75, 0.5 * (n2 - 0.75)) * (1.0 / 0.45), vec2(-1.0), vec2(1.0));
+    const vec2 offset = (across_dir * d.x + dir * d.y) * (shape.z * weight);
+    const vec2 source = vec2(p) + 0.5 + offset;
+    const ivec2 source_pixel = clamp(ivec2(floor(source)), rect.xy, rect.xy + rect.zw - 1);
+    if (ViewZ(source_pixel) < front) {
+        Count(HH_WORD_SOURCE);
+        if (depth_tests) {
+            return;
+        }
+    }
+    // Between the four atlas texels around the source.
+    const vec2 at = source - vec2(rect.xy) + vec2(atlas.xy) - 0.5;
+    const ivec2 lo = ivec2(floor(at));
+    const vec2 f = at - vec2(lo);
+    const vec4 colour = mix(mix(Atlas(lo), Atlas(lo + ivec2(1, 0)), f.x),
+                            mix(Atlas(lo + ivec2(0, 1)), Atlas(lo + ivec2(1, 1)), f.x), f.y);
+    vec3 rgb = colour.rgb;
+    if ((atlas.w & HH_FLAG_SHOW) != 0) {
+        // Test view: the column tinted blue-green, its brightness kept but at least a tenth of
+        // the flame's (the pixel at the flame, from the copy): at night the air above a flame
+        // is often near black, where a tint alone would not show.
+        const vec3 flame = Atlas(atlas.xy + ivec2(floor(axis.xy)) - rect.xy).rgb;
+        const float luma = max(dot(rgb, luma_weights), 0.1 * dot(max(flame, vec3(0.0)), luma_weights));
+        rgb = mix(rgb, luma * vec3(0.55, 0.95, 1.5), 0.6 * weight / max(field.z, 1e-3));
+    }
+    // (r97d) the offset this pixel took, in render pixels: bins, sum and largest, for the log
+    const float moved = length(offset);
+    const uint moved16 = uint(min(moved, 4000.0) * 16.0 + 0.5);
+    const uint bin = moved < 0.25 ? 0u : moved < 0.5 ? 1u : moved < 1.0 ? 2u : moved < 2.0 ? 3u
+                   : moved < 4.0 ? 4u : moved < 8.0 ? 5u : moved < 16.0 ? 6u : 7u;
+    Count(HH_WORD_OFF_BIN0 + bin);
+    atomicAdd(group_counts[HH_WORD_OFF_SUM], moved16);
+    atomicMax(group_max, moved16);
+    if ((atlas.w & HH_FLAG_PROOF) != 0) {
+        // Proof view: the written pixel 30% towards magenta, its own brightness (at least a tenth
+        // of the flame's), the real offset kept.
+        const vec3 flame_px = Atlas(atlas.xy + ivec2(floor(axis.xy)) - rect.xy).rgb;
+        const float proof_luma = max(dot(max(rgb, vec3(0.0)), luma_weights),
+                                     0.1 * dot(max(flame_px, vec3(0.0)), luma_weights));
+        rgb = mix(rgb, proof_luma * vec3(1.0, 0.0, 1.0), 0.3);
+    }
+    imageStore(scene_img, p, vec4(rgb, imageLoad(atlas_img, own).a));
+    Count(HH_WORD_WRITTEN);
+}
+
+void main() {
+    const ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+    const bool inside = all(lessThan(local, rect.zw));
+    if (atlas.z == HH_PASS_COPY) {
+        // (atlas.z is the same for the whole dispatch: this return is uniform)
+        if (inside) {
+            imageStore(atlas_img, atlas.xy + local, imageLoad(scene_img, rect.xy + local));
+        }
+        return;
+    }
+    if (gl_LocalInvocationIndex < HH_SHARED) {
+        group_counts[gl_LocalInvocationIndex] = 0u;
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        group_max = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    if (inside) {
+        Haze(local);
+    }
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex < HH_SHARED) {
+        const uint n = group_counts[gl_LocalInvocationIndex];
+        if (n != 0u) {
+            atomicAdd(words[gl_LocalInvocationIndex], n);
+        }
+    }
+    if (gl_LocalInvocationIndex == 0u && group_max != 0u) { // (r97d) the largest offset
+        atomicMax(words[HH_WORD_OFF_MAX], group_max);
+    }
+}

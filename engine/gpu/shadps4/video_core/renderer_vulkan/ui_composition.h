@@ -106,6 +106,103 @@ constexpr bool ObserveDraw(uint32_t mrt_mask, uint64_t vs_hash, bool has_stencil
            (mrt_mask == 0 && has_stencil && MovieShader(vs_hash));
 }
 
+// Clean shot (BbSettings clean_shot): where the frame being recorded is, as its draws show it.
+enum class CleanShotPhase : uint8_t {
+    NoWorld, ///< no G-buffer pass since the display pass (shadow passes; a loading screen)
+    World,   ///< a G-buffer pass was drawn: the scene, its post passes, the tonemap
+    Ui,      ///< the game's UI over the finished frame, up to the next display pass
+};
+// A G-buffer pass: 5 or more colour targets with a depth target.
+constexpr bool WorldPass(uint32_t mrt_mask, bool depth_target) {
+    return std::popcount(mrt_mask & 0xff) >= 5 && depth_target;
+}
+// One draw as clean shot sees it. Sizes are the guest targets' (the render size in a scaled
+// session, as the upscaler's RenderTarget).
+struct CleanShotDraw {
+    bool world_pass = false;   ///< WorldPass
+    bool movie = false;        ///< a Scaleform draw (MovieShader)
+    uint64_t color = 0;        ///< colour target 0's guest address when the draw writes it, else 0
+    bool rgba8 = false;        ///< that target is RGBA8
+    bool display = false;      ///< that target is a display buffer
+    uint32_t width = 0, height = 0;               ///< that target's size
+    uint64_t stencil = 0;      ///< the stencil buffer's guest address when stencil is on, else 0
+    uint32_t stencil_width = 0, stencil_height = 0; ///< that buffer's size
+};
+// Where the frame being recorded is. The display pass (the copy of a finished frame into a
+// display buffer, the first pass of the next frame's work) starts every frame with a new one.
+struct CleanShotFrame {
+    CleanShotPhase phase = CleanShotPhase::NoWorld;
+    uint32_t world_width = 0, world_height = 0; ///< the largest G-buffer target since NoWorld
+    uint64_t ldr = 0;      ///< the last frame-size RGBA8 target drawn in World (the tonemap's)
+    uint64_t ui_color = 0; ///< the UI's target (the frame the UI is drawn over)
+    uint64_t ui_stencil = 0; ///< the UI's stencil buffer (its clip masks)
+};
+// Within 8 pixels: the game aligns its targets a few pixels larger than the scene (as
+// TargetViewport).
+constexpr bool CleanShotNear(uint32_t width, uint32_t height, uint32_t world_width,
+                             uint32_t world_height) {
+    const auto near = [](uint32_t a, uint32_t b) { return (a > b ? a - b : b - a) <= 8; };
+    return world_width != 0 && near(width, world_width) && near(height, world_height);
+}
+// A draw into the frame: an RGBA8 colour target of the G-buffer's size that is not a display
+// buffer (the upscaler's LdrFrame).
+constexpr bool CleanShotFrameTarget(const CleanShotFrame& frame, const CleanShotDraw& draw) {
+    return draw.color != 0 && draw.rgba8 && !draw.display &&
+           CleanShotNear(draw.width, draw.height, frame.world_width, frame.world_height);
+}
+// Clean shot's rule for one draw (true: leave it out).
+// - A G-buffer pass sets World (a new frame's after a display pass gone unseen) and is drawn.
+// - In World the UI starts at the first Scaleform draw that is either an image into the frame
+//   (CleanShotFrameTarget) or a clip mask (no colour target) on a stencil buffer of the G-buffer's
+//   size; the UI's target is that image's, or for a clip mask the last frame-size RGBA8 target
+//   drawn in World. A Scaleform draw into any other target does not start it.
+// - In Ui a draw is left out when it writes the UI's target, whatever its shader (Scaleform's
+//   images, text, the item icons drawn through the clip masks, the gauges' backgrounds), or when it
+//   writes no colour and has stencil on with the UI's stencil buffer (the clip masks). The UI's
+//   target or stencil buffer, when the draw that started the UI did not show it, is taken from the
+//   first later Scaleform image into the frame and from the first draw into the UI's target with
+//   stencil on. Every draw into another target is drawn (Scaleform's own caches, the next frame's
+//   passes).
+// A frame without a G-buffer pass (a loading screen) keeps its UI.
+constexpr bool CleanShotSkip(CleanShotFrame& frame, const CleanShotDraw& draw) {
+    if (draw.world_pass) {
+        if (frame.phase != CleanShotPhase::World) {
+            frame = {};
+            frame.phase = CleanShotPhase::World;
+        }
+        frame.world_width = std::max(frame.world_width, draw.width);
+        frame.world_height = std::max(frame.world_height, draw.height);
+        return false;
+    }
+    if (frame.phase == CleanShotPhase::World) {
+        const bool frame_target = CleanShotFrameTarget(frame, draw);
+        const bool mask =
+            draw.color == 0 && draw.stencil != 0 &&
+            CleanShotNear(draw.stencil_width, draw.stencil_height, frame.world_width,
+                          frame.world_height);
+        if (!draw.movie || !(frame_target || mask)) {
+            if (frame_target) frame.ldr = draw.color;
+            return false;
+        }
+        frame.phase = CleanShotPhase::Ui;
+        frame.ui_color = frame_target ? draw.color : frame.ldr;
+        frame.ui_stencil = draw.stencil;
+        return true;
+    }
+    if (frame.phase != CleanShotPhase::Ui) {
+        return false;
+    }
+    if (frame.ui_color == 0 && draw.movie && CleanShotFrameTarget(frame, draw)) {
+        frame.ui_color = draw.color;
+    }
+    if (draw.color != 0) {
+        if (draw.color != frame.ui_color) return false;
+        if (frame.ui_stencil == 0) frame.ui_stencil = draw.stencil;
+        return true;
+    }
+    return draw.stencil != 0 && draw.stencil == frame.ui_stencil;
+}
+
 struct FitTransform {std::array<float,2> scale;std::array<float,2> offset;};
 // A UI viewport of `ui` units shown whole, centred and unstretched in a w x h image.
 inline FitTransform Fit(uint32_t w,uint32_t h,std::array<float,2> ui={1920.0f,1080.0f}) {

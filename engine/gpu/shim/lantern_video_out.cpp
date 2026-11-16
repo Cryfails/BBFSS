@@ -54,6 +54,33 @@ struct FlipRequest {
     }
 };
 
+// bbport (r102_camera-mode-3-4): camera mode's freeze (F8). The flip thread waits here after the
+// frame was handed on to be presented and before the game hears that it flipped, so the game holds with its
+// picture; the freeze watchdog (BB_FREEZE_REPORT_S) is told of a flip every 10 ms meanwhile. It
+// ends when the flag clears (F8, the settings menu) or after BB_CAMERA_FREEZE_S seconds (1 to
+// 600, default 60), whichever comes first.
+void HoldFrozen() {
+    static const long limit_s = [] {
+        const char* v = std::getenv("BB_CAMERA_FREEZE_S");
+        const long n = v && *v ? std::strtol(v, nullptr, 10) : 60;
+        return n >= 1 && n <= 600 ? n : 60L;
+    }();
+    auto& freeze = BbSettings::Get().camera_freeze;
+    const auto began = std::chrono::steady_clock::now();
+    while (freeze.load(std::memory_order_relaxed)) {
+        if (std::chrono::steady_clock::now() - began >= std::chrono::seconds(limit_s)) {
+            if (freeze.exchange(false)) {
+                std::printf("Camera: freeze off (the %ld s limit, BB_CAMERA_FREEZE_S)\n", limit_s);
+            }
+            break;
+        }
+        BbFreeze::NoteFlip();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::printf("Camera: freeze held %.1f s (at most %ld s, BB_CAMERA_FREEZE_S)\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count(), limit_s);
+}
+
 class Presentation {
 public:
     Presentation() {
@@ -148,6 +175,11 @@ private:
         }
         last_flip = std::chrono::steady_clock::now();
         LanternFrameReport::OnFlip();
+        // bbport (r102_camera-mode-3-4): camera mode's freeze holds the game here. Off: one relaxed
+        // load a flip.
+        if (BbSettings::Get().camera_freeze.load(std::memory_order_relaxed)) {
+            HoldFrozen();
+        }
         sys_video_out_flip_done(request.index, request.argument, request.from_gpu);
     }
 
@@ -409,7 +441,12 @@ const SysVideoOutHost host = {
         if (from_gpu) {
             presentation->Prepare(index, argument, true);
         } else {
-            liverpool->SendCommand([=] { presentation->Prepare(index, argument, false); });
+            // bbport: the frame's Reflex number, given on the game's thread (vk_streamline.cpp).
+            const u32 reflex_frame = index == -1 ? 0u : Vulkan::Streamline::OnGameFlip();
+            liverpool->SendCommand([=] {
+                Vulkan::Streamline::SetFlipFrame(reflex_frame);
+                presentation->Prepare(index, argument, false);
+            });
         }
     },
     [] { presentation->port.SignalVoLabel(); },
@@ -417,14 +454,46 @@ const SysVideoOutHost host = {
 
 } // namespace
 
+// bbport: BB_FRAME_STATS: flips that wait for their buffer label (up to 20 ms each, in the flip
+// step on the GPU command thread); printed every 300 flips when any did.
+static void NoteLabelWait(double ms) {
+    static const bool on = [] {
+        const char* env = std::getenv("BB_FRAME_STATS");
+        return env && env[0] == '1';
+    }();
+    if (!on) {
+        return;
+    }
+    static std::atomic<u32> flips{0}, waits{0};
+    static std::atomic<u64> total_us{0};
+    if (ms > 0.0) {
+        waits.fetch_add(1, std::memory_order_relaxed);
+        total_us.fetch_add(u64(ms * 1000.0), std::memory_order_relaxed);
+    }
+    if (flips.fetch_add(1, std::memory_order_relaxed) % 300 == 299) {
+        const u32 waited = waits.exchange(0, std::memory_order_relaxed);
+        const u64 us = total_us.exchange(0, std::memory_order_relaxed);
+        if (waited) {
+            std::printf("VideoOut: %u of the last 300 flips waited for their buffer label, %.2f ms "
+                        "a flip\n",
+                        waited, double(us) / 1000.0 / 300.0);
+        }
+    }
+}
+
 s32 SubmitEopFlip(s32 handle, u32 buffer, s64 argument) {
     if (handle != VideoHandle) {
         return ErrorHandle;
     }
+    // bbport: the frame's Reflex number, given on the game's thread (vk_streamline.cpp); the flip
+    // step on the GPU command thread hands it to PrepareFrame.
+    const u32 reflex_frame = Vulkan::Streamline::OnGameFlip();
     Platform::IrqC::Instance()->RegisterOnce(Platform::InterruptId::GfxFlip, [=](Platform::InterruptId) {
         volatile const u64& label = sys_video_out_labels()[buffer];
+        double waited_ms = 0.0; // bbport: NoteLabelWait
         if (label != 1) {
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+            const auto start = std::chrono::steady_clock::now();
+            const auto deadline = start + std::chrono::milliseconds(20);
             while (label != 1 && std::chrono::steady_clock::now() < deadline) {
                 std::this_thread::yield();
             }
@@ -434,7 +503,10 @@ s32 SubmitEopFlip(s32 handle, u32 buffer, s64 argument) {
                     std::printf("VideoOut: flip IRQ for buffer %u before its label was set; flipping anyway\n", buffer);
                 }
             }
+            waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         }
+        NoteLabelWait(waited_ms);
+        Vulkan::Streamline::SetFlipFrame(reflex_frame);
         sys_video_out_queue_flip(s32(buffer), argument, 1);
     });
     return 0;

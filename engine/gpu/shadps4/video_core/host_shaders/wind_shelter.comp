@@ -1,0 +1,715 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r117_wind-shelter): the wind shelter field (BB_WIND_SHELTER; vk_wind_shelter.cpp runs
+// these passes once a frame, right before the upscaler, when the scene depth is complete).
+//
+// What the field is: for every cell of a WS_N x WS_N window (1 m cells, around the camera) the
+// share of the outside wind that is taken away there, 0 in the open, 1 indoors. It is made from
+// what the camera's depth buffer has shown, so it needs no ray tracing:
+//  SPLAT  every WS_STRIDE-th depth pixel is a world point; its cell keeps the frame's lowest and
+//         highest height (atomic min/max, 16 bits) and a count. The pixels also read last frame's
+//         field (the same reader the plants use) for the log's "share of the view sheltered".
+//  MERGE  a cell with at least WS_MIN_SAMPLES samples takes this frame's lowest and highest height
+//         into the cache (128 x 128 cells, toroidal, world anchored: a cell the camera no longer
+//         sees keeps what it showed last); a cache slot that now belongs to another world cell is
+//         emptied first. The frame's min/max are reset.
+//  RAW    per window cell: the wind blows toward (dir_x, dir_z); three rays leave the cell UPWIND
+//         (-14, 0, +14 degrees), WS_STEPS cells long. A ray is blocked by a cell whose top stands
+//         more than WS_H_START above the receiving cell's ground g (its lowest height, or the
+//         lowest of its neighbours, or the camera's height minus WS_NO_GROUND) by
+//         smoothstep(WS_TAN_LO, WS_TAN_HI, (top - g - WS_H_START) / distance): a wall 3 m high
+//         shelters fully within 5 m behind it and not at all beyond 17 m; a cell that starts
+//         WS_LIFT_LO..HI above g (a bridge, an arch) blocks less. The leeward value is the MEDIAN of
+//         the three rays (a thin obstacle, a lamp post, a person, cannot shelter: the air goes
+//         round; a wall can). Overhead (r117b): the cell's COVER (below), the biggest of the cell
+//         and its 8 neighbours; raw = 1 - (1 - leeward) (1 - cover): indoors the cover is 1, so the
+//         field is 1 whatever the rays met. A tall thing (a tree, a wall, a lamp post) gives its own
+//         cell no roof (r117's roof rule painted every one of them half sheltered).
+//  FINAL  the raw field blurred 3 x 3 (1 2 1), times WS_GAIN (a bit above 1, so indoors is exactly
+//         1) and faded to 0 over the outer WS_EDGE_CELLS cells of the window (so that the window
+//         following the camera never makes a value jump), then followed in time (exp(-dt / WS_TAU),
+//         WS_TAU 0.5 s: a change is mostly through in a second) and written into the region (the
+//         reader, wind_shelter.glsl, takes it from there) with the header.
+//  COVER  (r117b) indoors is measured at the camera: of the sampled depth pixels, the ones whose
+//         view ray climbs (tangent above WS_COVER_TAN) and that end on a surface within WS_COVER_DIST
+//         m are covered; the sky dome and the far distance are open. The share covered, followed in
+//         time and mapped by smoothstep(WS_COVER_LO, WS_COVER_HI), is the camera's cover (the final
+//         pass makes it, the next frame uses it). The merge pass moves every cache cell that was
+//         seen within WS_COVER_RADIUS of the camera toward it (the cache remembers what the camera
+//         saw while it was indoors) and gives the cells next to the camera it outright.
+//  r117c  the cover counts a climbing ray that ends within WS_COVER_CLOSE m or, beyond that, on a surface
+//         that faces down (a ceiling, a vault, a canopy's underside: faces_down); an obstacle counts at
+//         most WS_EFF_MAX above WS_H_START; a low obstacle within WS_NEAR_CAM m of the camera (the
+//         Hunter) is not counted (keep in ray()). Four counter words say where the rays ended.
+//  r117d  an obstacle a ray meets counts by its height (nothing under WS_THIN_H_LO above the ground, in full from
+//         WS_THIN_H_HI) and by its width across the ray (thick_weight: a one-cell thing counts for nothing).
+//  r117e  a neighbour across the ray makes a thing wide only if it stands (its bottom under WS_LIFT_LO above the
+//         ground: branches over a trunk do not); a cell the cache knows nothing of counts WS_THIN_UNSEEN (0.15).
+//  r117f  a hit that beats the ray's value counts less with its distance (full to WS_DIST_NEAR m, WS_DIST_FLOOR from
+//         WS_DIST_FAR m) and only when its top rises about 25 degrees (WS_ELEV_LO..HI) above the cell, by its real
+//         height: far_weight(). A low wall or a tomb gives a short lee, a far tall wall a faint one.
+//  r117g  the lee of a low thing is short (far_weight: the distance weight reaches its floor at WS_SHORT_REACH m for a
+//         thing under WS_SHORT_LO, at WS_DIST_FAR for one from WS_SHORT_HI), and a cell that is itself tall is sheltered by
+//         a hit that does not rise above its own top only by WS_SELF_KEEP (self_weight): the inside and the top of a
+//         tree mass, a roof or a wall is not "indoors" (the cover is what makes a real roof 1).
+//  SHOW   (the SHOW build only) the field painted over the scene colour (cells.z 0), or alone
+//         on black (1): green open, yellow half, red sheltered.
+// Stage 1 limits (see the context file): one level (the camera's, +-10 m), no ray tracing, the
+// player and monsters count as thin obstacles (the median drops most of them), canopies and
+// bridge decks whose underside the camera has seen count as walls or roofs.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "wind_shelter_layout.h"
+#include "wind_shelter.glsl"
+
+layout(local_size_x = WS_GROUP, local_size_y = WS_GROUP) in;
+
+layout(binding = 0) uniform texture2D depth_tex; // D32, 0 near .. 1 far (D3D projection)
+layout(std430, binding = 1) buffer State {
+    uint s[];
+} state;
+layout(std430, binding = 2) buffer Counters {
+    uint c[];
+} counters;
+#ifdef SHOW
+layout(binding = 3, rgba16f) uniform image2D scene_img;
+#endif
+
+// wind_shelter.h's Push, field for field (128 bytes).
+layout(push_constant) uniform Push {
+    WindShelterRegion region;
+    uint mode;
+    uint frame;
+    vec4 row0; // the camera's view to world matrix, 3x4 rows (w: the camera's place)
+    vec4 row1;
+    vec4 row2;
+    vec4 proj;        // x scale, y scale (signed), z scale, z offset (as heat_haze.comp)
+    vec4 size_jitter; // the scene's width, height, the viewport's shift (px)
+    vec4 wind;        // dir_x, dir_z (toward where it blows), dt (s), strength
+    ivec4 cells;      // the camera's cell x, z; the test view (0 tint, 1 alone); 0
+};
+
+const int M = int(WS_M);
+const int N = int(WS_N);
+
+int wrap_mod(int a, int m) {
+    const int r = a - (a / m) * m;
+    return r < 0 ? r + m : r;
+}
+
+uint slot_of(ivec2 c) {
+    return uint(wrap_mod(c.y, M)) * WS_M + uint(wrap_mod(c.x, M));
+}
+
+uint quant(float y) {
+    return uint(clamp(floor((y + WS_Y_BIAS) * WS_Y_SCALE + 0.5), 0.0, 65535.0));
+}
+
+float unquant(uint q) {
+    return float(q) / WS_Y_SCALE - WS_Y_BIAS;
+}
+
+uint cache_at(uint slot, uint k) {
+    return state.s[slot * WS_CELL_WORDS + k];
+}
+
+uint fresh_at(uint slot) {
+    return WS_M * WS_M * WS_CELL_WORDS + slot * WS_FRESH_WORDS;
+}
+
+// r117b: the state buffer's globals (wind_shelter_layout.h says which word is which).
+const uint GLOBAL_BASE = WS_M * WS_M * (WS_CELL_WORDS + WS_FRESH_WORDS);
+
+// What the cache holds for a world cell: x lowest y, y highest y (m), z 1 if seen.
+vec3 column(ivec2 c) {
+    const uint h = cache_at(slot_of(c), 0u);
+    const uint top = h & 0xffffu;
+    const uint bot = h >> 16u;
+    if (top < bot) {
+        return vec3(0.0);
+    }
+    return vec3(unquant(bot), unquant(top), 1.0);
+}
+
+float view_z(float depth) {
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+vec3 world_of(vec2 pix, float depth) {
+    const float z = view_z(depth);
+    const vec2 ndc = ((pix - size_jitter.zw) / size_jitter.xy - 0.5) * 2.0;
+    const vec4 h = vec4(ndc.x * z / proj.x, ndc.y * z / proj.y, z, 1.0);
+    return vec3(dot(row0, h), dot(row1, h), dot(row2, h));
+}
+
+// r117b: the world direction (not normalised) of the view ray through a pixel centre.
+vec3 ray_dir(vec2 pix) {
+    const vec2 ndc = ((pix - size_jitter.zw) / size_jitter.xy - 0.5) * 2.0;
+    const vec3 v = vec3(ndc.x / proj.x, ndc.y / proj.y, 1.0);
+    return vec3(dot(row0.xyz, v), dot(row1.xyz, v), dot(row2.xyz, v));
+}
+
+// r117c: does the surface the depth pixel `px` shows (at `hit`, view depth z) face down? Its normal is
+// the cross product of the steps to the pixels 2 to the right and 2 down, turned toward the camera;
+// a neighbour that is no surface or a different one (view depth differing by more than WS_NORMAL_TOL)
+// gives no normal: not facing down.
+bool faces_down(ivec2 px, ivec2 size, vec3 hit, float z) {
+    const ivec2 pr = min(px + ivec2(2, 0), size - 1);
+    const ivec2 pd = min(px + ivec2(0, 2), size - 1);
+    const float dr = texelFetch(depth_tex, pr, 0).r;
+    const float dd = texelFetch(depth_tex, pd, 0).r;
+    if (!(dr > 0.0 && dr < 1.0 && dd > 0.0 && dd < 1.0)) {
+        return false;
+    }
+    const float zr = view_z(dr);
+    const float zd = view_z(dd);
+    if (!(zr > 0.0 && zd > 0.0) || abs(zr - z) > WS_NORMAL_TOL * z || abs(zd - z) > WS_NORMAL_TOL * z) {
+        return false;
+    }
+    vec3 n = cross(world_of(vec2(pr) + 0.5, dr) - hit, world_of(vec2(pd) + 0.5, dd) - hit);
+    const float len = length(n);
+    if (!(len > 1.0e-12)) {
+        return false;
+    }
+    n *= 1.0 / len;
+    if (dot(n, vec3(row0.w, row1.w, row2.w) - hit) < 0.0) {
+        n = -n;
+    }
+    return n.y < -WS_DOWN_NY;
+}
+
+// r115c: is the surface the depth pixel `px` shows (view depth z) solid, wide: the four pixels WS_ROOF_STEP away end on a surface
+// at the same view depth (within WS_NORMAL_TOL)? A branch, a rail or a pole has sky or a far wall beside it: not solid.
+bool solid_at(ivec2 px, ivec2 size, float z) {
+    const ivec2 d = ivec2(WS_ROOF_STEP);
+    const ivec2 n4[4] = ivec2[4](min(px + ivec2(d.x, 0), size - 1), min(px + ivec2(0, d.y), size - 1),
+                                 max(px - ivec2(d.x, 0), ivec2(0)), max(px - ivec2(0, d.y), ivec2(0)));
+    for (int i = 0; i < 4; ++i) {
+        const float dn = texelFetch(depth_tex, n4[i], 0).r;
+        if (!(dn > 0.0 && dn < 1.0)) {
+            return false;
+        }
+        const float zn = view_z(dn);
+        if (!(zn > 0.0) || abs(zn - z) > WS_NORMAL_TOL * z) {
+            return false;
+        }
+    }
+    return true;
+}
+
+shared uint g_pixels, g_sheltered, g_sum, g_indoor, g_up, g_covered, g_close, g_down, g_mid;
+shared uint g_qup[4], g_qroof[4]; // r115c: climbing rays and roof rays a world quadrant (only counted when cells.w != 0)
+
+void splat() {
+    if (gl_LocalInvocationIndex == 0u) {
+        g_pixels = 0u;
+        g_sheltered = 0u;
+        g_sum = 0u;
+        g_indoor = 0u;
+        g_up = 0u;
+        g_covered = 0u;
+        g_close = 0u;
+        g_down = 0u;
+        g_mid = 0u;
+        for (uint q = 0u; q < 4u; ++q) { // r115c
+            g_qup[q] = 0u;
+            g_qroof[q] = 0u;
+        }
+    }
+    barrier();
+    const ivec2 size = ivec2(size_jitter.xy);
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy) * int(WS_STRIDE) + int(WS_STRIDE / 2u);
+    if (all(lessThan(px, size))) {
+        const float depth = texelFetch(depth_tex, px, 0).r;
+        const vec3 look = ray_dir(vec2(px) + 0.5);
+        if (look.y > WS_COVER_TAN * length(look.xz)) {
+            // r117b: a climbing view ray: does it end on something near (a ceiling, a roof) or go on
+            // to the sky dome (a depth below 1, far away) or the distance?
+            atomicAdd(g_up, 1u);
+            // r115c: the world quadrant of the ray (x and z signs); counted only for BB_VOLUMETRIC_ROOF (cells.w)
+            const uint rq = (look.x >= 0.0 ? 1u : 0u) + (look.z >= 0.0 ? 2u : 0u);
+            if (cells.w != 0) {
+                atomicAdd(g_qup[rq], 1u);
+            }
+            if (depth > 0.0 && depth < 1.0 && view_z(depth) > 0.0) {
+                const float zc = view_z(depth);
+                const vec3 hit = world_of(vec2(px) + 0.5, depth);
+                const float away = distance(hit, vec3(row0.w, row1.w, row2.w));
+                if (cells.w != 0 && away < WS_ROOF_DIST && solid_at(px, size, zc)) { // r115c: a roof ray
+                    atomicAdd(g_qroof[rq], 1u);
+                }
+                if (away < WS_COVER_CLOSE) {
+                    atomicAdd(g_close, 1u);
+                    atomicAdd(g_covered, 1u);
+                } else if (away < WS_COVER_DIST) {
+                    // (r117c) beyond that only an underside counts: a ceiling, a vault, a canopy
+                    if (faces_down(px, size, hit, zc)) {
+                        atomicAdd(g_down, 1u);
+                        atomicAdd(g_covered, 1u);
+                    } else {
+                        atomicAdd(g_mid, 1u);
+                    }
+                }
+            }
+        }
+        if (depth > 0.0 && depth < 1.0) {
+            const float z = view_z(depth);
+            if (z > 0.0 && z < 90.0) {
+                const vec3 p = world_of(vec2(px) + 0.5, depth);
+                const ivec2 c = ivec2(floor(p.xz * (1.0 / WS_CELL)));
+                const ivec2 rel = c - (cells.xy - M / 2);
+                if (all(greaterThanEqual(rel, ivec2(0))) && all(lessThan(rel, ivec2(M)))) {
+                    const uint f = fresh_at(slot_of(c));
+                    const uint q = quant(p.y);
+                    atomicMax(state.s[f], q);
+                    atomicMin(state.s[f + 1u], q);
+                    atomicAdd(state.s[f + 2u], 1u);
+                }
+                const float v = wind_shelter_at(region, p);
+                atomicAdd(g_pixels, 1u);
+                atomicAdd(g_sum, uint(v * 1000.0 + 0.5));
+                if (v > 0.5) {
+                    atomicAdd(g_sheltered, 1u);
+                }
+                if (v > 0.95) {
+                    atomicAdd(g_indoor, 1u);
+                }
+            }
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (g_up != 0u) {
+            atomicAdd(state.s[GLOBAL_BASE], g_up);
+            atomicAdd(state.s[GLOBAL_BASE + 1u], g_covered);
+            atomicAdd(counters.c[WS_C_UP], g_up);
+            atomicAdd(counters.c[WS_C_CLOSE], g_close);
+            atomicAdd(counters.c[WS_C_DOWN], g_down);
+            atomicAdd(counters.c[WS_C_MID], g_mid);
+            if (cells.w != 0) { // r115c
+                for (uint q = 0u; q < 4u; ++q) {
+                    atomicAdd(state.s[GLOBAL_BASE + 8u + q], g_qup[q]);
+                    atomicAdd(state.s[GLOBAL_BASE + 12u + q], g_qroof[q]);
+                }
+            }
+        }
+        if (g_pixels != 0u) {
+            atomicAdd(counters.c[WS_C_PIXELS], g_pixels);
+            atomicAdd(counters.c[WS_C_PIXELS_SHELTERED], g_sheltered);
+            // a 64-bit total (r117b: 600 frames of 8.6M samples in thousandths pass 2^32)
+            const uint sum_before = atomicAdd(counters.c[WS_C_PIXELS_SUM], g_sum);
+            if (sum_before + g_sum < sum_before) {
+                atomicAdd(counters.c[WS_C_PIXELS_SUM_HI], 1u);
+            }
+            atomicAdd(counters.c[WS_C_PIXELS_INDOOR], g_indoor);
+        }
+    }
+    if (gl_GlobalInvocationID.x == 0u && gl_GlobalInvocationID.y == 0u) {
+        // last frame's field where the camera is (the log's number, and the fog's and the
+        // particles' stage 1 reader: Rasterizer::WindOnFrameEnd)
+        // (r117b: and the camera's own cover, whichever is bigger)
+        counters.c[WS_C_CAMERA] = floatBitsToUint(
+            max(wind_shelter_at(region, vec3(row0.w, row1.w, row2.w)),
+                uintBitsToFloat(state.s[GLOBAL_BASE + 3u]) * wind.w));
+    }
+}
+
+void clear_all() {
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= WS_M || id.y >= WS_M) {
+        return;
+    }
+    const uint slot = id.y * WS_M + id.x;
+    const uint cw = slot * WS_CELL_WORDS;
+    state.s[cw] = 0xffff0000u;
+    state.s[cw + 1u] = 0u;
+    state.s[cw + 2u] = 0u;
+    state.s[cw + 3u] = 0u;
+    state.s[cw + 4u] = 0xffffffffu;
+    state.s[cw + 5u] = 0u;
+    const uint f = fresh_at(slot);
+    state.s[f] = 0u;
+    state.s[f + 1u] = 0xffffu;
+    state.s[f + 2u] = 0u;
+}
+
+void merge() {
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= WS_M || id.y >= WS_M) {
+        return;
+    }
+    const ivec2 base = cells.xy - M / 2;
+    const ivec2 world = base + ivec2(wrap_mod(int(id.x) - base.x, M), wrap_mod(int(id.y) - base.y, M));
+    const uint slot = id.y * WS_M + id.x;
+    const uint cw = slot * WS_CELL_WORDS;
+    const uint want = (uint(world.x) & 0xffffu) | ((uint(world.y) & 0xffffu) << 16u);
+    if (state.s[cw + 4u] != want) {
+        state.s[cw] = 0xffff0000u;
+        state.s[cw + 1u] = 0u;
+        state.s[cw + 2u] = 0u;
+        state.s[cw + 3u] = 0u;
+        state.s[cw + 4u] = want;
+        state.s[cw + 5u] = 0u;
+    }
+    const uint f = fresh_at(slot);
+    const uint top = state.s[f];
+    const uint bot = state.s[f + 1u];
+    const uint n = state.s[f + 2u];
+    state.s[f] = 0u;
+    state.s[f + 1u] = 0xffffu;
+    state.s[f + 2u] = 0u;
+    if (n >= WS_MIN_SAMPLES) {
+        state.s[cw] = (top & 0xffffu) | (bot << 16u);
+        atomicAdd(counters.c[WS_C_MERGED], 1u);
+    }
+    // r117b: the cover memory (cell word 5): what the camera saw overhead while it looked here
+    const float c_in = uintBitsToFloat(state.s[GLOBAL_BASE + 3u]);
+    const float away = distance((vec2(world) + 0.5) * WS_CELL, vec2(row0.w, row2.w));
+    float cover = uintBitsToFloat(state.s[cw + 5u]);
+    if (away < WS_COVER_NEAR * WS_CELL) {
+        cover = c_in;
+    } else if (n >= WS_MIN_SAMPLES && away < WS_COVER_RADIUS * WS_CELL) {
+        cover += (c_in - cover) * WS_COVER_RATE;
+    }
+    state.s[cw + 5u] = floatBitsToUint(cover);
+}
+
+// r117d: the counts the raw pass keeps for the log (private to the invocation; raw_pass adds them to the counters).
+uint ws_thin_seen = 0u;
+uint ws_thin_low = 0u;
+uint ws_thin_narrow = 0u;
+uint ws_thin_kept = 0u; // r117e: hits whose weight stays at 0.5 or more
+uint ws_thin_tall = 0u; // of them, with a top WS_TALL_H or more above the ground
+uint ws_far_cut = 0u; // r117f: of the hits that beat the ray's value, those far_weight cut under 0.5
+uint ws_self_cut = 0u; // r117g: of the hits that counted 0.5 or more so far, those self_weight cut under 0.5
+
+// r117d: how wide the thing a ray meets at the world point `at` (xz, m) is across the ray (direction `dir`, unit):
+// w = 1 + its 4 neighbours across the ray (offsets -2, -1, 1, 2 cells from the middle of the cell met, each with the
+// cells a step up and down the ray: a slanting wall stays wide); a known cell whose top is at least
+// WS_THIN_NB above `ground` adds 1, one the cache knows nothing of WS_THIN_UNSEEN, a known low one 0.
+float thick_weight(vec2 at, vec2 dir, float ground) {
+    const vec2 side = vec2(-dir.y, dir.x) * WS_CELL;
+    const vec2 along = dir * WS_CELL;
+    const vec2 mid = (floor(at * (1.0 / WS_CELL)) + 0.5) * WS_CELL; // the cell's middle: a slanted ray meets a cell near its edge
+    float w = 1.0;
+    for (int j = -2; j <= 2; ++j) {
+        if (j != 0) {
+            // the cell across the ray and the two one step up and down the ray from it (a wall slanting across
+            // the ray stays wide): tall if any of the three is; unknown only by the middle one
+            const vec2 p = mid + side * float(j);
+            float v = 0.0;
+            for (int a = -1; a <= 1; ++a) {
+                const vec3 nb = column(ivec2(floor((p + along * float(a)) * (1.0 / WS_CELL))));
+                if (nb.z > 0.0 && nb.y - ground >= WS_THIN_NB && nb.x - ground < WS_LIFT_LO) { // r117e: it stands
+                    v = 1.0;
+                } else if (a == 0 && nb.z <= 0.0) {
+                    v = max(v, WS_THIN_UNSEEN);
+                }
+            }
+            w += v;
+        }
+    }
+    return smoothstep(WS_THIN_W_LO, WS_THIN_W_HI, w);
+}
+
+// r117f: how much an obstacle of `top_above` m (its top over the ground) counts at `dist` m along a ray: its weight
+// by distance (1 up to WS_DIST_NEAR, WS_DIST_FLOOR from WS_DIST_FAR, linear between) times how far its top rises above
+// the receiving point (WS_H_START over the ground): smoothstep(WS_ELEV_LO, WS_ELEV_HI, tangent), the real height.
+float far_weight(float dist, float top_above) {
+    // r117g: a low thing (under WS_SHORT_LO) gives a lee WS_SHORT_REACH m long and nothing beyond, a tall one (from
+    // WS_SHORT_HI) as in r117f: its floor and its reach by s
+    const float s = smoothstep(WS_SHORT_LO, WS_SHORT_HI, top_above);
+    const float reach = WS_SHORT_REACH + (WS_DIST_FAR - WS_SHORT_REACH) * s;
+    const float wd = 1.0 - (1.0 - WS_DIST_FLOOR * s) * clamp((dist - WS_DIST_NEAR) / (reach - WS_DIST_NEAR), 0.0, 1.0);
+    return wd * smoothstep(WS_ELEV_LO, WS_ELEV_HI, (top_above - WS_H_START) / dist);
+}
+
+// r117g: how much a hit of `top_above` m (its top over the ground) counts for a cell whose own top is `own_up` m over
+// its ground: 1 for a cell that is not tall, and for a hit that rises WS_SELF_RISE m or more above the cell's top; down
+// to WS_SELF_KEEP for a hit no higher than a tall cell's own top (the cell is part of the thing: the wind blows over it).
+float self_weight(float top_above, float own_up) {
+    const float k = smoothstep(WS_SELF_H_LO, WS_SELF_H_HI, own_up);
+    const float over = smoothstep(0.0, WS_SELF_RISE, top_above - own_up);
+    return 1.0 - k * (1.0 - WS_SELF_KEEP) * (1.0 - over);
+}
+
+// One ray from the cell centre `from` (world, m) upwind along `dir`: how far it is blocked, 0-1.
+float ray(vec2 from, vec2 dir, float ground, float own_up) {
+    float blocked = 0.0;
+    for (uint k = 1u; k <= WS_STEPS && blocked < 1.0; ++k) {
+        const float dist = float(k) * WS_CELL;
+        const ivec2 c = ivec2(floor((from + dir * dist) * (1.0 / WS_CELL)));
+        const vec3 col = column(c);
+        if (col.z > 0.0) {
+            // r117c: an obstacle counts at most WS_EFF_MAX above the start (a tree is a 3 m wall), and a
+            // low one near the camera (the Hunter) not at all
+            const float eff = min(max(col.y - ground - WS_H_START, 0.0), WS_EFF_MAX);
+            const float lift = col.x - ground;
+            const float pass_ = 1.0 - smoothstep(WS_LIFT_LO, WS_LIFT_HI, lift);
+            const float keep =
+                max(smoothstep(WS_NEAR_TOP_LO, WS_NEAR_TOP_HI, col.y - ground),
+                    smoothstep(WS_NEAR_CAM_LO, WS_NEAR_CAM_HI,
+                               distance((vec2(c) + 0.5) * WS_CELL, vec2(row0.w, row2.w))));
+            // r117d: by the height of the thing and by its width across the ray (thin or low things shelter little);
+            // the width is looked at only when the thing would raise the ray's value
+            float hit = smoothstep(WS_TAN_LO, WS_TAN_HI, eff / dist) * pass_ * keep;
+            if (hit > blocked) {
+                const float h_w = smoothstep(WS_THIN_H_LO, WS_THIN_H_HI, col.y - ground);
+                ++ws_thin_seen;
+                hit *= h_w;
+                if (h_w < 0.5) {
+                    ++ws_thin_low;
+                }
+                if (hit > blocked) {
+                    // r117f: by the distance and the elevation; the width only when the hit still beats the ray
+                    const float f_w = far_weight(dist, col.y - ground);
+                    if (f_w < 0.5) {
+                        ++ws_far_cut;
+                    }
+                    hit *= f_w;
+                    // r117g: the cell's own height (a hit no higher than a tall cell's own top shelters it by WS_SELF_KEEP)
+                    const float s_w = self_weight(col.y - ground, own_up);
+                    if (s_w < 0.5 && hit >= 0.5) {
+                        ++ws_self_cut;
+                    }
+                    hit *= s_w;
+                    const float t_w = hit > blocked ? thick_weight(from + dir * dist, dir, ground) : 1.0;
+                    if (t_w < 0.5) {
+                        ++ws_thin_narrow;
+                    }
+                    if (hit * t_w >= 0.5 && hit > blocked) { // r117e: a hit that still counts (for the log)
+                        ++ws_thin_kept;
+                        if (col.y - ground >= WS_TALL_H) {
+                            ++ws_thin_tall;
+                        }
+                    }
+                    blocked = max(blocked, hit * t_w);
+                }
+            }
+        }
+    }
+    return blocked;
+}
+
+vec2 rotated(vec2 v, float deg) {
+    const float a = radians(deg);
+    const float cs = cos(a);
+    const float sn = sin(a);
+    return vec2(v.x * cs - v.y * sn, v.x * sn + v.y * cs);
+}
+
+void raw_pass() {
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= WS_N || id.y >= WS_N) {
+        return;
+    }
+    const ivec2 c = cells.xy - N / 2 + ivec2(id);
+    const vec3 own = column(c);
+    float ground = row1.w - WS_NO_GROUND;
+    if (own.z > 0.0) {
+        ground = own.x;
+    } else {
+        float lowest = 1.0e9;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                const vec3 nb = column(c + ivec2(i, j));
+                if (nb.z > 0.0) {
+                    lowest = min(lowest, nb.x);
+                }
+            }
+        }
+        if (lowest < 1.0e8) {
+            ground = lowest;
+        }
+    }
+    const vec2 from = (vec2(c) + 0.5) * WS_CELL;
+    const vec2 upwind = -wind.xy;
+    const float own_up = own.z > 0.0 ? own.y - ground : 0.0; // r117g: how tall the cell itself is
+    const float r0 = ray(from, rotated(upwind, -WS_RAY_DEG), ground, own_up);
+    const float r1 = ray(from, upwind, ground, own_up);
+    const float r2 = ray(from, rotated(upwind, WS_RAY_DEG), ground, own_up);
+    const float leeward = max(min(r0, r1), min(max(r0, r1), r2));
+    // r117b: the cover of the cell, or of a neighbour (a cell seen from the floor but never with two
+    // samples leaves no hole), in place of the roof rule
+    float cover = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            cover = max(cover, uintBitsToFloat(cache_at(slot_of(c + ivec2(i, j)), 5u)));
+        }
+    }
+    const float raw = 1.0 - (1.0 - leeward) * (1.0 - cover);
+    state.s[slot_of(c) * WS_CELL_WORDS + 1u] = floatBitsToUint(raw);
+    if (own.z > 0.0) {
+        atomicAdd(counters.c[WS_C_CELLS_SEEN], 1u);
+        if (own_up >= WS_SELF_H_HI) { // r117g
+            atomicAdd(counters.c[WS_C_SELF_CELLS], 1u);
+        }
+    }
+    if (ws_thin_seen != 0u) { // r117d
+        atomicAdd(counters.c[WS_C_THIN_SEEN], ws_thin_seen);
+        atomicAdd(counters.c[WS_C_THIN_LOW], ws_thin_low);
+        atomicAdd(counters.c[WS_C_THIN_NARROW], ws_thin_narrow);
+        atomicAdd(counters.c[WS_C_THIN_KEPT], ws_thin_kept);
+        atomicAdd(counters.c[WS_C_THIN_TALL], ws_thin_tall);
+        atomicAdd(counters.c[WS_C_FAR_CUT], ws_far_cut);
+        atomicAdd(counters.c[WS_C_SELF_CUT], ws_self_cut);
+    }
+}
+
+void final_pass() {
+    const uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= WS_N || id.y >= WS_N) {
+        return;
+    }
+    const ivec2 origin = cells.xy - N / 2;
+    const ivec2 c = origin + ivec2(id);
+    float blur = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            const float weight = float((2 - abs(i)) * (2 - abs(j))) * (1.0 / 16.0);
+            blur += weight * uintBitsToFloat(cache_at(slot_of(c + ivec2(i, j)), 1u));
+        }
+    }
+    const int edge = min(min(int(id.x), N - 1 - int(id.x)), min(int(id.y), N - 1 - int(id.y)));
+    const float fade = smoothstep(0.0, WS_EDGE_CELLS, float(edge));
+    const float target = min(blur * WS_GAIN, 1.0) * fade;
+    const uint cw = slot_of(c) * WS_CELL_WORDS;
+    float prev = uintBitsToFloat(state.s[cw + 2u]);
+    const uint stamp = state.s[cw + 3u];
+    if (stamp == 0u || frame - stamp > WS_SNAP_FRAMES) {
+        prev = target;
+    }
+    const float follow = 1.0 - exp(-wind.z * (1.0 / WS_TAU));
+    const float now = prev + (target - prev) * follow;
+    state.s[cw + 2u] = floatBitsToUint(now);
+    state.s[cw + 3u] = frame;
+    const uint at = WS_BLOCK_WORD;
+    region.w[at + WS_HEADER_WORDS + id.y * WS_N + id.x] = floatBitsToUint(now);
+    if (id.x == 0u && id.y == 0u) {
+        region.w[at + 1u] = floatBitsToUint(float(origin.x) * WS_CELL);
+        region.w[at + 2u] = floatBitsToUint(float(origin.y) * WS_CELL);
+        region.w[at + 3u] = floatBitsToUint(1.0 / WS_CELL);
+        region.w[at + 4u] = floatBitsToUint(float(WS_N));
+        region.w[at + 5u] = floatBitsToUint(row1.w);
+        region.w[at + 6u] = floatBitsToUint(wind.w);
+        region.w[at + 7u] = floatBitsToUint(WS_BAND);
+        region.w[at] = floatBitsToUint(1.0);
+        // r117b: this frame's climbing view rays -> the camera's cover (the next frame's merge and
+        // camera sample use it); the frame's totals are cleared for the splat pass to fill again
+        const uint up = state.s[GLOBAL_BASE];
+        const uint covered = state.s[GLOBAL_BASE + 1u];
+        float share = uintBitsToFloat(state.s[GLOBAL_BASE + 2u]);
+        if (up >= WS_COVER_MIN) {
+            const float k = state.s[GLOBAL_BASE + 4u] == 0u
+                                ? 1.0
+                                : 1.0 - exp(-wind.z * (1.0 / WS_COVER_TAU));
+            share += (float(covered) / float(up) - share) * k;
+            state.s[GLOBAL_BASE + 4u] = 1u;
+        }
+        state.s[GLOBAL_BASE] = 0u;
+        state.s[GLOBAL_BASE + 1u] = 0u;
+        state.s[GLOBAL_BASE + 2u] = floatBitsToUint(share);
+        state.s[GLOBAL_BASE + 3u] = floatBitsToUint(smoothstep(WS_COVER_LO, WS_COVER_HI, share));
+        counters.c[WS_C_COVER] = floatBitsToUint(share);
+        if (cells.w != 0) {
+            // r115c: the roof share: the smallest roof share of the quadrants with enough climbing samples, followed in
+            // time, held without such a quadrant (the quadrant totals are cleared for the splat pass to fill again)
+            float roof = uintBitsToFloat(state.s[GLOBAL_BASE + 16u]);
+            float low = 1.0;
+            bool enough = false;
+            uint all_up = 0u;
+            uint all_roof = 0u;
+            for (uint q = 0u; q < 4u; ++q) {
+                const uint qu = state.s[GLOBAL_BASE + 8u + q];
+                const uint qr = state.s[GLOBAL_BASE + 12u + q];
+                state.s[GLOBAL_BASE + 8u + q] = 0u;
+                state.s[GLOBAL_BASE + 12u + q] = 0u;
+                all_up += qu;
+                all_roof += qr;
+                if (qu >= WS_ROOF_QMIN) {
+                    low = min(low, float(qr) / float(qu));
+                    enough = true;
+                }
+            }
+            if (enough) {
+                const float kr = state.s[GLOBAL_BASE + 17u] == 0u
+                                     ? 1.0
+                                     : 1.0 - exp(-wind.z * (1.0 / WS_COVER_TAU));
+                roof += (low - roof) * kr;
+                state.s[GLOBAL_BASE + 17u] = 1u;
+            }
+            state.s[GLOBAL_BASE + 16u] = floatBitsToUint(roof);
+            counters.c[WS_C_ROOF] = floatBitsToUint(roof);
+            counters.c[WS_C_ROOF_ALL] = floatBitsToUint(all_up != 0u ? float(all_roof) / float(all_up) : 0.0);
+        }
+    }
+    atomicAdd(counters.c[WS_C_CELLS], 1u);
+    atomicAdd(counters.c[WS_C_CELLS_SUM], uint(now * 1000.0 + 0.5));
+    if (now > 0.5) {
+        atomicAdd(counters.c[WS_C_CELLS_SHELTERED], 1u);
+    }
+}
+
+#ifdef SHOW
+vec3 ramp(float v) {
+    const vec3 open_ = vec3(0.1, 0.8, 0.2);
+    const vec3 half_ = vec3(1.0, 0.9, 0.1);
+    const vec3 shut = vec3(1.0, 0.1, 0.1);
+    return v < 0.5 ? mix(open_, half_, v * 2.0) : mix(half_, shut, (v - 0.5) * 2.0);
+}
+
+void show() {
+    const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = ivec2(size_jitter.xy);
+    if (any(greaterThanEqual(px, size))) {
+        return;
+    }
+    const float depth = texelFetch(depth_tex, px, 0).r;
+    const vec4 scene = imageLoad(scene_img, px);
+    // (r117b: the sky dome has a depth below 1: surfaces beyond 90 m count as no surface, black alone)
+    if (!(depth > 0.0 && depth < 1.0) || !(view_z(depth) > 0.0 && view_z(depth) < 90.0)) {
+        if (cells.z != 0) {
+            imageStore(scene_img, px, vec4(0.0, 0.0, 0.0, scene.a));
+        }
+        return;
+    }
+    const vec3 p = world_of(vec2(px) + 0.5, depth);
+    const vec2 off = p.xz - vec2(row0.w, row2.w);
+    const float v = wind_shelter_at(region, p);
+    const bool inside = all(lessThan(abs(off), vec2(float(N / 2 - 2) * WS_CELL)));
+    if (cells.z != 0) {
+        imageStore(scene_img, px, vec4(inside ? ramp(v) * 1.5 : vec3(0.04), scene.a));
+    } else if (inside) {
+        imageStore(scene_img, px, vec4(mix(scene.rgb, ramp(v) * 1.5, 0.55), scene.a));
+    }
+}
+#endif
+
+void main() {
+    switch (mode) {
+    case WS_MODE_CLEAR:
+        clear_all();
+        break;
+    case WS_MODE_SPLAT:
+        splat();
+        break;
+    case WS_MODE_MERGE:
+        merge();
+        break;
+    case WS_MODE_RAW:
+        raw_pass();
+        break;
+    case WS_MODE_FINAL:
+        final_pass();
+        break;
+#ifdef SHOW
+    case WS_MODE_SHOW:
+        show();
+        break;
+#endif
+    default:
+        break;
+    }
+}

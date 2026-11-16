@@ -102,9 +102,12 @@ bool StorageFormat(const Instance& instance, vk::Format format) {
     return bool(properties.optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage);
 }
 
-void Mark(u64 key, const char* name) {
+void Mark(u64 key, const char* name, bool pinned) {
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(0x4C49'0000ull | key, [name] { return std::string{"Lighting: "} + name; });
+        if (pinned) {
+            profiler->Pin(0x4C49'0000ull | key); // bbport (r76_sun-fog-outdoors)
+        }
     }
 }
 

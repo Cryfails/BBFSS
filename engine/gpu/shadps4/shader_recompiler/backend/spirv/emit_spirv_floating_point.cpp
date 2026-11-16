@@ -3,6 +3,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "bbport_wind_game.h" // bbport (r122_game-wind-drive)
 
 namespace Shader::Backend::SPIRV {
 
@@ -107,6 +108,10 @@ Id EmitFPNeg64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPSin(EmitContext& ctx, Id value) {
+    if (ctx.GameWindCut()) { // bbport (r122_game-wind-drive): the game's own foliage wave of a plant pipeline: its trough
+        BbWindGame::Count().sines.fetch_add(1, std::memory_order_relaxed);
+        return ctx.ConstF32(BbWindGame::CutLevel);
+    }
     return ctx.OpSin(ctx.F32[1], ctx.OpFMul(ctx.F32[1], ctx.pi_x2, value));
 }
 

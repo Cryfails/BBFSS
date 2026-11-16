@@ -1,6 +1,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <psapi.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,6 +100,69 @@ void win_mem_zero(uint64_t phys, uint64_t size) {
         at = next;
     }
 }
+// bbport (r78_guest-memory-resident): BB_ZERO_TRIM helpers. Bit i of the mask: host page i
+// (4 KiB) of [a, a + pages * 4096) is resident, readable and writable (no guard, no copy-on-write).
+uint64_t win_mem_trim_mask(uintptr_t a, unsigned pages) {
+    typedef BOOL (WINAPI *QueryFn)(HANDLE, PVOID, DWORD);
+    static QueryFn query;
+    static int looked;
+    if (!looked) {
+        HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+        query = kernel ? (QueryFn)(void *)GetProcAddress(kernel, "K32QueryWorkingSetEx") : NULL;
+        looked = 1;
+    }
+    PSAPI_WORKING_SET_EX_INFORMATION info[64];
+    if (!query || pages > 64) return 0;
+    for (unsigned i = 0; i < pages; ++i) info[i].VirtualAddress = (void *)(a + (uintptr_t)i * 4096);
+    if (!query(GetCurrentProcess(), info, (DWORD)(pages * sizeof(info[0])))) return 0;
+    uint64_t mask = 0;
+    for (unsigned i = 0; i < pages; ++i) {
+        unsigned prot = (unsigned)info[i].VirtualAttributes.Win32Protection & 0xff;
+        if (info[i].VirtualAttributes.Valid && (prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE))
+            mask |= UINT64_C(1) << i;
+    }
+    return mask;
+}
+static int page_is_zero(uintptr_t page) {
+    static __thread uint64_t buffer[512];
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), (void *)page, buffer, 4096, &got) || got != 4096) return 0;
+    uint64_t any = 0;
+    for (int i = 0; i < 512; ++i) any |= buffer[i];
+    return !any;
+}
+// 1 when the page was all zero and left the working set. A write between the first look and the
+// reset is seen by the second look: the page is then made dirty again with an atomic or of 0.
+int win_mem_trim_page(uintptr_t page) {
+    if (!page_is_zero(page)) return 0;
+    if (!VirtualAlloc((void *)page, 4096, MEM_RESET, PAGE_READWRITE)) return 0;
+    if (!page_is_zero(page)) {
+        SIZE_T got = 0;
+        uint64_t word = 0;
+        for (int i = 0; i < 512; ++i) {
+            if (ReadProcessMemory(GetCurrentProcess(), (void *)(page + i * 8), &word, 8, &got) && word) {
+                __atomic_fetch_or((uint64_t *)(page + i * 8), 0, __ATOMIC_SEQ_CST);
+                break;
+            }
+        }
+        return 0;
+    }
+    VirtualUnlock((void *)page, 4096); // not locked: this only takes it out of the working set
+    return 1;
+}
+static DWORD WINAPI spawn_entry(void *fn) {
+    ((void (*)(void))fn)();
+    return 0;
+}
+int win_mem_spawn(void (*fn)(void)) {
+    HANDLE thread = CreateThread(NULL, 0, spawn_entry, (void *)fn, 0, NULL);
+    if (!thread) return -1;
+    SetThreadPriority(thread, THREAD_PRIORITY_LOWEST);
+    CloseHandle(thread);
+    return 0;
+}
+void win_mem_sleep(unsigned ms) { Sleep(ms); }
+uint64_t win_mem_ms(void) { return GetTickCount64(); }
 static DWORD page_mode(int prot) {
     switch (prot & 7) {
     case 0: return PAGE_NOACCESS;

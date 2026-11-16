@@ -1,11 +1,51 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #version 450
 #extension GL_EXT_scalar_block_layout : require
+#ifdef AREA
+// bbport (r81_sun-fog-no-rt): the march's builds for the area light gate (BB_VOLUMETRIC_AREA_GATE=1,
+// marches without the ray traced gate): the fog image keeps r the energy of the samples nearer the
+// camera, g of those in the march's last AREA_FAR_METRES, b the share of samples in sun, for
+// volumetric_area_gate.comp to weigh at the game's directional light draw
+#extension GL_GOOGLE_include_directive : require
+#include "volumetric_area_layout.h"
+#if !(defined(INTEGRATE) || defined(REPAIR))
+#error AREA is a build of INTEGRATE or REPAIR
+#endif
+// bbport (r85_area-with-rt-gate): and with GATE (BB_VOLUMETRIC_AREA_GATE=1 on a march with the ray
+// traced sun gate: the gated sample, kept apart the same way), never with GATE_VIEW (a march the
+// gate view draws stays without the area gate: VolumetricLight::Integrate)
+#ifdef GATE_VIEW
+#error AREA is not built with GATE_VIEW
+#endif
+#endif
 
 #ifdef TINT
-layout(local_size_x = 1, local_size_y = 1) in;
+// bbport: one thread per record (VolumetricLight::Tint passes at most 256); push constant `serial`
+// runs the old one-thread loop instead (experiment bit 134217728).
+layout(local_size_x = 256, local_size_y = 1) in;
 #else
 layout(local_size_x = 8, local_size_y = 8) in;
+#endif
+#ifdef WIND
+// bbport (r82_wind-stage1): here, not under #version, so that r81's AREA head and the TINT
+// block stay as r81 wrote them (glslang takes #extension after other tokens in desktop GLSL)
+#extension GL_GOOGLE_include_directive : require
+#ifdef AREA
+// bbport (r82_wind-stage1): an area gate march (r81) never drifts (VolumetricLight::Integrate)
+#error WIND is not built with AREA
+#endif
+#endif
+#ifdef NOISE
+// bbport (r94_fog-noise): BB_FOG_NOISE above 0 only: the march with the sun fog's world anchored
+// noise (fog_noise.glsl), as a build of the plain, GATE, AREA or GATE+AREA march of INTEGRATE or
+// REPAIR (VolumetricLight::NoisePass); it carries the wind's drift itself, so never with WIND
+#extension GL_GOOGLE_include_directive : require
+#if !(defined(INTEGRATE) || defined(REPAIR))
+#error NOISE is a build of INTEGRATE or REPAIR
+#endif
+#if defined(WIND) || defined(GATE_VIEW)
+#error NOISE is not built with WIND or GATE_VIEW
+#endif
 #endif
 
 float depth_weight(vec4 fog, float depth) {
@@ -29,6 +69,47 @@ layout(binding = 5, r32f) uniform writeonly image2D depth_out;
 #ifdef REPAIR
 layout(binding = 6, rgba16f) uniform readonly image2D half_fog;
 #endif
+#ifdef GATE
+// bbport (r51b_volumetric-rt-check): the ray traced sun gate (volumetric_rt_gate.comp): 1 where a
+// ray from the cell toward the sun left the scene, 0 where it hit; cells across the screen and in
+// the square root of the distance over GateRange().
+#ifdef REPAIR
+layout(binding = 7) uniform sampler3D sun_gate;
+#else
+layout(binding = 6) uniform sampler3D sun_gate;
+#endif
+// bbport (r76_sun-fog-outdoors): per column of the gate, its first open slice ((F + 0.25) / 255;
+// F is the slice count where every slice is shut), written by volumetric_rt_gate.comp
+#ifdef REPAIR
+layout(binding = 8) uniform sampler2D sun_gate_first;
+#else
+layout(binding = 7) uniform sampler2D sun_gate_first;
+#endif
+#ifdef DUAL
+// bbport (r115_sun-fog-indoors): BB_VOLUMETRIC_AREA_GATE=2 on a march with the ray traced gate (a
+// build of the GATE+AREA march, never with the fog noise): the gate's wider answer, 1 where a ray
+// from the cell toward the sun left the scene with the camera's geometry in it too
+// (volumetric_rt_gate.comp's DUAL build)
+#if !(defined(GATE) && defined(AREA)) || defined(NOISE)
+#error DUAL is a build of the GATE+AREA march without NOISE
+#endif
+#ifdef REPAIR
+layout(binding = 9) uniform sampler3D sun_gate_open;
+#else
+layout(binding = 8) uniform sampler3D sun_gate_open;
+#endif
+#endif
+#ifdef GATE_VIEW
+#ifdef REPAIR
+#error GATE_VIEW is a build of INTEGRATE only
+#endif
+// bbport (r76_sun-fog-outdoors): BB_VOLUMETRIC_GATE_VIEW=1: the view at the march's resolution
+// (rgb the band's colour of the first shut cell along the view ray, a the share of shut cells;
+// 0 where none is shut), and each cell's band (volumetric_rt_gate.comp's DIAG build)
+layout(binding = 8, rgba8) uniform writeonly image2D gate_view_out;
+layout(binding = 9) uniform sampler3D sun_gate_band;
+#endif
+#endif
 
 layout(push_constant) uniform Params {
     uint offsets;
@@ -38,7 +119,26 @@ layout(push_constant) uniform Params {
     float strength;
     float anisotropy;
     float bias;
-    float unused;
+    // sun atlas cascades: bits 0-3 how many are drawn in full (the others count as outside the
+    // atlas); bbport (r51_volumetric-leak): bits 8-11 those holding casters, 16-23
+    // BB_VOLUMETRIC_OCCLUSION (volumetric_occlusion.h Pack)
+    uint cascades;
+#ifdef NOISE
+    // bbport (r94_fog-noise): BB_FOG_NOISE above 0 only (VolumetricFogNoise::Tail after the plain
+    // Params): the view to world matrix (3x4 rows) of the G-buffer pass's camera at the Integrate
+    // call, and each octave's offset in lattice cells; noise_off0.w the amplitude, noise_off1.w
+    // the gain, noise_off2.w 1 / scale (1/m)
+    vec4 noise_row0, noise_row1, noise_row2;
+    vec4 noise_off0, noise_off1, noise_off2;
+#endif
+#ifdef WIND
+    // bbport (r82_wind-stage1): BB_WIND=1 only (VolumetricLight::WindParams; the words above are
+    // the plain Params): the view to world matrix (3x4 rows) of the G-buffer pass's camera as it
+    // was at the Integrate call, and the fog noise's offsets in cells (wind_off1.w = contrast,
+    // wind_off2.w = 1 for the BB_WIND_VIEW=1 test view).
+    vec4 wind_row0, wind_row1, wind_row2;
+    vec4 wind_off1, wind_off2;
+#endif
 };
 
 #ifdef REPAIR
@@ -52,6 +152,19 @@ GROUP vec3 shared_splits;
 GROUP vec3 shared_direction;
 GROUP vec2 shared_coverage;
 GROUP uint shared_valid;
+#ifdef WIND
+#include "wind_noise.glsl"
+
+// bbport (r82_wind-stage1): the fog density factor m at view space point v: wind_factor_rows
+// (tested by wind-noise-test) with this pass's rows, offsets and contrast.
+float wind_factor(vec3 v) {
+    return wind_factor_rows(wind_row0, wind_row1, wind_row2, v, wind_off1.xyz, wind_off2.xyz,
+                            wind_off1.w);
+}
+#endif
+#ifdef NOISE
+#include "fog_noise.glsl"
+#endif
 
 uint base;
 float c(int i) { return uintBitsToFloat(cb.d[base + uint(i)]); }
@@ -81,10 +194,25 @@ void prepare() {
 
 mat4 local_light[4];
 vec3 local_splits;
+// bbport (r51_volumetric-leak): the bits of BB_VOLUMETRIC_OCCLUSION the shader reads.
+#ifdef DUAL
+// bbport (r115_sun-fog-indoors): every build that defines DUAL (the GATE block above holds the
+// first test; this one also catches a DUAL build without GATE)
+#if !(defined(GATE) && defined(AREA)) || defined(NOISE) || !(defined(INTEGRATE) || defined(REPAIR))
+#error DUAL is a build of the GATE+AREA march (INTEGRATE or REPAIR) without NOISE
+#endif
+#endif
+const uint OcclusionDarkest = 2u, OcclusionRobust = 4u;
 
 float visibility(vec3 p, vec2 texel) {
     int first = int(p.z > local_splits.x) + int(p.z > local_splits.y) + int(p.z > local_splits.z);
-    for (int cascade = first; cascade < 4; ++cascade) {
+    // bbport (r51_volumetric-leak): a cascade holding no casters counts as outside the atlas;
+    // with OcclusionDarkest every cascade holding the sample answers, the darkest answer stands.
+    uint valid = (cascades >> 8) & 15u;
+    bool darkest = ((cascades >> 16) & OcclusionDarkest) != 0u;
+    float answer = 2.0;
+    for (int cascade = first; cascade < int(min(cascades & 15u, 4u)); ++cascade) {
+        if (((valid >> cascade) & 1u) == 0u) continue;
         mat4 m = local_light[cascade];
         vec4 q = m * vec4(p, 1.0);
         if (abs(q.w) < 1e-8) return 0.0;
@@ -92,16 +220,96 @@ float visibility(vec3 p, vec2 texel) {
         vec2 lo = vec2(cascade & 1, cascade >> 1) * 0.5 + texel;
         vec2 hi = vec2(cascade & 1, cascade >> 1) * 0.5 + 0.5 - texel;
         if (any(lessThan(s.xy, lo)) || any(greaterThan(s.xy, hi))) continue;
-        if (s.z < 0.0 || s.z > 1.0) return 0.0;
+        if (s.z < 0.0 || s.z > 1.0) {
+            if (darkest) continue;
+            return 0.0;
+        }
         vec3 zrow = vec3(m[0][2], m[1][2], m[2][2]);
         vec3 wrow = vec3(m[0][3], m[1][3], m[2][3]);
         float depth_bias = bias * length(zrow - s.z * wrow) / abs(q.w);
         vec4 lit = vec4(greaterThanEqual(textureGather(shadow_tex, s.xy, 0), vec4(s.z - depth_bias)));
         float coverage = clamp(shared_coverage.y * (shared_coverage.x - length(p)), 0.0, 1.0);
-        return dot(lit, vec4(0.25)) * coverage;
+        if (!darkest) return dot(lit, vec4(0.25)) * coverage;
+        answer = min(answer, dot(lit, vec4(0.25)) * coverage);
+        if (answer == 0.0) break;
     }
-    return 0.0;
+    return answer <= 1.0 ? answer : 0.0;
 }
+
+#ifdef GATE
+// bbport (r51b_volumetric-rt-check): the gate's depth, as volumetric_rt_gate.comp lays it out: the
+// shadow distance when it is shorter than the reach (past it the fade is 0), else the reach.
+float GateRange() {
+    float d = shared_coverage.x;
+    return d > 0.0 && d < reach ? d : reach;
+}
+
+float GateAt(vec2 uv, float t, float range) {
+    return textureLod(sun_gate, vec3(uv, sqrt(clamp(t / range, 0.0, 1.0))), 0.0).r;
+}
+#ifdef DUAL
+// bbport (r115_sun-fog-indoors): the wider answer at the same place, filtered as GateAt
+float GateOpenAt(vec2 uv, float t, float range) {
+    return textureLod(sun_gate_open, vec3(uv, sqrt(clamp(t / range, 0.0, 1.0))), 0.0).r;
+}
+#endif
+
+// bbport (r76_sun-fog-outdoors): how far along the pixel's ray (m) GateAt reads exactly 0. Its
+// linear filter reads, at the depth coordinate w = sqrt(t / range), the slices floor(w N - 0.5)
+// and the next one (N slices, clamped to the edge), and in x and y two neighbouring columns each.
+// The four gathers take the first open slice of every column in the 4x4 block around uv, which
+// holds any two-by-two footprint whose first column lies within one of the gather's, so the
+// sampler's rounding of the footprint cannot reach a column not looked at. F is their least first
+// open slice: every slice before F of those columns is 0, so while floor(w N - 0.5) + 1 < F, that
+// is w < (F - 0.5) / N, GateAt filters zeros only and returns 0. The threshold is taken 1/16 slice
+// lower, which keeps the sampler's sub-texel rounding of w N - 0.5 (8 bits) on the side of
+// reading. F 0: nothing shut in front (0 m). F >= N: every slice of those columns is shut,
+// whatever w: 1e30 m, farther than any march. (Argued here; not compared on the GPU.)
+float GateShutTo(vec2 uv, float range) {
+    vec4 a = textureGatherOffset(sun_gate_first, uv, ivec2(-1, -1));
+    vec4 b = textureGatherOffset(sun_gate_first, uv, ivec2(1, -1));
+    vec4 c = textureGatherOffset(sun_gate_first, uv, ivec2(-1, 1));
+    vec4 d = textureGatherOffset(sun_gate_first, uv, ivec2(1, 1));
+    vec4 m = min(min(a, b), min(c, d));
+    float first = floor(min(min(m.x, m.y), min(m.z, m.w)) * 255.0 + 0.5);
+    float slices = float(textureSize(sun_gate, 0).z);
+    if (first >= slices) return 1e30;
+    float w = max(first - 0.5625, 0.0) / slices;
+    return range * w * w;
+}
+
+#ifdef GATE_VIEW
+// bbport (r76_sun-fog-outdoors): the view's colour of a band: 1 (<5 m) red, 2 (5-15 m) yellow, 3
+// (15-40 m) green, 4 (40-150 m) cyan, 5 (150-800 m) magenta
+vec3 GateBandColour(uint band) {
+    return band == 1u   ? vec3(1.0, 0.1, 0.1)
+           : band == 2u ? vec3(1.0, 0.9, 0.1)
+           : band == 3u ? vec3(0.1, 1.0, 0.2)
+           : band == 4u ? vec3(0.1, 0.9, 1.0)
+                        : vec3(1.0, 0.2, 1.0);
+}
+
+// bbport (r76_sun-fog-outdoors): the cells of the pixel's column (nearest, no filter) whose
+// centres lie before the march's end: the band of the first shut one and the share shut
+void GateView(ivec2 px, vec2 uv, float range, float limit) {
+    ivec3 cells = textureSize(sun_gate_band, 0);
+    ivec2 column = clamp(ivec2(uv * vec2(cells.xy)), ivec2(0), cells.xy - 1);
+    uint first = 0u;
+    float shut = 0.0, asked = 0.0;
+    for (int k = 0; k < cells.z; ++k) {
+        float s = (float(k) + 0.5) / float(cells.z);
+        if (range * s * s >= limit) break;
+        asked += 1.0;
+        uint band = uint(texelFetch(sun_gate_band, ivec3(column, k), 0).r * 255.0 + 0.5);
+        if (band != 0u) {
+            shut += 1.0;
+            if (first == 0u) first = band;
+        }
+    }
+    if (first != 0u) imageStore(gate_view_out, px, vec4(GateBandColour(first), shut / asked));
+}
+#endif
+#endif
 
 void main() {
     base = (offsets & 255u) >> 2;
@@ -113,6 +321,10 @@ void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(fog_out);
     if (any(greaterThanEqual(px, size))) return;
+#ifdef GATE_VIEW
+    // bbport (r76_sun-fog-outdoors): the view's pixel stays clear unless GateView finds a shut cell
+    imageStore(gate_view_out, px, vec4(0.0));
+#endif
 #ifndef REPAIR
     ivec2 depth_size = imageSize(depth_out);
     for (int y = 0; y < 2; ++y) {
@@ -145,6 +357,22 @@ void main() {
     prepare();
 #endif
     bool sky = depth == 1.0;
+#ifdef WIND
+    // bbport (r82_wind-stage1): BB_WIND_VIEW=1: the view shade of m on the surface instead of fog
+    // (0 on the sky), grey in the WIND_VIEW composite. Before the strength and sun tests, so it
+    // shows also at a volumetric intensity of 0 or without a sun direction. With BB_WIND_SPEED=0
+    // it must stay on the walls while the camera turns: that proves the matrix taken at the
+    // Integrate call.
+    if (wind_off2.w != 0.0) {
+        vec4 at = shared_inverse_projection * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+        float shade = 0.0;
+        if (depth > 0.0 && depth < 1.0 && abs(at.w) >= 1e-8) {
+            shade = wind_view_shade(wind_factor(at.xyz / at.w), wind_off1.w);
+        }
+        imageStore(fog_out, px, vec4(vec3(shade), 1.0 - depth));
+        return;
+    }
+#endif
     if (shared_valid == 0u || !(depth > 0.0 && depth <= 1.0) || strength <= 0.0) return;
 
     vec4 h = shared_inverse_projection * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0,
@@ -159,19 +387,148 @@ void main() {
     float phase = (1.0 - g * g) /
                   pow(max(1.0 + g * g - 2.0 * g * dot(ray, shared_direction), 0.01), 1.5);
     float limit = sky ? reach : min(distance_to_surface, reach);
+    // bbport (r51_volumetric-leak): no fog for a fade rate that is not positive and finite (it
+    // would turn the fade around), and no steps past the shadow distance, where the fade is 0.
+    if (((cascades >> 16) & OcclusionRobust) != 0u) {
+        if (!(shared_coverage.y > 0.0) || isinf(shared_coverage.y)) return;
+        if (shared_coverage.x < limit) limit = max(shared_coverage.x, 0.0);
+    }
     float ds = limit / float(steps);
 
     float jitter = fract(52.9829189 * fract(dot(vec2(px), vec2(0.06711056, 0.00583715))));
     vec2 texel = 1.0 / vec2(textureSize(shadow_tex, 0));
     float energy = 0.0;
+#ifdef WIND
+    // bbport (r82_wind-stage1): the fog's density is density * m along the ray, m at ray * t
+    // (wind_ray_step), taken only where the sample is lit (BbWind::MarchLitStep): a sample in
+    // shadow adds no light and its stretch dims the light behind it at the mean density. At m = 1
+    // the step is the plain line within float rounding. Samples the gate skips (r76) count as m = 1.
+    float excess = 0.0;
+#endif
     local_light = shared_view_to_light;
     local_splits = shared_splits;
+#ifdef AREA
+    // bbport (r81_sun-fog-no-rt): the samples nearer the camera, those in the march's last
+    // AREA_FAR_METRES (`limit`: the surface, the reach or the shadow distance, whichever is nearest;
+    // at the sky the gate weighs both alike), and the sun's share
+    const float area_far_from = limit - float(AREA_FAR_METRES);
+    float area_near = 0.0, area_far = 0.0, area_lit = 0.0;
+#endif
+#ifdef GATE
+    float gate_range = GateRange();
+#ifdef GATE_VIEW
+    GateView(px, uv, gate_range, limit);
+#endif
+    // bbport (r76_sun-fog-outdoors): the samples nearer than GateShutTo add exactly 0 (their gate
+    // is 0), so the march starts after them; a pixel whose columns are shut all the way (indoors
+    // under a roof the ray traced scene holds) is not marched and keeps the 0 stored above. A
+    // sample left out has t = (i + jitter) ds < shut_to; adding 0 never changed the sum.
+    float shut_to = GateShutTo(uv, gate_range);
+    uint first_step = 0u;
+    if (shut_to > 0.0) {
+        first_step = shut_to < limit ? uint(clamp(ceil(shut_to / ds - jitter), 0.0, float(steps)))
+                                     : steps;
+    }
+    for (uint i = first_step; i < steps; ++i) {
+#else
     for (uint i = 0u; i < steps; ++i) {
+#endif
         float t = (float(i) + jitter) * ds;
+#if defined(GATE) && defined(AREA)
+        // bbport (r85_area-with-rt-gate): the GATE builds' sample (the atlas's answer, then the ray
+        // traced gate's), kept apart as r81's AREA builds keep the plain one: near and far energy of
+        // what the gate lets through, and in `area_lit` the atlas's own answer, so that the share in
+        // sun (b, the beam test) stays r81's measure, over the samples marched: those before
+        // first_step (shut by the gate from the camera) are left out, and each counts
+        // steps / (steps - first_step) so that the store's area_lit / steps is the mean of those
+        // marched (the loop runs only while first_step < steps)
+        float v = visibility(ray * t, texel);
+#ifndef DUAL // bbport (r115_sun-fog-indoors): r85's share in sun; a DUAL build keeps the open energy
+        area_lit += v * (float(steps) / float(steps - first_step));
+#endif // (r115_sun-fog-indoors) not DUAL
+        if (v > 0.0) v *= GateAt(uv, t, gate_range);
+        float e = exp(-density * t) * density * ds * v;
+#ifdef DUAL
+        // bbport (r115_sun-fog-indoors): the part of the sample the wider answer lets through (open
+        // air, a beam through a real opening) in area_lit, kept whole; the rest (shut only by the
+        // camera's geometry: a room, or outdoor air in a building's shadow) in near and far, which
+        // the light sets weigh
+        float open_e = e > 0.0 ? e * GateOpenAt(uv, t, gate_range) : 0.0;
+        area_lit += open_e;
+        e -= open_e;
+#endif
+#ifdef NOISE
+        e *= fog_noise_weight(v, ray * t, t); // bbport (r94_fog-noise): m where lit
+#endif
+        if (t < area_far_from) {
+            area_near += e;
+        } else {
+            area_far += e;
+        }
+#elif defined(GATE)
+        // bbport (r51b_volumetric-rt-check): the atlas's answer, then the ray traced gate's
+        float v = visibility(ray * t, texel);
+        if (v > 0.0) v *= GateAt(uv, t, gate_range);
+#ifdef NOISE
+        v *= fog_noise_weight(v, ray * t, t); // bbport (r94_fog-noise): m where lit
+#endif
+#ifdef WIND
+        if (v > 0.0) {
+            wind_ray_step(energy, excess, density, ray, t, ds, jitter, v, wind_row0, wind_row1,
+                          wind_row2, wind_off1.xyz, wind_off2.xyz, wind_off1.w);
+        }
+#else
+        energy += exp(-density * t) * density * ds * v;
+#endif
+#elif defined(WIND)
+        // bbport (r82_wind-stage1): the plain march drifting (never an AREA build: #error above)
+        float vis = visibility(ray * t, texel);
+        if (vis > 0.0) {
+            wind_ray_step(energy, excess, density, ray, t, ds, jitter, vis, wind_row0, wind_row1,
+                          wind_row2, wind_off1.xyz, wind_off2.xyz, wind_off1.w);
+        }
+#elif defined(AREA)
+        // bbport (r81_sun-fog-no-rt): the same sample, kept apart by where it lies
+        float v = visibility(ray * t, texel);
+        float e = exp(-density * t) * density * ds * v;
+        area_lit += v;
+#ifdef NOISE
+        e *= fog_noise_weight(v, ray * t, t); // bbport (r94_fog-noise): m where lit
+#endif
+        if (t < area_far_from) {
+            area_near += e;
+        } else {
+            area_far += e;
+        }
+#elif defined(NOISE)
+        // bbport (r94_fog-noise): the plain march with the fog noise (m where lit)
+        float v = visibility(ray * t, texel);
+        energy += exp(-density * t) * density * ds * v * fog_noise_weight(v, ray * t, t);
+#else
         energy += exp(-density * t) * density * ds * visibility(ray * t, texel);
+#endif
     }
 
+#ifdef AREA
+    // bbport (r81_sun-fog-no-rt): near, far and the share in sun (volumetric_area_gate.comp's
+    // APPLY turns them into the fog before anything else reads it)
+#ifdef DUAL
+    float area_b = strength * phase * area_lit; // bbport (r115_sun-fog-indoors): the open energy
+#else
+    float area_b = area_lit / float(steps);
+#endif
+    // bbport (r115_sun-fog-indoors): BB_VOLUMETRIC_AREA_GATE=2 (AREA_NEAR_MARK in `cascades`, 0
+    // otherwise): a surface nearer than AREA_NEAR_METRES (the hunter, the ground at his feet) is
+    // marked by b's sign, b = -(b + AREA_NEAR_FLOOR); volumetric_area_gate.comp leaves it out of the
+    // camera's light sets and weighs its own ray with the camera's
+    if ((cascades & AREA_NEAR_MARK) != 0u && !sky && distance_to_surface < float(AREA_NEAR_METRES)) {
+        area_b = -(area_b + float(AREA_NEAR_FLOOR));
+    }
+    imageStore(fog_out, px, vec4(strength * phase * area_near, strength * phase * area_far,
+                                 area_b, 1.0 - depth)); // (r115) b
+#else
     imageStore(fog_out, px, vec4(vec3(strength * phase * energy), 1.0 - depth));
+#endif
 }
 #elif defined(TINT)
 layout(scalar, binding = 0) readonly buffer Lighting { uint d[]; } lighting;
@@ -181,6 +538,7 @@ layout(push_constant) uniform TintParams {
     uint record_count;
     float blend;
     uint skip_fallback;
+    uint serial;
 };
 
 vec3 record_vec3(uint id, uint field) {
@@ -212,17 +570,63 @@ bool brighter(vec4 a, vec4 b) {
     return a.b > b.b;
 }
 
+shared vec4 tint_best[256];
+shared uint tint_index[256];
+shared uint tint_fallback[256];
+
+// Record ib (value b) goes before record ia (value a): brighter, or as bright and earlier. The
+// serial loop keeps the first of equally bright records, since it replaces only on brighter().
+bool wins(vec4 b, uint ib, vec4 a, uint ia) {
+    return brighter(b, a) || (!brighter(a, b) && ib < ia);
+}
+
 void main() {
     vec4 best = vec4(0.0);
     bool has_fallback = false;
-    for (uint id = 0u; id < record_count; ++id) {
-        if (skip_fallback != 0u && is_fallback(id)) {
-            has_fallback = true;
-            continue;
+    if (serial != 0u) {
+        if (gl_LocalInvocationIndex != 0u) return;
+        for (uint id = 0u; id < record_count; ++id) {
+            if (skip_fallback != 0u && is_fallback(id)) {
+                has_fallback = true;
+                continue;
+            }
+            vec3 rgb = primary(id);
+            vec4 candidate = vec4(rgb, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+            if (brighter(candidate, best)) best = candidate;
         }
-        vec3 rgb = primary(id);
-        vec4 candidate = vec4(rgb, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
-        if (brighter(candidate, best)) best = candidate;
+    } else {
+        // Each thread loads its own record, so the load round trips overlap. A skipped or missing
+        // record holds vec4(0), which never beats the starting vec4(0) below.
+        const uint id = gl_LocalInvocationIndex;
+        vec4 mine = vec4(0.0);
+        uint fallback = 0u;
+        if (id < record_count) {
+            if (skip_fallback != 0u && is_fallback(id)) {
+                fallback = 1u;
+            } else {
+                vec3 rgb = primary(id);
+                mine = vec4(rgb, dot(rgb, vec3(0.2126, 0.7152, 0.0722)));
+            }
+        }
+        tint_best[id] = mine;
+        tint_index[id] = id;
+        tint_fallback[id] = fallback;
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            memoryBarrierShared();
+            barrier();
+            if (id < stride) {
+                const vec4 b = tint_best[id + stride];
+                const uint ib = tint_index[id + stride];
+                if (wins(b, ib, tint_best[id], tint_index[id])) {
+                    tint_best[id] = b;
+                    tint_index[id] = ib;
+                }
+                tint_fallback[id] |= tint_fallback[id + stride];
+            }
+        }
+        if (id != 0u) return;
+        if (brighter(tint_best[0], best)) best = tint_best[0];
+        has_fallback = tint_fallback[0] != 0u;
     }
     if (best.w == 0.0 && has_fallback) best = vec4(1.0);
     vec3 target = mix(vec3(best.w), best.rgb, 0.75);
@@ -259,6 +663,10 @@ layout(binding = 2, rgba16f) uniform image2D scene;
 layout(scalar, binding = 3) readonly buffer TintState { vec4 atmosphere; } state;
 layout(binding = 4) uniform sampler2D repair_tex;
 layout(binding = 5) uniform sampler2D point_tex;
+#ifdef GATE_VIEW
+// bbport (r76_sun-fog-outdoors): BB_VOLUMETRIC_GATE_VIEW=1: the march's view image (GateView)
+layout(binding = 6) uniform sampler2D gate_view_tex;
+#endif
 
 void main() {
     ivec2 px = ivec2(gl_GlobalInvocationID.xy);
@@ -284,7 +692,25 @@ void main() {
     }
     vec3 scattering = weight_sum < 1e-5 ? texelFetch(repair_tex, px, 0).rgb : sum / weight_sum;
     vec4 color = imageLoad(scene, px);
+#ifdef WIND_VIEW
+    // bbport (r82_wind-stage1): BB_WIND_VIEW=1: the fog image holds the view shade of m (0-1),
+    // shown as linear grey 0-0.5 in place of the HDR scene (no tint, no lamp fog).
+    imageStore(scene, px, vec4(vec3(0.5 * scattering.r), color.a));
+    return;
+#endif
+#ifdef GATE_VIEW
+    // bbport (r76_sun-fog-outdoors): the gate view over the finished fog: the band's colour at
+    // the pixel's own brightness (at least 0.02), more of it the more cells along the view are shut
+    vec3 rgb = color.rgb + scattering * state.atmosphere.rgb + texelFetch(point_tex, px, 0).rgb;
+    vec4 view = textureLod(gate_view_tex, uv, 0.0);
+    if (view.a > 0.0) {
+        float luma = max(dot(rgb, vec3(0.2126, 0.7152, 0.0722)), 0.02);
+        rgb = mix(rgb, view.rgb * luma * 2.0, 0.3 + 0.5 * view.a);
+    }
+    imageStore(scene, px, vec4(rgb, color.a));
+#else
     imageStore(scene, px, vec4(color.rgb + scattering * state.atmosphere.rgb +
                                    texelFetch(point_tex, px, 0).rgb, color.a));
+#endif
 }
 #endif

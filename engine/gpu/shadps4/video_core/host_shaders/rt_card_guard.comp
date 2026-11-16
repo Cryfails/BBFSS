@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r62e_leaf-cards-usable): the guard of the cut-out shadows (true shape): BB_RT_CARD_ALPHA on
+// and BB_RT_CARD_SAFE not 0 only (never recorded otherwise). For each BLAS build of
+// RtShadow::RecordBuilds whose entry was ever drawn as a cut-out (it has card data, so its capture
+// pipelines are the CaptureUv variants), after rt_unproject.comp put its vertices in world space and
+// before the build reads them.
+// DETECT: one invocation a triangle of the entry's own list (the indices the build reads). A triangle
+// that names a vertex past the build's, has a corner that is not a finite number, or an edge longer
+// than `edge` metres sets the build's flag and is counted.
+// COLLAPSE: one invocation a vertex of the build. When the build's flag is set every vertex goes to the
+// world origin: each triangle then has no area, so no ray hits the entry (it casts nothing for this
+// build) and the build stays valid for a later refit (no triangle turns inactive, which a refit may not
+// do). The first vertex counts the build and records its key (the first CARD_GUARD_RECORDS of the run).
+
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "rt_card_guard_layout.h"
+
+layout(local_size_x = CARD_GUARD_GROUP) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Indices { uint i[]; };
+
+layout(std430, set = 0, binding = 0) buffer Positions { vec4 p[]; } positions;
+layout(std430, set = 0, binding = 1) buffer Guard { uint w[]; } guard;
+
+layout(push_constant) uniform Constants {
+    Indices indices;   // the entry's triangle list, relative to `store`
+    uint store;        // its first vertex in `positions`
+    uint triangles;    // triangles in the list
+    uint vertex_count; // vertices of the build (its maxVertex + 1)
+    uint slot;         // its flag: word CARD_GUARD_W_FLAGS + slot
+    uint mode;         // CARD_GUARD_DETECT or CARD_GUARD_COLLAPSE
+    float edge;        // metres
+    uint key_lo;       // the entry's key (Entry::base), for the record
+    uint key_hi;
+};
+
+shared uint g_flag;
+
+bool Finite(vec3 v) {
+    return !any(equal(floatBitsToUint(v) & uvec3(0x7f800000u), uvec3(0x7f800000u)));
+}
+
+void main() {
+    const uint t = gl_GlobalInvocationID.x;
+    const uint flag_at = uint(CARD_GUARD_W_FLAGS) + slot;
+    if (mode == uint(CARD_GUARD_DETECT)) {
+        if (t >= triangles) {
+            return;
+        }
+        const uint a = indices.i[3u * t];
+        const uint b = indices.i[3u * t + 1u];
+        const uint c = indices.i[3u * t + 2u];
+        bool bad = true;
+        bool not_finite = true;
+        float longest = 0.0;
+        if (a < vertex_count && b < vertex_count && c < vertex_count) {
+            const vec3 pa = positions.p[store + a].xyz;
+            const vec3 pb = positions.p[store + b].xyz;
+            const vec3 pc = positions.p[store + c].xyz;
+            if (Finite(pa) && Finite(pb) && Finite(pc)) {
+                not_finite = false;
+                longest = max(distance(pa, pb), max(distance(pb, pc), distance(pc, pa)));
+                // An edge that overflowed to infinity is not <= edge either.
+                bad = !(longest <= edge);
+            }
+        }
+        if (bad) {
+            atomicAdd(guard.w[CARD_GUARD_W_BAD], 1u);
+            if (not_finite) {
+                atomicAdd(guard.w[CARD_GUARD_W_NOT_FINITE], 1u);
+            } else {
+                atomicMax(guard.w[CARD_GUARD_W_LONGEST], floatBitsToUint(min(longest, 3.4028235e38)));
+            }
+            atomicOr(guard.w[flag_at], 1u);
+        }
+        return;
+    }
+    // COLLAPSE (`mode` is a push constant: the whole group takes this branch)
+    if (gl_LocalInvocationIndex == 0u) {
+        g_flag = guard.w[flag_at];
+    }
+    barrier();
+    if (g_flag == 0u) {
+        return;
+    }
+    if (t == 0u) {
+        atomicAdd(guard.w[CARD_GUARD_W_DROPPED], 1u);
+        const uint at = atomicAdd(guard.w[CARD_GUARD_W_RECORDS], 1u);
+        if (at < uint(CARD_GUARD_RECORDS)) {
+            guard.w[CARD_GUARD_W_FIRST_RECORD + 2u * at] = key_lo;
+            guard.w[CARD_GUARD_W_FIRST_RECORD + 2u * at + 1u] = key_hi;
+        }
+    }
+    if (t < vertex_count) {
+        positions.p[store + t].xyz = vec3(0.0);
+    }
+}

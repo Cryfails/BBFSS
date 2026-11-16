@@ -116,6 +116,8 @@ static SYS_ABI int32_t pad_read_state(int32_t handle, PadData *pad) {
     bbgpu_anti_lag_before_input();
     host_lock(&lock);
     sample(pad);
+    bbgpu_spark_probe_pad(pad->buttons); /* bbport (r108_spark-probe, TOOL): BB_SPARK_PROBE=1 only */
+    bbgpu_weapon_sparks_pad(pad->buttons); /* bbport (r110_weapon-sparks): BB_WEAPON_SPARKS only */
     ++reads;
     host_unlock(&lock);
     return 0;
