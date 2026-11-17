@@ -114,6 +114,12 @@ void Rasterizer::EffectsEndLampBatch() {
 }
 
 void Rasterizer::EffectsOnFrameEnd() {
+    if (blood_pool_probe) { // bbport (r100c_blood-pool-probe, TOOL): a new box, the frames, the log
+        blood_pool_probe->OnFrameEnd();
+    }
+    if (sun_term_view) {
+        sun_term_view->OnFrameEnd();
+    }
     effects_wanted = AnyWanted();
     // Lamps apart: a batch nothing ended. The frame is composed and the scene's depth forgotten
     // (CameraMotion::OnDisplayPass), so its lamp light is lost; it is counted and printed.
@@ -244,6 +250,9 @@ void Rasterizer::EffectsBlendedScene() {
     if (effects_wanted) {
         ssgi->OnOpaqueScene(cb_descs[0].first, db_desc.first, upscaler->Jitter());
     }
+    if (sun_term_view) {
+        sun_term_view->Show(cb_descs[0].first, point_shadow->Pending());
+    }
 }
 
 void Rasterizer::EffectsBeforeUpscaler(u64 compute_hash) {
@@ -255,6 +264,15 @@ void Rasterizer::EffectsBeforeUpscaler(u64 compute_hash) {
 }
 
 void Rasterizer::EffectsBeforeResources(const GraphicsPipeline* pipeline) {
+    // bbport (r100c_blood-pool-probe, TOOL): BB_BLOOD_POOL_PROBE only (off: one null pointer test a
+    // draw). First, so that what the passes below write before this draw counts for it as well.
+    // A light draw: the shadow resolve, the sun or moon, a lamp of the grid (as r100's kinds).
+    if (blood_pool_probe) {
+        const u64 probe_ps = FragmentHash(pipeline);
+        BloodPoolProbeBefore(pipeline, false,
+                             PointLightCount(probe_ps) != 0 || probe_ps == DirectionalFragmentShaderHash ||
+                                 probe_ps == ShadowResolveHash);
+    }
     if (effects_wanted && FragmentHash(pipeline) == HdrPostHash) {
         const auto camera = camera_motion->PassMatrices();
         volumetric_light->SetCamera({camera.view, camera.inv_view, camera.valid});
@@ -750,6 +768,9 @@ void Rasterizer::HqAoAfterDraw(const GraphicsPipeline* pipeline, const RenderSta
 void Rasterizer::EffectsAfterDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                                   u32 num_indices, u32 num_instances, u32 first_vertex) {
     auto& dc = Dc();
+    if (blood_pool_probe) { // bbport (r100c_blood-pool-probe, TOOL): the compare right after the draw
+        blood_pool_probe->AfterDraw();
+    }
     if (!effects_wanted) {
         return;
     }

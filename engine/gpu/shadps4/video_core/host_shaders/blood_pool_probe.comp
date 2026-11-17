@@ -1,0 +1,165 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r100c_blood-pool-probe, r100d_blood-pool-draws): TOOL (branch dev/test-tools). Which draws change a box of the
+// scene: right before a draw POOL_SNAPSHOT keeps a 32-bit print of each target the draw has (colour
+// targets 0-7 and its depth) at every pixel of the box and at every stride-th pixel of the frame
+// each way; right after it POOL_COMPARE counts where the prints changed and notes the draw as the
+// last writer of the box pixels whose G-buffer albedo, scene colour or depth it changed.
+// renderer_vulkan/blood_pool_probe.h has the knob and the numbers, vk_blood_pool_probe.cpp records
+// the passes. Log only: no target is written.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#include "blood_pool_probe_layout.h"
+
+#if !((defined(POOL_SNAPSHOT) && !defined(POOL_COMPARE)) || (!defined(POOL_SNAPSHOT) && defined(POOL_COMPARE)))
+#error "blood_pool_probe.comp: define exactly one of POOL_SNAPSHOT, POOL_COMPARE"
+#endif
+
+layout(local_size_x = BLOOD_POOL_PROBE_GROUP, local_size_y = BLOOD_POOL_PROBE_GROUP, local_size_z = 1) in;
+
+// BloodPoolProbeRules::Push, word for word (12 words). Dispatch z 0: the box, z 1: the frame samples.
+layout(push_constant) uniform Push {
+    ivec4 box;          // x0, y0, width, height (scene pixels)
+    ivec4 grid;         // frame sample columns, rows, stride, 0
+    uint mask;          // targets read: bit t for texture binding t (8: the depth)
+    uint record;        // COMPARE: the draw's first counter word
+    uint owner;         // COMPARE: the value the owner maps take where the draw changed them
+    uint owner_targets; // COMPARE: BLOOD_POOL_PROBE_NO_TARGET, BLOOD_POOL_PROBE_OWN_DEPTH (layout)
+};
+
+layout(binding = 0) uniform texture2D target0;
+layout(binding = 1) uniform texture2D target1;
+layout(binding = 2) uniform texture2D target2;
+layout(binding = 3) uniform texture2D target3;
+layout(binding = 4) uniform texture2D target4;
+layout(binding = 5) uniform texture2D target5;
+layout(binding = 6) uniform texture2D target6;
+layout(binding = 7) uniform texture2D target7;
+layout(binding = 8) uniform texture2D depth_target;
+layout(binding = BLOOD_POOL_PROBE_PRINTS_BINDING, std430) buffer Prints {
+    uint prints[];
+};
+#if defined(POOL_COMPARE)
+layout(binding = BLOOD_POOL_PROBE_COUNTS_BINDING, std430) buffer Counts {
+    uint counts[];
+};
+layout(binding = BLOOD_POOL_PROBE_OWNERS_BINDING, std430) buffer Owners {
+    uint owners[];
+};
+#endif
+
+// Every bit of the texel goes into the print (float bits: exact for every float, unorm and srgb
+// format); two different texels print alike about once in 2^32.
+uint Print(vec4 c) {
+    const uvec4 u = floatBitsToUint(c);
+    uint h = u.x * 0x9E3779B1u;
+    h = (h ^ (h >> 15u) ^ u.y) * 0x85EBCA77u;
+    h = (h ^ (h >> 13u) ^ u.z) * 0xC2B2AE3Du;
+    h = (h ^ (h >> 16u) ^ u.w) * 0x27D4EB2Fu;
+    return h ^ (h >> 15u);
+}
+
+uint PrintOf(uint t, ivec2 p) {
+    vec4 c = vec4(0.0);
+    switch (t) {
+    case 0u: c = texelFetch(target0, p, 0); break;
+    case 1u: c = texelFetch(target1, p, 0); break;
+    case 2u: c = texelFetch(target2, p, 0); break;
+    case 3u: c = texelFetch(target3, p, 0); break;
+    case 4u: c = texelFetch(target4, p, 0); break;
+    case 5u: c = texelFetch(target5, p, 0); break;
+    case 6u: c = texelFetch(target6, p, 0); break;
+    case 7u: c = texelFetch(target7, p, 0); break;
+    default: c = vec4(texelFetch(depth_target, p, 0).x, 0.0, 0.0, 0.0); break;
+    }
+    return Print(c);
+}
+
+#if defined(POOL_COMPARE)
+// The group's counts, then one atomic per word for the group. r100d: every count goes straight into
+// the shared words at a constant index (r100c kept them in a local array indexed at run time first;
+// b21 then showed a draw's box count above the box's size).
+shared uint group_counts[BLOOD_POOL_PROBE_RECORD_WORDS];
+
+void CountTarget(uint t) {
+    switch (t) {
+    case 0u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 0u], 1u); break;
+    case 1u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 1u], 1u); break;
+    case 2u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 2u], 1u); break;
+    case 3u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 3u], 1u); break;
+    case 4u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 4u], 1u); break;
+    case 5u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 5u], 1u); break;
+    case 6u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 6u], 1u); break;
+    case 7u: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 7u], 1u); break;
+    default: atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_TARGET0 + 8u], 1u); break;
+    }
+}
+#endif
+
+void main() {
+    const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+    const bool in_box = gl_GlobalInvocationID.z == 0u;
+    const ivec2 size = in_box ? box.zw : grid.xy;
+    const bool inside = all(lessThan(g, size));
+    const ivec2 p = in_box ? box.xy + g : g * grid.z;
+    const uint box_px = uint(box.z * box.w), frame_px = uint(grid.x * grid.y);
+    const uint index = uint(g.y * size.x + g.x);
+    // prints: the box's 9 planes of box_px words, then the frame samples' 9 planes of frame_px
+    const uint base = in_box ? 0u : BLOOD_POOL_PROBE_TARGETS * box_px;
+    const uint plane = in_box ? box_px : frame_px;
+#if defined(POOL_SNAPSHOT)
+    if (inside) {
+        for (uint t = 0u; t < BLOOD_POOL_PROBE_TARGETS; ++t) {
+            if ((mask & (1u << t)) != 0u) {
+                prints[base + t * plane + index] = PrintOf(t, p);
+            }
+        }
+    }
+#else
+    if (gl_LocalInvocationIndex < BLOOD_POOL_PROBE_RECORD_WORDS) {
+        group_counts[gl_LocalInvocationIndex] = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    if (inside) {
+        bool any_changed = false;
+        for (uint t = 0u; t < BLOOD_POOL_PROBE_TARGETS; ++t) {
+            if ((mask & (1u << t)) == 0u) {
+                continue;
+            }
+            const bool changed = PrintOf(t, p) != prints[base + t * plane + index];
+            any_changed = any_changed || changed;
+            if (in_box && changed) {
+                CountTarget(t);
+                if (t == (owner_targets & 255u)) {
+                    owners[index] = owner;
+                }
+                if (t == ((owner_targets >> 8u) & 255u)) {
+                    owners[box_px + index] = owner;
+                }
+                if (t == BLOOD_POOL_PROBE_DEPTH && (owner_targets & BLOOD_POOL_PROBE_OWN_DEPTH) != 0u) {
+                    owners[2u * box_px + index] = owner;
+                }
+            }
+        }
+        if (in_box) {
+            atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_SEEN_BOX], 1u);
+            if (any_changed) {
+                atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_BOX], 1u);
+            }
+        } else {
+            atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_SEEN_FRAME], 1u);
+            if (any_changed) {
+                atomicAdd(group_counts[BLOOD_POOL_PROBE_WORD_FRAME], 1u);
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    const uint w = gl_LocalInvocationIndex;
+    if (w < BLOOD_POOL_PROBE_RECORD_WORDS && group_counts[w] != 0u) {
+        atomicAdd(counts[record + w], group_counts[w]);
+    }
+#endif
+}

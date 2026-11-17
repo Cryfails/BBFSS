@@ -100,10 +100,20 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
                                                  *scene_targets, *camera_motion);
     contact_shadow = std::make_unique<ContactShadow>(instance, scheduler, texture_cache, runtime,
                                                      *scene_targets, *camera_motion, *rt_shadow);
+    if (SunTermView::Wanted()) {
+        sun_term_view = std::make_unique<SunTermView>(instance, scheduler, texture_cache, runtime,
+                                                     *scene_targets, *camera_motion);
+    }
     point_shadow = std::make_unique<PointShadow>(instance, scheduler, texture_cache, runtime,
                                                  *scene_targets, *camera_motion, *rt_shadow);
     volumetric_light = std::make_unique<VolumetricLight>(instance, scheduler, texture_cache,
                                                          runtime, *scene_targets);
+    // bbport (r100c_blood-pool-probe, TOOL): BB_BLOOD_POOL_PROBE not off at start only
+    // (BloodPoolProbe::Wanted, read once); its passes and buffers are made at the first probed box.
+    if (BloodPoolProbe::Wanted()) {
+        blood_pool_probe = std::make_unique<BloodPoolProbe>(instance, scheduler, texture_cache, runtime,
+                                                            *scene_targets, *camera_motion);
+    }
     sky_seam = std::make_unique<SkySeam>(instance, scheduler);
     sky_zenith = std::make_unique<SkyZenith>(instance, scheduler);
     depth_of_field = std::make_unique<DepthOfField>(instance, scheduler, texture_cache,
@@ -2706,6 +2716,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         BB_SECTION(RtCapture);
         EffectsCaptureDraw(regs, pipeline, is_indexed, index_offset);
     }
+    if (blood_pool_probe) { // bbport (r100d_blood-pool-draws, TOOL): the draw's indices and textures
+        BloodPoolProbeNote(pipeline, false, is_indexed, index_offset);
+    }
     effect_skip_draw = false;
     if (effects_wanted) {
         const auto [effect_first_vertex, effect_first_instance] =
@@ -2942,10 +2955,16 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     PrepareRenderState(pipeline);
     NotifyUiDraw(pipeline);
+    if (blood_pool_probe) { // bbport (r100c_blood-pool-probe, TOOL): as EffectsBeforeResources; an
+        BloodPoolProbeBefore(pipeline, true, false); // indirect draw is never taken for a light draw
+    }
     if (!BindResources(pipeline)) {
         return;
     }
     auto state = BeginRendering(pipeline); // (SunKeepBeforePass may take its clear over)
+    if (blood_pool_probe) { // bbport (r100d_blood-pool-draws, TOOL): as for a direct draw
+        BloodPoolProbeNote(pipeline, true, is_indexed, 0u);
+    }
     if (ProxyTraceOn()) {
         const auto target = cb_descs[0].first ? cb_descs[0].first : db_desc.first;
         FlushProxyReads(dc.push_data.scene_size != 0,
@@ -3064,6 +3083,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             cmdbuf.endQuery(query.pool, query.index);
         }
     });
+    if (blood_pool_probe) { // bbport (r100c_blood-pool-probe, TOOL): as after a direct draw
+        blood_pool_probe->AfterDraw();
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);

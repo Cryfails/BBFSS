@@ -16,6 +16,8 @@
 #include "video_core/host_shaders/froyok_bloom_first_comp.h"
 #include "video_core/host_shaders/froyok_bloom_upsample_comp.h"
 #include "video_core/host_shaders/contact_shadow_comp.h"
+#include "video_core/host_shaders/sun_term_view_copy_comp.h"
+#include "video_core/host_shaders/sun_term_view_show_comp.h"
 #include "video_core/host_shaders/gtao_frag.h"
 #include "video_core/host_shaders/native_motion_blur_frag.h"
 #include "video_core/host_shaders/point_shadow_comp.h"
@@ -139,6 +141,8 @@ int main() {
          {eStorageBuffer, eCombinedImageSampler, eStorageImage, eCombinedImageSampler,
           eStorageBuffer},
          68},
+        {"sun term view copy", SUN_TERM_VIEW_COPY_COMP, {eStorageImage, eStorageImage}, 8},
+        {"sun term view show", SUN_TERM_VIEW_SHOW_COMP, {eStorageImage, eStorageImage}, 8},
         {"point shadows",
          POINT_SHADOW_COMP,
          {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage,

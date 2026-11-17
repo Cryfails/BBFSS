@@ -17,7 +17,9 @@
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_contact_shadow.h"
+#include "video_core/renderer_vulkan/vk_sun_term_view.h"
 #include "video_core/renderer_vulkan/vk_depth_of_field.h"
+#include "video_core/renderer_vulkan/vk_blood_pool_probe.h" // bbport (r100c_blood-pool-probe, TOOL)
 #include "video_core/renderer_vulkan/vk_froyok_bloom.h"
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
 #include "video_core/renderer_vulkan/vk_point_shadow.h"
@@ -646,10 +648,20 @@ private:
     std::unique_ptr<SsrTemporal> ssr_temporal;
     std::unique_ptr<RtShadow> rt_shadow;
     std::unique_ptr<ContactShadow> contact_shadow;
+    std::unique_ptr<SunTermView> sun_term_view;
     std::unique_ptr<PointShadow> point_shadow;
     std::unique_ptr<VolumetricLight> volumetric_light;
     std::unique_ptr<SkySeam> sky_seam;
     std::unique_ptr<SkyZenith> sky_zenith;
+    /// bbport (r100c_blood-pool-probe, TOOL): made only with BB_BLOOD_POOL_PROBE not off at start
+    /// (BloodPoolProbe::Wanted), else null: its hooks are null pointer tests. BloodPoolProbeBefore
+    /// (vk_blood_pool_probe.cpp) hands it a draw's targets; called only while it is made.
+    std::unique_ptr<BloodPoolProbe> blood_pool_probe;
+    void BloodPoolProbeBefore(const GraphicsPipeline* pipeline, bool indirect, bool light);
+    /// bbport (r100d_blood-pool-draws, TOOL): a probed draw's index range and textures once they are
+    /// bound (vk_blood_pool_probe.cpp); called only while blood_pool_probe is made.
+    void BloodPoolProbeNote(const GraphicsPipeline* pipeline, bool indirect, bool is_indexed,
+                            u32 index_offset);
     std::unique_ptr<DepthOfField> depth_of_field;
     std::unique_ptr<FroyokBloom> froyok_bloom;
     bool effects_wanted = false;

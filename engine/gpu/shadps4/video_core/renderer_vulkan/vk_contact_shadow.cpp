@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
+#include "video_core/renderer_vulkan/vk_sun_term_view.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -220,6 +221,10 @@ void ContactShadow::Flush(bool native_blur) {
                           .frame_index = in.frame_index,
                           .width = width,
                           .height = height});
+        // The directional term now contains the ordinary RT result for this pass.
+        if (auto* term_view = SunTermView::Active(); term_view && sun_replaced) {
+            term_view->Capture(target_view, width, height);
+        }
         return;
     }
     EffectPass::Mark(4, "contact shadows and PCSS");
