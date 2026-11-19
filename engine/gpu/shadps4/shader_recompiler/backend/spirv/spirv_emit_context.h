@@ -266,6 +266,10 @@ public:
     [[nodiscard]] bool GameWindCut() const {
         return VertexMotion() && (runtime_info.hw.vs.motion_vectors & MotionVectors::GameCut) != 0;
     }
+    [[nodiscard]] bool FragmentFoliageMask() const {
+        return sw_stage == SwStage::Fragment && runtime_info.hw.fs.foliage_mask;
+    }
+
     [[nodiscard]] bool FragmentMotion() const {
         return sw_stage == SwStage::Fragment && runtime_info.hw.fs.motion_vectors;
     }
@@ -467,6 +471,9 @@ private:
     Id DefineReadConst(bool dynamic);
 
     Id GetBufferSize(u32 sharp_idx);
+
+public:
+    Id foliage_mask_out{};
 };
 
 } // namespace Shader::Backend::SPIRV

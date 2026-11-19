@@ -43,6 +43,20 @@ GpuProfiler::GpuProfiler(const Instance& instance, Scheduler& scheduler_)
     std::printf("GPU profile: on (timestamp period %.2f ns)\n", period_ns);
 }
 
+std::optional<u64> GpuProfiler::BeginRound2Copy(Round2Copy copy) {
+    round2_copy_active = true;
+    const auto index = size_t(copy);
+    if (held[slice] || used[slice] + 2 >= SliceQueries) {
+        ++round2_rejected_pairs[index];
+        return std::nullopt;
+    }
+    const u64 previous = Current();
+    const u64 key = Round2CopyKeys[index];
+    Pin(key);
+    Mark(key, [index] { return std::string{Round2CopyNames[index]}; });
+    return previous;
+}
+
 void GpuProfiler::WriteTimestamp(u64 key) {
     if (held[slice] || used[slice] + 1 >= SliceQueries) {
         return; // the frame's slice is full: the rest of the frame goes to the last label
@@ -167,6 +181,20 @@ void GpuProfiler::Print() {
     std::printf("GPU profile: %.2f ms/frame over %llu frames, %zu labels (%llu frames not ready, skipped)\n",
                 sum / frames, static_cast<unsigned long long>(frames), sorted.size(),
                 static_cast<unsigned long long>(skipped_frames));
+    if (round2_copy_active) {
+        ++round2_window;
+        const auto print = [](u64 value) { return static_cast<unsigned long long>(value); };
+        for (size_t i = 0; i < Round2CopyKeys.size(); ++i) {
+            const auto found = totals.find(Round2CopyKeys[i]);
+            const auto total = found == totals.end() ? Total{} : found->second;
+            std::printf("  Round2 GPU cost: {\"schema\":\"round2-gpu-cost-v1\",\"kind\":\"%s\","
+                        "\"window\":%llu,\"total_ms\":%.9f,\"segments\":%llu,\"frames\":%llu,"
+                        "\"skipped_frames\":%llu,\"rejected_pairs\":%llu}\n",
+                        Round2CopyNames[i], print(round2_window), total.ms, print(total.segments),
+                        print(frames), print(skipped_frames), print(round2_rejected_pairs[i]));
+            round2_rejected_pairs[i] = 0;
+        }
+    }
     skipped_frames = 0;
     // BB_GPU_PROFILE_ROWS: how many labels are printed (default 30; the rest can add up to
     // several ms per frame that no row shows).

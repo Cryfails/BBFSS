@@ -129,6 +129,12 @@ inline constexpr float SmallMinH = 4.0f, SmallMaxH = TreeMax;
 /// bbport (r89k_twigs-opaque-word): a limb piece of a tree (BbWindTrees::LimbOf) must be at least this tall in the world
 /// (the lean's tree weight starts at W::TreeLo)
 inline constexpr float LimbMinH = 3.0f;
+/// bbport (r89r_twigs-limb-units): BB_WIND_TWIGS_LIMB_MIN_H (read once, default LimbMinH, 1 or more up to 10: the lean's tree weight starts
+/// at W::TreeLo): the world height a limb piece's box needs (Judge). The default is the old constant.
+[[nodiscard]] inline float LimbMinHeight() {
+    static const float v = std::clamp(W::ParseNumber(std::getenv("BB_WIND_TWIGS_LIMB_MIN_H"), LimbMinH), 1.0f, 10.0f);
+    return v;
+}
 inline constexpr float SmallAspectLo = 0.20f, SmallAspectHi = 1.8f, SmallThin = 0.30f;
 /// bbport (r89m_twigs-no-tear): a mesh whose larger horizontal box side is over this is more than one tree: refused ('box-many').
 inline constexpr float OneTreeBox = 30.0f;
@@ -623,7 +629,7 @@ private:
     e.height = m.crown - m.base;
     e.last = m;
     if (e.small) { // bbport (r89e_twigs-big-trees): a static cut-out candidate
-        e.why = SmallWhy(m, Moved(e.snap, m), e.per_frame, e.loose, e.limb ? LimbMinH : SmallMinH);
+        e.why = SmallWhy(m, Moved(e.snap, m), e.per_frame, e.loose, e.limb ? LimbMinHeight() : SmallMinH);
         e.verdict = e.why == nullptr ? Verdict::Tree : Verdict::NotTree;
         return e.verdict;
     }

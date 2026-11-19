@@ -115,6 +115,153 @@ struct TickIn {
     float hang_box[6] = {};
 };
 
+/// Facts from the R120 render-thread driver; this does not identify a guest object or a ground draw.
+struct SewerHoldEpoch {
+    std::uint64_t epoch = 0, begin_frame = 0, ready_frame = 0;
+    std::array<float, 3> target{}, hunter{};
+    Session::WalkEvidence walks{};
+};
+
+struct SewerEpochReceipt {
+    SewerHoldEpoch original{}, alternate{};
+    std::uint64_t original_release_frame = 0, sample_frame = 0;
+    std::array<float, 3> release_hunter{}, hunter{}, eye{}, forward{};
+};
+
+class SewerEpochObserver {
+public:
+    [[nodiscard]] bool NeedsReleasedSample() const { return phase == Phase::Released; }
+
+    void Advance(const TickIn& t) {
+        if (phase == Phase::Idle || phase == Phase::Original) return;
+        if (t.frame <= last_frame || t.frame - last_frame != 1 || !SameSample(t) ||
+            !MailboxIdle() || (phase == Phase::Released && t.frame - receipt.original_release_frame > 120) ||
+            (phase == Phase::Alternate && !receipt.alternate.ready_frame &&
+             t.frame - receipt.alternate.begin_frame > 240)) {
+            phase = Phase::Idle;
+        }
+        last_frame = t.frame;
+    }
+
+    /// Called before the old session is released. Only an explicit off transition can bridge the holds.
+    void Change(const TickIn& t, const Goal& goal, const Session& previous, bool hold_on) {
+        if (phase == Phase::OriginalReady && goal.kind == Kind::Off && !goal.bad &&
+            previous.GetPhase() == Session::Phase::Ready && hold_on) {
+            receipt.original_release_frame = t.frame;
+            std::copy_n(t.hunter, 3, receipt.release_hunter.begin());
+            phase = Phase::Released;
+        } else if (phase == Phase::Released && ExactGoal(goal, Kind::Aim, kAlternate)) {
+            receipt.alternate = {++epoch, t.frame};
+            phase = Phase::Alternate;
+        } else {
+            phase = Phase::Idle;
+            if (ExactGoal(goal, Kind::LookAt, kOriginal) && goal.dist_set && goal.dist == 7.f &&
+                goal.yaw_set && goal.yaw == 147.f && goal.elev == 25.f) {
+                receipt = {};
+                receipt.original = {++epoch, t.frame};
+                phase = Phase::Original;
+            }
+        }
+    }
+
+    /// Called after the stock session tick, optional post and capture-gate publication.
+    void Observe(const TickIn& t, const Session& session, const Session::Out& o,
+                 std::vector<std::string>& lines) {
+        if (phase == Phase::Idle || phase == Phase::Released) return;
+        const auto walks = session.ReadWalkEvidence();
+        const bool ready = session.GetPhase() == Session::Phase::Ready &&
+                           o.hold && o.engaged && o.cmd_valid && o.framed && !o.failed && HoldWanted();
+        if (phase == Phase::Original) {
+            if (o.failed || walks.posted > 2) {
+                phase = Phase::Idle;
+            } else if (ready && walks.posted == 2 && walks.marked_ok == 2 &&
+                       walks.marked_sequence[0] && walks.marked_sequence[1] > walks.marked_sequence[0] &&
+                       t.frame > receipt.original.begin_frame && ValidHunter(t)) {
+                receipt.original.walks = walks;
+                if (!MailboxIdle()) return;
+                FillReady(receipt.original, t, session);
+                last_frame = t.frame;
+                phase = Phase::OriginalReady;
+            }
+            return;
+        }
+        if (phase == Phase::OriginalReady) {
+            if (!ready || walks.posted != 2 || walks.marked_ok != 2) phase = Phase::Idle;
+            return;
+        }
+        const bool current_view = t.matrices_ok && FiniteView(t);
+        if (o.failed || walks.posted || walks.marked_ok ||
+            (receipt.alternate.ready_frame && (!ready || !current_view))) {
+            phase = Phase::Idle;
+            return;
+        }
+        if (!ready || !current_view) return;
+        if (!receipt.alternate.ready_frame) {
+            FillReady(receipt.alternate, t, session);
+            Say(lines, "[sewer-r120-epoch] original=%llu original_begin=%llu original_ready=%llu original_release=%llu "
+                       "original_posted=%u original_marked=%u original_seq=%u,%u "
+                       "alternate=%llu alternate_begin=%llu alternate_ready=%llu alternate_posted=%u alternate_marked=%u "
+                       "hunter=%.9g,%.9g,%.9g",
+                static_cast<unsigned long long>(receipt.original.epoch),
+                static_cast<unsigned long long>(receipt.original.begin_frame),
+                static_cast<unsigned long long>(receipt.original.ready_frame),
+                static_cast<unsigned long long>(receipt.original_release_frame),
+                receipt.original.walks.posted, receipt.original.walks.marked_ok,
+                receipt.original.walks.marked_sequence[0], receipt.original.walks.marked_sequence[1],
+                static_cast<unsigned long long>(receipt.alternate.epoch),
+                static_cast<unsigned long long>(receipt.alternate.begin_frame),
+                static_cast<unsigned long long>(receipt.alternate.ready_frame), walks.posted, walks.marked_ok,
+                double(t.hunter[0]), double(t.hunter[1]), double(t.hunter[2]));
+        }
+        receipt.sample_frame = t.frame;
+        std::copy_n(t.hunter, 3, receipt.hunter.begin());
+        receipt.eye = {t.inv_view[3], t.inv_view[7], t.inv_view[11]};
+        std::copy_n(t.view + 8, 3, receipt.forward.begin());
+    }
+
+    [[nodiscard]] bool Read(std::uint64_t frame, SewerEpochReceipt& out) const {
+        if (phase != Phase::Alternate || !receipt.alternate.ready_frame || receipt.sample_frame != frame ||
+            last_frame != frame || !HoldWanted() || !MailboxIdle()) return false;
+        out = receipt;
+        return true;
+    }
+
+private:
+    enum class Phase { Idle, Original, OriginalReady, Released, Alternate };
+    static constexpr std::array<float, 3> kOriginal{17.275f, -29.597f, 102.718f};
+    static constexpr std::array<float, 3> kAlternate{16.765f, -29.525f, 101.825f};
+
+    static bool ExactGoal(const Goal& goal, Kind kind, const std::array<float, 3>& target) {
+        return goal.kind == kind && !goal.bad && !goal.centre && !goal.kept &&
+               !goal.from_hang && !goal.stepback && std::equal(target.begin(), target.end(), goal.point);
+    }
+    static bool ValidHunter(const TickIn& t) {
+        return t.hunter_ok && BbTestGoto::Finite3(t.hunter);
+    }
+    static bool FiniteView(const TickIn& t) {
+        const float eye[]{t.inv_view[3], t.inv_view[7], t.inv_view[11]};
+        return BbTestGoto::Finite3(eye) && BbTestGoto::Finite3(t.view + 8);
+    }
+    bool SameSample(const TickIn& t) const {
+        return ValidHunter(t) && Dist3(t.hunter, receipt.original.hunter.data()) <= .01f;
+    }
+    bool MailboxIdle() const {
+        const auto done = BbTestGoto::g_done_seq.load(std::memory_order_acquire);
+        return !BbTestGoto::Pending() && !BbTestGoto::Walking() &&
+               done == receipt.original.walks.marked_sequence[1] &&
+               BbTestGoto::g_done_ok.load(std::memory_order_relaxed);
+    }
+    static void FillReady(SewerHoldEpoch& stamp, const TickIn& t, const Session& session) {
+        stamp.ready_frame = t.frame;
+        std::copy_n(session.Target(), 3, stamp.target.begin());
+        std::copy_n(t.hunter, 3, stamp.hunter.begin());
+    }
+
+    SewerEpochReceipt receipt{};
+    Phase phase = Phase::Idle;
+    std::uint64_t epoch = 0, last_frame = 0;
+};
+
 struct Driver {
     std::uint32_t generation = 0xFFFFFFFFu; ///< the knobs file's generation last read
     char camera_text[LIVE_KNOB_VALUE_MAX] = {};
@@ -126,6 +273,7 @@ struct Driver {
     bool hold_on = false;
     std::uint64_t updates_base = 0;
     std::uint32_t centre_asked = 0;
+    SewerEpochObserver sewer_epoch;
 
     /// The two knobs' texts as the file or the environment gives them now (null: not set).
     void Refresh(const char* camera, const char* world) {
@@ -151,7 +299,8 @@ struct Driver {
     }
 
     [[nodiscard]] bool Needed() const {
-        return goal_changed || !pending_lines.empty() || session.Busy();
+        return goal_changed || !pending_lines.empty() || session.Busy() ||
+               (SewerEpochEnabled() && sewer_epoch.NeedsReleasedSample());
     }
 
     void StopHold() {
@@ -166,8 +315,11 @@ struct Driver {
             lines.push_back(l);
         }
         pending_lines.clear();
+        const bool observe_epoch = SewerEpochEnabled();
+        if (observe_epoch) sewer_epoch.Advance(t);
         if (goal_changed) {
             goal_changed = false;
+            if (observe_epoch) sewer_epoch.Change(t, goal, session, hold_on);
             session.Release(lines, goal.kind == Kind::Off ? "BB_TEST_CAMERA unset" : "BB_TEST_CAMERA changed");
             StopHold();
             PublishGate(false, false, std::string(), std::string());
@@ -267,12 +419,20 @@ struct Driver {
             session.Posted(BbTestGoto::Post(o.stand), t.frame);
         }
         PublishGate(o.engaged, o.framed, o.text, o.why, o.failed);
+        if (observe_epoch) sewer_epoch.Observe(t, session, o, lines);
     }
 };
 
 [[nodiscard]] inline Driver& TheDriver() {
     static Driver d;
     return d;
+}
+
+/// Render thread only. Match the exact R120 frame-end source serial, then independently qualify any later draw.
+[[nodiscard]] inline bool ReadSewerEpoch(std::uint64_t source_frame, SewerEpochReceipt& out) {
+    if (!SewerEpochEnabled()) return false;
+    const Driver& d = TheDriver();
+    return !d.goal_changed && d.sewer_epoch.Read(source_frame, out);
 }
 
 /// Once a frame: true when Tick has something to do. Reads the two knobs again when the knobs file's generation moved (the

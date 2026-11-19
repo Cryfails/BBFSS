@@ -1,5 +1,15 @@
 # Heat haze above flames
 
+## Development snapshot, 2026-11-19
+
+HAZ 30%. Feature work is paused.
+
+- Verified scope. The 4K effect draws. A flame-finder addresses the earlier light-placement cause.
+- Open scope. Subtle appearance and multiple-lamp targeting still need a combined check.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 50%
 
 A shimmer rises above flames. The haze runs and shows at 4K, but it is subtle, it was placed wrongly in the owner's hand test, and the fix for the placement has not been judged. The rating is held down by the placement.
@@ -46,3 +56,6 @@ No fork branch yet. The branch plan names visual/heat-haze.
 - lamp-test-spot: the torch, the faithful 4K view.
 - A lamp post with two lanterns (the owner's street place) for r97f: haze over each flame, not between them.
 - dark-interior and dream-house: interior must stay quiet.
+
+
+</details>

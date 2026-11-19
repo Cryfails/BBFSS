@@ -1,5 +1,15 @@
 # Real reflections: mirrors, glass and wet ground
 
+## Development snapshot, 2026-11-19
+
+REF 4%. Feature work is paused.
+
+- Verified scope. Three direct fireplace hits and an opaque frame control are verified.
+- Open scope. A genuine mirror draw and reflected world lighting remain open. Private recorder, Runtime and blit diagnostics are separate.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 3%. Study only; nothing is built and no patch script exists.
 
 ## What works
@@ -29,3 +39,6 @@ None. Nothing to apply (scripts.txt is empty). The surface probe tools r64 and r
 ## Test places
 - Dream house in front of the standing mirror (save dream-house): walk in from the door, face the mirror 20 s, then the cabinet and the hall windows.
 - Graveyard on the blood pool (save graveyard-blood) for wet ground.
+
+
+</details>

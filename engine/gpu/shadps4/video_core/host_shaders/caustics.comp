@@ -68,6 +68,10 @@ layout(binding = 7, std430) buffer WorldMap {
     uint world_map[];
 };
 
+// bbport (r130e_sewer-water-moves): the copy of the mirrored plane's water colours (the host binds the scene view as a stand-in
+// when no warp runs; the shader touches it only under the two warp flags).
+layout(binding = 8, rgba16f) uniform image2D warp_img;
+layout(binding = 9) uniform texture2D bed_tex; // native R32F copy before the water depth write
 // caustics_params.h Push, field for field (128 bytes).
 layout(push_constant) uniform Push {
     vec4 proj;  // x scale, y scale, z scale, z offset
@@ -84,6 +88,8 @@ layout(push_constant) uniform Push {
 };
 
 shared uint group_counts[CAUSTICS_SLOT_WORDS];
+shared uint group_ring; // r130b: the water pixels in this group a ring packet reached
+shared uint group_warp[2]; // r130e: the water pixels this group's WARP threads took a colour for, and those they left as they were
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const vec3 TINT_DRAWN = vec3(0.15, 0.85, 1.0);
@@ -94,6 +100,69 @@ const vec3 TINT_LAMP = vec3(0.2, 1.0, 0.15);
 const vec3 TINT_UNSEEN = vec3(0.5); // r107c: grey (Tinted keeps the brightness)
 // Water(): what the screen shows at a point of the plane.
 const int AT_WATER = 0, AT_BELOW = 1, AT_OFF = 2, AT_HIDDEN = 3, AT_DRY = 4;
+
+#ifdef BB_BED_OBSERVER
+// Each destination selects only its own stage/point row. Donor tests never write it.
+uint bed_observer_row = 0u;
+
+void ObserveBedEnter(ivec2 p, uint stage) {
+    uint point = BED_OBS_NPOINTS;
+    for (uint i = 0u; i < BED_OBS_NPOINTS; ++i) {
+        const uint address = BED_OBS_POINTS + 2u * i;
+        if (all(equal(uvec2(p), uvec2(counts[address], counts[address + 1u])))) point = i;
+    }
+    if (point != BED_OBS_NPOINTS) {
+        bed_observer_row = BED_OBS_BASE + (stage * BED_OBS_NPOINTS + point) * BED_OBS_WORDS;
+        counts[bed_observer_row + BED_OBS_ENTRY] = BED_OBS_MAGIC;
+        counts[bed_observer_row + BED_OBS_READS] = 0u;
+        counts[bed_observer_row + BED_OBS_STORE] = BED_STORE_NONE;
+    }
+}
+
+void ObserveBedUint(uint field, uint value) {
+    if (bed_observer_row != 0u) counts[bed_observer_row + field] = value;
+}
+
+void ObserveBedRgb(uint field, vec3 value) {
+    if (bed_observer_row != 0u) {
+        counts[bed_observer_row + field] = floatBitsToUint(value.x);
+        counts[bed_observer_row + field + 1u] = floatBitsToUint(value.y);
+        counts[bed_observer_row + field + 2u] = floatBitsToUint(value.z);
+    }
+}
+
+vec4 ObserveBedStore(vec4 value, uint target) {
+    ObserveBedRgb(BED_OBS_OPERAND, value.rgb);
+    ObserveBedUint(BED_OBS_OPERAND + 3u, floatBitsToUint(value.a));
+    ObserveBedUint(BED_OBS_STORE, target);
+    return value;
+}
+
+bool ObserveBedTest(bool passed, uint field, uint refusal) {
+    if (!passed) ObserveBedUint(field, refusal);
+    return passed;
+}
+
+#define BED_U(field, value) ObserveBedUint(field, value);
+#define BED_F(field, value) ObserveBedUint(field, floatBitsToUint(value));
+#define BED_RGB(field, value) ObserveBedRgb(field, value);
+#define BED_TEST(test, field, refusal) ObserveBedTest((test), field, refusal)
+#define BED_STORE(target, pixel, value, kind) imageStore(target, pixel, ObserveBedStore(value, kind));
+#define BED_DST_PARAM , bool bed_destination
+#define BED_DST_ARG(value) , value
+#define BED_POSITION_PARAM , uint bed_sample
+#define BED_POSITION_ARG(value) , value
+#else
+#define BED_U(field, value)
+#define BED_F(field, value)
+#define BED_RGB(field, value)
+#define BED_TEST(test, field, refusal) (test)
+#define BED_STORE(target, pixel, value, kind) imageStore(target, pixel, value);
+#define BED_DST_PARAM
+#define BED_DST_ARG(value)
+#define BED_POSITION_PARAM
+#define BED_POSITION_ARG(value)
+#endif
 
 // As heat_haze.comp's (and caustics_params.h's C++ twin).
 uint Hash(uvec3 v) {
@@ -128,9 +197,73 @@ float Ridge(vec3 p) {
     return 1.0 - abs(2.0 * Noise(p) - 1.0);
 }
 
+// bbport (r130b_water-moves): the moving water. The slot's motion block (caustics_layout.h CAUSTICS_MOTION_*), written by the host.
+uint Motion(uint i) {
+    return counts[CAUSTICS_MOTION_BASE + slot * CAUSTICS_MOTION_WORDS + i];
+}
+
+bool ring_hit = false; // WaveAt evaluated a ring packet (its last call)
+
+// The wave field at a point of the water (world x, z): returns its curvature (the Laplacian of eta), `g` its slope (the gradient).
+// 4 waves eta = A sin(k . xz - phase) and the rings' packets f(s) of the radius: f = G E C, G = a exp(-age / tau) / sqrt(1 + r / r0),
+// E = exp(-s^2 / 2 w^2), C = cos(K s), s = r - speed x age; f' and f'' analytic (G' = -G / (2 (r0 + r)), G'' = 0.75 G / (r0 + r)^2).
+float WaveAt(vec2 xz, out vec2 g) {
+    g = vec2(0.0);
+    float lap = 0.0;
+    ring_hit = false;
+    for (uint i = 0u; i < uint(CAUSTICS_MOTION_WAVES); ++i) {
+        const uint at = uint(CAUSTICS_MOTION_WAVES_AT) + i * uint(CAUSTICS_MOTION_WAVE_WORDS);
+        const vec2 kv = vec2(uintBitsToFloat(Motion(at)), uintBitsToFloat(Motion(at + 1u)));
+        const float amp = uintBitsToFloat(Motion(at + 2u));
+        const float th = dot(kv, xz) - uintBitsToFloat(Motion(at + 3u));
+        g += (amp * cos(th)) * kv;
+        lap -= amp * dot(kv, kv) * sin(th);
+    }
+    const uint rings = min(Motion(CAUSTICS_MOTION_RINGS), uint(CAUSTICS_MOTION_MAX_RINGS));
+    for (uint j = 0u; j < rings; ++j) {
+        const uint at = uint(CAUSTICS_MOTION_RINGS_AT) + j * uint(CAUSTICS_MOTION_RING_WORDS);
+        const float age = uintBitsToFloat(Motion(at + 2u));
+        const vec2 d = xz - vec2(uintBitsToFloat(Motion(at)), uintBitsToFloat(Motion(at + 1u)));
+        const float r = length(d);
+        const float s = r - CAUSTICS_RING_SPEED * age;
+        if (abs(s) >= 3.0 * CAUSTICS_RING_WIDTH || r < 1e-4 || age >= CAUSTICS_RING_LIFE) {
+            continue;
+        }
+        const float w2 = CAUSTICS_RING_WIDTH * CAUSTICS_RING_WIDTH;
+        const float gain = uintBitsToFloat(Motion(at + 3u)) * exp(-age / CAUSTICS_RING_TAU) * inversesqrt(1.0 + r / CAUSTICS_RING_R0);
+        const float e = exp(-0.5 * s * s / w2);
+        const float c = cos(CAUSTICS_RING_K * s), sn = sin(CAUSTICS_RING_K * s);
+        const float h0 = e * c;
+        const float h1 = e * (-(s / w2) * c - CAUSTICS_RING_K * sn);
+        const float h2 = e * (c * (s * s / (w2 * w2) - 1.0 / w2 - CAUSTICS_RING_K * CAUSTICS_RING_K) +
+                              2.0 * s * CAUSTICS_RING_K * sn / w2);
+        const float g1 = -0.5 * gain / (CAUSTICS_RING_R0 + r);
+        const float g2 = 0.75 * gain / ((CAUSTICS_RING_R0 + r) * (CAUSTICS_RING_R0 + r));
+        const float f1 = g1 * h0 + gain * h1;
+        const float f2 = g2 * h0 + 2.0 * g1 * h1 + gain * h2;
+        g += f1 * (d / r);
+        lap += f2 + f1 / max(r, 0.02);
+        ring_hit = true;
+    }
+    return lap;
+}
+
+// The caustic brightness the curvature gives (mean 1: a hollow focuses, a crest spreads).
+float Focus(float lap) {
+    return clamp(1.0 - CAUSTICS_MOTION_FOCUS * lap, 0.0, 3.0);
+}
+
 // The caustic pattern at a point of the water (world x, z), mean 1 (CAUSTICS_PATTERN_MEAN).
 // r107e: `speed` scales its drift and its change over time (1: as before).
-float Pattern(vec2 xz, float speed) {
+float PatternAt(vec2 xz, float speed, bool moving) {
+    // The waves bend the pattern position and change its focus.
+    float c = 1.0;
+    if (moving) {
+        vec2 slope;
+        const float lap = WaveAt(xz, slope);
+        xz += CAUSTICS_MOTION_WARP * slope;
+        c = Focus(lap);
+    }
     const vec2 a = (xz + drift.xy * speed) * (1.0 / CAUSTICS_LAMBDA1);
     const vec2 m = xz + drift.zw * speed;
     const vec2 b = vec2(CAUSTICS_COS2 * m.x - CAUSTICS_SIN2 * m.y,
@@ -138,7 +271,12 @@ float Pattern(vec2 xz, float speed) {
                    (1.0 / CAUSTICS_LAMBDA2);
     const float r1 = Ridge(vec3(a, evolve * speed));
     const float r2 = Ridge(vec3(b, evolve * speed * CAUSTICS_EVOLVE2 + CAUSTICS_EVOLVE2_SHIFT));
-    return 0.5 * (pow(r1, CAUSTICS_SHARP) + pow(r2, CAUSTICS_SHARP)) * (1.0 / CAUSTICS_PATTERN_MEAN);
+    const float net = 0.5 * (pow(r1, CAUSTICS_SHARP) + pow(r2, CAUSTICS_SHARP)) * (1.0 / CAUSTICS_PATTERN_MEAN);
+    return net * c; // r130b: c is 1.0 without the motion flag
+}
+
+float Pattern(vec2 xz, float speed) {
+    return PatternAt(xz, speed, (flags & CAUSTICS_FLAG_MOTION) != 0u);
 }
 
 float ViewZ(float depth) {
@@ -273,13 +411,442 @@ void MapSet(vec2 xz, uint state) {
     world_map[MapIndex(xz)] = (Data(CAUSTICS_DATA_WORLD_GEN) << 2u) | state;
 }
 
-void Shade(ivec2 p) {
+// bbport (r130e_sewer-water-moves): the rippled reflection of a mirrored plane's water (see CAUSTICS_FLAG_WARP_COPY and _WARP).
+// The pixel (centre, + 0.5) a view position projects to: ViewPos inverted.
+vec2 PixelOf(vec3 v) {
+    return (v.xy * proj.xy / max(v.z, 1e-4) + 1.0) * 0.5 * frame.xy + frame.zw;
+}
+
+// The game's water pixel at p: depth on the mirrored plane within the tolerance, up-facing, nearer than CAUSTICS_FADE_END (the water
+// is drawn before this pass, so the plane test of the depth is its pixels). P, Pw: its view and world position.
+bool WaterPixel(ivec2 p, out vec3 P, out vec3 Pw BED_DST_PARAM) {
+    P = vec3(0.0);
+    Pw = vec3(0.0);
     const float depth = texelFetch(depth_tex, p, 0).r;
+#ifdef BB_BED_OBSERVER
+    if (bed_destination) { BED_F(BED_OBS_DEPTH, depth) }
+#endif
     if (depth >= 1.0) {
+#ifdef BB_BED_OBSERVER
+        if (bed_destination) { BED_U(BED_OBS_GATE, BED_GATE_CLEAR) }
+#endif
+        return false;
+    }
+    P = ViewPos(vec2(p) + 0.5, ViewZ(depth));
+#ifdef BB_BED_OBSERVER
+    if (bed_destination) { BED_F(BED_OBS_WATER_Z, P.z) }
+#endif
+    if (!(P.z < CAUSTICS_FADE_END)) {
+#ifdef BB_BED_OBSERVER
+        if (bed_destination) { BED_U(BED_OBS_GATE, BED_GATE_FADE) }
+#endif
+        return false;
+    }
+    Pw = ToWorld(P);
+#ifdef BB_BED_OBSERVER
+    if (bed_destination) { BED_RGB(BED_OBS_WATER_WORLD, Pw) }
+#endif
+    if (abs(Pw.y - sun.w) > CAUSTICS_WATER_M + CAUSTICS_WATER_REL * P.z) {
+#ifdef BB_BED_OBSERVER
+        if (bed_destination) { BED_U(BED_OBS_GATE, BED_GATE_DRY) }
+#endif
+        return false;
+    }
+#ifdef BB_BED_OBSERVER
+    const float up = DirToWorld(NormalAt(p, P)).y;
+    if (bed_destination) {
+        BED_F(BED_OBS_NORMAL, up)
+        BED_U(BED_OBS_GATE, up >= CAUSTICS_PUDDLE_UP ? BED_GATE_COPY_WET : BED_GATE_NORMAL)
+    }
+    return up >= CAUSTICS_PUDDLE_UP;
+#else
+    return DirToWorld(NormalAt(p, P)).y >= CAUSTICS_PUDDLE_UP;
+#endif
+}
+
+// t133f: binding 4 is an independent result slice for this dispatch.
+bool ProbeFinite(float x) {
+    return !isnan(x) && !isinf(x);
+}
+
+bool ProbeFinite(vec3 v) {
+    return !any(isnan(v)) && !any(isinf(v));
+}
+
+bool ProbeDepthValid(float raw) {
+    return ProbeFinite(raw) && raw >= 0.0 && raw < 1.0 && raw < proj.z &&
+           ProbeFinite(ViewZ(raw)) && ViewZ(raw) > 0.0;
+}
+
+uint ProbePoint(uint point, inout uint words[CAUSTICS_PROBE_POINT_WORDS]) {
+    const vec2 offsets[4] = vec2[4](vec2(-1, 0), vec2(1, 0), vec2(0, -1), vec2(0, 1));
+    const vec2 xz = sun.xz + offsets[point] * drift.z;
+    const vec3 Q = vec3(xz.x, sun.w, xz.y);
+    const vec3 V = ToView(Q);
+    if (!ProbeFinite(V) || !(V.z > 0.05)) {
+        return CAUSTICS_PROBE_PROJECTION;
+    }
+    const vec2 q = PixelOf(V);
+    if (any(isnan(q)) || any(isinf(q))) {
+        return CAUSTICS_PROBE_PROJECTION;
+    }
+    if (any(lessThan(q, vec2(0))) || any(greaterThanEqual(q, frame.xy))) {
+        return CAUSTICS_PROBE_OFFSCREEN;
+    }
+    const ivec2 p = ivec2(q);
+    words[4] = uint(p.x);
+    words[5] = uint(p.y);
+    if (any(lessThanEqual(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(frame.xy) - 1))) {
+        return CAUSTICS_PROBE_BORDER;
+    }
+    const vec2 centre = vec2(p) + 0.5;
+    const vec3 ray = DirToWorld(ViewPos(centre, 1.0));
+    const float expected_z = (sun.w - inv1.w) / ray.y;
+    const vec3 Qc = ToWorld(ViewPos(centre, expected_z));
+    if (!ProbeFinite(Qc) || !ProbeFinite(expected_z) || !(expected_z > 0.0)) {
+        return CAUSTICS_PROBE_COARSE;
+    }
+    words[7] = floatBitsToUint(expected_z);
+    if (!(distance(Qc, Q) <= drift.w)) {
+        return CAUSTICS_PROBE_COARSE;
+    }
+    const float raw = texelFetch(depth_tex, p, 0).r;
+    words[6] = floatBitsToUint(raw);
+    if (raw == 1.0) {
+        return CAUSTICS_PROBE_SKY;
+    }
+    if (!ProbeDepthValid(raw)) {
+        return CAUSTICS_PROBE_DEPTH;
+    }
+    const vec3 P = ViewPos(centre, ViewZ(raw));
+    const vec3 Pw = ToWorld(P);
+    if (!ProbeFinite(Pw)) {
+        return CAUSTICS_PROBE_DEPTH;
+    }
+    words[8] = floatBitsToUint(P.z);
+    words[13] = floatBitsToUint(Pw.y - sun.w);
+    words[14] = floatBitsToUint(distance(Pw.xz, Qc.xz));
+    words[15] = floatBitsToUint(P.z - expected_z);
+    if (!(distance(Pw, Qc) <= drift.w)) {
+        return P.z < expected_z ? CAUSTICS_PROBE_OCCLUDED : CAUSTICS_PROBE_NO_SURFACE;
+    }
+    vec3 adjacent[4];
+    for (uint i = 0; i < 4; ++i) {
+        const ivec2 step = ivec2(offsets[i]);
+        const float neighbour = texelFetch(depth_tex, p + step, 0).r;
+        if (!ProbeDepthValid(neighbour)) {
+            return CAUSTICS_PROBE_NEIGHBOUR;
+        }
+        adjacent[i] = ViewPos(centre + vec2(step), ViewZ(neighbour));
+    }
+    // Use the validated samples for the logged normal. WaterPixel still runs the
+    // production NormalAt and predicate unchanged.
+    const vec3 l = adjacent[0], r = adjacent[1], u = adjacent[2], d = adjacent[3];
+    const vec3 dx = abs(r.z - P.z) < abs(P.z - l.z) ? r - P : P - l;
+    const vec3 dy = abs(d.z - P.z) < abs(P.z - u.z) ? d - P : P - u;
+    const vec3 cross_view = cross(dy, dx);
+    const float len = length(cross_view);
+    if (!ProbeFinite(len) || !(len > 1e-12)) {
+        return CAUSTICS_PROBE_NORMAL;
+    }
+    const vec3 n = DirToWorld(dot(cross_view, P) > 0.0 ? -cross_view / len : cross_view / len);
+    if (!ProbeFinite(n) || !(dot(n, n) > 1e-12)) {
+        return CAUSTICS_PROBE_NORMAL;
+    }
+    words[9] = floatBitsToUint(Pw.x);
+    words[10] = floatBitsToUint(Pw.y);
+    words[11] = floatBitsToUint(Pw.z);
+    words[12] = floatBitsToUint(n.y);
+    vec3 tested_view, tested_world;
+    return WaterPixel(p, tested_view, tested_world BED_DST_ARG(false)) ? CAUSTICS_PROBE_OK : CAUSTICS_PROBE_PREDICATE;
+}
+
+void ProbeWrite(uint point) {
+    if (point == 0u) {
+        counts[0] = CAUSTICS_PROBE_MAGIC;
+        counts[1] = CAUSTICS_PROBE_VERSION;
+        counts[2] = slot;
+        counts[3] = floatBitsToUint(drift.x);
+        counts[4] = floatBitsToUint(drift.y);
+        counts[5] = CAUSTICS_PROBE_POINTS;
+        counts[6] = CAUSTICS_PROBE_POINT_WORDS;
+        counts[7] = 0u;
+        for (uint i = 0; i < 4; ++i) {
+            counts[8 + i] = floatBitsToUint(sun[i]);
+        }
+        counts[12] = floatBitsToUint(drift.z);
+        counts[13] = floatBitsToUint(drift.w);
+        counts[14] = 0u;
+        counts[15] = 0u;
+    }
+    uint words[CAUSTICS_PROBE_POINT_WORDS];
+    words[0] = slot;
+    words[1] = point;
+    words[4] = CAUSTICS_PROBE_INVALID_PIXEL;
+    words[5] = CAUSTICS_PROBE_INVALID_PIXEL;
+    for (uint i = 6; i < CAUSTICS_PROBE_POINT_WORDS; ++i) {
+        words[i] = CAUSTICS_PROBE_INVALID_FLOAT;
+    }
+    const uint reason = ProbePoint(point, words);
+    words[2] = reason == CAUSTICS_PROBE_OK ? CAUSTICS_PROBE_WATER :
+               reason == CAUSTICS_PROBE_PREDICATE ? CAUSTICS_PROBE_REJECTED : CAUSTICS_PROBE_UNKNOWN;
+    words[3] = reason;
+    const uint base = CAUSTICS_PROBE_HEADER_WORDS + point * CAUSTICS_PROBE_POINT_WORDS;
+    for (uint i = 0; i < CAUSTICS_PROBE_POINT_WORDS; ++i) {
+        counts[base + i] = words[i];
+    }
+}
+
+bool BedPosition(ivec2 p, out vec3 view_pos, out vec3 world_pos BED_POSITION_PARAM) {
+    const ivec2 q = (flags & CAUSTICS_FLAG_BED_2X) != 0u ? 2 * p + ivec2(1) : p;
+    const float raw = texelFetch(bed_tex, q, 0).r;
+#ifdef BB_BED_OBSERVER
+    if (bed_observer_row != 0u) {
+        counts[bed_observer_row + BED_OBS_READS] |= 1u << bed_sample;
+        if ((flags & CAUSTICS_FLAG_BED_2X) != 0u) {
+            const uint row = (bed_observer_row - BED_OBS_BASE) / BED_OBS_WORDS;
+            const uint tap = BED_OBS_TAPS + (row * BED_OBS_NTAPS + bed_sample) * BED_OBS_TAP_WORDS;
+            counts[tap] = uint(q.x);
+            counts[tap + 1u] = uint(q.y);
+            counts[tap + 2u] = floatBitsToUint(raw);
+        }
+        if (bed_sample == 0u) { BED_F(BED_OBS_RAW, raw) }
+    }
+#endif
+    if (!ProbeDepthValid(raw)) {
+#ifdef BB_BED_OBSERVER
+        if (bed_sample == 0u) { BED_U(BED_OBS_REASON, BED_CAUSE_CENTRE_RAW) }
+#endif
+        return false;
+    }
+    view_pos = ViewPos(vec2(p) + 0.5, ViewZ(raw));
+    world_pos = ToWorld(view_pos);
+#ifdef BB_BED_OBSERVER
+    if (bed_sample == 0u) {
+        BED_F(BED_OBS_BED_Z, view_pos.z)
+        BED_RGB(BED_OBS_BED_WORLD, world_pos)
+        return BED_TEST(ProbeFinite(world_pos), BED_OBS_REASON, BED_CAUSE_CENTRE_WORLD) &&
+               BED_TEST(sun.w - world_pos.y > CAUSTICS_WATER_M + CAUSTICS_WATER_REL * view_pos.z,
+                        BED_OBS_REASON, BED_CAUSE_CENTRE_ABOVE);
+    }
+#endif
+    return ProbeFinite(world_pos) &&
+           sun.w - world_pos.y > CAUSTICS_WATER_M + CAUSTICS_WATER_REL * view_pos.z;
+}
+
+// Called only for a visible wet destination with compatible native depth and albedo.
+vec3 NativeBedLight(ivec2 p, float water_z, bool moving) {
+    if (!(water_z > 0.0 && water_z < CAUSTICS_FADE_END)) {
+        BED_U(BED_OBS_REASON, BED_CAUSE_WATER_Z)
+        return vec3(0.0);
+    }
+    vec3 Bv, B;
+    if (!BedPosition(p, Bv, B BED_POSITION_ARG(0u)) ||
+        !BED_TEST(Bv.z > water_z && Bv.z < CAUSTICS_FADE_END, BED_OBS_REASON, BED_CAUSE_CENTRE_Z)) {
+        return vec3(0.0);
+    }
+    const ivec2 px = p + ivec2(p.x + 1 < int(frame.x) ? 1 : -1, 0);
+    const ivec2 py = p + ivec2(0, p.y + 1 < int(frame.y) ? 1 : -1);
+    vec3 bxv, bx, byv, by;
+    if (!BED_TEST(BedPosition(px, bxv, bx BED_POSITION_ARG(1u)), BED_OBS_REASON, BED_CAUSE_X) ||
+        !BED_TEST(BedPosition(py, byv, by BED_POSITION_ARG(2u)), BED_OBS_REASON, BED_CAUSE_Y)) {
+        return vec3(0.0);
+    }
+    const vec3 dx = bxv - Bv;
+    const vec3 dy = byv - Bv;
+    const float edge_limit = 0.08 + 0.02 * Bv.z;
+    const vec3 cross_view = cross(dy, dx);
+    const float normal2 = dot(cross_view, cross_view);
+    if (!(BED_TEST(dot(dx, dx) < edge_limit * edge_limit, BED_OBS_REASON, BED_CAUSE_EDGE_X) &&
+          BED_TEST(dot(dy, dy) < edge_limit * edge_limit, BED_OBS_REASON, BED_CAUSE_EDGE_Y) &&
+          BED_TEST(normal2 > 1e-18, BED_OBS_REASON, BED_CAUSE_DEGENERATE))) {
+        return vec3(0.0);
+    }
+    const float orient = dot(cross_view, Bv) > 0.0 ? -1.0 : 1.0;
+    const vec3 normal = DirToWorld(cross_view * (orient * inversesqrt(normal2)));
+    const uint count = min(Data(CAUSTICS_DATA_COUNT), uint(CAUSTICS_MAX_LAMPS));
+    const float gain = uintBitsToFloat(Data(CAUSTICS_DATA_GAIN));
+    vec3 lit = vec3(0.0);
+    for (uint k = 0u; k < count; ++k) {
+        const uint at = CAUSTICS_DATA_LAMPS + k * CAUSTICS_LAMP_WORDS;
+        const vec3 L = uintBitsToFloat(uvec3(Data(at), Data(at + 1u), Data(at + 2u)));
+        const float radius = uintBitsToFloat(Data(at + 3u));
+        const vec3 d = L - B;
+        const float d2 = dot(d, d);
+        const float facing = dot(normal, d);
+        if (!(BED_TEST(L.y > sun.w, BED_OBS_LAMPS + k, BED_LAMP_HEIGHT) &&
+              BED_TEST(radius > 0.0, BED_OBS_LAMPS + k, BED_LAMP_RADIUS) &&
+              BED_TEST(d2 < radius * radius, BED_OBS_LAMPS + k, BED_LAMP_RANGE) &&
+              BED_TEST(d2 > 1e-6, BED_OBS_LAMPS + k, BED_LAMP_NEAR) &&
+              BED_TEST(facing > 0.0, BED_OBS_LAMPS + k, BED_LAMP_INCIDENCE))) {
+            continue;
+        }
+        vec3 X = B + d * ((sun.w - B.y) / d.y);
+        X.y = sun.w;
+        ivec2 qi;
+        vec2 q;
+#ifdef BB_BED_OBSERVER
+        const int crossing = Water(X, qi, q);
+        BED_U(BED_OBS_LAMPS + k, BED_LAMP_WATER_RESULT + uint(crossing))
+        if (crossing != AT_WATER) {
+#else
+        if (Water(X, qi, q) != AT_WATER) {
+#endif
+            continue;
+        }
+        const float dl = sqrt(d2);
+        // Freeze the pattern clock. Moving bed light uses only the active water wave block.
+        const float focus = clamp(PatternAt(X.xz, 0.0, moving), 0.0, 3.0);
+#ifdef BB_BED_OBSERVER
+        if (moving && bed_observer_row >= BED_OBS_BASE && counts[BED_OBS_MOTION_SERIES] == 1u) {
+            const uint row = (bed_observer_row - BED_OBS_BASE) / BED_OBS_WORDS;
+            const uint wet = row - BED_OBS_WARP * BED_OBS_NPOINTS;
+            if (wet < 2u) {
+                const uint at_optic = BED_OBS_OPTICS + (wet * CAUSTICS_MAX_LAMPS + k) * BED_OBS_OPTIC_WORDS;
+                counts[at_optic] = floatBitsToUint(X.x);
+                counts[at_optic + 1u] = floatBitsToUint(X.y);
+                counts[at_optic + 2u] = floatBitsToUint(X.z);
+                counts[at_optic + 3u] = floatBitsToUint(focus);
+            }
+        }
+#endif
+        const float transmission = 1.0 - exp(-gain * CAUSTICS_BED_T * focus);
+        const vec3 colour = uintBitsToFloat(uvec3(Data(at + 4u), Data(at + 5u), Data(at + 6u)));
+        lit += colour * (LampCurve(dl / radius) * clamp(facing / dl, 0.0, 1.0) * transmission);
+    }
+    BED_RGB(BED_OBS_INCIDENT, lit)
+    if (!(dot(lit, LUMA) > 0.0)) {
+        BED_U(BED_OBS_REASON, BED_CAUSE_NO_INCIDENT)
+        return vec3(0.0);
+    }
+    const vec3 albedo = texelFetch(albedo_tex, p, 0).rgb;
+    const float fade = 1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, Bv.z);
+#ifdef BB_BED_OBSERVER
+    const float strength = uintBitsToFloat(Data(CAUSTICS_DATA_BED));
+    const vec3 product = lit * albedo * (fade * strength);
+    BED_RGB(BED_OBS_CB2, albedo)
+    BED_F(BED_OBS_FADE, fade)
+    BED_F(BED_OBS_STRENGTH, strength)
+    BED_RGB(BED_OBS_NATIVE, product)
+    BED_U(BED_OBS_REASON, dot(product, LUMA) > 0.0 ? BED_CAUSE_POSITIVE : BED_CAUSE_NO_PRODUCT)
+    return product;
+#else
+    return lit * albedo * (fade * uintBitsToFloat(Data(CAUSTICS_DATA_BED)));
+#endif
+}
+
+// One thread of the WARP_COPY or WARP dispatch: g is its place in the band (the band starts at the block's ROW0).
+void WarpPixel(ivec2 g) {
+    const int row0 = int(Motion(CAUSTICS_MOTION_ROW0));
+    const ivec2 p = ivec2(g.x, g.y + row0);
+    if (any(greaterThanEqual(p, ivec2(frame.xy)))) {
+        return;
+    }
+#ifdef BB_BED_OBSERVER
+    ObserveBedEnter(p, (flags & CAUSTICS_FLAG_WARP_COPY) != 0u ? BED_OBS_COPY : BED_OBS_WARP);
+#endif
+    vec3 P, Pw;
+    if (!WaterPixel(p, P, Pw BED_DST_ARG(true))) {
+        return;
+    }
+    const float stamp = float(Motion(CAUSTICS_MOTION_STAMP));
+    BED_F(BED_OBS_STAMP, stamp)
+    const vec4 s = imageLoad(scene_img, p);
+    if ((flags & CAUSTICS_FLAG_WARP_COPY) != 0u) {
+        BED_RGB(BED_OBS_RGB_BASE, s.rgb)
+        BED_STORE(warp_img, p, vec4(s.rgb, stamp), BED_STORE_COPY)
+        return;
+    }
+    // The mirror image moves by 2 x REFLECT_M x the slope (a tilt t turns the reflected ray by 2 t): project the point and the point
+    // moved on the plane, the difference is the shift (faded out with distance, at most SHIFT_MAX x the frame's height).
+    vec2 slope;
+    const float lap = WaveAt(Pw.xz, slope);
+    const float fade = 1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z);
+    const vec3 V2 = ToView(Pw + (2.0 * CAUSTICS_MOTION_REFLECT_M) * vec3(slope.x, 0.0, slope.y));
+    vec2 shift = V2.z > 0.05 ? (PixelOf(V2) - PixelOf(P)) * fade : vec2(0.0);
+    const float lim = CAUSTICS_MOTION_SHIFT_MAX * frame.y;
+    const float len = length(shift);
+    if (len > lim) {
+        shift *= lim / len;
+    }
+    const bool ambient = (flags & CAUSTICS_FLAG_AMBIENT) != 0u;
+    // Bilinear over the four copy texels that hold this dispatch's stamp.
+    const vec2 q = vec2(p) + shift;
+    const ivec2 q0 = ivec2(floor(q));
+    const vec2 f = q - vec2(q0);
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            const ivec2 t = q0 + ivec2(i, j);
+            if (any(lessThan(t, ivec2(0))) || any(greaterThanEqual(t, ivec2(frame.xy)))) {
+                continue;
+            }
+            if (ambient) {
+                // A wrapped stamp cannot distinguish a texel this COPY did not write.
+                vec3 donor_view, donor_world;
+                if (t.y < row0 || !WaterPixel(t, donor_view, donor_world BED_DST_ARG(false))) {
+                    continue;
+                }
+            }
+            const vec4 c = imageLoad(warp_img, t);
+            if (abs(c.a - stamp) > 0.25) {
+                continue;
+            }
+            const float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            sum += w * c.rgb;
+            wsum += w;
+        }
+    }
+    vec3 rgb = s.rgb;
+    atomicAdd(group_warp[0], 1u);
+    if (wsum >= 0.5) {
+        rgb = sum / wsum;
+    } else {
+        atomicAdd(group_warp[1], 1u); // kept: the source is not water
+    }
+    const bool native_bed = (flags & (CAUSTICS_FLAG_NATIVE_BED | CAUSTICS_FLAG_ALBEDO)) ==
+                            (CAUSTICS_FLAG_NATIVE_BED | CAUSTICS_FLAG_ALBEDO);
+    BED_F(BED_OBS_DONOR, wsum)
+    BED_U(BED_OBS_GATE, native_bed ? BED_GATE_NATIVE : BED_GATE_LEGACY)
+    const vec3 bed = native_bed ? NativeBedLight(p, P.z, true) : vec3(0.0);
+    const bool bed_lit = dot(bed, LUMA) > 0.0;
+    if (ambient) {
+        BED_RGB(BED_OBS_RGB_BASE, rgb)
+        if (bed_lit) {
+            BED_STORE(scene_img, p, vec4(rgb + bed, s.a), BED_STORE_SCENE)
+        } else if (wsum >= 0.5) {
+            BED_STORE(scene_img, p, vec4(rgb, s.a), BED_STORE_SCENE)
+        }
+        return;
+    }
+    // The glint: bright reflections sparkle, dark water does not; the focus has mean 1 (light moved, not added); it follows the knob.
+    const float lum = dot(max(rgb, vec3(0.0)), LUMA);
+    const float strength = uintBitsToFloat(Motion(CAUSTICS_MOTION_STRENGTH));
+    const float t = clamp(CAUSTICS_MOTION_GLINT * strength * (Focus(lap) - 1.0) * (lum / (lum + CAUSTICS_MOTION_GLINT_KNEE)),
+                          -CAUSTICS_MOTION_GLINT_MAX, CAUSTICS_MOTION_GLINT_MAX) * fade;
+    rgb *= 1.0 + t;
+    BED_RGB(BED_OBS_RGB_BASE, rgb)
+    if (bed_lit) {
+        rgb += bed;
+    }
+    BED_STORE(scene_img, p, vec4(rgb, s.a), BED_STORE_SCENE)
+}
+
+void Shade(ivec2 p) {
+#ifdef BB_BED_OBSERVER
+    ObserveBedEnter(p, BED_OBS_SHADE);
+#endif
+    const float depth = texelFetch(depth_tex, p, 0).r;
+    BED_F(BED_OBS_DEPTH, depth)
+    if (depth >= 1.0) {
+        BED_U(BED_OBS_GATE, BED_GATE_CLEAR)
         return;
     }
     const vec3 P = ViewPos(vec2(p) + 0.5, ViewZ(depth));
     const vec3 Pw = ToWorld(P);
+    BED_F(BED_OBS_WATER_Z, P.z)
+    BED_RGB(BED_OBS_WATER_WORLD, Pw)
     const bool show = (flags & CAUSTICS_FLAG_SHOW) != 0u;
     float factor = 1.0;
     vec3 tint = vec3(0.0);
@@ -388,6 +955,7 @@ void Shade(ivec2 p) {
     // pixel gets the lamps' unshadowed light on a horizontal surface, as the bed's (a mirrored
     // plane) or as the ripple that moves its own lamp light (a puddle).
     const bool world = (flags & CAUSTICS_FLAG_WORLD) != 0u;
+    BED_U(BED_OBS_GATE, world ? BED_GATE_HEIGHT : BED_GATE_NO_WORLD)
     vec3 bed_add = vec3(0.0); // light seen through a mirrored plane's water, added
     vec3 bed_lit = vec3(0.0); // a puddle pixel's own lamp light (modelled)
     float bed_c = 1.0;        // the ripple's pattern there (1: none)
@@ -396,7 +964,15 @@ void Shade(ivec2 p) {
             n = NormalAt(p, P);
             have_n = true;
         }
+        BED_U(BED_OBS_GATE, BED_GATE_NORMAL)
+#ifdef BB_BED_OBSERVER
+        const float up = DirToWorld(n).y;
+        BED_F(BED_OBS_NORMAL, up)
+        if (up >= CAUSTICS_PUDDLE_UP) {
+#else
         if (DirToWorld(n).y >= CAUSTICS_PUDDLE_UP) {
+#endif
+            BED_U(BED_OBS_GATE, BED_GATE_DRY)
             const bool on_plane = height <= CAUSTICS_WATER_M + CAUSTICS_WATER_REL * P.z;
             bool wet = on_plane;
             if (on_plane && puddle) {
@@ -406,35 +982,75 @@ void Shade(ivec2 p) {
             if (wet) {
                 MapSet(Pw.xz, CAUSTICS_MAP_WATER);
                 atomicAdd(group_counts[CAUSTICS_W_MAP_WATER], 1u);
-                const uint lamps_here = min(Data(CAUSTICS_DATA_COUNT), uint(CAUSTICS_MAX_LAMPS));
-                vec3 bed = vec3(0.0);
-                for (uint k = 0u; k < lamps_here; ++k) {
-                    const uint at = CAUSTICS_DATA_LAMPS + k * CAUSTICS_LAMP_WORDS;
-                    const vec3 L = uintBitsToFloat(uvec3(Data(at), Data(at + 1u), Data(at + 2u)));
-                    const float reach = uintBitsToFloat(Data(at + 3u));
-                    const vec3 colour = uintBitsToFloat(uvec3(Data(at + 4u), Data(at + 5u), Data(at + 6u)));
-                    const vec3 d = L - Pw;
-                    const float dl = length(d);
-                    if (dl < reach && dl > 1e-3) {
-                        bed += colour * (LampCurve(dl / reach) * max(d.y / dl, 0.0));
+                if (!puddle && (flags & CAUSTICS_FLAG_NATIVE_BED) != 0u) {
+                    if ((flags & CAUSTICS_FLAG_BED_IN_WARP) == 0u) {
+                        BED_U(BED_OBS_GATE, BED_GATE_NATIVE)
+                        bed_add = NativeBedLight(p, P.z, false);
                     }
-                }
-                const vec3 bed_albedo =
-                    (flags & CAUSTICS_FLAG_ALBEDO) != 0u
-                        ? texelFetch(albedo_tex, TexelOf(albedo_tex, p, vec2(p) + 0.5), 0).rgb
-                        : vec3(0.5);
-                const float bed_fade = 1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z);
-                if (puddle) {
-                    bed_lit = bed * bed_albedo * bed_fade;
-                    bed_c = clamp(mix(1.0, Pattern(Pw.xz, CAUSTICS_RIPPLE_SPEED), CAUSTICS_RIPPLE_CONTRAST), 0.0, 3.0);
+#ifdef BB_BED_OBSERVER
+                    else { BED_U(BED_OBS_GATE, BED_GATE_DEFERRED) }
+#endif
                 } else {
-                    bed_add = bed * bed_albedo *
-                              (CAUSTICS_BED_T * uintBitsToFloat(Data(CAUSTICS_DATA_BED)) * bed_fade *
-                               Pattern(Pw.xz, 1.0));
+                    BED_U(BED_OBS_GATE, puddle ? BED_GATE_PUDDLE : BED_GATE_LEGACY)
+                    const uint lamps_here = min(Data(CAUSTICS_DATA_COUNT), uint(CAUSTICS_MAX_LAMPS));
+                    vec3 bed = vec3(0.0);
+                    for (uint k = 0u; k < lamps_here; ++k) {
+                        const uint at = CAUSTICS_DATA_LAMPS + k * CAUSTICS_LAMP_WORDS;
+                        const vec3 L = uintBitsToFloat(uvec3(Data(at), Data(at + 1u), Data(at + 2u)));
+                        const float reach = uintBitsToFloat(Data(at + 3u));
+                        const vec3 colour = uintBitsToFloat(uvec3(Data(at + 4u), Data(at + 5u), Data(at + 6u)));
+                        const vec3 d = L - Pw;
+                        const float dl = length(d);
+                        if (dl < reach && dl > 1e-3) {
+                            bed += colour * (LampCurve(dl / reach) * max(d.y / dl, 0.0));
+                        }
+                    }
+                    const vec3 bed_albedo =
+                        (flags & CAUSTICS_FLAG_ALBEDO) != 0u
+                            ? texelFetch(albedo_tex, TexelOf(albedo_tex, p, vec2(p) + 0.5), 0).rgb
+                            : vec3(0.5);
+                    const float bed_fade = 1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z);
+                    if (puddle) {
+                        bed_lit = bed * bed_albedo * bed_fade;
+                        bed_c = clamp(mix(1.0, Pattern(Pw.xz, CAUSTICS_RIPPLE_SPEED), CAUSTICS_RIPPLE_CONTRAST), 0.0, 3.0);
+                    } else {
+                        bed_add = bed * bed_albedo *
+                                  (CAUSTICS_BED_T * uintBitsToFloat(Data(CAUSTICS_DATA_BED)) * bed_fade *
+                                   Pattern(Pw.xz, 1.0));
+                    }
                 }
             } else if (MapState(Pw.xz) != CAUSTICS_MAP_WATER) {
                 MapSet(Pw.xz, CAUSTICS_MAP_DRY);
                 atomicAdd(group_counts[CAUSTICS_W_MAP_DRY], 1u);
+            }
+        }
+    }
+    // bbport (r130b_water-moves): the surface shimmer. A water pixel (up-facing, on the mirrored plane within the tolerance, or a
+    // glossy one on the checked puddle plane) closer than CAUSTICS_FADE_END has its own light times 1 + SHIMMER x strength x the
+    // wave field's slope toward the camera (clamped, mean 1, faded out with distance). Not a true re-reflection: the tilt
+    // brightens or darkens the light the pixel has. The host sets the plane's kind (0 none, 1 mirrored, 2 puddle plane).
+    if ((flags & CAUSTICS_FLAG_MOTION) != 0u) {
+        const uint mo_kind = Motion(CAUSTICS_MOTION_KIND);
+        if (mo_kind != 0u && P.z < CAUSTICS_FADE_END && abs(height) <= CAUSTICS_WATER_M + CAUSTICS_WATER_REL * P.z &&
+            (mo_kind == 1u ||
+             ((flags & CAUSTICS_FLAG_MATERIAL) != 0u &&
+              texelFetch(material_tex, TexelOf(material_tex, p, vec2(p) + 0.5), 0).r >= CAUSTICS_PUDDLE_GLOSS))) {
+            if (!have_n) {
+                n = NormalAt(p, P);
+                have_n = true;
+            }
+            const vec2 mo_to_camera = vec2(inv0.w, inv2.w) - Pw.xz;
+            const float mo_len = length(mo_to_camera);
+            if (DirToWorld(n).y >= CAUSTICS_PUDDLE_UP && mo_len > 1e-3) {
+                vec2 mo_slope;
+                WaveAt(Pw.xz, mo_slope);
+                const float mo_tilt = clamp(dot(mo_slope, mo_to_camera / mo_len) * 8.0, -0.6, 0.6) *
+                                      (1.0 - smoothstep(CAUSTICS_FADE_START, CAUSTICS_FADE_END, P.z));
+                factor *= 1.0 + CAUSTICS_MOTION_SHIMMER * uintBitsToFloat(Motion(CAUSTICS_MOTION_STRENGTH)) * mo_tilt;
+                atomicAdd(group_counts[CAUSTICS_W_MOTION_WATER], 1u);
+                if (ring_hit) {
+                    atomicAdd(group_ring, 1u);
+                }
             }
         }
     }
@@ -587,6 +1203,10 @@ void Shade(ivec2 p) {
         rgb *= 1.0 + CAUSTICS_BED_PUDDLE * clamp(dot(bed_lit, LUMA) / own_bed, 0.0, 1.0) * (bed_c - 1.0);
         atomicAdd(group_counts[CAUSTICS_W_BED_PUDDLE], 1u);
     }
+#ifdef BB_BED_OBSERVER
+    const bool is_native = (flags & CAUSTICS_FLAG_NATIVE_BED) != 0u;
+    if (is_native) { BED_RGB(BED_OBS_RGB_BASE, rgb) }
+#endif
     if (dot(bed_add, LUMA) > 0.0) {
         rgb += bed_add; // r107f: the lamps' light on the bed under a mirrored plane's water
         atomicAdd(group_counts[CAUSTICS_W_BED], 1u);
@@ -594,17 +1214,57 @@ void Shade(ivec2 p) {
     if (tint_k > 0.0) {
         rgb = Tinted(rgb, tint, tint_k);
     }
-    imageStore(scene_img, p, vec4(rgb, s.a));
+#ifdef BB_BED_OBSERVER
+    if (!is_native) { BED_RGB(BED_OBS_RGB_BASE, rgb) }
+#endif
+    BED_STORE(scene_img, p, vec4(rgb, s.a), BED_STORE_SCENE)
 }
 
 void main() {
+    if ((flags & CAUSTICS_FLAG_WETNESS_PROBE) != 0u) {
+        if (gl_LocalInvocationIndex < CAUSTICS_PROBE_POINTS) {
+            ProbeWrite(gl_LocalInvocationIndex);
+        }
+        return;
+    }
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const bool in_bounds = all(lessThan(p, ivec2(frame.xy)));
+
+    // r132g: dispatch-uniform flags keep copy and warp out of the ordinary caustics counters.
+    if ((flags & CAUSTICS_FLAG_WARP_COPY) != 0u) {
+        if (in_bounds) {
+            WarpPixel(p);
+        }
+        return;
+    }
+    if ((flags & CAUSTICS_FLAG_WARP) != 0u) {
+        if (gl_LocalInvocationIndex == 0u) {
+            group_warp[0] = 0u;
+            group_warp[1] = 0u;
+        }
+        barrier();
+        if (in_bounds) {
+            WarpPixel(p);
+        }
+        // Out-of-bounds invocations in an edge workgroup reach both barriers.
+        barrier();
+        if (gl_LocalInvocationIndex == 0u && (group_warp[0] | group_warp[1]) != 0u) {
+            // r130e: the water pixels the warp took a colour for and those it kept, to the slot's motion block
+            atomicAdd(counts[CAUSTICS_MOTION_BASE + slot * CAUSTICS_MOTION_WORDS + CAUSTICS_MOTION_WARP_PX], group_warp[0]);
+            atomicAdd(counts[CAUSTICS_MOTION_BASE + slot * CAUSTICS_MOTION_WORDS + CAUSTICS_MOTION_WARP_KEPT], group_warp[1]);
+        }
+        return;
+    }
+
     // r107e: more words than threads: each thread clears and adds every 64th.
     for (uint i = gl_LocalInvocationIndex; i < CAUSTICS_SLOT_WORDS; i += CAUSTICS_GROUP * CAUSTICS_GROUP) {
         group_counts[i] = 0u;
     }
+    if ((flags & CAUSTICS_FLAG_MOTION) != 0u && gl_LocalInvocationIndex == 0u) {
+        group_ring = 0u; // r130b
+    }
     barrier();
-    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (all(lessThan(p, ivec2(frame.xy)))) {
+    if (in_bounds) {
         Shade(p);
     }
     barrier();
@@ -613,5 +1273,9 @@ void main() {
         if (v != 0u) {
             atomicAdd(counts[slot * CAUSTICS_SLOT_WORDS + i], v);
         }
+    }
+    if ((flags & CAUSTICS_FLAG_MOTION) != 0u && gl_LocalInvocationIndex == 0u && group_ring != 0u) {
+        // r130b: the water pixels a ring reached, to the slot's motion block (the host reads it before it rewrites the slot)
+        atomicAdd(counts[CAUSTICS_MOTION_BASE + slot * CAUSTICS_MOTION_WORDS + CAUSTICS_MOTION_RING_PX], group_ring);
     }
 }

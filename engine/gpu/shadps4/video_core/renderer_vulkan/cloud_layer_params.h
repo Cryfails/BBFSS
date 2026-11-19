@@ -88,6 +88,16 @@ inline constexpr float RingNear = 12.0f, RingFar = 40.0f; ///< pixels at a 1080 
 inline constexpr float DefaultGlow = 1.6f, MaxGlow = 8.0f;
 inline constexpr float DefaultHorizon = 30.0f, MaxHorizon = 60.0f;
 inline constexpr float HorizonFromShare = 0.4f; ///< the fade-in starts at this share of the full elevation
+// bbport (r119j_clouds-banding): BB_VOLUMETRIC_CLOUDS_SMOOTH (a live knob with the test tools' file): 0 to 15, a sum of the
+// CL_SMOOTH_* bits (cloud_layer_layout.h); 0 is the r119i march, the default is every fix. It rides in bits 4 to 7 of the push word.
+inline constexpr std::uint32_t DefaultSoften = CL_SMOOTH_ALL;
+inline std::uint32_t ParseSoften(const char* text) {
+    return static_cast<std::uint32_t>(
+        std::lround(std::clamp(CloudShadows::Number(text, float(DefaultSoften)), 0.0f, float(CL_SMOOTH_ALL))));
+}
+inline std::uint32_t SoftenFlags(std::uint32_t bits) {
+    return (bits & CL_SMOOTH_ALL) << CL_FLAG_SMOOTH_SHIFT;
+}
 inline float ParsePainted(const char* text) {
     return std::clamp(CloudShadows::Number(text, DefaultPainted), 0.0f, 1.0f);
 }
@@ -192,6 +202,7 @@ struct Knobs {
     float painted = DefaultPainted;   ///< bbport (r119i): the share of the opacity a painted shape takes back (0: off)
     float horizon = DefaultHorizon;   ///< bbport (r119i): degrees up where the clouds are in full (0: the old fade)
     float glow = DefaultGlow;         ///< bbport (r119i): the cloud's colour at most this x the sky's brightness (0: off)
+    std::uint32_t soften = DefaultSoften; ///< bbport (r119j): the banding fixes' bits (CL_SMOOTH_*; 0: the r119i march)
     bool show = false;
 };
 
@@ -223,7 +234,7 @@ inline Knobs MakeKnobs(const char* on, const char* cover, const char* density, c
                        const char* speed = nullptr, const char* contrast = nullptr,
                        const char* tint = nullptr, const char* smear = nullptr,
                        const char* painted = nullptr, const char* horizon = nullptr,
-                       const char* glow = nullptr) {
+                       const char* glow = nullptr, const char* soften = nullptr) {
     Knobs k;
     k.on = ParseOn(on);
     k.cover = std::clamp(CloudShadows::Number(cover, DefaultCover), 0.0f, 1.0f);
@@ -241,6 +252,7 @@ inline Knobs MakeKnobs(const char* on, const char* cover, const char* density, c
     k.painted = ParsePainted(painted); // bbport (r119i_clouds-behind-painted-sky)
     k.horizon = ParseHorizon(horizon);
     k.glow = ParseGlow(glow);
+    k.soften = ParseSoften(soften); // bbport (r119j_clouds-banding)
     k.show = show != nullptr && show[0] == '1';
     return k;
 }
@@ -466,6 +478,9 @@ struct Push {
     std::uint32_t flags = 0;
 };
 static_assert(sizeof(Push) == 16);
+static_assert(CL_FLAG_SMOOTH_SHIFT == 4 && CL_SMOOTH_JITTER == 1u && CL_SMOOTH_EDGE == 2u && CL_SMOOTH_PAINT == 4u &&
+              CL_SMOOTH_GLOW == 8u && CL_SMOOTH_ALL == 15u &&
+              ((CL_SMOOTH_ALL << CL_FLAG_SMOOTH_SHIFT) & CL_FLAG_SHOW) == 0u); // bbport (r119j_clouds-banding)
 
 /// The counter words (cloud_layer_layout.h).
 inline constexpr std::uint32_t CounterWords = CL_WORDS;

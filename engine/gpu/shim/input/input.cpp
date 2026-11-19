@@ -27,6 +27,37 @@ std::atomic<bool> g_focused{true}, g_in_window{true}, g_text_entry{false};
 
 std::atomic<bool> g_relative{false}, g_wants_relative{false};
 
+std::atomic<std::uint32_t> g_rest_events{0};
+
+bool ObserveRestEvents() {
+    static const bool enabled = [] {
+        const char* mode = std::getenv("BB_SEWER_PAD_PC_REST");
+        return mode && std::strcmp(mode, "1") == 0;
+    }();
+    return enabled;
+}
+
+void NoteRestEvent(const SDL_Event& event) {
+    std::uint32_t source = 0;
+    switch (event.type) {
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP: source = BB_PC_REST_KEYS; break;
+    case SDL_EVENT_TEXT_EDITING:
+    case SDL_EVENT_TEXT_INPUT: source = BB_PC_REST_TEXT; break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_MOUSE_MOTION:
+    case SDL_EVENT_MOUSE_WHEEL: source = BB_PC_REST_MOUSE; break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+    case SDL_EVENT_GAMEPAD_TOUCHPAD_UP: source = BB_PC_REST_PAD; break;
+    default: break;
+    }
+    if (source) g_rest_events.fetch_or(source, std::memory_order_acq_rel);
+}
+
 struct Mouse {
     float x = 0, y = 0;
     int window_w = 1920, window_h = 1080;
@@ -169,12 +200,12 @@ std::uint32_t DragValue(const MouseRead& mouse, bool preview) {
 }
 
 void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const MouseRead& mouse, bool menu,
-                         bool keys_move_hunter, bool camera) {
+                         bool keys_move_hunter, bool camera, BbPcRestWitness* rest) {
     const auto& s = BbSettings::Get();
     bool held[kBindCount] = {};
     if (keys) host_bindings_keys_held(keys, nkeys, held);
     if (g_device.load(std::memory_order_relaxed) == InputDevice::KeyboardMouse) {
-
+        if (rest) rest->branch = BB_PC_REST_KEYBOARD;
         for (std::uint8_t* stick : {&pad.lx, &pad.ly, &pad.rx, &pad.ry}) {
             if (*stick == 128) *stick = kStickRest;
         }
@@ -235,10 +266,12 @@ void AddKeyboardAndMouse(PadState& pad, const bool* keys, int nkeys, const Mouse
     }
     float fx, fy;
     if (camera && MouseCamera::Flick(fx, fy)) {
+        if (rest) rest->external |= BB_PC_REST_MOUSE;
         pad.rx = StickFromUnit(fx);
         pad.ry = StickFromUnit(fy);
     }
     const bool sprint_at_once = host_bindings_dodge(now, menu, pad);
+    if (rest && sprint_at_once) rest->external |= BB_PC_REST_BIND;
     if (float* hold = g_sprint_hold.load(std::memory_order_relaxed)) *hold = sprint_at_once ? 0.0f : kSprintHold;
     g_last_buttons = pad.buttons;
 }
@@ -292,12 +325,16 @@ void Tick() {
 
 void Event(const SDL_Event& e, bool blocked) {
     if (!g_active.load(std::memory_order_relaxed)) return;
+    if (ObserveRestEvents()) NoteRestEvent(e);
     switch (e.type) {
     case SDL_EVENT_WINDOW_FOCUS_LOST: {
         g_focused = false;
         g_wants_relative = false;
         MouseCamera::Reset();
         std::scoped_lock lock(g_mouse_lock);
+        if (ObserveRestEvents() && (g_mouse.held || g_mouse.pressed || g_mouse.wheel ||
+            g_mouse.drag_x || g_mouse.drag_y))
+            g_rest_events.fetch_or(BB_PC_REST_MOUSE, std::memory_order_acq_rel);
         g_mouse.held = g_mouse.pressed = 0;
         g_mouse.wheel = 0;
         return;
@@ -373,8 +410,11 @@ void Pump(SDL_Window* window, bool text_active) {
         g_mouse.window_w = w;
         g_mouse.window_h = h;
     }
-    const bool want = g_wants_relative && BbSettings::Get().pc_controls && !text_active && !BbOverlay::CapturesInput() &&
-                      g_focused;
+    // bbport (r124_camera-mode-keys): camera mode turns the camera with the mouse, so the mouse is captured
+    // while it is on (the game's pad is neutral then and bbgpu_pc_input does not run to ask for it).
+    const bool camera_mode = BbSettings::Get().mouse_camera && MouseCamera::Installed() && MouseCamera::OrbitDriving();
+    const bool want = (g_wants_relative || camera_mode) && BbSettings::Get().pc_controls && !text_active &&
+                      !BbOverlay::CapturesInput() && g_focused;
     if (want != g_relative && SDL_SetWindowRelativeMouseMode(window, want)) {
         g_relative = want;
         MouseCamera::Reset();
@@ -438,6 +478,8 @@ static void SpectateButton(std::uint32_t& buttons) {
 
 extern "C" int bbgpu_pc_input(BbPcPad* d, const bool* keys, int nkeys, int gamepad_present) {
     const auto& s = BbSettings::Get();
+    auto* rest = d->rest;
+    if (rest) rest->branch = BB_PC_REST_OTHER;
     if (!g_active.load(std::memory_order_relaxed) || !s.pc_controls) {
         g_wants_relative = false;
         SpectateButton(d->buttons);
@@ -466,21 +508,42 @@ extern "C" int bbgpu_pc_input(BbPcPad* d, const bool* keys, int nkeys, int gamep
                          camera && keyboard_mouse && !s.mouse_auto_rotation);
 
     MouseRead mouse = TakeMouse();
-    if (BbEngine::OnlineFixes::Spectating() && !menu) {
+    const bool spectating = BbEngine::OnlineFixes::Spectating();
+    if (rest) {
+        if (!keys || nkeys < SDL_SCANCODE_COUNT) rest->external |= BB_PC_REST_UNKNOWN;
+        if (mouse.held || mouse.pressed || mouse.wheel || mouse.drag_x || mouse.drag_y)
+            rest->external |= BB_PC_REST_MOUSE;
+        if (g_turning_hunter || g_dragging_value || g_drag_steps || menu || spectating)
+            rest->external |= BB_PC_REST_MENU;
+        if (BbOverlay::CapturesInput()) rest->external |= BB_PC_REST_OVERLAY;
+        if (host_bind_capture_blocking()) rest->external |= BB_PC_REST_BIND;
+    }
+    if (spectating && !menu) {
         if (mouse.pressed & kLeftButton) BbEngine::OnlineFixes::SpectateNext();
         mouse.held &= ~kLeftButton;
         mouse.pressed &= ~kLeftButton;
     }
     bool any_down = mouse.held != 0;
     for (int i = 0; keys && i < nkeys && !any_down; ++i) any_down = keys[i];
+    if (rest && any_down) rest->external |= BB_PC_REST_KEYS;
     host_bind_capture_note_held(any_down);
-    if (!g_focused || g_text_entry || host_bind_capture_blocking()) {
-
+    const bool unfocused = !g_focused;
+    const bool text = (!unfocused || rest) && g_text_entry;
+    const bool binding = ((!unfocused && !text) || rest) && host_bind_capture_blocking();
+    if (rest) {
+        if (text) rest->external |= BB_PC_REST_TEXT;
+        if (binding) rest->external |= BB_PC_REST_BIND;
+    }
+    if (unfocused || text || binding) {
+        if (rest && unfocused) rest->branch = BB_PC_REST_INACTIVE;
         pad = PadState{};
         g_wants_relative = false;
     } else {
-        AddKeyboardAndMouse(pad, keys, nkeys, mouse, menu, keys_move_hunter, camera);
+        AddKeyboardAndMouse(pad, keys, nkeys, mouse, menu, keys_move_hunter, camera, rest);
     }
+    // Each sample consumes only the aggregate observed since the preceding native read.
+    // The gamepad's analog authority is the actual stock mapped axes from this read.
+    if (rest) rest->external |= g_rest_events.exchange(0, std::memory_order_acq_rel);
     SpectateButton(pad.buttons);
     {
         std::scoped_lock lock(g_pad_lock);

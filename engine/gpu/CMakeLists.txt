@@ -178,6 +178,12 @@ function(add_host_shader FILENAME SHADER_NAME)
         list(APPEND INCLUDES ${SHADER_SRC}/glass_glint_layout.h ${SHADER_SRC}/rt_glass_layout.h)
     endif()
     # bbport (r117_wind-shelter): the wind shelter's pass and its reader include their layout
+    if (FILENAME STREQUAL "window_path_probe.comp")
+        list(APPEND INCLUDES ${SHADER_SRC}/window_path_probe_layout.h)
+    endif()
+    if (FILENAME STREQUAL "interior_roof_probe.comp")
+        list(APPEND INCLUDES ${SHADER_SRC}/interior_roof_layout.h)
+    endif()
     if (FILENAME MATCHES "^wind_shelter")
         list(APPEND INCLUDES ${SHADER_SRC}/wind_shelter_layout.h ${SHADER_SRC}/wind_shelter.glsl)
     endif()
@@ -214,6 +220,22 @@ function(add_host_shader FILENAME SHADER_NAME)
         list(APPEND INCLUDES ${SHADER_SRC}/rt_card_layers_layout.h ${SHADER_SRC}/rt_cards.glsl
              ${SHADER_SRC}/rt_card_uv_layout.h)
     endif()
+    # bbport (r130c_glass-lamp-light): the lamp pass's GLASS builds include the glass light's numbers, shared with C++ (glass_light.h)
+    if (FILENAME MATCHES "^point_shadow_ray")
+        list(APPEND INCLUDES ${SHADER_SRC}/glass_light_layout.h)
+    endif()
+    # bbport (r130g_glass-light-forward): and the glass counter's numbers (glass_light_forward.h)
+    if (FILENAME MATCHES "^point_shadow_ray")
+        list(APPEND INCLUDES ${SHADER_SRC}/glass_light_forward_layout.h)
+    endif()
+    if (FILENAME MATCHES "^point_shadow_ray" AND "T191=1" IN_LIST ARGN)
+        list(APPEND INCLUDES ${SHADER_SRC}/lamp_actual_blocker_layout.h)
+    endif()
+    # bbport (r131a_foliage-translucency): the back-lit glow pass includes the card test and its own numbers (foliage_glow_layout.h, shared with C++)
+    if (FILENAME MATCHES "^foliage_glow")
+        list(APPEND INCLUDES ${SHADER_SRC}/rt_card_layers_layout.h ${SHADER_SRC}/rt_cards.glsl ${SHADER_SRC}/rt_card_uv_layout.h
+             ${SHADER_SRC}/foliage_glow_layout.h)
+    endif()
     # bbport (r81_sun-fog-no-rt): the area light gate's numbers, shared with C++ (volumetric_area_gate.h)
     if (FILENAME MATCHES "^volumetric_(light|area_gate)")
         list(APPEND INCLUDES ${SHADER_SRC}/volumetric_area_layout.h)
@@ -225,6 +247,14 @@ function(add_host_shader FILENAME SHADER_NAME)
     # bbport (r100_blood-sheen): the blood sheen's numbers, shared with C++ (blood_sheen.h)
     if (FILENAME MATCHES "^blood_sheen")
         list(APPEND INCLUDES ${SHADER_SRC}/blood_sheen_layout.h)
+    endif()
+    # bbport (r129a_glass-registry): the glass view's numbers, shared with C++ (glass_registry.h)
+    if (FILENAME MATCHES "^glass_view")
+        list(APPEND INCLUDES ${SHADER_SRC}/glass_view_layout.h)
+    endif()
+    # bbport (r131c_cabinet-glass-clear): the glass clear's numbers, shared with C++ (vk_glass_clear.h)
+    if (FILENAME MATCHES "^glass_clear")
+        list(APPEND INCLUDES ${SHADER_SRC}/glass_clear_layout.h)
     endif()
     # bbport (r107_caustics): the water caustics' numbers, shared with C++ (caustics_params.h)
     if (FILENAME MATCHES "^caustics")
@@ -291,6 +321,7 @@ add_host_shader(paint_strokes.comp paint_strokes_comp)
 add_host_shader(paint_lock.comp paint_lock_first_comp FIRST=1)
 add_host_shader(paint_lock.comp paint_lock_down_comp DOWN=1)
 add_host_shader(paint_lock.comp paint_lock_comp)
+add_host_shader(paint_ink.comp paint_ink_comp) # bbport (r55_drawn-look-lines)
 # bbport (r97_heat-haze): the heat haze above flames (BB_HEAT_HAZE; renderer_vulkan/vk_heat_haze.cpp)
 add_host_shader(heat_haze.comp heat_haze_comp)
 add_custom_command(OUTPUT ${SHADER_DIR}/heat_haze_comp.h APPEND DEPENDS ${SHADER_SRC}/heat_haze_layout.h) # bbport (r97b_heat-haze-paths): the shader's include
@@ -299,9 +330,11 @@ add_host_shader(heat_haze_find.comp heat_haze_find_comp)
 add_custom_command(OUTPUT ${SHADER_DIR}/heat_haze_find_comp.h APPEND DEPENDS ${SHADER_SRC}/heat_haze_find_layout.h)
 # bbport (r107_caustics): BB_CAUSTICS only: the water caustics (renderer_vulkan/vk_caustics.cpp)
 add_host_shader(caustics.comp caustics_comp)
+add_host_shader(caustics.comp caustics_bed_observer_comp BB_BED_OBSERVER=1)
 add_host_shader(rt_shadow.comp rt_shadow_comp)
 add_host_shader(rt_shadow.comp rt_shadow_coverage_comp COVERAGE_SKIP=1)
 add_host_shader(rt_unproject.comp rt_unproject_comp)
+add_host_shader(rt_unproject_lamp_affine.comp rt_unproject_lamp_affine_comp)
 # bbport (r62d_card-uv-diag): the geometry check of the BLAS inputs (BB_RT_CARD_UV_DIAG not 0,
 # or BB_RT_GEOMETRY_CHECK=1)
 add_host_shader(rt_geometry_check.comp rt_geometry_check_comp)
@@ -337,14 +370,57 @@ add_host_shader(point_shadow_ray.comp point_shadow_ray_cards_comp CARDS=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_cards_comp HALF=1 CARDS=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_cards_comp CENTRED=1 CARDS=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_cards_comp HALF=1 CENTRED=1 CARDS=1)
+# bbport (r128c_lrt-cutout-props): BB_RT_CARD_SUN=1: the sun trace's two builds with the cut-out cards in its rays (CARDS; the five builds of
+# rt_shadow.comp above are unchanged). They include the card test and the sun side's numbers.
+add_host_shader(rt_shadow.comp rt_shadow_cards_comp COVERAGE_SKIP=1 CARDS=1)
+add_host_shader(rt_shadow.comp rt_shadow_half_cards_comp COVERAGE_SKIP=1 HALF=1 CARDS=1)
+add_custom_command(OUTPUT ${SHADER_DIR}/rt_shadow_cards_comp.h APPEND DEPENDS ${SHADER_SRC}/rt_cards.glsl
+    ${SHADER_SRC}/rt_card_layers_layout.h ${SHADER_SRC}/rt_card_uv_layout.h ${SHADER_SRC}/rt_card_sun_layout.h)
+add_custom_command(OUTPUT ${SHADER_DIR}/rt_shadow_half_cards_comp.h APPEND DEPENDS ${SHADER_SRC}/rt_cards.glsl
+    ${SHADER_SRC}/rt_card_layers_layout.h ${SHADER_SRC}/rt_card_uv_layout.h ${SHADER_SRC}/rt_card_sun_layout.h)
+# bbport (r131a_foliage-translucency): graphics_foliage_translucency / BB_FOLIAGE_TRANSLUCENCY only: the light through leaves and the back-lit glow. Every
+# build above is unchanged, byte for byte: each new form is behind a new define. The COLOUR form of the card alpha fill also writes the colour layers; the
+# FOLIAGE form of each CARDS lamp build is CARDS=1 COLOUR=1 FOLIAGE=1 (the lamp's hue comes with the colour image); the sun trace's two CARDS builds get
+# a FOLIAGE form (the hue image); the glow is one build.
+add_host_shader(rt_card_alpha_fill.comp rt_card_alpha_fill_colour_comp COLOUR=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_cards_colour_foliage_comp CARDS=1 COLOUR=1 FOLIAGE=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_cards_colour_foliage_comp HALF=1 CARDS=1 COLOUR=1 FOLIAGE=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_cards_colour_foliage_comp CENTRED=1 CARDS=1 COLOUR=1 FOLIAGE=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_cards_colour_foliage_comp HALF=1 CENTRED=1 CARDS=1 COLOUR=1 FOLIAGE=1)
+add_host_shader(rt_shadow.comp rt_shadow_cards_foliage_comp COVERAGE_SKIP=1 CARDS=1 FOLIAGE=1)
+add_host_shader(rt_shadow.comp rt_shadow_half_cards_foliage_comp COVERAGE_SKIP=1 HALF=1 CARDS=1 FOLIAGE=1)
+add_custom_command(OUTPUT ${SHADER_DIR}/rt_shadow_cards_foliage_comp.h APPEND DEPENDS ${SHADER_SRC}/rt_cards.glsl
+    ${SHADER_SRC}/rt_card_layers_layout.h ${SHADER_SRC}/rt_card_uv_layout.h ${SHADER_SRC}/rt_card_sun_layout.h)
+add_custom_command(OUTPUT ${SHADER_DIR}/rt_shadow_half_cards_foliage_comp.h APPEND DEPENDS ${SHADER_SRC}/rt_cards.glsl
+    ${SHADER_SRC}/rt_card_layers_layout.h ${SHADER_SRC}/rt_card_uv_layout.h ${SHADER_SRC}/rt_card_sun_layout.h)
+add_host_shader(foliage_glow.comp foliage_glow_comp)
+add_host_shader(bottle_caustic.comp bottle_caustic_comp)
+add_host_shader(bottle_cold_validate.comp bottle_cold_validate_comp)
+add_host_shader(reflection_first_hit.comp reflection_first_hit_comp)
+add_host_shader(foliage_glow.comp foliage_glow_mask_comp FOLIAGE_MASK=1)
 # bbport (r92_lamp-shadow-colour): BB_LAMP_SHADOW_COLOUR=1: the COLOUR form of each lamp build without
 # CARDS (one binding more, the colour image); the lamp pass's builds above are unchanged.
 add_host_shader(point_shadow_ray.comp point_shadow_ray_colour_comp COLOUR=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_colour_comp HALF=1 COLOUR=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_colour_comp CENTRED=1 COLOUR=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_colour_comp HALF=1 CENTRED=1 COLOUR=1)
+# bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT=1: the GLASS form of each tracing COLOUR build (lamp light through glass); the
+# builds above are unchanged, byte for byte. The two resolve builds do not trace and have none.
+add_host_shader(point_shadow_ray.comp point_shadow_ray_colour_glass_comp COLOUR=1 GLASS=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_colour_glass_comp HALF=1 COLOUR=1 GLASS=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_colour_glass_comp CENTRED=1 COLOUR=1 GLASS=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_colour_glass_comp HALF=1 CENTRED=1 COLOUR=1 GLASS=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_resolve_colour_comp CENTRED=1 RESOLVE=1 COLOUR=1)
 add_host_shader(point_shadow_ray.comp point_shadow_ray_half_resolve_colour_comp HALF=1 CENTRED=1 RESOLVE=1 COLOUR=1)
+# t131e TEST TOOL: reuse the standard colour layouts and keep the original shaders for off.
+add_host_shader(point_shadow_ray.comp point_shadow_ray_colour_t131e_comp COLOUR=1 T131E=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_centred_colour_t131e_comp CENTRED=1 COLOUR=1 T131E=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_resolve_colour_t131e_comp CENTRED=1 RESOLVE=1 COLOUR=1 T131E=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_colour_t131e_comp HALF=1 COLOUR=1 T131E=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_colour_t131e_comp HALF=1 CENTRED=1 COLOUR=1 T131E=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_resolve_colour_t131e_comp HALF=1 CENTRED=1 RESOLVE=1 COLOUR=1 T131E=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_centred_t191_comp HALF=1 CENTRED=1 T191=1)
+add_host_shader(point_shadow_ray.comp point_shadow_ray_half_resolve_t191_comp HALF=1 CENTRED=1 RESOLVE=1 T191=1)
 add_host_shader(rt_shadow_filter.comp rt_shadow_filter_comp)
 # bbport (r25_rt-sun-trace): the engine's build (fade-0 shortcut, counters); tests keep the plain
 # one. The BB_RT_SUN_HALF=1 trace is a build of its own, so the default trace carries none of it.
@@ -393,6 +469,19 @@ add_host_shader(blood_sheen.comp blood_sheen_snapshot_comp BLOOD_SNAPSHOT=1)
 add_host_shader(blood_sheen.comp blood_sheen_mark_comp BLOOD_MARK=1)
 add_host_shader(blood_sheen.comp blood_sheen_edit_comp BLOOD_EDIT=1)
 add_host_shader(blood_sheen.comp blood_sheen_show_comp BLOOD_SHOW=1)
+# bbport (r129a_glass-registry): the glass view's snapshot, mark (G-buffer hit draws), paint (forward hit draws) and show passes
+# (renderer_vulkan/vk_glass_view.cpp)
+add_host_shader(glass_view.comp glass_view_snapshot_comp GLASS_SNAPSHOT=1)
+add_host_shader(glass_view.comp glass_view_mark_comp GLASS_MARK=1)
+add_host_shader(glass_view.comp glass_view_paint_comp GLASS_PAINT=1)
+add_host_shader(glass_view.comp glass_view_show_comp GLASS_SHOW=1)
+# bbport (r131c_cabinet-glass-clear): BB_GLASS_CLEAR on only: the cabinet's pane as a glass layer over the lit scene
+# (renderer_vulkan/vk_glass_clear.cpp)
+add_host_shader(glass_clear.comp glass_clear_comp)
+# bbport (t129c_sun-term-view, TOOL): BB_RT_SUN_TERM_VIEW only: the ray traced sun/moon term's copy and show passes
+# (renderer_vulkan/vk_sun_term_view.cpp)
+add_host_shader(sun_term_view.comp sun_term_view_copy_comp SUN_TERM_COPY=1)
+add_host_shader(sun_term_view.comp sun_term_view_show_comp SUN_TERM_SHOW=1)
 # bbport (r100c_blood-pool-probe, TOOL): BB_BLOOD_POOL_PROBE only: the probe's snapshot and compare
 # passes (renderer_vulkan/vk_blood_pool_probe.cpp)
 add_host_shader(blood_pool_probe.comp blood_pool_probe_snapshot_comp POOL_SNAPSHOT=1)
@@ -454,6 +543,10 @@ add_host_shader(volumetric_light.comp volumetric_light_integrate_area_noise_comp
 add_host_shader(volumetric_light.comp volumetric_light_repair_area_noise_comp REPAIR=1 AREA=1 NOISE=1)
 add_host_shader(volumetric_light.comp volumetric_light_integrate_gate_area_noise_comp INTEGRATE=1 GATE=1 AREA=1 NOISE=1)
 add_host_shader(volumetric_light.comp volumetric_light_repair_gate_area_noise_comp REPAIR=1 GATE=1 AREA=1 NOISE=1)
+# bbport (r94c_fog-noise-dual-gate): BB_FOG_NOISE with BB_VOLUMETRIC_AREA_GATE=2 on marches with
+# the ray traced gate (made at the first such march): the DUAL march with the fog noise in it
+add_host_shader(volumetric_light.comp volumetric_light_integrate_gate_area_dual_noise_comp INTEGRATE=1 GATE=1 AREA=1 DUAL=1 NOISE=1)
+add_host_shader(volumetric_light.comp volumetric_light_repair_gate_area_dual_noise_comp REPAIR=1 GATE=1 AREA=1 DUAL=1 NOISE=1)
 add_host_shader(ssgi.comp ssgi_prep_comp PREP=1)
 add_host_shader(ssgi.comp ssgi_gather_comp GATHER=1)
 add_host_shader(ssgi.comp ssgi_denoise_comp DENOISE=1)
@@ -502,6 +595,8 @@ add_host_shader(upscale_debug.comp upscale_debug_ldr_comp LDR_OUTPUT=1)
 add_host_shader(upscale_reactive.comp upscale_reactive_comp)
 # bbport (r99_interior-exposure): the interior exposure meter (made only with BB_INTERIOR_EXPOSURE=1 or 2)
 add_host_shader(interior_meter.comp interior_meter_comp)
+add_host_shader(interior_roof_probe.comp interior_roof_probe_comp)
+add_host_shader(window_path_probe.comp window_path_probe_comp)
 add_host_shader(taa.comp taa_comp)
 add_host_shader(taa_sharpen.comp taa_sharpen_comp)
 add_host_shader(taa_sharpen.comp taa_sharpen_ldr_comp LDR_OUTPUT=1)
@@ -554,6 +649,7 @@ endif()
 add_library(bbgpu ${BBGPU_LIBRARY_TYPE} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOURCES}
     shadps4/core/libraries/gnmdriver/gnmdriver.cpp)
 add_dependencies(bbgpu host_shaders)
+target_sources(bbgpu PRIVATE ../tools/engine/sha256.cpp)
 add_subdirectory(bbnet)
 target_link_libraries(bbgpu PUBLIC bbnet)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
@@ -576,6 +672,12 @@ target_include_directories(bbgpu PRIVATE shim shadps4 ../src ${SHADER_INCLUDE} t
 # bbport: NVIDIA Streamline SDK headers (MIT), for DLSS Frame Generation (vk_streamline.cpp).
 target_include_directories(bbgpu PRIVATE third_party/streamline/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+# The separately applied T04 raw-capture build overlay shares C++ renderer types with
+# optional tests that link bbgpu. Keep the experiment's definitions on that interface.
+target_compile_definitions(bbgpu PUBLIC
+    $<$<COMPILE_LANGUAGE:CXX>:BB_TEST_BOTTLE_CUT_SOURCE=1>
+    $<$<COMPILE_LANGUAGE:CXX>:BB_TEST_SHARED_POST_GRAPH=1>
+    $<$<COMPILE_LANGUAGE:CXX>:BB_TEST_POST_PRESENT_RESOURCES=1>)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # The Linux shared library is loaded at process startup; Windows links it statically.
 if(NOT WIN32)
@@ -711,6 +813,12 @@ target_include_directories(lamp-fog-shaft-smooth-test PRIVATE ..)
 add_executable(lamp-flicker-test EXCLUDE_FROM_ALL ../tests/test_lamp_flicker.cpp)
 target_compile_options(lamp-flicker-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(lamp-flicker-test PRIVATE ..)
+# bbport (r123_lamp-colour-temperature): the lamp colour temperature's knobs, blackbody colours, kinds,
+# tint and its place in the lamp flicker's tracker (lamp_temperature.h); also built and run by
+# engine/build.sh --test.
+add_executable(lamp-temperature-test EXCLUDE_FROM_ALL ../tests/test_lamp_temperature.cpp)
+target_compile_options(lamp-temperature-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(lamp-temperature-test PRIVATE ..)
 # bbport (r89_wind-foliage-sway): the plant sway's knob, word, layout, camera math and rule
 # (shim/bbport_wind_sway.h); also built and run by engine/build.sh --test.
 add_executable(wind-sway-test EXCLUDE_FROM_ALL ../tests/test_wind_sway.cpp)
@@ -756,6 +864,11 @@ target_include_directories(wind-hang-gpu-test PRIVATE ..)
 add_executable(wind-hang-route-test EXCLUDE_FROM_ALL ../tests/test_wind_hang_route.cpp)
 target_compile_options(wind-hang-route-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(wind-hang-route-test PRIVATE ..)
+# bbport (r112v_lantern-hangs): the lantern rule's plan, weight, keys and guard (shim/bbport_wind_lantern.h); also built and run by
+# engine/build.sh --test.
+add_executable(wind-lantern-test EXCLUDE_FROM_ALL ../tests/test_wind_lantern.cpp)
+target_compile_options(wind-lantern-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(wind-lantern-test PRIVATE ..)
 # bbport (r82_wind-stage1): the shared wind state and the CPU copy of the fog noise and march step
 # (shim/bbport_wind.h; wind-noise-test checks the GLSL copy); also built and run by
 # engine/build.sh --test.
@@ -767,11 +880,21 @@ target_include_directories(wind-test PRIVATE ..)
 add_executable(wind-shelter-test EXCLUDE_FROM_ALL ../tests/test_wind_shelter.cpp)
 target_compile_options(wind-shelter-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(wind-shelter-test PRIVATE ..)
+# bbport (r97g_shelter-haze-sparks): the wind the haze and the sparks feel in sheltered air
+# (shim/bbport_wind_felt_shelter.h); also built and run by engine/build.sh --test.
+add_executable(wind-felt-shelter-test EXCLUDE_FROM_ALL ../tests/test_wind_felt_shelter.cpp)
+target_compile_options(wind-felt-shelter-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(wind-felt-shelter-test PRIVATE ..)
 # bbport (r122_game-wind-drive): the game-wind cut's knob, level, bit and counters (shim/bbport_wind_game.h);
 # also built and run by engine/build.sh --test.
 add_executable(wind-game-test EXCLUDE_FROM_ALL ../tests/test_wind_game.cpp)
 target_compile_options(wind-game-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(wind-game-test PRIVATE ..)
+# bbport (r122b_game-particles-follow-wind): the game-particle lean's knob text, lean, word, counters and the patch of
+# the vertex module (shim/bbport_wind_game_particles.h); also built and run by engine/build.sh --test.
+add_executable(wind-game-particles-test EXCLUDE_FROM_ALL ../tests/test_wind_game_particles.cpp)
+target_compile_options(wind-game-particles-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(wind-game-particles-test PRIVATE ..)
 # bbport (r94_fog-noise): the sun fog noise's knobs, shaping and drift (volumetric_fog_noise.h);
 # also built and run by engine/build.sh --test
 add_executable(volumetric-fog-noise-test EXCLUDE_FROM_ALL ../tests/test_volumetric_fog_noise.cpp)
@@ -827,6 +950,11 @@ target_include_directories(drawn-look-test PRIVATE ${SHADER_INCLUDE} shadps4)
 target_compile_options(drawn-look-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-missing-field-initializers)
 target_link_libraries(drawn-look-test PRIVATE Vulkan::Vulkan)
 add_dependencies(drawn-look-test host_shaders)
+# bbport (r55_drawn-look-lines): the drawn look's rules that need no GPU (drawn_look_params.h:
+# which passes a frame records, the ink pass's words, BB_DRAWN_LOOK_LINE); also in build.sh --test.
+add_executable(drawn-look-rules-test EXCLUDE_FROM_ALL ../tests/test_drawn_look_rules.cpp)
+target_compile_options(drawn-look-rules-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(drawn-look-rules-test PRIVATE ..)
 # bbport (r43_copy-turns): the turns of the ray tracing scene's shared copies (rt_copy_turns.h)
 add_executable(rt-copy-turns-test EXCLUDE_FROM_ALL ../tests/test_rt_copy_turns.cpp)
 target_compile_options(rt-copy-turns-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
@@ -858,6 +986,26 @@ target_include_directories(caustics-test PRIVATE ..)
 add_executable(glass-glint-test EXCLUDE_FROM_ALL ../tests/test_glass_glint.cpp)
 target_compile_options(glass-glint-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(glass-glint-test PRIVATE ..)
+# bbport (r129a_glass-registry): the glass registry's table text, lookup and view knob (glass_registry.h); also built and run
+# by engine/build.sh --test.
+# bbport (r130g_glass-light-forward): the forward glass light's steady rule and shared numbers (glass_light_forward.h); also
+# built and run by engine/build.sh --test.
+add_executable(glass-light-forward-test EXCLUDE_FROM_ALL ../tests/test_glass_light_forward.cpp)
+target_compile_options(glass-light-forward-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(glass-light-forward-test PRIVATE ..)
+# bbport (r131a_foliage-translucency): the foliage translucency's knob rules, leaf pass and card ray rule (foliage_translucency.h); also built and run by
+# engine/build.sh --test.
+add_executable(foliage-translucency-test EXCLUDE_FROM_ALL ../tests/test_foliage_translucency.cpp)
+target_compile_options(foliage-translucency-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(foliage-translucency-test PRIVATE ..)
+add_executable(glass-registry-test EXCLUDE_FROM_ALL ../tests/test_glass_registry.cpp)
+target_compile_options(glass-registry-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(glass-registry-test PRIVATE ..)
+# bbport (r130c_glass-lamp-light): lamp light through glass: tint words, strengths, custom index, the s token (glass_light.h); also
+# built and run by engine/build.sh --test.
+add_executable(glass-light-test EXCLUDE_FROM_ALL ../tests/test_glass_light.cpp)
+target_compile_options(glass-light-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(glass-light-test PRIVATE ..)
 # bbport (r54_leaf-stage2): the card UVs' pure parts (renderer_vulkan/rt_card_uv.h)
 add_executable(rt-card-uv-test EXCLUDE_FROM_ALL ../tests/test_rt_card_uv.cpp)
 target_compile_options(rt-card-uv-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
@@ -890,6 +1038,9 @@ add_executable(native-local-shadows-test EXCLUDE_FROM_ALL ../tests/test_native_l
     shim/engine/graphics.cpp shim/engine/native_sss.cpp shim/engine/engine_hooks.cpp shim/bbport_settings.cpp shim/bbport_menu_i18n.cpp)
 target_include_directories(native-local-shadows-test PRIVATE shim)
 target_compile_options(native-local-shadows-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+add_executable(foliage-mask-test EXCLUDE_FROM_ALL ../tests/test_foliage_mask.cpp)
+target_include_directories(foliage-mask-test PRIVATE shadps4)
+target_compile_options(foliage-mask-test PRIVATE -UNDEBUG)
 add_executable(occlusion-test EXCLUDE_FROM_ALL ../tests/test_occlusion.cpp)
 target_compile_options(occlusion-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(occlusion-test PRIVATE ..)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -21,13 +22,16 @@
 #include <unordered_set> // bbport (r64b_surface-probe-more)
 
 #include <fmt/format.h>
+#include "bbport_wind_felt_shelter.h" // bbport (r97g_shelter-haze-sparks)
 
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "bbport_sun_cascades.h"
 #include <xxhash.h>
 #include "engine/engine_state.h" // bbport (r112h_hang-not-the-hunter): the hunter's position
+#include "engine/loading.h"
 #include "bbport_test_goto_hang.h" // bbport (r112n_hang-teleport-camera, TOOL): BB_TEST_GOTO
+#include "bbport_wind_lantern.h" // bbport (r112v_lantern-hangs)
 
 #include "core/memory.h"
 #include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50b_leaf-matcher)
@@ -35,7 +39,16 @@
 #include "video_core/renderer_vulkan/vk_card_alpha.h" // bbport (r62_leaf-stage3)
 #include "video_core/renderer_vulkan/vk_effect_shaders.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "engine/gx_objects.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+#include "video_core/renderer_vulkan/vk_bottle_cold_source_b177.h"
+#if defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+#include "video_core/renderer_vulkan/vk_bottle_raw_apply_b180.h"
+#endif
+#endif
+#include "video_core/renderer_vulkan/vk_reflection_first_retire.h"
+#include "video_core/renderer_vulkan/vk_reflection_fragment_discard.h"
 #if __has_include("bbport_live_knobs.h")
 #include "bbport_live_knobs.h" // bbport (r89d_tree-twigs): the test tools' (r84) live knobs, when present
 #define BB_WIND_TWIGS_LIVE 1
@@ -44,11 +57,14 @@
 #endif
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_window_path_directional.h"
 #include "video_core/renderer_vulkan/volumetric_occlusion.h"
 #include "video_core/renderer_vulkan/rt_glass_probe.h" // bbport (r83b_glass-pane-probe)
 #include "video_core/renderer_vulkan/rt_glass_find.h" // bbport (r86g_glint-find-bottles)
 #include "video_core/renderer_vulkan/rt_glass_static.h" // bbport (r121b_glass-pane-hang)
 #include "bbport_test_camera_run.h" // bbport (r120_test-camera-lookat, TOOL): BB_TEST_CAMERA, BB_TEST_WORLD_AT
+#include "video_core/renderer_vulkan/vk_sewer_motion_observer.h"
+#include "video_core/renderer_vulkan/vk_lamp_pane_probe.h"
 #include "video_core/renderer_vulkan/lamp_flicker.h" // bbport (r96_lamp-flicker-colour)
 
 namespace Vulkan {
@@ -59,6 +75,69 @@ constexpr u64 ShadowBlurHash = 0x11ffdfb5;
 constexpr u64 PointLightsFullHash = 0x9f9ef267;
 constexpr u64 HdrPostHash = 0xccbf44a6;
 constexpr u64 SceneTargetHash = 0x32e47788;
+
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+namespace BottleSource = BottleCaustic::CutSource;
+namespace BottleCold = BottleColdSource177;
+
+BottleCold::Frame BottleCutFrame(const Rasterizer* owner, u32 request, Scheduler& scheduler,
+                                 const SceneTargets& targets, const RtShadow& rt,
+                                 const ObjectMotion& objects) {
+    return {owner, request, BbStats::frame_number.load(std::memory_order_relaxed),
+            BbEngine::Loading::Generation(), targets.Generation(), rt.WindowDiagnosticFrame(),
+            objects.Frame(), scheduler.GetWorkSemaphore()->Handle(), BbEngine::Loading::ScreenUp()};
+}
+
+BottleSource::Camera BottleCutCamera(const CameraMotion& owner, std::array<float, 2> jitter) {
+    const auto matrices = owner.PassMatrices();
+    return matrices.valid ? BottleSource::Camera{matrices.view, matrices.proj, jitter}
+                          : BottleSource::Camera{};
+}
+
+bool BottleCutNativeScope(const SceneTargets& targets) {
+    return !BbEngine::Loading::ScreenUp() && SceneResolution::Native() == SceneResolution::Size{3840, 2160} &&
+           targets.Size() == SceneResolution::Size{1920, 1080};
+}
+
+BottleCold::Image BottleCutImage(const SceneTargets& targets, VideoCore::ImageId id,
+                                 const VideoCore::Image* image, bool depth) {
+    if (!id || !image || image->binding.needs_rebind || !image->backing || !targets.EligibleScene(*image) ||
+        bool(image->info.props.is_depth) != depth || image->info.resources != VideoCore::SubresourceExtent{1, 1} ||
+        image->info.num_samples != 1 || image->backing->num_samples != 1) return {};
+    return {id.index, image->image_uid, image->GetImage(), image->backing->image.allocation};
+}
+
+struct BottleCutBindings {
+    BottleSource::Backing color{}, depth{};
+};
+
+BottleCutBindings BottleCutBoundAttachments(Scheduler& scheduler, const SceneTargets& targets,
+                                           VideoCore::ImageId color_id, const VideoCore::Image& color,
+                                           VideoCore::ImageId depth_id, const VideoCore::Image& depth) {
+    const auto& state = scheduler.GetRenderState();
+    if (!scheduler.IsRenderingWith(state) || state.width != 1920 || state.height != 1080 ||
+        state.num_layers != 1) return {};
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    const auto& cb = state.color_attachments[0];
+    const auto& db = state.depth_stencil_attachment;
+    BottleCutBindings result;
+    if (state.num_color_attachments && cb.image_view &&
+        cb.image_layout == vk::ImageLayout::eColorAttachmentOptimal) {
+        result.color = BottleCaustic::ObserveCutBacking(targets, color_id, color, cb.image_view,
+                           Stage::eColorAttachmentOutput, Access::eColorAttachmentRead | Access::eColorAttachmentWrite);
+        if (result.color.layout != cb.image_layout) result.color = {};
+    }
+    if (db.has_depth && db.image_view &&
+        db.image_layout == vk::ImageLayout::eDepthStencilAttachmentOptimal) {
+        result.depth = BottleCaustic::ObserveCutBacking(targets, depth_id, depth, db.image_view,
+                           Stage::eEarlyFragmentTests | Stage::eLateFragmentTests,
+                           Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite);
+        if (result.depth.layout != db.image_layout) result.depth = {};
+    }
+    return result;
+}
+#endif
 
 constexpr u32 PointLightCount(u64 hash) {
     switch (hash) {
@@ -240,10 +319,21 @@ void Rasterizer::WindOnFrameEnd() {
         char followers[320];
         BbWind::FollowersText(s, followers, sizeof(followers));
         BbReport::Printf("%s\n", followers);
+        { // bbport (r97g_shelter-haze-sparks): what the haze and the sparks read of the shelter
+            char felt[320];
+            if (BbWindFelt::ReportText(felt, sizeof(felt))) {
+                BbReport::Printf("%s\n", felt);
+            }
+        }
         if (BbWindGame::CutOn()) { // bbport (r122_game-wind-drive)
             char game[256];
             BbWindGame::ReportText(game, sizeof(game));
             BbReport::Printf("%s\n", game);
+        }
+        if (BbWindParticles::On()) { // bbport (r122b_game-particles-follow-wind)
+            char particles[320];
+            BbWindParticles::ReportText(particles, sizeof(particles));
+            BbReport::Printf("%s\n", particles);
         }
     }
     // bbport (r116b_wind-weather): one line each WeatherLine of weather clock (a minute of weather; at
@@ -1350,7 +1440,73 @@ u32 Rasterizer::WindPostWord(u32* words, u32 frame_slot, u32 view, u32 slot, boo
         ++hang_post.no_box;
         return 0;
     }
-    if (BbWindHang::PostGuardOn()) { // bbport (r112u_hang-post-no-bridge): only a hanging lantern is pushed, never the bridge or a post
+    BbWindLantern::Keys lantern_keys{}; // bbport (r112v_lantern-hangs): only the lantern leans (bbport_wind_lantern.h); the slot's words are written below
+    if (BbWindHang::LanternAsked()) {
+        BbWindLantern::Book& lantern = BbWindLantern::Global();
+        ++lantern.draws;
+        if (!lantern.said) {
+            lantern.said = true;
+            char lantern_once[1280];
+            if (BbWindLantern::On()) {
+                BbWindLantern::OnceText(lantern_once, sizeof(lantern_once));
+            } else {
+                BbWindLantern::OffText(lantern_once, sizeof(lantern_once));
+            }
+            BbReport::Printf("%s\n", lantern_once);
+        }
+        if (!BbWindLantern::On()) { // the twigs' box keys do not exist: no plan can be given, so nothing moves
+            ++lantern.twigs_off;
+            return 0;
+        }
+        BbWindLantern::StreamPlan& stream_plan = lantern.Touch(positions, positions_size);
+        if (!stream_plan.analysed) { // the stream's vertices, read once
+            stream_plan.analysed = true;
+            const bool lantern_readable = positions_stride >= 12 && memory->IsValidGpuMapping(positions, 0) &&
+                                          memory->ClampRangeSize(positions, positions_size) == positions_size;
+            stream_plan.plan = BbWindLantern::Analyse(lantern_readable ? reinterpret_cast<const unsigned char*>(positions) : nullptr, positions_size,
+                                                      positions_stride, BbWindLantern::KnobOnce());
+            if (stream_plan.plan.ok) {
+                ++lantern.plans_ok;
+            } else {
+                ++lantern.plans_bad;
+            }
+            char plan_line[1792];
+            BbWindLantern::PlanText(positions, stream_plan.plan, plan_line, sizeof(plan_line));
+            BbReport::Printf("%s\n", plan_line);
+        }
+        if (!stream_plan.plan.ok) {
+            ++lantern.no_plan;
+            return 0;
+        }
+        if (stream_plan.guard_frame != frame) { // the boxes change every 60 frames, the camera every frame: once a frame
+            stream_plan.guard_frame = frame;
+            stream_plan.guard = BbWindLantern::GuardCheck(hang_find_boxes.All(), positions);
+            stream_plan.axis = BbWindLantern::AxisOf(hang_find_boxes.All(), positions, pick,
+                                                     hang_find_boxes.camera_ok ? hang_find_boxes.camera.data() : nullptr);
+        }
+        if (stream_plan.guard.why != BbWindLantern::Refuse::None) { // a bridge, a wall, a building, architecture: never pushed
+            ++lantern.refused;
+            ++lantern.by_reason[static_cast<std::size_t>(stream_plan.guard.why)];
+            if (stream_plan.said != stream_plan.guard.why) { // one line per stream and reason
+                stream_plan.said = stream_plan.guard.why;
+                char lantern_guard_line[640];
+                BbWindLantern::GuardText(positions, stream_plan.guard, lantern_guard_line, sizeof(lantern_guard_line));
+                BbReport::Printf("%s\n", lantern_guard_line);
+            }
+            return 0;
+        }
+        stream_plan.said = BbWindLantern::Refuse::None;
+        if (!stream_plan.axis.found) {
+            ++lantern.no_axis;
+            return 0;
+        }
+        lantern_keys = BbWindLantern::MakeKeys(stream_plan.plan, pick.base, stream_plan.axis.x, stream_plan.axis.z);
+        lantern.last_arm_world = lantern_keys.arm_world;
+        lantern.last_x = stream_plan.axis.x;
+        lantern.last_z = stream_plan.axis.z;
+        ++lantern.pushed;
+    }
+    if (BbWindHang::PostGuardOn() && !BbWindLantern::On()) { // bbport (r112u_hang-post-no-bridge): only a hanging lantern is pushed, never the bridge or a post (r112v: the lantern rule has its own guard)
         if (!hang_post.guard_said) {
             hang_post.guard_said = true;
             char guard_once[640];
@@ -1386,8 +1542,19 @@ u32 Rasterizer::WindPostWord(u32* words, u32 frame_slot, u32 view, u32 slot, boo
     }
     post_entry.base = pick.base;
     post_entry.top = pick.top;
-    const u32 post_base_key = BbWindSway::HeightKey(pick.base);
-    const u32 post_top_key = BbWindHang::TopKey(pick.top);
+    u32 post_base_key = BbWindSway::HeightKey(pick.base);
+    u32 post_top_key = BbWindHang::TopKey(pick.top);
+    if (BbWindLantern::On()) { // bbport (r112v_lantern-hangs): the plan's keys: the arm's edge, and in the twigs' box keys the axis and R0, R1 (every call: the same values)
+        post_base_key = lantern_keys.base;
+        post_top_key = lantern_keys.top;
+        if (slot < BbWindSway::BaseSlots) {
+            u32* const box_words = words + BbWindTwigs::TwigAt + slot * BbWindTwigs::TwigSlotWords;
+            box_words[0] = lantern_keys.x_lo;
+            box_words[1] = lantern_keys.x_hi;
+            box_words[2] = lantern_keys.z_lo;
+            box_words[3] = lantern_keys.z_hi;
+        }
+    }
     if (!item.keys_written || item.base_key != post_base_key || item.top_key != post_top_key) {
         words[BbWindSway::BaseAt + slot] = post_base_key; // two stores into the mapped words, as the slot's reset does
         words[BbWindHang::TopAt + slot] = post_top_key;
@@ -1735,7 +1902,10 @@ bool Rasterizer::WindTreesDraw(u64& positions, u32& positions_size, u32 stride, 
         }
     }
     // bbport (r89k_twigs-opaque-word): an opaque draw the shape rule refuses but the limb rule takes (a piece of a tree)
-    const bool limb = !mesh->tree && mesh->limb && opaque && BbWindTrees::LimbOn();
+    // bbport (r89q_twigs-limb-discard): a limb piece whose pixel shader discards (alpha-tested bark and twig cards) is taken too
+    // (BB_WIND_TWIGS_LIMB_CUTOUT, default 1): the visible wood of the bare trees; r89k took opaque draws only
+    const bool limb = !mesh->tree && mesh->limb && (opaque || BbWindTrees::CutoutOn()) && BbWindTrees::LimbOn();
+    const bool cut_limb = limb && !opaque;
     if (!mesh->tree && !limb) {
         // bbport (r89p_twigs-really-move): a limb piece by shape, refused only because the draw is not opaque
         st.limb_cutout += (mesh->limb && !opaque && BbWindTrees::LimbOn()) ? 1u : 0u;
@@ -1744,13 +1914,22 @@ bool Rasterizer::WindTreesDraw(u64& positions, u32& positions_size, u32 stride, 
     }
     // bbport (r89o_wind-chains-twigs-visible): a chain, a grille bar or a prop whose model is small is no tree, however its proportions
     // read (BbWindTrees::SizeOk, BB_WIND_TWIGS_MIN_MODEL): it stays still
-    if (!BbWindTrees::SizeOk(mesh->shape.height, limb)) {
+    // bbport (r89r_twigs-limb-units): a limb piece is sized by its world box (BbWindTwigs::Judge), not by its model height: the model
+    // units are not metres and Shape::height of a limb piece is an arbitrary axis (0.01 to 0.11 for the bare trees' cards)
+    if (!BbWindTrees::SizeOk(mesh->shape.height, limb) && !(limb && BbWindTrees::LimbWorldOn())) {
         ++st.too_small;
+        st.lr_model += limb ? 1u : 0u;
+        return false;
+    }
+    // bbport (r89q_twigs-limb-discard): a cut-out limb piece must also be tall enough (BB_WIND_TWIGS_CUTOUT_MIN_MODEL: fences and cages)
+    if (cut_limb && !BbWindTrees::LimbWorldOn() && !BbWindTrees::CutoutSizeOk(mesh->shape.height)) {
+        ++st.limb_cut_small;
         return false;
     }
     // bbport (r89p_twigs-really-move): the gate is BB_WIND_TWIGS_OPEN_MIN (0.2; was the constant 0.5, which a canopy tripped)
     if (wind_shelter != nullptr && wind_shelter->CameraOpen() < BbWindTrees::OpenMin()) {
         ++st.indoors;
+        st.lr_indoors += limb ? 1u : 0u; // bbport (r89r_twigs-limb-units)
         return false;
     }
     positions = mesh->addr;
@@ -1759,6 +1938,24 @@ bool Rasterizer::WindTreesDraw(u64& positions, u32& positions_size, u32 stride, 
     if (limb) {
         ++st.limbs;
         trees_last_limb = true;
+        st.lr_old += BbWindTrees::LimbOldRuleRefuses(mesh->shape.height, cut_limb) ? 1u : 0u; // bbport (r89r_twigs-limb-units)
+        if (cut_limb) { // bbport (r89q_twigs-limb-discard): counted, and the first few told once each
+            ++st.limb_cut;
+            static u64 cut_said[12];
+            static u32 cut_said_count = 0;
+            if (cut_said_count < 12) {
+                bool known = false;
+                for (u32 i = 0; i < cut_said_count; ++i) {
+                    known = known || cut_said[i] == key;
+                }
+                if (!known) {
+                    cut_said[cut_said_count++] = key;
+                    char cut_text[320];
+                    BbWindTrees::CutLimbText(*mesh, mesh->addr, cut_text, sizeof(cut_text));
+                    BbReport::Printf("%s\n", cut_text);
+                }
+            }
+        }
     }
     return true;
 }
@@ -1855,8 +2052,28 @@ void Rasterizer::WindTreesPickFrameEnd() {
         char once[1024];
         BbWindTrees::OnceText(once, sizeof(once));
         BbReport::Printf("%s\n", once);
+        BbWindTrees::CutoutOnceText(once, sizeof(once)); // bbport (r89q_twigs-limb-discard)
+        BbReport::Printf("%s\n", once);
+        BbWindTrees::UnitsOnceText(once, sizeof(once)); // bbport (r89r_twigs-limb-units)
+        BbReport::Printf("%s\n", once);
     }
-    if (BbWindTrees::On() && ++trees_frames % BbWindSway::ReportFrames == 0) {
+    // bbport (r89r_twigs-limb-units): the limb counts line (why each limb-shaped draw was refused, and the world box verdicts of the
+    // twig book's limb entries): at frame UnitsEarlyFrame and with the 600-frame lines. Only called with the trees route on.
+    const auto limb_units_line = [&]() {
+        BbWindTrees::LimbCensus census;
+        twig_book.ForEach([&](std::uint64_t, const BbWindTwigs::Entry& e) {
+            if (e.limb) {
+                census.Add(e.verdict == BbWindTwigs::Verdict::Waiting, e.verdict == BbWindTwigs::Verdict::Tree, e.why, e.height);
+            }
+        });
+        char units_text[720];
+        BbWindTrees::UnitsLineText(trees_stats, census, units_text, sizeof(units_text));
+        BbReport::Printf("%s\n", units_text);
+    };
+    if (BbWindTrees::On() && ++trees_frames == BbWindTrees::UnitsEarlyFrame) {
+        limb_units_line();
+    }
+    if (BbWindTrees::On() && trees_frames % BbWindSway::ReportFrames == 0) {
         char text[704];
         // bbport (r89k_twigs-opaque-word): the limb pieces in the twig book, and those its world box judged trees
         unsigned limb_meshes = 0, limb_trees = 0;
@@ -1871,6 +2088,9 @@ void Rasterizer::WindTreesPickFrameEnd() {
         BbReport::Printf("%s\n", text);
         BbWindTrees::GateLineText(trees_stats, text, sizeof(text)); // bbport (r89p_twigs-really-move)
         BbReport::Printf("%s\n", text);
+        BbWindTrees::CutoutLineText(trees_stats, text, sizeof(text)); // bbport (r89q_twigs-limb-discard)
+        BbReport::Printf("%s\n", text);
+        limb_units_line(); // bbport (r89r_twigs-limb-units)
         trees_stats = {};
     }
     GlassPickPoll(); // bbport (r86l_glint-pick-glass, TOOL): BB_GLASS_PICK armed or dropped (live)
@@ -2669,6 +2889,11 @@ void Rasterizer::WindSwayFrameEnd() {
             char post_box_line[704]; // bbport (r112t_hang-post-measure): the box the keys come from
             BbWindHang::PostBoxLineText(hang_post, post_box_line, sizeof(post_box_line));
             BbReport::Printf("%s\n", post_box_line);
+            if (BbWindHang::LanternAsked()) { // bbport (r112v_lantern-hangs)
+                char lantern_line[768];
+                BbWindLantern::LineText(BbWindLantern::Global(), lantern_line, sizeof(lantern_line));
+                BbReport::Printf("%s\n", lantern_line);
+            }
             if (BbWindHang::PostGuardOn()) { // bbport (r112u_hang-post-no-bridge)
                 char post_guard_line[640];
                 BbWindHang::PostGuardLineText(hang_post, post_guard_line, sizeof(post_guard_line));
@@ -2782,6 +3007,24 @@ void Rasterizer::WindSwayFrameEnd() {
 }
 
 void Rasterizer::EffectsOnFrameEnd() {
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (const u32 request = BottleSource::Run()) {
+        const auto frame = BottleCutFrame(this, request, scheduler, *scene_targets, *rt_shadow, *object_motion);
+        if (const auto closed = BottleCold::Current().Close(frame, {}, {}, {}, false)) BottleCold::Report(*closed);
+    }
+#endif
+    if (reflection_probe) {
+        if (reflection_native_serial) {
+            ReflectionNativePoll();
+        }
+        ReflectionFrameEnd();
+    }
+    if (window_receiver_enabled) {
+        PollWindowReceiver();
+    }
+    if (foliage_mask) {
+        FoliageFrameEnd();
+    }
     if (blood_pool_probe) { // bbport (r100c_blood-pool-probe, TOOL): a new box, the frames, the log
         blood_pool_probe->OnFrameEnd();
     }
@@ -2817,8 +3060,18 @@ void Rasterizer::EffectsOnFrameEnd() {
             BbReport::Printf("%s\n", line.c_str());
         }
     }
+    if (SewerMotion::Alternate::Enabled() && SewerMotion::Alternate::pending &&
+        !SewerMotion::Alternate::pending->frame_end_seen) {
+        const auto* active_depth = texture_cache.TryGetImage(previous_scene_depth, 0);
+        SewerMotion::Alternate::Close(camera_motion ? camera_motion->CameraMatrices() : CameraMotion::Matrices{},
+                                      object_motion->Frame(), BbStats::frame_number.load(std::memory_order_relaxed),
+                                      BbEngine::Loading::Generation(), scene_targets->Generation(),
+                                      scene_targets->Reduced() && !BbEngine::Loading::ScreenUp(),
+                                      previous_scene_depth.index, active_depth ? active_depth->image_uid : 0);
+    }
     WindOnFrameEnd(); // bbport (r82_wind-stage1): BB_WIND=1 only
     WindSwayFrameEnd(); // bbport (r89_wind-foliage-sway): its log lines
+    if (workflow) WorkflowFrameEnd();
     WindTreesPickFrameEnd(); // bbport (r89j_twigs-pick-trees): the trees' line, the pick (TOOL)
     // bbport (r119_volumetric-clouds): the cloud layer (null when off): its own clock while the cloud
     // shadows are off (after the wind's step, so that BB_WIND=1 gives this frame's direction; the
@@ -2871,10 +3124,26 @@ void Rasterizer::EffectsOnFrameEnd() {
     if (blood_sheen) { // bbport (r100_blood-sheen)
         blood_sheen->OnFrameEnd();
     }
+    if (glass_view) { // bbport (r129a_glass-registry): first (drops a pending MARK), then the registry's frame counts
+        glass_view->OnFrameEnd();
+    }
+    if (glass_registry) {
+        glass_registry->OnFrameEnd();
+    }
+    if (glass_clear) { // bbport (r131c_cabinet-glass-clear): the live knob, counters, log; the knob to the ray traced scene
+        glass_clear->OnFrameEnd();
+        rt_shadow->SetGlassClear(glass_clear->On());
+    }
+    if (sun_term_view) { // bbport (t129c_sun-term-view, TOOL)
+        sun_term_view->OnFrameEnd();
+    }
     if (glass_glint) { // bbport (r86b_glass-visible); a noted pane draw never made is forgotten
         glass_glint->OnFrameEnd();
         glint_pending = nullptr;
         glint_gpane_on = false; // bbport (r86i_glint-find-gbuffer)
+    }
+    if (foliage_glow) { // bbport (r131a_foliage-translucency)
+        foliage_glow->OnFrameEnd();
     }
     if (footprints) { // bbport (r111_footprints): the hunter, the steps, the prints' fading
         footprints->OnFrameEnd();
@@ -2886,6 +3155,7 @@ void Rasterizer::EffectsOnFrameEnd() {
         SurfaceProbeRtScene(); // bbport (r64b_surface-probe-more): before the scene's frame end
     }
     rt_shadow->OnFrameEnd();
+    rt_shadow->PollLampPane(object_motion->Frame());
     if (card_alpha) { // bbport (r62_leaf-stage3)
         card_alpha->OnFrameEnd();
     }
@@ -2916,6 +3186,7 @@ void Rasterizer::EffectsOnFrameEnd() {
     LampFlicker::FrameEnd(BbReport::Printf);
     if (surface_probe_on) {
         SurfaceProbeFrameEnd(); // bbport (r64_surface-probe): its lines go out with the reports
+        SurfaceProbeRect(true); // bbport (t70b_mirror-probe, TOOL): its lines, and the hide line
     }
 }
 
@@ -2989,10 +3260,3175 @@ void Rasterizer::EffectsBeforeTargets(const GraphicsPipeline* pipeline) {
     }
 }
 
+void Rasterizer::LampPaneTargets(const GraphicsPipeline* pipeline, bool gbuffer) {
+    auto* p = rt_shadow->ActiveLampPane();
+    if (!p) {
+        return;
+    }
+    const u64 frame = object_motion->Frame();
+    if (frame == p->armed_frame || (p->Captured() && p->capture.scene != frame)) {
+        return;
+    }
+    if (p->seen_frame != frame) {
+        p->seen_frame = frame;
+        p->ordinal = 0;
+        p->exact_draws = 0;
+    }
+    ++p->ordinal;
+    const auto& regs = Regs();
+    const bool writes_depth = regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
+    // Before the copy, same-image scene writes are included in the two depth samples.
+    // A write over either pick can still make its triangle fail depth matching.
+    if (p->Captured() && db_desc.first.index == p->capture.image &&
+        RtLampPane::RefuseDepthWrite(regs.depth_render_control.depth_clear_enable,
+                                    writes_depth, p->depth_tick != 0)) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+        const auto* image = texture_cache.TryGetImage(db_desc.first, 0);
+        std::printf("Lamp pane (t132d): depth-refusal req=%u scene=%llu ord=%u pair=%llx:%llx g=%u clear=%u write=%u "
+                    "depth-tick=%llu image=%u/%llu capture=%u/%llu\n",
+                    p->request.id, static_cast<unsigned long long>(frame), p->ordinal,
+                    static_cast<unsigned long long>(vs.pgm_hash),
+                    static_cast<unsigned long long>(ps ? ps->pgm_hash : 0),
+                    unsigned(gbuffer), unsigned(regs.depth_render_control.depth_clear_enable),
+                    unsigned(writes_depth), static_cast<unsigned long long>(p->depth_tick),
+                    db_desc.first.index, static_cast<unsigned long long>(image ? image->image_uid : 0),
+                    p->capture.image, static_cast<unsigned long long>(p->capture.uid));
+        p->refusal = "depth target cleared or written outside the sampled G-buffer pass";
+        return;
+    }
+    if (!gbuffer || regs.num_indices != RtLampPane::DrawIndices ||
+        regs.num_instances.NumInstances() != RtLampPane::Instances) {
+        return;
+    }
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    if (ps && RtLampPane::Target(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, ps->pgm_hash,
+                                regs.num_indices, regs.num_instances.NumInstances())) {
+        p->saw_target = true;
+        if (++p->exact_draws > 1 && p->Captured()) {
+            p->refusal = "multiple exact target draws in the capture frame";
+        }
+    }
+}
+
+bool Rasterizer::LampPaneDraw(LampPaneProbe& p, const AmdGpu::Regs& regs,
+                              const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
+                              const RtShadow::Draw& draw) {
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    const u64 frame = object_motion->Frame();
+    if (p.Captured() || p.seen_frame != frame || p.exact_draws != 1 ||
+        !ps || !RtLampPane::Target(draw.shader, ps->pgm_hash, draw.index_count, draw.instances)) {
+        return false;
+    }
+    p.capture = {.request = p.request.id, .draw = p.ordinal, .scene = frame};
+    const auto fail = [&](const char* why) {
+        p.refusal = why;
+        return false;
+    };
+    if (!is_indexed || !draw.triangles || !draw.camera_pass || !draw.solid || draw.glass ||
+        !regs.depth_control.depth_enable || !db_desc.first ||
+        db_desc.first != camera_motion->Depth()) {
+        return fail("target is not an indexed solid camera depth draw");
+    }
+    if (trees_pick_rect_on || scene_targets->Reduced()) {
+        return fail("scissored pick or reduced depth proxy unsupported");
+    }
+    const auto matrices = camera_motion->PassMatrices();
+    const auto size = camera_motion->RenderSize();
+    const auto& viewport = regs.viewports[0];
+    const auto& controls = regs.viewport_control;
+    const float zoffset = controls.zoffset_enable ? viewport.zoffset : 0.f;
+    const float zscale = controls.zscale_enable ? viewport.zscale : 1.f;
+    if (!size[0] || !size[1] || (u64(p.request.width) * size[1] != u64(p.request.height) * size[0]) ||
+        regs.IsClipDisabled() || regs.clipper_control.clip_space != AmdGpu::ClipSpace::ZeroToW ||
+        !controls.xscale_enable || !controls.xoffset_enable || !controls.yscale_enable ||
+        !controls.yoffset_enable || zoffset != 0.f || zscale != 1.f ||
+        regs.polygon_control.NeedsBias() ||
+        target_scale[0] != 1.f || target_scale[1] != 1.f ||
+        target_offset[0] != 0.f || target_offset[1] != 0.f ||
+        viewport.xoffset != float(size[0]) * 0.5f || viewport.yoffset != float(size[1]) * 0.5f ||
+        std::abs(viewport.xscale) != viewport.xoffset || std::abs(viewport.yscale) != viewport.yoffset) {
+        return fail("unsupported viewport, depth range, bias or picture aspect");
+    }
+    for (u32 i = 1; i < AmdGpu::NUM_VIEWPORTS; ++i) {
+        if (regs.viewports[i].xscale != 0.f) {
+            return fail("multiple raster viewports unsupported");
+        }
+    }
+    const float* constants = draw.constants;
+    if (!matrices.valid || !constants || !std::equal(matrices.view.begin(), matrices.view.end(), constants + 8) ||
+        matrices.proj[0] != constants[52] * (viewport.xscale < 0.f ? -1.f : 1.f) ||
+        matrices.proj[1] != constants[57] * (viewport.yscale < 0.f ? -1.f : 1.f) ||
+        matrices.proj[2] != constants[62] || matrices.proj[3] != constants[63] ||
+        !(matrices.proj[3] < 0.f) ||
+        constants[53] != 0.f || constants[54] != 0.f || constants[55] != 0.f ||
+        constants[56] != 0.f || constants[58] != 0.f || constants[59] != 0.f ||
+        constants[60] != 0.f || constants[61] != 0.f ||
+        constants[64] != 0.f || constants[65] != 0.f || constants[66] != 1.f || constants[67] != 0.f) {
+        return fail("capture and depth camera/projection not equivalent");
+    }
+    const auto& range = db_desc.second.view_info.range;
+    if (range.base.level != 0 || range.base.layer != 0 || range.extent.layers != 1) {
+        return fail("depth attachment is not the base layer and mip");
+    }
+    p.width = size[0];
+    p.height = size[1];
+    p.jitter = upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{};
+    if (!std::isfinite(p.jitter[0]) || !std::isfinite(p.jitter[1]) ||
+        std::abs(p.jitter[0]) > 1.f || std::abs(p.jitter[1]) > 1.f) {
+        return fail("invalid raster jitter");
+    }
+    const auto scissor = DrawScissor(0);
+    for (u32 i = 0; i < p.samples.size(); ++i) {
+        const auto sample = RtLampPane::Texel(p.request, p.request.pixels[i], p.width, p.height, p.jitter);
+        if (s64(sample.x) < scissor.offset.x || s64(sample.y) < scissor.offset.y ||
+            s64(sample.x) >= s64(scissor.offset.x) + scissor.extent.width ||
+            s64(sample.y) >= s64(scissor.offset.y) + scissor.extent.height) {
+            return fail("control pixel outside the draw scissor");
+        }
+        p.samples[i] = sample;
+    }
+    if (p.samples[0].x == p.samples[1].x && p.samples[0].y == p.samples[1].y) {
+        return fail("pane and control map to the same depth texel");
+    }
+    p.capture.image = db_desc.first.index;
+    p.capture.uid = texture_cache.GetImage(db_desc.first).image_uid;
+    p.camera = {matrices.view, matrices.inv_view, matrices.proj};
+    if (p.reconstruction) {
+        auto& reconstruction = *p.reconstruction;
+        std::copy_n(constants + 52, reconstruction.projection.size(), reconstruction.projection.begin());
+        std::copy_n(constants + 180, reconstruction.inverse_view.size(), reconstruction.inverse_view.begin());
+        reconstruction.projection_saved = true;
+    }
+    p.first_index = index_offset;
+    p.base_vertex = draw.first_vertex;
+    return true;
+}
+
+void Rasterizer::LampPaneDepth(LampPaneProbe& p) {
+    if (!p.Captured() || p.depth_tick) {
+        return;
+    }
+    const auto id = camera_motion->Depth();
+    auto* image = id ? texture_cache.TryGetImage(id, p.capture.uid) : nullptr;
+    const auto matrices = camera_motion->PassMatrices();
+    const RtLampPane::Camera camera{matrices.view, matrices.inv_view, matrices.proj};
+    if (!image || !RtLampPane::SameDepth(p.capture, p.request.id, object_motion->Frame(), id.index,
+                                        image->image_uid) ||
+        !matrices.valid || !(camera == p.camera) ||
+        camera_motion->RenderSize() != std::array<u32, 2>{p.width, p.height} || scene_targets->Reduced()) {
+        p.refusal = "depth source, frame, extent or camera changed";
+        return;
+    }
+    if (p.material_enabled) {
+        if (!image->backing || !image->GetImage() || image->scene_proxy || scene_targets->Tracks(image->image_uid)) {
+            p.refusal = "alias-unproven: final depth is not isolated native backing";
+            return;
+        }
+        if (p.material.phases.Complete(p.capture)) {
+            const auto& immediate = p.material.sources.back().backing;
+            if (immediate.image != std::bit_cast<u64>(VkImage(image->GetImage())) ||
+                immediate.backing != u64(reinterpret_cast<std::uintptr_t>(image->backing)) ||
+                immediate.begin != image->guest_begin || immediate.end != image->guest_end) {
+                p.material.refusal = "alias-unproven: final depth backing changed after B";
+            }
+        }
+    }
+    const auto format = image->info.pixel_format;
+    if ((format != vk::Format::eD32Sfloat && format != vk::Format::eD32SfloatS8Uint) ||
+        image->info.num_samples > 1 || p.width > image->info.size.width ||
+        p.height > image->info.size.height ||
+        !(image->usage_flags & vk::ImageUsageFlagBits::eTransferSrc)) {
+        p.refusal = "unsupported depth format, samples, size or transfer usage";
+        return;
+    }
+    if (!p.Allocate(instance.GetAllocator(), scheduler)) {
+        return;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(image, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    std::array<vk::BufferImageCopy, 2> regions{};
+    for (u32 i = 0; i < regions.size(); ++i) {
+        regions[i] = {.bufferOffset = p.WorldBytes() + i * sizeof(float),
+                      .imageSubresource = {vk::ImageAspectFlagBits::eDepth, 0, 0, 1},
+                      .imageOffset = {s32(p.samples[i].x), s32(p.samples[i].y), 0},
+                      .imageExtent = {1, 1, 1}};
+    }
+    scheduler.RecordCrumb({.name = "t132d lamp pane depth"}, [source = image->GetImage(),
+                          target = vk::Buffer{p.buffer}, regions](vk::CommandBuffer cmdbuf) {
+        cmdbuf.copyImageToBuffer(source, vk::ImageLayout::eTransferSrcOptimal, target, regions);
+        const vk::MemoryBarrier2 to_host{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+    });
+    p.depth_tick = scheduler.CurrentTick();
+}
+
+void Rasterizer::FoliageRefuseWriter(const char* guard, u32 subject, u64 observed, u64 expected) {
+    auto& probe = pipeline_cache.BoundaryProbe();
+    if (probe.Active() && std::strcmp(guard, "overlapping-writer") != 0) {
+        probe.Observe({.kind = FoliageBoundary::Kind::Writer,
+                       .later = foliage_mask->Reason() != FoliageMask::Refusal::None,
+                       .reason = guard, .epoch = mask_receivers.key.serial,
+                       .ps = subject, .a = observed, .b = expected});
+    }
+    if (mask_diagnostic && foliage_mask->Reason() == FoliageMask::Refusal::None) {
+        mask_writer_evidence = {guard, subject, observed, expected};
+    }
+    foliage_mask->Invalidate(FoliageMask::Refusal::Writer);
+}
+
+void Rasterizer::FoliageCheckReceivers() {
+    const auto& tracked = mask_receivers;
+    if (!tracked.key.serial || mask_finished) return;
+    auto& probe = pipeline_cache.BoundaryProbe();
+    if (foliage_mask->Reason() != FoliageMask::Refusal::None) {
+        // Production stamps stop advancing. A later check cannot establish validity
+        // against stamps that would have changed if the refused draws had attached.
+        if (probe.Active()) {
+            probe.Observe({.kind = FoliageBoundary::Kind::Receiver, .later = true,
+                           .reason = "unknown-stamps-after-refusal", .epoch = tracked.key.serial}, true);
+        }
+        return;
+    }
+    const u64 generation = scene_targets->Generation();
+    if (generation != tracked.proxy_generation) {
+        return FoliageRefuseWriter("proxy-generation", 0, generation, tracked.proxy_generation);
+    }
+    const std::array uid{tracked.key.depth.uid, tracked.key.normal.uid, tracked.key.albedo.uid};
+    const std::array backing{tracked.key.depth.generation, tracked.key.normal.generation,
+                             tracked.key.albedo.generation};
+    for (u32 i = 0; i < tracked.ids.size(); ++i) {
+        const auto* image = texture_cache.TryGetImage(tracked.ids[i], uid[i]);
+        if (!image) {
+            return FoliageRefuseWriter("receiver-missing", i, 0, uid[i]);
+        }
+        if (!texture_cache.IsRegisteredImage(tracked.ids[i], uid[i])) {
+            return FoliageRefuseWriter("receiver-unregistered", i);
+        }
+        const u64 current_backing = std::bit_cast<u64>(image->GetImage());
+        if (current_backing != backing[i]) {
+            return FoliageRefuseWriter("receiver-backing", i, current_backing, backing[i]);
+        }
+        if (image->write_seq != tracked.writes[i]) {
+            return FoliageRefuseWriter("receiver-write-seq", i, image->write_seq, tracked.writes[i]);
+        }
+        if (True(image->flags & VideoCore::ImageFlagBits::Dirty)) {
+            return FoliageRefuseWriter("receiver-dirty", i, u64(image->flags));
+        }
+    }
+}
+
+void Rasterizer::FoliageWriter(VAddr address, u64 size, FoliageBoundary::Source source) {
+    if (!mask_receivers.key.serial || mask_finished || size == 0) return;
+    auto& probe = pipeline_cache.BoundaryProbe();
+    const bool later = foliage_mask->Reason() != FoliageMask::Refusal::None;
+    if (later && !probe.Active()) return;
+    for (u32 i = 0; i < mask_receivers.starts.size(); ++i) {
+        const VAddr start = mask_receivers.starts[i];
+        if (address < mask_receivers.ends[i] && (address >= start || size > start - address)) {
+            if (probe.Active()) {
+                constexpr std::array names{"overlap-depth", "overlap-normal", "overlap-albedo"};
+                probe.Observe({.kind = FoliageBoundary::Kind::Writer, .source = source, .later = later,
+                               .reason = names[i], .epoch = mask_receivers.key.serial,
+                               .a = address, .b = size});
+            }
+            if (!later) FoliageRefuseWriter("overlapping-writer", i, size);
+            return;
+        }
+    }
+}
+
+void Rasterizer::FoliageObserveDraw(const GraphicsPipeline* pipeline, FoliageBoundary::Source source,
+                                    bool tagged) {
+    constexpr u32 fragment = u32(Shader::SwStage::Fragment);
+    const char* selection = source == FoliageBoundary::Source::Indirect ? "class-not-run-indirect" :
+                            tagged ? "grass-diagnostic" : "class-zero";
+    pipeline_cache.BoundaryProbe().Observe({
+        .kind = FoliageBoundary::Kind::Draw, .source = source,
+        .later = foliage_mask->Reason() != FoliageMask::Refusal::None,
+        .reason = selection, .epoch = mask_receivers.key.serial,
+        .original = reinterpret_cast<uintptr_t>(pipeline),
+        .stage = pipeline->GetGraphicsKey().stage_hashes[fragment],
+        .ps = FragmentHash(pipeline), .a = tagged});
+}
+
+void Rasterizer::FoliageFrameEnd() {
+    auto& probe = pipeline_cache.BoundaryProbe();
+    if (probe.Active()) {
+        probe.End("abandoned-frame-end", unsigned(foliage_mask->Reason()), mask_writer_evidence.guard);
+    }
+    if (mask_frame_started && (mask_diagnostic || mask_tags)) {
+        std::printf("Foliage mask (r132a): frame %llu draws %u diagnostic tags %u refusal %u\n",
+                    static_cast<unsigned long long>(mask_frame), mask_draws, mask_tags,
+                    unsigned(foliage_mask->Reason()));
+        if (mask_diagnostic && foliage_mask->Reason() == FoliageMask::Refusal::Writer &&
+            mask_writer_evidence.guard) {
+            const auto& evidence = mask_writer_evidence;
+            // Receiver subjects are depth/normal/albedo (0/1/2). Candidate subjects are guest PS hashes.
+            std::printf("Foliage mask (r132a): frame %llu epoch %llu writer guard %s subject 0x%x "
+                        "observed %llu expected %llu\n",
+                        static_cast<unsigned long long>(mask_frame),
+                        static_cast<unsigned long long>(mask_receivers.key.serial), evidence.guard,
+                        evidence.subject, static_cast<unsigned long long>(evidence.observed),
+                        static_cast<unsigned long long>(evidence.expected));
+        }
+    }
+    foliage_mask->OnFrameEnd();
+    mask_receivers = {};
+    mask_frame_started = false;
+    mask_finished = false;
+    mask_draws = mask_tags = 0;
+    ++mask_frame;
+
+    const bool collect = FoliageTranslucency::GlowNow();
+    foliage_collect.store(collect, std::memory_order_relaxed);
+    bool arm = false;
+#if BB_WIND_TWIGS_LIVE
+    static BbLiveKnobs::Knob<bool> diagnostic{"BB_FOLIAGE_MASK_DIAGNOSTIC", [](const char* text) {
+        return text && std::strcmp(text, "1") == 0;
+    }};
+    arm = diagnostic.Get();
+#else
+    {
+        const char* startup = std::getenv("BB_FOLIAGE_MASK_DIAGNOSTIC");
+        arm = startup && std::strcmp(startup, "1") == 0;
+    }
+#endif
+    arm = arm && collect && FoliageTranslucency::Tuning().strength == 0.0f;
+    if (arm && !mask_diag_requested) {
+        ++mask_capture;
+        mask_diag_started = mask_frame;
+    }
+    mask_diag_requested = arm;
+    mask_diagnostic = arm && mask_frame - mask_diag_started <= 4;
+    if (probe.Active()) {
+        probe.FrameEnd(mask_diagnostic);
+    } else if (mask_diagnostic && mask_frame == mask_diag_started) {
+        const char* census = std::getenv("BB_FOLIAGE_BOUNDARY");
+        if (census && std::strcmp(census, "1") == 0) {
+            const auto& profile = pipeline_cache.GetProfile();
+            probe.Arm(mask_frame, mask_capture,
+                      {reinterpret_cast<const u8*>(&profile), sizeof(profile)});
+        }
+    }
+    if (!mask_diagnostic) {
+        foliage_mask->Selection().Reset();
+    }
+}
+
+const GraphicsPipeline* Rasterizer::FoliageAttach(const GraphicsPipeline* pipeline,
+                                                const RenderState& original, RenderState& state,
+                                                FoliageBoundary::Source source) {
+    if (!foliage_collect.load(std::memory_order_relaxed) || mask_finished) {
+        return pipeline;
+    }
+    using Refusal = FoliageMask::Refusal;
+    auto& probe = pipeline_cache.BoundaryProbe();
+    const bool observe = probe.Active();
+    const auto& regs = Regs();
+    const auto& key = pipeline->GetGraphicsKey();
+    constexpr u32 slot = Shader::FoliageMaskOutput::Location;
+    const bool slot6 = original.num_color_attachments > slot &&
+                       original.color_attachments[slot].image_view;
+    const auto& ds = original.depth_stencil_attachment;
+    const bool depth_write = regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
+    const auto& old = mask_receivers;
+    const bool color_pair = (key.mrt_mask & 5u) == 5u &&
+                            cb_descs[0].first && cb_descs[2].first;
+    const bool candidate = gbuffer_draw && ds.has_depth && color_pair &&
+                           db_desc.first == camera_motion->Depth();
+    const bool depth_clear = ds.depth_clear && scheduler.WillRunLoadOps(original);
+    const bool full_clear = candidate && depth_clear && original.color_attachments[0].is_clear &&
+                            original.color_attachments[2].is_clear;
+
+    if (!candidate) {
+        if (old.key.serial) {
+            // Native pass setup may declare a depth-write access even for depth testing.
+            // Refresh that stamp only for the exact, read-only receiver binding.
+            for (u32 i = 0; i < original.num_color_attachments; ++i) {
+                if ((key.mrt_mask & (1u << i)) && original.color_attachments[i].image_view &&
+                    cb_descs[i].first && (key.write_masks[i] || original.color_attachments[i].is_clear)) {
+                    const auto& image = texture_cache.GetImage(cb_descs[i].first);
+                    FoliageWriter(image.guest_begin, image.guest_end - image.guest_begin, source);
+                }
+            }
+            if (db_desc.first && (depth_write || depth_clear)) {
+                const auto& image = texture_cache.GetImage(db_desc.first);
+                FoliageWriter(image.guest_begin, image.guest_end - image.guest_begin, source);
+            } else if (db_desc.first == old.ids[0] && ds.image_view == old.views[0] &&
+                       foliage_mask->Reason() == Refusal::None) {
+                mask_receivers.writes[0] = texture_cache.GetImage(db_desc.first).write_seq;
+            }
+        }
+        return pipeline;
+    }
+
+    const bool first = !std::exchange(mask_frame_started, true);
+    const bool new_epoch = first || full_clear;
+    const auto camera = camera_motion->PassMatrices();
+    // Shading uses the base depth/normal/albedo views. Scope this increment to the same
+    // single-layer, base-level receivers and to the original internal raster extent.
+    const std::array ids{db_desc.first, cb_descs[0].first, cb_descs[2].first};
+    const std::array ranges{db_desc.second.view_info.range, cb_descs[0].second.view_info.range,
+                            cb_descs[2].second.view_info.range};
+    const std::array views{ds.image_view, original.color_attachments[0].image_view,
+                           original.color_attachments[2].image_view};
+    MaskReceivers current;
+    current.ids = ids;
+    current.views = views;
+    current.view = camera.view;
+    current.projection = camera.proj;
+    current.jitter = upscaler->Jitter();
+    current.proxy_generation = scene_targets->Generation();
+    current.key = {.serial = new_epoch ? ++mask_serial : old.key.serial,
+                   .frame = mask_frame, .width = original.width, .height = original.height};
+    std::array receivers{&current.key.depth, &current.key.normal, &current.key.albedo};
+    bool supported = camera.valid && original.num_layers == 1 && !ui_pass.active &&
+                     !attachment_feedback_loop && !Dc().clear_draw;
+    for (u32 i = 0; i < ids.size(); ++i) {
+        const auto& image = texture_cache.GetImage(ids[i]);
+        const auto& range = ranges[i];
+        supported &= views[i] && range.base.layer == 0 && range.base.level == 0 &&
+                     range.extent.layers == 1 && range.extent.levels == 1 &&
+                     !image.binding.needs_rebind;
+        *receivers[i] = {image.image_uid, std::bit_cast<u64>(image.GetImage()), 0};
+        current.writes[i] = image.write_seq;
+        current.starts[i] = image.guest_begin;
+        current.ends[i] = image.guest_end;
+    }
+    current.key.camera = supported ? current.key.depth.uid : 0;
+    if (new_epoch) {
+        if (observe) {
+            probe.End("superseded-by-full-clear", unsigned(foliage_mask->Reason()), mask_writer_evidence.guard);
+        }
+        mask_receivers = current;
+        mask_writer_evidence = {};
+        foliage_mask->BeginEpoch(current.key);
+        if (observe) {
+            probe.Begin({.key = current.key,
+                         .views = {std::bit_cast<u64>(views[0]), std::bit_cast<u64>(views[1]),
+                                   std::bit_cast<u64>(views[2])},
+                         .writes = current.writes, .begins = current.starts, .ends = current.ends,
+                         .proxy = current.proxy_generation, .samples = key.num_samples},
+                        full_clear ? "full-clear-load-ops" : "first-receiver-setup");
+        }
+    }
+    const auto* variant = pipeline->FoliageVariant();
+    if (observe) {
+        constexpr u32 fs = u32(Shader::SwStage::Fragment);
+        const auto* ps = pipeline->GetStages()[fs];
+        const bool later = foliage_mask->Reason() != Refusal::None;
+        // Inspect original prepared targets before any host mask is attached.
+        const u64 facts = u64(slot6) | (u64(bool(key.mrt_mask & (1u << slot))) << 1) |
+                          (u64(ps && (ps->mrt_mask & (1u << slot))) << 2) |
+                          (u64(ps && ps->stores.GetAny(Shader::IR::Attribute::RenderTarget6)) << 3) |
+                          (u64(bool(key.cb_shader_mask.GetMask(slot))) << 4) |
+                          (u64(supported) << 5) | (u64(depth_write) << 6) |
+                          (u64(full_clear) << 7) | (u64(bool(pipeline->HandleIfReady())) << 8);
+        const char* readiness = !variant ? "variant-absent" :
+                                variant->HandleIfReady() ? "variant-ready" : "variant-pending";
+        probe.Observe({.kind = FoliageBoundary::Kind::Candidate, .source = source, .later = later,
+                       .reason = readiness, .epoch = current.key.serial,
+                       .original = reinterpret_cast<uintptr_t>(pipeline), .stage = key.stage_hashes[fs],
+                       .masked = variant ? variant->GetGraphicsKey().stage_hashes[fs] : 0,
+                       .ps = ps ? ps->pgm_hash : 0, .a = facts, .b = key.num_samples}, !ps);
+    }
+    constexpr auto rgb = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+                         vk::ColorComponentFlagBits::eB;
+    if (slot6 || (key.mrt_mask & (1u << slot))) {
+        if (mask_diagnostic && foliage_mask->Reason() == Refusal::None) {
+            std::printf("Foliage mask (r132a): location 6 collision, PS %08x\n", u32(FragmentHash(pipeline)));
+        }
+        if (observe) {
+            probe.Observe({.kind = FoliageBoundary::Kind::Writer, .source = source,
+                           .later = foliage_mask->Reason() != Refusal::None,
+                           .reason = "guest-slot6", .epoch = current.key.serial,
+                           .ps = FragmentHash(pipeline)});
+        }
+        foliage_mask->Invalidate(Refusal::Slot6);
+    } else if (!supported || current.key != old.key || current.views != old.views ||
+               current.view != old.view || current.projection != old.projection ||
+               current.jitter != old.jitter || current.proxy_generation != old.proxy_generation ||
+               (state.color_attachments[0].image_view != original.color_attachments[0].image_view) ||
+               (state.color_attachments[2].image_view != original.color_attachments[2].image_view) ||
+               (state.depth_stencil_attachment.image_view != ds.image_view)) {
+        if (observe) {
+            probe.Observe({.kind = FoliageBoundary::Kind::Writer, .source = source,
+                           .later = foliage_mask->Reason() != Refusal::None,
+                           .reason = "receiver-targets", .epoch = current.key.serial,
+                           .ps = FragmentHash(pipeline)});
+        }
+        foliage_mask->Invalidate(Refusal::Targets);
+    } else if (!new_epoch && (depth_clear || ds.stencil_clear ||
+                              original.color_attachments[0].is_clear ||
+                              original.color_attachments[2].is_clear)) {
+        FoliageRefuseWriter("candidate-partial-clear", u32(FragmentHash(pipeline)));
+    } else if ((key.write_masks[0] & rgb) != rgb || (key.write_masks[2] & rgb) != rgb) {
+        FoliageRefuseWriter("candidate-rgb-write-mask", u32(FragmentHash(pipeline)),
+                            u64(u32(key.write_masks[0])) | (u64(u32(key.write_masks[2])) << 8),
+                            u64(u32(rgb)) | (u64(u32(rgb)) << 8));
+    } else if (key.blend_controls[0].enable || key.blend_controls[2].enable) {
+        FoliageRefuseWriter("candidate-blend", u32(FragmentHash(pipeline)),
+                            u32(key.blend_controls[0].enable) | (u32(key.blend_controls[2].enable) << 1));
+    } else if (!variant) {
+        FoliageRefuseWriter("candidate-no-variant", u32(FragmentHash(pipeline)));
+    } else if (!variant->HandleIfReady()) {
+        FoliageRefuseWriter("candidate-variant-pending", u32(FragmentHash(pipeline)));
+    } else if (!pipeline->HandleIfReady()) {
+        FoliageRefuseWriter("candidate-original-pending", u32(FragmentHash(pipeline)));
+    }
+    if (!foliage_mask->Attach(mask_receivers.key, state)) {
+        return pipeline;
+    }
+    mask_receivers.writes = current.writes;
+    return variant;
+}
+
+bool Rasterizer::FoliageClass(const GraphicsPipeline& pipeline, bool indexed, u32 first) {
+    const auto& regs = Regs();
+    const auto* ps = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto& vs = pipeline.GetStage(Shader::SwStage::Vertex);
+    auto& probe = pipeline_cache.BoundaryProbe();
+    const auto observe = [&](const char* result) {
+        if (probe.Active()) {
+            probe.Observe({.kind = FoliageBoundary::Kind::Selection, .source = FoliageBoundary::Source::Direct,
+                           .later = foliage_mask->Reason() != FoliageMask::Refusal::None,
+                           .reason = result, .epoch = mask_receivers.key.serial,
+                           .original = reinterpret_cast<uintptr_t>(&pipeline),
+                           .stage = pipeline.GetGraphicsKey().stage_hashes[u32(Shader::SwStage::Fragment)],
+                           .ps = ps ? ps->pgm_hash : 0, .a = first, .b = regs.num_indices});
+        }
+    };
+    if (!mask_diagnostic || !indexed || !ps || vs.pgm_hash != 0x3eaa5555 || ps->pgm_hash != 0xdbeccd9c ||
+        !((first == 0 && regs.num_indices == 45150) ||
+          (first == 342552 && regs.num_indices == 173016))) {
+        observe("selection-prefilter-rejected");
+        return false;
+    }
+    // Reuse the leaf owner's exact material/mesh facts from the settled local ROI. The
+    // descriptor addresses and resource generations are collected fresh for this arm.
+    const auto facts = FoliageProbeFacts(pipeline, true, false, true, first);
+    if (!facts.bindings_exact || !facts.card_valid || facts.alpha_matches != 1 ||
+        facts.alpha_slot != 1 || !facts.position_valid || !facts.offsets_known ||
+        facts.position_size != 2648884 || facts.position_data_format != 13 ||
+        facts.position_number_format != 7 || facts.texture_count != 2 ||
+        facts.num_inputs != 4 || facts.default_inputs || facts.flat_inputs ||
+        facts.input_offsets[0] != 0 || facts.input_offsets[1] != 1 ||
+        facts.input_offsets[2] != 2 || facts.input_offsets[3] != 3 ||
+        facts.uv_hash != 0xdd861594842ba966ULL ||
+        facts.constants_hash != (first == 0 ? 0xca309f3ab6b27b22ULL : 0xdef535f1f7f0da0fULL)) {
+        foliage_mask->Selection().Reset();
+        observe("selection-probe-facts-rejected");
+        FoliageRefuseWriter("class-probe-facts", first);
+        return false;
+    }
+    const auto& alpha = facts.textures[1].sharp;
+    const std::array expected_alpha = first == 0
+        ? std::array{0x26300000u, 0x01ffc7ffu, 0x96db0facu, 0x00ffe000u, 0u, 0u, 0u}
+        : std::array{0x26300000u, 0x007fc1ffu, 0x96d90facu, 0x003fe000u, 0u, 0u, 0u};
+    if (!std::equal(expected_alpha.begin(), expected_alpha.end(), alpha.begin() + 1)) {
+        foliage_mask->Selection().Reset();
+        observe("selection-alpha-descriptor-rejected");
+        FoliageRefuseWriter("class-alpha-descriptor", first);
+        return false;
+    }
+    const auto& draw = Dc();
+    if (!draw.vertex_binds.num_buffers || !draw.index_bind.handle) {
+        observe("selection-bindings-missing");
+        return false;
+    }
+    const u64 vertex_generation = std::bit_cast<u64>(draw.vertex_binds.host_buffers[0]);
+    const u64 index_generation = std::bit_cast<u64>(draw.index_bind.handle);
+    FoliageMaskRules::Draw signature{
+        .vs = facts.vs, .ps = facts.ps,
+        .permutation = pipeline.GetGraphicsKey().stage_hashes[u32(Shader::SwStage::Fragment)],
+        .capture = mask_capture, .vertex_address = facts.position_base,
+        .index_address = facts.index_base, .vertex_generation = vertex_generation,
+        .index_generation = index_generation, .vertex_size = facts.position_size,
+        .vertex_binding_offset = draw.vertex_binds.host_offsets[0],
+        .index_binding_offset = draw.index_bind.offset,
+        .uv_hash = facts.uv_hash, .constants_hash = facts.constants_hash,
+        .first_index = first, .index_count = facts.count, .first_instance = facts.first_instance,
+        .instance_count = facts.instances, .stride = facts.stride, .first_vertex = s32(facts.first_vertex),
+        .primitive = facts.primitive, .index_type = facts.index_type, .camera_gbuffer = true,
+        .direct_indexed = true, .restart = facts.restart, .resolved_cutout = facts.discard,
+        .complete_textures = true,
+    };
+    for (u32 i = 0; i < signature.textures.size(); ++i) {
+        const auto& texture = facts.textures[i];
+        if (texture.source != BloodPoolProbe::FoliageTexture::Source::Registered) {
+            foliage_mask->Selection().Reset();
+            observe("selection-texture-unregistered");
+            return false;
+        }
+        const auto& view = texture.view;
+        signature.textures[i] = {
+            .image = {texture.uid, texture.uid, 0}, .write_sequence = texture.write_seq,
+            .descriptor = texture.sharp,
+            .view = {view.range[0], view.range[1], view.range[2], view.range[3],
+                     view.swizzle[0], view.swizzle[1], view.swizzle[2], view.swizzle[3],
+                     view.type, view.format, view.min_lod},
+        };
+    }
+    auto& selection = foliage_mask->Selection();
+    const float strength = FoliageTranslucency::Tuning().strength;
+    if (!selection.Authorize(signature, true, strength, mask_frame)) {
+        observe("selection-authorization-rejected");
+        FoliageRefuseWriter("class-authorize", first);
+        return false;
+    }
+    const bool tagged = selection.ClassifyDraw(signature, strength, mask_frame) ==
+                        FoliageMaskRules::Class::GrassDiagnostic;
+    observe(tagged ? "selection-qualified" : "selection-unqualified");
+    return tagged;
+}
+
+vk::ImageView Rasterizer::FoliageDiagnosticView() {
+    if (mask_finished || !mask_frame_started) {
+        return {};
+    }
+    FoliageCheckReceivers();
+    const auto& tracked = mask_receivers;
+    const auto camera = camera_motion->PassMatrices();
+    mask_finished = true;
+    auto& probe = pipeline_cache.BoundaryProbe();
+    if (!mask_diagnostic || db_desc.first != tracked.ids[0] || !camera.valid ||
+        camera.view != tracked.view || camera.proj != tracked.projection ||
+        upscaler->Jitter() != tracked.jitter) {
+        if (probe.Active()) {
+            probe.End("consumer-camera-or-depth-refused", unsigned(foliage_mask->Reason()),
+                      mask_writer_evidence.guard);
+        }
+        return {};
+    }
+    const auto view = foliage_mask->ReadableMask(tracked.key);
+    if (probe.Active()) {
+        probe.End(view ? "consumer-readable" : "consumer-no-readable-mask",
+                  unsigned(foliage_mask->Reason()), mask_writer_evidence.guard);
+    }
+    return view;
+}
+
+namespace {
+struct ReflectionInputTrace;
+ReflectionInputTrace* ReflectionInputsFor(u32 role);
+
+// The first failing condition in the existing short-circuit order.
+enum NativeStampReject : u32 {
+    StampAbsent = 1u << 0,
+    StampFrame = 1u << 1,
+    StampGeneration = 1u << 2,
+    StampLoading = 1u << 3,
+    StampPreview = 1u << 4,
+    StampReduced = 1u << 5,
+    StampCamera = 1u << 6,
+    StampView = 1u << 7,
+    StampProjection = 1u << 8,
+    StampExtent = 1u << 9,
+    StampCameraDepth = 1u << 10,
+    StampBindDepth = 1u << 11,
+    StampBindCb0 = 1u << 12,
+    StampJitter = 1u << 13,
+    StampDepthUid = 1u << 14,
+    StampCb0Uid = 1u << 15,
+    StampDepthBacking = 1u << 16,
+    StampCb0Backing = 1u << 17,
+    StampDepthImage = 1u << 18,
+    StampCb0Image = 1u << 19,
+};
+
+constexpr u32 FireplaceRole = u32(ReflectionFirstHit::PlacedSource::Fireplace);
+
+const char* StampRetryValidatorRefusal(u32 reason) {
+    constexpr std::array names{"stamp-absent", "stamp-frame", "stamp-generation", "stamp-loading",
+        "stamp-preview", "stamp-reduced", "stamp-camera", "stamp-view", "stamp-projection", "stamp-extent",
+        "stamp-camera-depth", "stamp-bound-depth", "stamp-bound-cb0", "stamp-jitter", "stamp-depth-uid",
+        "stamp-cb0-uid", "stamp-depth-backing", "stamp-cb0-backing", "stamp-depth-image", "stamp-cb0-image"};
+    const auto index = std::countr_zero(reason);
+    return index < int(names.size()) ? names[index] : "native-unqualified";
+}
+
+const char* RetryBindingRefusal(const ReflectionNativeProbe::Binding* binding,
+                               Core::MemoryManager& memory, VideoCore::BufferCache& cache,
+                               bool& live_handle) {
+    if (!binding) return "palette-descriptor";
+    live_handle = binding->buffer->Handle() == binding->handle;
+    if (!live_handle) return "palette-handle";
+    const auto size = binding->guest_bytes;
+    const auto backing_size = binding->buffer->SizeBytes();
+    if (binding->descriptor_offset > backing_size || size > backing_size - binding->descriptor_offset) {
+        return "palette-backing-span";
+    }
+    if (!binding->guest || !memory.IsValidGpuMapping(binding->guest, 0) ||
+        memory.ClampRangeSize(binding->guest, size) != size) return "palette-guest-span";
+    if (cache.IsInPlace(binding->guest, size)) return "palette-in-place";
+    if (!cache.IsRegionGpuModified(binding->guest, size)) return "palette-clean";
+    return nullptr;
+}
+}
+
+void Rasterizer::ReflectionNativeBeforeDraw(ReflectionNativeProbe::Draw& draw) {
+    using namespace ReflectionNativeProbe;
+    const auto& observed = reflection_probe->stamp;
+    const auto camera = camera_motion->PassMatrices();
+    const auto frame = rt_shadow->WindowDiagnosticFrame();
+    auto* retry = draw.stamp_retry && draw.stamp_retry->attempted ? &*draw.stamp_retry : nullptr;
+    const auto reject = [&](bool refused, NativeStampReject reason) {
+        if (refused && retry) {
+            retry->validator_reject = reason;
+        } else if (refused && ReflectionInputsFor(Match(draw.key))) {
+            draw.stamp_reject = reason;
+        }
+        return refused;
+    };
+    const auto unsafe = [&] {
+        return point_shadow->Apart() || std::ranges::any_of(Dc().bound_buffers, [](const BoundBuffer& binding) {
+            return binding.is_written;
+        });
+    };
+    if (reject(!observed, StampAbsent)) {
+        return;
+    }
+    if (reject(observed->frame != frame, StampFrame)) {
+        // Current camera evidence is independent of the still-published previous stamp.
+        if (!retry && !draw.stamp_retry && !draw.trace && !draw.stamped && !draw.placement_safe &&
+            gbuffer_draw && ReflectionFirstHit::On() && ReflectionFirstHit::PlacedOn() &&
+            Match(draw.key) == FireplaceRole &&
+            OneFrameBehind(*observed, BbEngine::Loading::Generation(), frame) &&
+            !BbEngine::Loading::ScreenUp() && !camera_motion->PreviewFrame() &&
+            !scene_targets->Reduced() && camera.valid && db_desc.first && cb_descs[0].first &&
+            camera_motion->Depth() == db_desc.first && !unsafe()) {
+            const auto* binding = PlacedDescriptor(draw);
+            const auto* depth = texture_cache.TryGetImage(db_desc.first, 0);
+            const auto* cb0 = texture_cache.TryGetImage(cb_descs[0].first, 0);
+            const u64 tick = scheduler.CurrentTick();
+            if (binding && binding->buffer->Handle() == binding->handle && depth && cb0 &&
+                depth->backing && cb0->backing && depth->GetImage() && cb0->GetImage() && tick) {
+                draw.stamp_retry.emplace(StampRetry{
+                    .early = {
+                        .generation = observed->generation, .frame = frame,
+                        .depth = db_desc.first, .cb0 = cb_descs[0].first,
+                        .depth_uid = depth->image_uid, .cb0_uid = cb0->image_uid,
+                        .depth_image = depth->GetImage(), .cb0_image = cb0->GetImage(),
+                        .view = camera.view, .projection = camera.proj,
+                        .jitter = upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{},
+                        .extent = camera_motion->RenderSize(), .valid_native = true,
+                    },
+                    .prior_frame = observed->frame, .prior_pass = observed->pass, .early_tick = tick,
+                });
+            }
+        }
+        return;
+    }
+    if (reject(observed->generation != BbEngine::Loading::Generation(), StampGeneration) ||
+        reject(BbEngine::Loading::ScreenUp(), StampLoading) ||
+        reject(camera_motion->PreviewFrame(), StampPreview) ||
+        reject(scene_targets->Reduced(), StampReduced) ||
+        reject(!camera.valid, StampCamera) ||
+        reject(camera.view != observed->view, StampView) ||
+        reject(camera.proj != observed->projection, StampProjection) ||
+        reject(camera_motion->RenderSize() != observed->extent, StampExtent) ||
+        reject(camera_motion->Depth() != observed->depth, StampCameraDepth) ||
+        reject(db_desc.first != observed->depth, StampBindDepth) ||
+        reject(cb_descs[0].first != observed->cb0, StampBindCb0) ||
+        reject((upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{}) != observed->jitter,
+               StampJitter)) {
+        return;
+    }
+    const auto* depth = texture_cache.TryGetImage(observed->depth, observed->depth_uid);
+    const auto* cb0 = texture_cache.TryGetImage(observed->cb0, observed->cb0_uid);
+    if (reject(!depth, StampDepthUid) || reject(!cb0, StampCb0Uid) ||
+        reject(!depth->backing, StampDepthBacking) || reject(!cb0->backing, StampCb0Backing) ||
+        reject(depth->GetImage() != observed->depth_image, StampDepthImage) ||
+        reject(cb0->GetImage() != observed->cb0_image, StampCb0Image)) {
+        return;
+    }
+    if (retry) {
+        if (unsafe()) {
+            retry->failure = "pending-lamp-batch-or-writable-draw";
+            return;
+        }
+        const auto* binding = PlacedDescriptor(draw);
+        retry->palette = binding != nullptr;
+        if (const char* failure = RetryBindingRefusal(binding, *memory, buffer_cache, retry->handle)) {
+            retry->failure = failure;
+            return;
+        }
+    }
+    draw.stamp = *observed;
+    draw.stamped = true;
+    if (!retry && unsafe()) {
+        draw.readback_reason = "pending-lamp-batch-or-writable-draw";
+        return;
+    }
+    draw.placement_safe = true;
+    if (!draw.trace) {
+        return;
+    }
+    if (draw.overflow) {
+        draw.readback_reason = "binding-cap";
+        return;
+    }
+    std::array<u32, MaxBindings> copied{};
+    const auto bindings = std::span{draw.bindings}.first(draw.binding_count);
+    bool any = false;
+    for (u32 i = 0; i < bindings.size(); ++i) {
+        const auto& src = bindings[i];
+        if (!src.range_known) {
+            draw.readback_reason = "guest-binding-range-unknown";
+            return;
+        }
+        if (!src.gpu_dirty) {
+            continue;
+        }
+        const u64 offset = src.descriptor_offset + src.adjust;
+        if (!src.buffer || !src.handle || src.handle != src.buffer->Handle() || src.in_place ||
+            src.writable || src.effective_bytes != src.guest_bytes || src.guest_bytes > MaxBindingBytes ||
+            offset < src.descriptor_offset || (offset % 4) || (src.guest_bytes % 4) ||
+            offset > src.buffer->SizeBytes() || src.guest_bytes > src.buffer->SizeBytes() - offset) {
+            draw.readback_reason = "unsupported-effective-buffer";
+            return;
+        }
+        copied[i] = src.guest_bytes;
+        any = true;
+    }
+    if (!any) {
+        draw.readback_reason = "no-dirty-small-skeleton";
+        return;
+    }
+    if (!scheduler.CurrentTick()) {
+        draw.readback_reason = "no-active-scheduler-tick";
+        return;
+    }
+    const auto free = std::ranges::find_if(reflection_native_slots, [](const ReflectionNativeSlot& slot) {
+        return !slot.tick;
+    });
+    if (free == reflection_native_slots.end()) {
+        draw.readback_reason = "ring-busy";
+        return;
+    }
+    if (!free->buffer) {
+        const VkBufferCreateInfo create{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                        .size = ReadbackBytes, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo memory{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        };
+        VkBuffer buffer{};
+        VmaAllocationInfo info{};
+        if (!EffectPass::HasRoom(instance, ReadbackBytes) ||
+            vmaCreateBuffer(instance.GetAllocator(), &create, &memory, &buffer, &free->allocation, &info) != VK_SUCCESS) {
+            draw.readback_reason = "readback-allocation";
+            return;
+        }
+        if (!info.pMappedData || info.size > 65536) {
+            vmaDestroyBuffer(instance.GetAllocator(), buffer, free->allocation);
+            free->allocation = {};
+            draw.readback_reason = "readback-mapping-or-limit";
+            return;
+        }
+        free->buffer = buffer;
+        free->mapped = info.pMappedData;
+        free->bytes = info.size;
+    }
+    scheduler.EndRendering();
+    runtime.FlushBarriers();
+    using S = vk::PipelineStageFlagBits2;
+    using A = vk::AccessFlagBits2;
+    std::array<vk::BufferMemoryBarrier2, MaxBindings> before{};
+    std::array<vk::BufferCopy, MaxBindings> regions{};
+    for (u32 i = 0; i < bindings.size(); ++i) {
+        if (!copied[i]) {
+            continue;
+        }
+        const auto& src = bindings[i];
+        const u64 offset = src.descriptor_offset + src.adjust;
+        before[i] = {.srcStageMask = S::eAllCommands, .srcAccessMask = A::eMemoryWrite,
+                     .dstStageMask = S::eCopy, .dstAccessMask = A::eTransferRead,
+                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                     .buffer = src.handle, .offset = offset, .size = copied[i]};
+        regions[i] = {.srcOffset = offset, .dstOffset = u64(i) * MaxBindingBytes, .size = copied[i]};
+        runtime.AccessBuffer(src.buffer, offset, copied[i], S::eCopy, A::eTransferRead);
+    }
+    scheduler.RecordCrumb({.name = "Reflection native palette readback"},
+                          [before, regions, target = free->buffer](vk::CommandBuffer cmd) {
+        for (u32 i = 0; i < regions.size(); ++i) {
+            if (regions[i].size) {
+                cmd.pipelineBarrier2({.bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &before[i]});
+                cmd.copyBuffer(before[i].buffer, target, regions[i]);
+            }
+        }
+        EffectPass::MemoryBarrier(cmd, S::eCopy, A::eTransferWrite, S::eHost, A::eHostRead);
+    });
+    free->tick = scheduler.CurrentTick();
+    free->generation = draw.stamp.generation;
+    free->serial = draw.serial;
+    free->key = draw.key;
+    free->binding_bytes = copied;
+    free->confirmed = false;
+    draw.readback_reason = "recorded";
+}
+
+void Rasterizer::ReflectionNativeAfterDraw(const ReflectionNativeProbe::Draw& draw) {
+    using namespace ReflectionNativeProbe;
+    const auto& stamp = reflection_probe->stamp;
+    const bool confirmed = draw.submission_stamp && stamp && *stamp == draw.stamp && gbuffer_draw &&
+                           draw.stamp.frame == rt_shadow->WindowDiagnosticFrame() &&
+                           !BbEngine::Loading::ScreenUp() && draw.stamp.generation == BbEngine::Loading::Generation() &&
+                           Dc().draw_jitter == draw.stamp.jitter && Dc().draw_inputs.index_offset == draw.key.first;
+    if (confirmed) {
+        rt_shadow->ReflectionNativeSubmitted(draw);
+        for (auto& slot : reflection_native_slots) {
+            if (slot.tick && slot.serial == draw.serial) {
+                slot.confirmed = true;
+            }
+        }
+    }
+    const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+    const auto label = labels[Match(draw.key)];
+    std::printf("Reflection native draw target=%s cookie=%llu generation=%llu frame=%llu pass=%llu "
+                "depth_uid=%llu cb0_uid=%llu confirmed=%u ordinary_entry=%u allocation=%llu "
+                "param=%u resident_frame=%llu revision=%llu resident_cookie=%llu binds=%u readback=%s\n",
+                label, u(draw.serial), u(draw.stamp.generation), u(draw.stamp.frame), u(draw.stamp.pass),
+                u(draw.stamp.depth_uid), u(draw.stamp.cb0_uid), u32(confirmed), u32(draw.native_entry),
+                u(draw.allocation), draw.capture_param, u(draw.resident_frame), u(draw.revision),
+                u(draw.resident_cookie), draw.binding_count, draw.readback_reason);
+    for (const auto& b : std::span{draw.bindings}.first(draw.binding_count)) {
+        std::printf("Reflection native bind target=%s cookie=%llu ordinal=%u slot=%u guest=%llx "
+                    "guest_bytes=%u buffer=%llx offset=%llu range=%llu shader_offset=%u "
+                    "effective_offset=%llu effective_bytes=%u range_known=%u gpu_dirty=%u in_place=%u writable=%u\n",
+                    label, u(draw.serial), b.ordinal, b.slot, u(b.guest), b.guest_bytes,
+                    u(std::bit_cast<u64>(b.handle)), u(b.descriptor_offset), u(b.descriptor_range), b.adjust,
+                    u(b.descriptor_offset + b.adjust), b.effective_bytes, u32(b.range_known),
+                    u32(b.gpu_dirty), u32(b.in_place), u32(b.writable));
+    }
+}
+
+void Rasterizer::ReflectionNativePoll() {
+    using namespace ReflectionNativeProbe;
+    for (auto& slot : reflection_native_slots) {
+        if (!slot.tick || !scheduler.IsFree(slot.tick)) {
+            continue;
+        }
+        slot.tick = 0;
+        const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+        const auto label = labels[Match(slot.key)];
+        if (!slot.confirmed || slot.generation != BbEngine::Loading::Generation() ||
+            BbEngine::Loading::ScreenUp() ||
+            vmaInvalidateAllocation(instance.GetAllocator(), slot.allocation, 0, ReadbackBytes) != VK_SUCCESS) {
+            std::printf("Reflection native bytes target=%s cookie=%llu status=stale-unconfirmed-or-unreadable\n",
+                        label, u(slot.serial));
+            continue;
+        }
+        const auto* data = static_cast<const u8*>(slot.mapped);
+        for (u32 i = 0; i < slot.binding_bytes.size(); ++i) {
+            const auto bytes = slot.binding_bytes[i];
+            if (bytes) {
+                const auto digest = XXH3_128bits(data + i * MaxBindingBytes, bytes);
+                std::printf("Reflection native bytes target=%s cookie=%llu bind_row=%u bytes=%u "
+                            "xxh3_128=%016llx%016llx scope=effective-native-bind\n",
+                            label, u(slot.serial), i, bytes, u(digest.high64), u(digest.low64));
+            }
+        }
+    }
+}
+
+void Rasterizer::ReflectionNativeDestroy() {
+    // The Presenter finishes its schedulers before Rasterizer destruction.
+    for (auto& slot : reflection_native_slots) {
+        if (slot.buffer) {
+            vmaDestroyBuffer(instance.GetAllocator(), slot.buffer, slot.allocation);
+            slot = {};
+        }
+    }
+}
+
+bool Rasterizer::ReflectionStamp(const AmdGpu::Regs& regs) {
+    auto& probe = *reflection_probe;
+    const u64 frame = rt_shadow->WindowDiagnosticFrame();
+    const u64 generation = BbEngine::Loading::Generation();
+    if (probe.input_frame != frame) {
+        probe.input_frame = frame;
+        probe.input_bytes = 0;
+        probe.source_attempts = 0;
+        probe.tainted = false;
+    }
+    if (BbEngine::Loading::ScreenUp() || camera_motion->PreviewFrame() ||
+        (probe.stamp && probe.stamp->generation != generation)) {
+        if (probe.stamp) {
+            rt_shadow->ReflectionCloseEpoch();
+            probe.stamp.reset();
+        }
+        return false;
+    }
+    const auto matrices = camera_motion->PassMatrices();
+    const auto extent = camera_motion->RenderSize();
+    const auto jitter = upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{};
+    const auto depth_id = db_desc.first;
+    const auto cb0_id = cb_descs[0].first;
+    auto* depth = depth_id ? texture_cache.TryGetImage(depth_id, 0) : nullptr;
+    auto* cb0 = cb0_id ? texture_cache.TryGetImage(cb0_id, 0) : nullptr;
+    const auto& vp = regs.viewports[0];
+    const auto& vp_ctl = regs.viewport_control;
+    const auto near = [](float a, float b) { return std::abs(a - b) <= 0.01f; };
+    if (probe.tainted || !matrices.valid || camera_motion->Depth() != depth_id ||
+        !depth || !cb0 || !depth->backing || !cb0->backing || scene_targets->Reduced() ||
+        trees_pick_rect_on || regs.IsClipDisabled() ||
+        !vp_ctl.xscale_enable || !vp_ctl.yscale_enable ||
+        !vp_ctl.xoffset_enable || !vp_ctl.yoffset_enable ||
+        extent != std::array<u32, 2>{1920, 1080} ||
+        target_scale != std::array<float, 2>{1.f, 1.f} || target_offset != std::array<float, 2>{} ||
+        !near(std::abs(vp.xscale), float(extent[0]) * .5f) ||
+        !near(std::abs(vp.yscale), float(extent[1]) * .5f) ||
+        !near(vp.xoffset, float(extent[0]) * .5f) || !near(vp.yoffset, float(extent[1]) * .5f)) {
+        ++probe.bad_stamp;
+        return false;
+    }
+    const bool same_camera_pass = probe.stamp && probe.stamp->frame == frame &&
+                                  probe.stamp->depth == depth_id && probe.stamp->cb0 == cb0_id;
+    const ReflectionFirstHit::Stamp stamp{
+        .generation = generation,
+        .frame = frame,
+        .pass = same_camera_pass ? probe.stamp->pass : ++probe.pass_serial,
+        .depth = depth_id,
+        .cb0 = cb0_id,
+        .depth_uid = depth->image_uid,
+        .cb0_uid = cb0->image_uid,
+        .depth_image = depth->GetImage(),
+        .cb0_image = cb0->GetImage(),
+        .view = matrices.view,
+        .projection = matrices.proj,
+        .jitter = jitter,
+        .extent = extent,
+        .valid_native = true,
+    };
+    if (!same_camera_pass || *probe.stamp != stamp) {
+        if (!rt_shadow->ReflectionBeginPass(stamp)) {
+            probe.stamp.reset();
+            probe.tainted = true;
+            ++probe.bad_stamp;
+            return false;
+        }
+        probe.stamp = stamp;
+    }
+    return true;
+}
+
+namespace {
+bool ReflectionJoinTraceOn() {
+    static const bool on = [] {
+        const char* text = std::getenv("BB_REFLECTION_JOIN_DIAG");
+        return text && std::strcmp(text, "1") == 0;
+    }();
+    return on;
+}
+
+enum class ReflectionJoinTarget { None, Mirror, Fireplace, WallCandidate };
+
+ReflectionJoinTarget JoinTarget(u64 vs, u64 ps, u32 count, u32 first) {
+    using enum ReflectionJoinTarget;
+    if (count == 42441) {
+        return WallCandidate;
+    }
+    if (vs != 0x9da6aacb) {
+        return None;
+    }
+    if (ps == 0xca7226ec && count == 24 && first == 2440816) {
+        return Mirror;
+    }
+    if (ps == 0xbb10e440 && count == 18282 && first == 158744) {
+        return Fireplace;
+    }
+    return None;
+}
+
+bool JoinCount(u32 count) {
+    return count == 24 || count == 18282 || count == 42441;
+}
+
+// At most 24 distinct rows for each of the three witnesses in a process. No guest-data
+// reads, allocation or GPU work are introduced by the trace.
+void TraceReflectionJoin(ReflectionJoinTarget target, u64 frame, u64 phase, u64 vs, u64 ps,
+                         u32 count, u32 first, std::string_view stage, std::string_view gate,
+                         const AmdGpu::Regs& regs, u32 mrt,
+                         const RtShadow::Draw* draw = nullptr, u64 a = 0, u64 b = 0) {
+    if (target == ReflectionJoinTarget::None) {
+        return;
+    }
+    struct Key {
+        u64 phase, vs, ps;
+        u32 first;
+        std::string_view stage, gate;
+        bool operator==(const Key&) const = default;
+    };
+    struct Rows {
+        std::array<Key, 24> emitted{};
+        u32 used{};
+    };
+    static std::array<Rows, 3> by_target{};
+    auto& rows = by_target[u32(target) - 1];
+    const Key key{phase, vs, ps, first, stage, gate};
+    const auto seen = std::span{rows.emitted}.first(rows.used);
+    if (rows.used == rows.emitted.size() || std::ranges::find(seen, key) != seen.end()) {
+        return;
+    }
+    rows.emitted[rows.used++] = key;
+    u32 blend = 0;
+    for (u32 slot = 0; slot < std::size(regs.blend_control); ++slot) {
+        blend |= u32(regs.blend_control[slot].enable != 0) << slot;
+    }
+    const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+    constexpr std::array names{"mirror", "fireplace", "wall-candidate"};
+    std::printf("Reflection join target=%s frame=%llu phase=%llu vs=%08llx ps=%08llx "
+                "count=%u first=%u stage=%.*s gate=%.*s mrt=%02x cb0_mask=%x blend=%02x "
+                "blend_active=%02x depth_test=%u depth_write=%u depth_compare=%u "
+                "instances=%u index_type=%u swap=%u value_a=%llu value_b=%llu\n",
+                names[u32(target) - 1], u(frame), u(phase), u(vs), u(ps), count, first,
+                int(stage.size()), stage.data(), int(gate.size()), gate.data(), mrt,
+                regs.color_target_mask.GetMask(0), blend, blend & mrt,
+                u32(regs.depth_control.depth_enable), u32(regs.depth_control.depth_write_enable),
+                u32(regs.depth_control.depth_func), regs.num_instances.NumInstances(),
+                u32(regs.index_buffer_type.index_type), u32(regs.index_buffer_type.swap_mode),
+                u(a), u(b));
+    if (draw) {
+        std::printf("Reflection join inputs target=%s frame=%llu phase=%llu position=%u "
+                    "constants=%u indices=%u index_bytes=%u placement_palette=%u cpu_palette=%u "
+                    "skinned=%u bones=%u first_vertex=%d first_instance=%u glass=%u glass_entry=%u "
+                    "alpha=%u solid=%u strip=%u restart=%u\n",
+                    names[u32(target) - 1], u(frame), u(phase), u32(draw->positions != 0),
+                    u32(draw->constants != nullptr), u32(draw->indices != 0), draw->index_size,
+                    u32(draw->palette_placed), u32(draw->palette && !draw->palette_placed),
+                    u32(draw->skinned), draw->skeleton_bones, s32(draw->first_vertex),
+                    draw->first_instance, u32(draw->glass), u32(draw->glass_entry), u32(draw->alpha),
+                    u32(draw->solid), u32(draw->strip), u32(draw->restart));
+    }
+}
+
+enum class PlacementPart : u8 {
+    Binding, Index, ObjectDescriptor, ObjectContent, PaletteDescriptor, FetchDescriptor, FetchContent, End,
+};
+
+struct PlacementCheckpoint {
+    u64 prefix{};
+    u32 bytes{};
+    u16 ordinal{};
+    PlacementPart part = PlacementPart::End;
+    bool operator==(const PlacementCheckpoint&) const = default;
+};
+
+struct PlacementSample {
+    std::array<PlacementCheckpoint, 128> checkpoints{};
+    // These four categories can be compared independently. Their inputs are already local
+    // descriptor tuples. Content uses the original hash chain and is never read a second time.
+    std::array<u64, 4> descriptors{};
+    u64 generation{}, frame{}, pass{}, final{};
+    u32 used{};
+    bool overflow{};
+
+    void Add(PlacementPart part, u16 ordinal, u64 bytes, u64 prefix) {
+        if (used == checkpoints.size()) {
+            overflow = true;
+            return;
+        }
+        checkpoints[used++] = {.prefix = prefix, .bytes = u32(bytes), .ordinal = ordinal, .part = part};
+    }
+
+    void Descriptor(u32 category, PlacementPart part, u16 ordinal,
+                    std::span<const u64> fields, u64 prefix) {
+        auto& digest = descriptors[category];
+        digest = XXH3_64bits_withSeed(fields.data(), fields.size_bytes(), digest);
+        Add(part, ordinal, fields.size_bytes(), prefix);
+    }
+};
+
+struct PlacementHistory {
+    PlacementSample sample{}, queued{};
+    u64 build_cookie{}, build_allocation{};
+    u32 build_param{}, rows{};
+};
+
+constexpr u32 PlacementTraceRows = 12;
+
+PlacementHistory* ReflectionPlacementHistory(u32 role) {
+    static const bool on = [] {
+        const char* flag = std::getenv("BB_REFLECTION_PLACEMENT_COMPONENTS");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (!on || role >= ReflectionNativeProbe::WitnessCount) {
+        return nullptr;
+    }
+    static std::array<PlacementHistory, ReflectionNativeProbe::WitnessCount> history{};
+    auto& row = history[role];
+    return row.rows < PlacementTraceRows ? &row : nullptr;
+}
+
+PlacementSample* StartPlacementSample(u32 role, const ReflectionFirstHit::Stamp& stamp) {
+    auto* history = ReflectionPlacementHistory(role);
+    if (!history) {
+        return nullptr;
+    }
+    auto& sample = history->sample;
+    sample.descriptors = {};
+    sample.generation = stamp.generation;
+    sample.frame = stamp.frame;
+    sample.pass = stamp.pass;
+    sample.final = 0;
+    sample.used = 0;
+    sample.overflow = false;
+    return &sample;
+}
+
+void FinishPlacementSample(const ReflectionFirstHit::Stamp& stamp,
+                           const RtShadow::ReflectionDrawToken& token, u32 capture_param) {
+    auto* history = ReflectionPlacementHistory(u32(token.placed));
+    if (!history || !token.cookie) {
+        return;
+    }
+    const auto& sample = history->sample;
+    if (sample.generation != stamp.generation || sample.frame != stamp.frame || sample.pass != stamp.pass ||
+        sample.final != token.placement) {
+        return;
+    }
+    const auto u = [](u64 v) { return static_cast<unsigned long long>(v); };
+    const auto label = ReflectionNativeProbe::labels[u32(token.placed)];
+    const auto& queued = history->queued;
+    if (history->build_param && queued.generation == sample.generation && queued.frame < sample.frame) {
+        constexpr std::array names{"binding", "index-data", "object-descriptor", "object-content",
+                                   "palette-descriptor", "fetch-descriptor", "fetch-content", "end"};
+        u32 first = 0;
+        const u32 shared = std::min(sample.used, queued.used);
+        while (first < shared && sample.checkpoints[first] == queued.checkpoints[first]) {
+            ++first;
+        }
+        const auto a = first < queued.used ? queued.checkpoints[first] : PlacementCheckpoint{};
+        const auto b = first < sample.used ? sample.checkpoints[first] : PlacementCheckpoint{};
+        const bool same = a.part == PlacementPart::End && b.part == PlacementPart::End;
+        u32 descriptor_delta = 0;
+        for (u32 i = 0; i < sample.descriptors.size(); ++i) {
+            descriptor_delta |= u32(sample.descriptors[i] != queued.descriptors[i]) << i;
+        }
+        // Only the first differing prefix is attributable. Later prefixes inherit its seed.
+        const char* change = sample.overflow || queued.overflow ? "overflow" :
+                             same && sample.final != queued.final ? "unexplained" :
+                             same ? "same" : a.part != b.part || a.ordinal != b.ordinal || a.bytes != b.bytes
+                                 ? "shape" : "prefix";
+        std::printf("Reflection placement components target=%s event=compare generation=%llu "
+                    "build_frame=%llu build_pass=%llu build_allocation=%llu build_cookie=%llu build_param=%u "
+                    "frame=%llu pass=%llu allocation=%llu cookie=%llu capture_param=%u "
+                    "result=%s first_step=%u before=%s/%u/%u after=%s/%u/%u "
+                    "descriptor_delta=%u previous_hash=%016llx hash=%016llx previous_prefix=%016llx prefix=%016llx\n",
+                    label, u(sample.generation), u(queued.frame), u(queued.pass), u(history->build_allocation),
+                    u(history->build_cookie), history->build_param, u(sample.frame), u(sample.pass),
+                    u(token.allocation), u(token.cookie), capture_param, change, first,
+                    names[u32(a.part)], a.ordinal, a.bytes, names[u32(b.part)], b.ordinal, b.bytes,
+                    descriptor_delta, u(queued.final), u(sample.final), u(a.prefix), u(b.prefix));
+        ++history->rows;
+        history->build_param = 0;
+    }
+    if (capture_param && history->rows < PlacementTraceRows) {
+        // This is a preflight with a native capture parameter. The lifecycle trace attests
+        // whether it actually became an ordinary build with the same frame, pass and cookie.
+        history->queued = sample;
+        history->build_param = capture_param;
+        history->build_cookie = token.cookie;
+        history->build_allocation = token.allocation;
+        std::printf("Reflection placement components target=%s event=capture generation=%llu "
+                    "frame=%llu pass=%llu allocation=%llu cookie=%llu capture_param=%u "
+                    "steps=%u overflow=%u hash=%016llx\n",
+                    label, u(sample.generation), u(sample.frame), u(sample.pass), u(token.allocation),
+                    u(token.cookie), capture_param, sample.used, u32(sample.overflow), u(sample.final));
+        ++history->rows;
+    }
+}
+
+constexpr u32 OrdinalZeroByteLimit = 4096;
+constexpr u32 OrdinalZeroWordCount = 104;
+constexpr u32 OrdinalZeroWordBytes = OrdinalZeroWordCount * sizeof(u32);
+constexpr u32 OrdinalZeroPlacementWord = 20;
+using OrdinalZeroWords = std::array<u32, OrdinalZeroWordCount>;
+
+bool CopyOrdinalZeroWords(OrdinalZeroWords& words, std::span<const u8> owned, u64 range,
+                          u32 stride, u32 records, std::string_view route) {
+    // The binder supplies a span only after the direct CPU copy is complete at the bound offset.
+    if ((route != "constant-ring" && route != "staged-cpu-copy") || range != OrdinalZeroWordBytes ||
+        stride != 16 || records != 26 || owned.size() < OrdinalZeroWordBytes) {
+        return false;
+    }
+    std::memcpy(words.data(), owned.data(), OrdinalZeroWordBytes);
+    return true;
+}
+
+struct OrdinalZeroSample {
+    OrdinalZeroWords words{};
+    u64 exact_object3_digest{};
+    u32 exact_object3_origin{};
+    bool exact_object3{}, exact_placement{};
+    AmdGpu::Buffer sharp{};
+    std::string_view route{};
+    u64 source_address{}, descriptor_range{}, effective_digest{}, guest_digest{};
+    u64 preflight_address{}, cookie{}, allocation{}, placement{}, generation{}, frame{}, pass{};
+    u32 slot{}, adjust{}, binding_type{}, flags{}, effective_bytes{}, guest_bytes{};
+    u32 preflight_size{}, param{};
+    bool descriptor_present{}, preflight{}, exact_sharp{}, words_certified{};
+    u64 guest_vs{}, guest_ps{}, stage_vs{}, stage_ps{};
+    u32 foliage_mask{}, user_clip_planes{};
+};
+
+struct OrdinalZeroDifference {
+    std::array<u64, 2> mask{};
+    u32 before20{}, after20{};
+    bool certified{};
+};
+
+OrdinalZeroDifference CompareOrdinalZeroWords(const OrdinalZeroSample& before,
+                                              const OrdinalZeroSample& after) {
+    OrdinalZeroDifference result;
+    if (!before.words_certified || !after.words_certified) {
+        return result;
+    }
+    result.certified = true;
+    result.before20 = before.words[OrdinalZeroPlacementWord];
+    result.after20 = after.words[OrdinalZeroPlacementWord];
+    for (u32 i = 0; i < OrdinalZeroWordCount; ++i) {
+        result.mask[i / 64] |= u64(before.words[i] != after.words[i]) << (i % 64);
+    }
+    return result;
+}
+
+struct OrdinalZeroTrace {
+    const ReflectionNativeProbe::Draw* owner{};
+    OrdinalZeroSample bind{}, build{};
+    u32 attempts{}, rows{};
+};
+constexpr u32 OrdinalZeroRowLimit = 12;
+
+OrdinalZeroTrace* OrdinalZeroTraceFor(u32 target) {
+    static const bool on = [] {
+        const char* flag = std::getenv("BB_REFLECTION_ORDINAL0_PROOF");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (!on || target >= ReflectionNativeProbe::WitnessCount) {
+        return nullptr;
+    }
+    static std::array<OrdinalZeroTrace, ReflectionNativeProbe::WitnessCount> traces{};
+    return &traces[target];
+}
+
+OrdinalZeroSample* OrdinalZeroFor(const ReflectionNativeProbe::Draw& draw) {
+    auto* trace = OrdinalZeroTraceFor(ReflectionNativeProbe::Match(draw.key));
+    return trace && trace->owner == &draw ? &trace->bind : nullptr;
+}
+
+void LogOrdinalZero(const char* event, u32 role, const OrdinalZeroSample& now,
+                    const OrdinalZeroSample& build) {
+    const auto u = [](u64 v) { return static_cast<unsigned long long>(v); };
+    const auto tag = [&](u64 address) { return u(XXH3_64bits(&address, sizeof(address))); };
+    const auto compare = [](u32 a_len, u64 a, u32 b_len, u64 b) {
+        return !a_len || !b_len ? "unavailable" : a_len == b_len && a == b ? "same" : "different";
+    };
+    const u32 delta = u32(now.sharp.base_address != build.sharp.base_address) |
+                      (u32(now.sharp.GetSize() != build.sharp.GetSize()) << 1) |
+                      (u32(now.sharp.GetStride() != build.sharp.GetStride()) << 2) |
+                      (u32(now.sharp.type != build.sharp.type || now.binding_type != build.binding_type) << 3) |
+                      (u32(now.flags != build.flags) << 4) |
+                      (u32(now.source_address != build.source_address) << 5);
+    const auto words = CompareOrdinalZeroWords(build, now);
+    const char* word_compare = !words.certified ? "unavailable" :
+                               words.mask[0] || words.mask[1] ? "different" : "same";
+    // Print most-significant hex digits first; bit 0 is ordinal0 word 0.
+    std::array<char, 27> changed_words{'-'};
+    std::array<char, 9> before20{'-'}, after20{'-'};
+    if (words.certified) {
+        std::snprintf(changed_words.data(), changed_words.size(), "%010llx%016llx",
+                      u(words.mask[1]), u(words.mask[0]));
+        std::snprintf(before20.data(), before20.size(), "%08x", words.before20);
+        std::snprintf(after20.data(), after20.size(), "%08x", words.after20);
+    }
+    std::printf("Reflection ordinal0 target=%s event=%s generation=%llu frame=%llu pass=%llu "
+                "allocation=%llu cookie=%llu param=%u placement=%016llx "
+                "build_frame=%llu build_pass=%llu build_allocation=%llu build_cookie=%llu build_param=%u "
+                "guest_address_tag=%016llx source_address_tag=%016llx preflight_address_tag=%016llx "
+                "guest_size=%u preflight_size=%u stride=%u records=%u sharp_type=%u resource_type=%u "
+                "flags=%u slot=%u range=%llu adjust=%u sharp_matches_preflight=%u "
+                "source=%.*s descriptor_present=%u actual_bytes=%u actual_digest=%016llx "
+                "guest_bytes=%u guest_digest=%016llx descriptor_delta=%u actual_compare=%s guest_compare=%s "
+                "word_compare=%s changed_words=%s word20_build=%s word20_now=%s "
+                "guest_vs=%016llx guest_ps=%016llx stage_vs=%016llx stage_ps=%016llx foliage_mask=%u "
+                "build_guest_vs=%016llx build_guest_ps=%016llx build_stage_vs=%016llx build_stage_ps=%016llx "
+                "build_foliage_mask=%u user_clip_planes=%u build_user_clip_planes=%u\n",
+                ReflectionNativeProbe::labels[role], event, u(now.generation), u(now.frame), u(now.pass),
+                u(now.allocation), u(now.cookie), now.param, u(now.placement), u(build.frame), u(build.pass),
+                u(build.allocation), u(build.cookie), build.param,
+                tag(now.sharp.base_address), tag(now.source_address), tag(now.preflight_address),
+                now.sharp.GetSize(), now.preflight_size, now.sharp.GetStride(), now.sharp.num_records,
+                u32(now.sharp.type), now.binding_type, now.flags, now.slot, u(now.descriptor_range), now.adjust,
+                u32(now.exact_sharp), int(now.route.size()), now.route.data(), u32(now.descriptor_present),
+                now.effective_bytes, u(now.effective_digest), now.guest_bytes, u(now.guest_digest), delta,
+                compare(now.effective_bytes, now.effective_digest, build.effective_bytes, build.effective_digest),
+                compare(now.guest_bytes, now.guest_digest, build.guest_bytes, build.guest_digest),
+                word_compare, changed_words.data(), before20.data(), after20.data(),
+                u(now.guest_vs), u(now.guest_ps), u(now.stage_vs), u(now.stage_ps), now.foliage_mask,
+                u(build.guest_vs), u(build.guest_ps), u(build.stage_vs), u(build.stage_ps), build.foliage_mask,
+                now.user_clip_planes, build.user_clip_planes);
+}
+
+constexpr u64 ReflectionInputDrawBytes = 4 << 20;
+constexpr u64 ReflectionInputRoleBytes = 12 << 20;
+constexpr u32 ReflectionInputSlots = 32;
+constexpr u32 ReflectionNoPayload = ~u32{0};
+
+enum class ReflectionInputPart : u8 { Index, Object, UnboundObject, Camera, Palette, Fetch };
+
+struct ReflectionInputEntry {
+    AmdGpu::Buffer sharp{};
+    // Object resource metadata, palette effective binding, or fetch load fields.
+    std::array<u64, 6> fields{};
+    u64 guest{}, bytes{};
+    u32 ordinal{}, payload = ReflectionNoPayload;
+    ReflectionInputPart part{};
+    bool fetch_guarded{};
+};
+
+struct ReflectionInputPayload {
+    u64 guest{}, bytes{}, digest{};
+};
+
+struct ReflectionInputSample {
+    std::array<u64, 6> binding{};
+    std::array<ReflectionInputEntry, ReflectionInputSlots> entries{};
+    std::array<ReflectionInputPayload, ReflectionInputSlots> payloads{};
+    u64 generation{}, frame{}, pass{}, hashed{};
+    u32 used{}, unique{};
+    bool overflow{}, fetch_unsupported{};
+
+    u32 HashPayload(u64 guest, u64 bytes, u64& remaining) {
+        const auto checked = std::span{payloads}.first(unique);
+        const auto duplicate = std::ranges::find_if(checked, [&](const auto& payload) {
+            return payload.guest == guest && payload.bytes == bytes;
+        });
+        if (duplicate != checked.end()) {
+            return u32(duplicate - checked.begin());
+        }
+        if (bytes > remaining || bytes > ReflectionInputDrawBytes - hashed ||
+            unique == payloads.size()) {
+            overflow = true;
+            return ReflectionNoPayload;
+        }
+        const u32 slot = unique++;
+        payloads[slot] = {guest, bytes, XXH3_64bits(reinterpret_cast<const void*>(guest), bytes)};
+        remaining -= bytes;
+        hashed += bytes;
+        return slot;
+    }
+
+    // Fetch descriptors only arrive here for clean ranges or exact repeats of them.
+    // Hash the overlapping fetch unions after the full descriptor inventory is known.
+    void Add(ReflectionInputEntry entry, bool clean, u64& remaining) {
+        if (used == entries.size()) {
+            overflow = true;
+            return;
+        }
+        if (entry.part == ReflectionInputPart::Fetch) {
+            entry.fetch_guarded = clean;
+        } else if (clean) {
+            entry.payload = HashPayload(entry.guest, entry.bytes, remaining);
+        }
+        entries[used++] = entry;
+    }
+
+    template <typename Guard>
+    void FinishFetch(u64& remaining, Guard&& guarded) {
+        std::array<u32, ReflectionInputSlots> order{};
+        u32 count = 0;
+        for (u32 slot = 0; slot < used; ++slot) {
+            const auto& entry = entries[slot];
+            if (entry.part != ReflectionInputPart::Fetch) {
+                continue;
+            }
+            if (!entry.fetch_guarded || !entry.guest || !entry.bytes ||
+                entry.bytes > std::numeric_limits<u64>::max() - entry.guest) {
+                fetch_unsupported = true;
+                continue;
+            }
+            order[count++] = slot;
+        }
+        const auto fetches = std::span{order}.first(count);
+        std::ranges::sort(fetches, {}, [&](u32 slot) { return entries[slot].guest; });
+        for (u32 start = 0; start < count;) {
+            const auto& first = entries[fetches[start]];
+            const u64 address = first.guest;
+            u64 end = address + first.bytes;
+            u32 next = start + 1;
+            while (next < count && entries[fetches[next]].guest < end) {
+                const auto& overlap = entries[fetches[next++]];
+                end = std::max(end, overlap.guest + overlap.bytes);
+            }
+            const u64 bytes = end - address;
+            if (!guarded(address, bytes)) {
+                fetch_unsupported = true;
+            } else {
+                const u32 payload = HashPayload(address, bytes, remaining);
+                for (u32 slot : fetches.subspan(start, next - start)) {
+                    entries[slot].payload = payload;
+                }
+            }
+            start = next;
+        }
+    }
+};
+
+struct ReflectionInputTrace {
+    ReflectionInputSample current{}, build{};
+    u64 remaining = ReflectionInputRoleBytes;
+    struct Refusal {
+        u64 request{};
+        u32 flags{}, native_stamp_reject{};
+        bool operator==(const Refusal&) const = default;
+    };
+    std::array<Refusal, 8> refusals{};
+    u32 refusal_count{};
+    bool stamp_retry_reported{};
+};
+
+ReflectionInputTrace* ReflectionInputsFor(u32 role) {
+    static const bool on = [] {
+        const char* flag = std::getenv("BB_REFLECTION_INDEPENDENT_INPUTS");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (!on || role >= ReflectionNativeProbe::WitnessCount || !ReflectionFirstHit::PlacedOn()) {
+        return nullptr;
+    }
+    static std::array<ReflectionInputTrace, ReflectionNativeProbe::WitnessCount> traces{};
+    return &traces[role];
+}
+
+bool ClaimStampRetryTrace(const Rasterizer* owner, const ReflectionNativeProbe::StampRetry& retry) {
+    const auto* row = ReflectionFirstRetire::Current(owner);
+    if (!row || !ReflectionFirstRetire::receipt.fireplace.current ||
+        ReflectionFirstRetire::receipt.fireplace.generation != retry.early.generation) {
+        return false;
+    }
+    auto* input = ReflectionInputsFor(FireplaceRole);
+    return input && !std::exchange(input->stamp_retry_reported, true);
+}
+
+void TraceStampRetry(const char* event, const Rasterizer* owner, const ReflectionNativeProbe::StampRetry& retry,
+                     const ReflectionFirstHit::Stamp* stamp, u64 tick, const RtShadow::ReflectionDrawToken& token,
+                     bool original = false, bool exact = false, bool confirmed = false) {
+    const auto* row = ReflectionFirstRetire::Current(owner);
+    if (!retry.reporting || !row) return;
+    const auto u = ReflectionFirstRetire::Print;
+    std::printf("Reflection stamp retry (r140a): event=%s renderer=%llx sequence=%llu generation=%llu "
+                "prior_frame=%llu prior_pass=%llu early_frame=%llu frame=%llu pass=%llu early_tick=%llu tick=%llu "
+                "early_reason=%u failure=%s validator_reject=%u current=%u safe=%u palette=%u handle=%u alpha=%u "
+                "classified=%u allocation=%llu cookie=%llu placement=%llu original=%u exact=%u confirmed=%u\n",
+                event, u(reinterpret_cast<uintptr_t>(owner)), u(row->sequence), u(retry.early.generation),
+                u(retry.prior_frame), u(retry.prior_pass), u(retry.early.frame),
+                u(stamp ? stamp->frame : 0), u(stamp ? stamp->pass : 0), u(retry.early_tick), u(tick),
+                u32(StampFrame), retry.failure, retry.validator_reject, u32(retry.current), u32(retry.safe),
+                u32(retry.palette), u32(retry.handle), u32(retry.alpha), u32(retry.classified),
+                u(token.allocation), u(token.cookie), u(token.placement), u32(original), u32(exact), u32(confirmed));
+}
+
+bool SameInputStamp(const ReflectionInputSample& sample, const OrdinalZeroSample& note) {
+    return sample.generation == note.generation && sample.frame == note.frame && sample.pass == note.pass;
+}
+
+void LogReflectionInputs(const char* event, u32 role, const OrdinalZeroSample& note,
+                         const OrdinalZeroSample& build_note) {
+    auto* trace = ReflectionInputsFor(role);
+    if (!trace) {
+        return;
+    }
+    const bool capture = note.frame == build_note.frame && note.pass == build_note.pass;
+    const auto& now = trace->current;
+    const auto& before = capture ? now : trace->build;
+    const bool stamped = SameInputStamp(now, note) && SameInputStamp(before, build_note);
+    const char* status = !stamped ? "unavailable" :
+                         now.fetch_unsupported || before.fetch_unsupported ? "unsupported" :
+                         now.overflow || before.overflow ? "overflow" : "complete";
+    const auto u = [](u64 v) { return static_cast<unsigned long long>(v); };
+    const auto label = ReflectionNativeProbe::labels[role];
+    std::printf("Reflection independent target=%s event=%s generation=%llu frame=%llu pass=%llu "
+                "allocation=%llu cookie=%llu param=%u placement=%016llx "
+                "build_frame=%llu build_pass=%llu build_allocation=%llu build_cookie=%llu build_param=%u "
+                "status=%s entries=%u/%u unique=%u/%u hashed=%llu/%llu remaining=%llu binding_same=%u\n",
+                label, event, u(note.generation), u(note.frame), u(note.pass), u(note.allocation),
+                u(note.cookie), note.param, u(note.placement), u(build_note.frame), u(build_note.pass),
+                u(build_note.allocation), u(build_note.cookie), build_note.param, status,
+                before.used, now.used, before.unique, now.unique, u(before.hashed), u(now.hashed),
+                u(trace->remaining), u32(stamped && before.binding == now.binding));
+    if (!stamped) {
+        return;
+    }
+    const auto log_sample = [&](const char* side, const OrdinalZeroSample& stamp,
+                                const ReflectionInputSample& sample) {
+        const auto& bind = sample.binding;
+        std::printf("Reflection independent binding target=%s event=%s side=%s frame=%llu pass=%llu "
+                    "cookie=%llu words=%016llx/%016llx/%016llx/%016llx/%016llx/%016llx\n",
+                    label, event, side, u(stamp.frame), u(stamp.pass), u(stamp.cookie),
+                    u(bind[0]), u(bind[1]), u(bind[2]), u(bind[3]), u(bind[4]), u(bind[5]));
+        constexpr std::array parts{"index", "object", "unbound-object", "camera", "palette", "fetch"};
+        for (const auto& entry : std::span{sample.entries}.first(sample.used)) {
+            std::array<u32, 4> words{};
+            static_assert(sizeof(words) == sizeof(entry.sharp));
+            std::memcpy(words.data(), &entry.sharp, sizeof(words));
+            const auto* payload = entry.payload == ReflectionNoPayload ? nullptr : &sample.payloads[entry.payload];
+            const auto& f = entry.fields;
+            std::printf("Reflection independent input target=%s event=%s side=%s frame=%llu pass=%llu "
+                        "cookie=%llu part=%s ordinal=%u sharp=%08x/%08x/%08x/%08x stride=%u format=%u/%u "
+                        "guest=%016llx bytes=%llu fields=%016llx/%016llx/%016llx/%016llx/%016llx/%016llx "
+                        "payload_slot=%d digest=%016llx payload_guest=%016llx payload_bytes=%llu payload_scope=%s\n",
+                        label, event, side, u(stamp.frame), u(stamp.pass), u(stamp.cookie),
+                        parts[u32(entry.part)], entry.ordinal, words[0], words[1], words[2], words[3],
+                        entry.sharp.GetStride(), u32(entry.sharp.data_format), u32(entry.sharp.num_format),
+                        u(entry.guest), u(entry.bytes), u(f[0]), u(f[1]), u(f[2]), u(f[3]), u(f[4]), u(f[5]),
+                        payload ? int(entry.payload) : -1, u(payload ? payload->digest : 0),
+                        u(payload ? payload->guest : 0), u(payload ? payload->bytes : 0),
+                        !payload ? "unavailable" : entry.part == ReflectionInputPart::Fetch ?
+                            "fetch-union" : "span");
+        }
+    };
+    if (capture) {
+        trace->build = now;
+        log_sample("build", note, now);
+    } else {
+        log_sample("build", build_note, before);
+        log_sample("now", note, now);
+    }
+}
+
+void TraceReflectionPlacedRefusal(u32 role, u64 request, const ReflectionFirstHit::Stamp& stamp,
+                                  const ReflectionNativeProbe::Draw* native) {
+    auto* trace = ReflectionInputsFor(role);
+    if (!trace) {
+        return;
+    }
+    const bool same_stamp = native && native->stamped && native->stamp == stamp;
+    const auto* binding = native && native->binding_count ? &native->bindings.front() : nullptr;
+    const u32 flags = u32(native != nullptr) | (u32(native && native->stamped) << 1) |
+                      (u32(same_stamp) << 2) | (u32(native && native->placement_safe) << 3) |
+                      (u32(native && native->overflow) << 4) | (u32(binding && binding->range_known) << 5) |
+                      (u32(binding && binding->gpu_dirty) << 6) | (u32(binding && binding->in_place) << 7) |
+                      (u32(binding && binding->writable) << 8) | (u32(binding && binding->handle) << 9) |
+                      (u32(binding && binding->buffer) << 10);
+    const u32 stamp_reject = native ? native->stamp_reject : 0;
+    const ReflectionInputTrace::Refusal key{request, flags, stamp_reject};
+    const auto seen = std::span{trace->refusals}.first(trace->refusal_count);
+    if (trace->refusal_count == trace->refusals.size() || std::ranges::find(seen, key) != seen.end()) {
+        return;
+    }
+    trace->refusals[trace->refusal_count++] = key;
+    const auto u = [](u64 v) { return static_cast<unsigned long long>(v); };
+    std::printf("Reflection independent refusal target=%s stage=preflight request=%llu generation=%llu "
+                "frame=%llu pass=%llu native_generation=%llu native_frame=%llu native_pass=%llu "
+                "flags=%x native_stamp_reject=%x bindings=%u ordinal=%u slot=%u adjust=%u offset=%llu "
+                "guest_bytes=%u effective_bytes=%u range=%llu\n",
+                ReflectionNativeProbe::labels[role], u(request), u(stamp.generation), u(stamp.frame),
+                u(stamp.pass), u(native ? native->stamp.generation : 0), u(native ? native->stamp.frame : 0),
+                u(native ? native->stamp.pass : 0), flags, stamp_reject, native ? native->binding_count : 0,
+                binding ? binding->ordinal : 0, binding ? binding->slot : 0, binding ? binding->adjust : 0,
+                u(binding ? binding->descriptor_offset : 0), binding ? binding->guest_bytes : 0,
+                binding ? binding->effective_bytes : 0, u(binding ? binding->descriptor_range : 0));
+}
+
+void SubmitOrdinalZero(const ReflectionNativeProbe::Draw& draw, const ReflectionFirstHit::Stamp& stamp,
+                       const RtShadow::ReflectionDrawToken& token, const GraphicsPipeline& raster_pipeline,
+                       u32 user_clip_planes) {
+    const u32 role = ReflectionNativeProbe::Match(draw.key);
+    auto* trace = OrdinalZeroTraceFor(role);
+    if (!trace || trace->owner != &draw ||
+        !token.cookie || u32(token.placed) != role || trace->rows >= OrdinalZeroRowLimit) {
+        return;
+    }
+    trace->owner = nullptr;
+    auto& actual = trace->bind;
+    if (!actual.preflight || actual.param == ~u32{0}) {
+        return;
+    }
+    actual.cookie = token.cookie;
+    actual.allocation = token.allocation;
+    actual.placement = token.placement;
+    actual.generation = stamp.generation;
+    actual.frame = stamp.frame;
+    actual.pass = stamp.pass;
+    actual.user_clip_planes = user_clip_planes;
+    constexpr u32 vs = u32(Shader::SwStage::Vertex), ps = u32(Shader::SwStage::Fragment);
+    const auto& key = raster_pipeline.GetGraphicsKey();
+    const auto stages = raster_pipeline.GetStages();
+    // Pipeline keys name the selected ShaderMeta permutation. Guest pgm_hash alone cannot.
+    actual.guest_vs = stages[vs] ? stages[vs]->pgm_hash : 0;
+    actual.guest_ps = stages[ps] ? stages[ps]->pgm_hash : 0;
+    actual.stage_vs = key.stage_hashes[vs];
+    actual.stage_ps = key.stage_hashes[ps];
+    actual.foliage_mask = key.foliage_mask;
+    if (draw.exact) {
+        const auto& exact = *draw.exact;
+        actual.exact_object3 = exact.binding3.complete;
+        actual.exact_object3_origin = u32(exact.binding3.origin);
+        actual.exact_placement = exact.placement && exact.submitted;
+        if (actual.exact_object3) {
+            actual.exact_object3_digest = XXH3_64bits(exact.object3.data(), exact.object3.size());
+        }
+    }
+    auto& build = trace->build;
+    if (build.param && build.generation == actual.generation && build.frame < actual.frame) {
+        const char* event = actual.param ? "next-capture" : "next-cached";
+        LogOrdinalZero(event, role, actual, build);
+        if (draw.exact) {
+            const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+            std::printf("Reflection exact pair target=%s generation=%llu frame=%llu pass=%llu cookie=%llu "
+                        "build_frame=%llu build_pass=%llu build_cookie=%llu status=%s "
+                        "object3_effective=%016llx/%016llx origin=%u/%u canonical=%u/%u\n",
+                        ReflectionNativeProbe::labels[role], u(actual.generation), u(actual.frame),
+                        u(actual.pass), u(actual.cookie), u(build.frame), u(build.pass), u(build.cookie),
+                        !build.exact_object3 || !actual.exact_object3 ? "unsupported" :
+                        build.exact_object3_digest == actual.exact_object3_digest ? "same" : "changed",
+                        u(build.exact_object3_digest), u(actual.exact_object3_digest),
+                        build.exact_object3_origin, actual.exact_object3_origin,
+                        u32(build.exact_placement), u32(actual.exact_placement));
+        }
+        LogReflectionInputs(event, role, actual, build);
+        ++trace->rows;
+        build = {};
+    }
+    if (actual.param && trace->rows < OrdinalZeroRowLimit) {
+        build = actual;
+        LogOrdinalZero("capture", role, actual, build);
+        LogReflectionInputs("capture", role, actual, build);
+        ++trace->rows;
+    }
+}
+} // namespace
+
+namespace ReflectionNativeProbe {
+bool BeginOrdinalZero(const Draw& draw) {
+    if (!ReflectionFirstHit::PlacedOn()) {
+        return false;
+    }
+    auto* trace = OrdinalZeroTraceFor(Match(draw.key));
+    if (!trace) {
+        return false;
+    }
+    trace->owner = nullptr;
+    if (trace->rows >= OrdinalZeroRowLimit || trace->attempts == 32) {
+        return false;
+    }
+    ++trace->attempts;
+    trace->owner = &draw;
+    trace->bind = {};
+    trace->bind.param = ~u32{0};
+    return true;
+}
+
+void RecordOrdinalZero(const Draw& draw, const Shader::BufferResource& resource,
+                       const AmdGpu::Buffer& sharp, const vk::DescriptorBufferInfo& bound,
+                       u32 slot, u32 adjust, VAddr source_address, bool prepared,
+                       std::string_view route, std::span<const u8> owned) {
+    auto* sample = OrdinalZeroFor(draw);
+    if (!sample) {
+        return;
+    }
+    sample->sharp = sharp;
+    sample->source_address = source_address;
+    sample->route = route;
+    sample->descriptor_present = bool(bound.buffer);
+    sample->descriptor_range = bound.range;
+    sample->slot = slot;
+    sample->adjust = adjust;
+    sample->binding_type = u32(resource.buffer_type);
+    sample->flags = u32(resource.is_uniform) | (u32(resource.is_written) << 1) |
+                    (u32(resource.is_formatted) << 2) | (u32(resource.only_const_reads) << 3) |
+                    (u32(prepared) << 4);
+    if (!bound.buffer || resource.IsSpecial() || resource.is_written || adjust || !bound.range ||
+        bound.range == VK_WHOLE_SIZE || (route != "constant-ring" && route != "staged-cpu-copy")) {
+        return;
+    }
+    const u64 effective = bound.range;
+    if (effective <= OrdinalZeroByteLimit && effective <= owned.size()) {
+        sample->effective_bytes = u32(effective);
+        sample->effective_digest = XXH3_64bits(owned.data(), effective);
+        sample->words_certified = sharp.Valid() && sharp.GetSize() == effective &&
+            CopyOrdinalZeroWords(sample->words, owned, effective, sharp.GetStride(), sharp.num_records, route);
+    }
+}
+void RecordExactObject(ReflectionFirstRetire::Row* receipt, Draw& draw, u32 ordinal,
+                       const Shader::BufferResource& resource,
+                       const AmdGpu::Buffer& sharp, const vk::DescriptorBufferInfo& bound,
+                       u32 slot, u32 adjust, VAddr source_address, std::string_view route,
+                       std::span<const u8> owned) {
+    auto& exact = *draw.exact;
+    auto& note = ordinal == 0 ? exact.binding0 : exact.binding3;
+    const bool duplicate = note.origin != ObjectOrigin::Unseen;
+    const auto out = ordinal == 0 ? std::span<u8>{exact.object0} : std::span<u8>{exact.object3};
+    auto* observed = receipt && receipt->key == draw.key ? &receipt->objects[ordinal == 0 ? 0 : 1] : nullptr;
+    ObjectOrigin origin = ObjectOrigin::BufferCache;
+    if (route == "constant-ring") {
+        origin = ObjectOrigin::ConstantRing;
+    } else if (route == "staged-cpu-copy") {
+        origin = ObjectOrigin::StagedCpuCopy;
+    } else if (route == "gpu-copy-unavailable") {
+        origin = ObjectOrigin::GpuCopy;
+    } else if (route == "stream-copy-unproven") {
+        origin = ObjectOrigin::UnprovenStream;
+    }
+    constexpr std::array slots0{20u, 17u, 23u}, slots3{23u, 20u, 26u};
+    const u32 role = Match(draw.key);
+    note = {.sharp = sharp, .address = source_address, .range = bound.range,
+            .slot = slot, .adjust = adjust, .origin = origin};
+    if (ordinal == 3 && receipt && ReflectionOrdinal3::On()) {
+        auto& chosen = ReflectionOrdinal3::state.chosen;
+        if (chosen.active && chosen.draw.sequence == receipt->sequence) {
+            chosen.bind_complete = ReflectionOrdinal3::writer.Cutoff(ReflectionOrdinal3::Bound);
+        }
+    }
+    if (observed) {
+        *observed = {.buffer = std::bit_cast<u64>(bound.buffer), .offset = bound.offset,
+            .range = bound.range, .guest = source_address, .guest_bytes = sharp.Valid() ? sharp.GetSize() : 0,
+            .slot = slot, .adjust = adjust, .origin = u32(origin), .count = observed->count + 1, .route = route};
+    }
+    if (duplicate || role == NoWitness || !bound.buffer || resource.IsSpecial() ||
+        !resource.is_uniform || resource.is_written || resource.is_formatted || !resource.only_const_reads ||
+        !sharp.Valid() || !source_address || sharp.base_address != source_address ||
+        sharp.GetStride() != 16 || sharp.GetSize() != out.size() || sharp.num_records != out.size() / 16 ||
+        slot != (ordinal == 0 ? slots0[role] : slots3[role]) || adjust || bound.range != out.size() ||
+        owned.size() != out.size() ||
+        (origin != ObjectOrigin::ConstantRing && origin != ObjectOrigin::StagedCpuCopy)) {
+        return;
+    }
+    std::ranges::copy(owned, out.begin());
+    note.complete = true;
+    if (observed) {
+        observed->complete = true;
+        observed->digest = XXH3_64bits(out.data(), out.size());
+    }
+}
+} // namespace ReflectionNativeProbe
+
+namespace {
+bool ExactReflectionActiveWordsOn() {
+    static const bool on = [] {
+        const char* flag = std::getenv("BB_REFLECTION_EXACT_ACTIVE_WORDS");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    return on;
+}
+
+bool ExactReflectionWord22On() {
+    static const bool on = [] {
+        const char* flag = std::getenv("BB_REFLECTION_EXACT_WORD22");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    return on;
+}
+
+enum class DeltaPart : u8 {
+    Binding, Mode, Index, PaletteGuest, PaletteBinding, ObjectRange, ObjectSharp, ObjectResource,
+    ObjectBinding, ObjectWords, ObjectPayload, FetchRange, FetchSharp, FetchResource, FetchPayload
+};
+constexpr std::array delta_parts{"binding", "exact-domain", "index-payload", "palette-guest",
+    "palette-binding", "object-range", "object-sharp", "object-resource", "object-binding",
+    "object-words", "object-payload", "fetch-range", "fetch-sharp", "fetch-resource", "fetch-payload"};
+
+struct PlacementDeltaStep {
+    u64 before{}, after{}, address{}, bytes{};
+    u16 offset{}, ordinal{};
+    DeltaPart part{};
+    u8 word_bytes{};
+};
+
+struct PlacementDeltaSample {
+    std::array<PlacementDeltaStep, 48> steps{};
+    std::array<u8, 1280> small{};
+    u64 generation{}, frame{}, pass{}, key{}, cookie{}, allocation{};
+    u16 used{}, small_used{};
+    bool overflow{}, canonical{};
+    u32 origin0{}, origin3{}, raw_word22{}, raw_word23{};
+
+    void Begin(const ReflectionFirstHit::Stamp& stamp) {
+        generation = stamp.generation;
+        frame = stamp.frame;
+        pass = stamp.pass;
+        used = small_used = 0;
+        overflow = canonical = false;
+        key = cookie = allocation = 0;
+        origin0 = origin3 = raw_word22 = raw_word23 = 0;
+    }
+
+    void Add(DeltaPart part, u16 ordinal, u64 hash, u64 guest, u64 bytes,
+             const void* data = nullptr, u8 word_bytes = 0) {
+        if (used == steps.size() || (data && bytes > small.size() - small_used)) {
+            overflow = true;
+            return;
+        }
+        const u64 before = used ? steps[used - 1].after : 0;
+        steps[used++] = {before, hash, guest, bytes, small_used, ordinal, part, word_bytes};
+        if (data) {
+            std::memcpy(small.data() + small_used, data, bytes);
+            small_used += u16(bytes);
+        }
+    }
+
+    template <typename T, size_t Count>
+    void Tuple(DeltaPart part, u16 ordinal, const std::array<T, Count>& value, u64 hash) {
+        Add(part, ordinal, hash, 0, sizeof(value), value.data(), sizeof(T));
+    }
+
+    u64 Word(const PlacementDeltaStep& step, u32 index) const {
+        u64 value = 0;
+        std::memcpy(&value, small.data() + step.offset + index * step.word_bytes, step.word_bytes);
+        return value;
+    }
+};
+
+enum class DeltaKind : u8 { Same, Mode, Field, Shape, Range, Payload, Coverage, Overflow };
+
+struct PlacementDeltaDifference {
+    DeltaKind kind{};
+    u32 step{}, field{};
+};
+
+PlacementDeltaDifference FirstPlacementDifference(const PlacementDeltaSample& old,
+                                                  const PlacementDeltaSample& next) {
+    if (old.overflow || next.overflow) {
+        return {DeltaKind::Overflow};
+    }
+    if (old.canonical != next.canonical) {
+        return {DeltaKind::Mode};
+    }
+    for (u32 i = 0; i < std::min(old.used, next.used); ++i) {
+        const auto& a = old.steps[i];
+        const auto& b = next.steps[i];
+        if (a.part != b.part || a.ordinal != b.ordinal || a.word_bytes != b.word_bytes) {
+            return {DeltaKind::Shape, i};
+        }
+        if (a.before != b.before) {
+            return {DeltaKind::Coverage, i};
+        }
+        if (a.address != b.address || a.bytes != b.bytes) {
+            return {DeltaKind::Range, i};
+        }
+        if (a.word_bytes) {
+            for (u32 word = 0; word < a.bytes / a.word_bytes; ++word) {
+                if (old.Word(a, word) != next.Word(b, word)) {
+                    return {DeltaKind::Field, i, word};
+                }
+            }
+        }
+        if (a.after != b.after) {
+            return {a.word_bytes ? DeltaKind::Coverage : DeltaKind::Payload, i};
+        }
+    }
+    if (old.used != next.used) {
+        return {DeltaKind::Shape, std::min(old.used, next.used)};
+    }
+    return {old.key == next.key ? DeltaKind::Same : DeltaKind::Coverage, old.used};
+}
+
+struct PlacementDeltaTrace {
+    std::array<PlacementDeltaSample, 2> samples{};
+    u32 current{};
+    u8 raw_words_reported{};
+    bool baseline{}, done{};
+
+    PlacementDeltaSample& Pending() { return samples[current]; }
+    const PlacementDeltaSample& Prior() const { return samples[current ^ 1]; }
+};
+static_assert(sizeof(PlacementDeltaTrace) <= 8 * 1024);
+
+PlacementDeltaTrace* FireplacePlacementDelta(const ReflectionNativeProbe::Draw* draw) {
+    static const bool on = [] {
+        const char* flag = std::getenv("BB_REFLECTION_FIRST_PLACEMENT_DELTA");
+        return flag && std::strcmp(flag, "1") == 0;
+    }();
+    if (!on || !draw || !ReflectionFirstHit::PlacedOn() ||
+        ReflectionNativeProbe::Match(draw->key) != u32(ReflectionFirstHit::PlacedSource::Fireplace)) {
+        return nullptr;
+    }
+    static PlacementDeltaTrace trace;
+    return trace.done ? nullptr : &trace;
+}
+
+const char* PlacementDeltaField(DeltaPart part, u32 field) {
+    switch (part) {
+    case DeltaPart::Binding: {
+        constexpr std::array names{"vs", "positions", "indices", "first", "first-vertex", "index-size"};
+        return names[field];
+    }
+    case DeltaPart::PaletteGuest: {
+        constexpr std::array names{"guest-base", "guest-bytes"};
+        return names[field];
+    }
+    case DeltaPart::PaletteBinding: {
+        constexpr std::array names{"slot", "adjust", "descriptor-offset", "descriptor-range", "handle"};
+        return names[field];
+    }
+    case DeltaPart::ObjectRange: {
+        constexpr std::array names{"normalized-base", "size"};
+        return names[field];
+    }
+    case DeltaPart::ObjectResource: {
+        constexpr std::array names{"ordinal", "resource-type", "flags", "used-types", "post-op", "post-mask"};
+        return names[field];
+    }
+    case DeltaPart::ObjectBinding: {
+        constexpr std::array names{"slot", "adjust", "range", "origin"};
+        return names[field];
+    }
+    case DeltaPart::FetchRange: {
+        constexpr std::array names{"guest-base", "bytes", "semantic", "stride"};
+        return names[field];
+    }
+    case DeltaPart::FetchResource: {
+        constexpr std::array names{"ordinal", "dest-vgpr", "elements", "sgpr-and-offset",
+                                   "instance-offset-and-data", "data-and-number-format"};
+        return names[field];
+    }
+    case DeltaPart::ObjectSharp:
+    case DeltaPart::FetchSharp:
+    case DeltaPart::ObjectWords: return "dword";
+    default: return "-";
+    }
+}
+
+void ReportPlacementDelta(const char* event, const char* why, const PlacementDeltaSample& old,
+                          const PlacementDeltaSample& next, const RtShadow::ReflectionDrawToken& token,
+                          bool joined, PlacementDeltaDifference difference = {}) {
+    const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+    const auto& prior = token.placement_delta;
+    std::printf("Reflection placement delta target=fireplace event=%s why=%s generation=%llu "
+                "old_generation=%llu old_allocation=%llu old_frame=%llu old_pass=%llu "
+                "old_cookie=%llu old_key=%016llx "
+                "frame=%llu pass=%llu cookie=%llu key=%016llx allocation=%llu "
+                "prior_pass=%llu prior_cookie=%llu prior_key=%016llx prior_revision=%llu "
+                "joined=%u canonical=%u/%u object0_origin=%u/%u object3_origin=%u/%u\n",
+                event, why, u(next.generation), u(old.generation), u(old.allocation),
+                u(old.frame), u(old.pass), u(old.cookie), u(old.key),
+                u(next.frame), u(next.pass), u(next.cookie), u(next.key), u(token.allocation),
+                u(prior.pass), u(prior.cookie), u(prior.key), u(prior.revision), u32(joined),
+                u32(old.canonical), u32(next.canonical), old.origin0, next.origin0,
+                old.origin3, next.origin3);
+    if (difference.kind == DeltaKind::Same || difference.kind == DeltaKind::Mode ||
+        difference.step >= old.used || difference.step >= next.used) {
+        return;
+    }
+    const auto& a = old.steps[difference.step];
+    const auto& b = next.steps[difference.step];
+    const bool field = difference.kind == DeltaKind::Field;
+    std::printf("Reflection placement delta first step=%u part=%s/%s ordinal=%u/%u field=%s[%u] "
+                "value=%016llx/%016llx guest=%016llx/%016llx bytes=%llu/%llu "
+                "in=%016llx/%016llx out=%016llx/%016llx\n",
+                difference.step, delta_parts[u32(a.part)], delta_parts[u32(b.part)], a.ordinal, b.ordinal,
+                field ? PlacementDeltaField(a.part, difference.field) : "-", difference.field,
+                u(field ? old.Word(a, difference.field) : 0),
+                u(field ? next.Word(b, difference.field) : 0),
+                u(a.address), u(b.address), u(a.bytes), u(b.bytes), u(a.before), u(b.before), u(a.after), u(b.after));
+}
+
+void SubmitPlacementDelta(const ReflectionNativeProbe::Draw* draw, const ReflectionFirstHit::Stamp& stamp,
+                          const RtShadow::ReflectionDrawToken& token, bool joined) {
+    auto* trace = FireplacePlacementDelta(draw);
+    if (!trace || !token.placement_delta.enabled) {
+        return;
+    }
+    auto& next = trace->Pending();
+    const auto& old = trace->Prior();
+    const auto& prior = token.placement_delta;
+    if (next.generation != stamp.generation || next.frame != stamp.frame || next.pass != stamp.pass ||
+        next.key != token.placement) {
+        if (prior.revision) {
+            trace->done = true;
+            ReportPlacementDelta("unavailable", "submission-stamp-or-key-mismatch", old, next, token, joined);
+        }
+        return;
+    }
+    next.cookie = token.cookie;
+    next.allocation = token.allocation;
+    const bool same_allocation = old.cookie && old.generation == next.generation &&
+                                 old.allocation == next.allocation;
+    const bool adjacent = same_allocation && old.frame + 1 == next.frame && old.pass + 1 == next.pass;
+    if (joined && adjacent && old.canonical && next.canonical) {
+        const bool active_words = ExactReflectionActiveWordsOn();
+        const bool word22 = (active_words || ExactReflectionWord22On()) && old.raw_word22 != next.raw_word22;
+        const bool word23 = active_words && old.raw_word23 != next.raw_word23;
+        const u8 changed = u8(word22) | (u8(word23) << 1);
+        if (changed & ~trace->raw_words_reported) {
+            trace->raw_words_reported |= changed;
+            const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+            if (active_words) {
+                std::printf("Reflection exact active words target=fireplace generation=%llu allocation=%llu "
+                            "old_frame=%llu old_pass=%llu old_cookie=%llu frame=%llu pass=%llu cookie=%llu "
+                            "raw22=%08x/%08x raw23=%08x/%08x key=%016llx/%016llx prior_revision=%llu\n",
+                            u(next.generation), u(next.allocation), u(old.frame), u(old.pass), u(old.cookie),
+                            u(next.frame), u(next.pass), u(next.cookie), old.raw_word22, next.raw_word22,
+                            old.raw_word23, next.raw_word23, u(old.key), u(next.key), u(prior.revision));
+            } else {
+                std::printf("Reflection exact word22 target=fireplace generation=%llu allocation=%llu "
+                            "old_frame=%llu old_pass=%llu old_cookie=%llu frame=%llu pass=%llu cookie=%llu "
+                            "raw=%08x/%08x key=%016llx/%016llx prior_revision=%llu\n",
+                            u(next.generation), u(next.allocation), u(old.frame), u(old.pass), u(old.cookie),
+                            u(next.frame), u(next.pass), u(next.cookie), old.raw_word22, next.raw_word22,
+                            u(old.key), u(next.key), u(prior.revision));
+            }
+        }
+    }
+    if (prior.revision) {
+        trace->done = true;
+        if (!prior.same_identity || !adjacent || old.key != prior.key || old.cookie != prior.cookie ||
+            old.pass != prior.pass || !joined) {
+            const char* why = !prior.same_identity ? "different-identity" :
+                !adjacent ? "nonconsecutive-or-missing" :
+                !joined ? "submission-refused" : "prior-identity-unjoined";
+            ReportPlacementDelta("unavailable", why, old, next, token, joined);
+            return;
+        }
+        const auto difference = FirstPlacementDifference(old, next);
+        constexpr std::array reasons{"final-key-unaccounted", "exact-route-changed", "tuple-field",
+            "component-shape", "payload-range", "payload-hash", "checkpoint-coverage", "snapshot-cap"};
+        const bool explained = difference.kind != DeltaKind::Same &&
+                               difference.kind != DeltaKind::Coverage && difference.kind != DeltaKind::Overflow;
+        ReportPlacementDelta(explained ? "changed" : "unavailable", reasons[u32(difference.kind)],
+                             old, next, token, joined, difference);
+    } else if (joined && adjacent && !trace->baseline && old.key == next.key && next.canonical &&
+               FirstPlacementDifference(old, next).kind == DeltaKind::Same) {
+        trace->baseline = true;
+        ReportPlacementDelta("unchanged", "consecutive-confirmed", old, next, token, joined);
+    }
+    if (joined) {
+        trace->current ^= 1;
+    }
+}
+
+u64 HashExactObject(const ReflectionNativeProbe::ExactObjects& exact, u32 ordinal, u64 hash,
+                    PlacementDeltaSample* delta) {
+    const auto& note = ordinal == 0 ? exact.binding0 : exact.binding3;
+    const std::array<u64, 4> effective{note.slot, note.adjust, note.range, u32(note.origin)};
+    auto payload = ordinal == 0
+        ? std::span<const u8>{exact.object0}.first(ReflectionNativeProbe::ExactObjects::UsedObject0Bytes)
+        : std::span<const u8>{exact.object3};
+    std::array<u8, ReflectionNativeProbe::ExactObjects::UsedObject0Bytes> normalized;
+    const bool active_words = ordinal == 0 && ExactReflectionActiveWordsOn();
+    if (ordinal == 0 && (active_words || ExactReflectionWord22On())) {
+        constexpr u32 word22 = 22 * sizeof(u32);
+        constexpr u32 word23 = 23 * sizeof(u32);
+        static_assert(word23 + sizeof(u32) == normalized.size());
+        if (delta) {
+            std::memcpy(&delta->raw_word22, payload.data() + word22, sizeof(u32));
+            if (active_words) {
+                std::memcpy(&delta->raw_word23, payload.data() + word23, sizeof(u32));
+            }
+        }
+        if (active_words) {
+            // The pinned VS stages read only words 12Ã¢â‚¬â€œ15 and 20 of ordinal0 with adjust=0.
+            // Keep their slots fixed in the diagnostic key and keep the full actual bind check.
+            normalized.fill(0);
+            constexpr u32 first = 12 * sizeof(u32), palette = 20 * sizeof(u32);
+            std::memcpy(normalized.data() + first, payload.data() + first, 4 * sizeof(u32));
+            std::memcpy(normalized.data() + palette, payload.data() + palette, sizeof(u32));
+        } else {
+            std::ranges::copy(payload, normalized.begin());
+            std::fill_n(normalized.begin() + word22, sizeof(u32), u8{0});
+        }
+        payload = normalized;
+    }
+    hash = XXH3_64bits_withSeed(effective.data(), sizeof(effective), hash);
+    if (delta) {
+        delta->Tuple(DeltaPart::ObjectBinding, u16(ordinal), effective, hash);
+    }
+    hash = XXH3_64bits_withSeed(payload.data(), payload.size(), hash);
+    if (delta) {
+        delta->Add(DeltaPart::ObjectWords, u16(ordinal), hash, 0, payload.size(), payload.data(), sizeof(u32));
+    }
+    return hash;
+}
+
+bool ReflectProbeHide(u64 vs, u64 ps, bool indirect, bool indexed, u32 index_count, u32 first_index,
+                      bool record = true);
+
+bool ExactReflectionStages(const GraphicsPipeline& pipeline, const ReflectionNativeProbe::Draw& draw) {
+    constexpr std::array<u64, ReflectionNativeProbe::WitnessCount> vs_ids{
+        0x000009db8f183ea1ull, ReflectionDiscard::Fireplace.vertex_stage, ReflectionDiscard::Wall.vertex_stage};
+    constexpr std::array<u64, ReflectionNativeProbe::WitnessCount> ps_ids{
+        0x00000ca7073f7ac4ull, ReflectionDiscard::Fireplace.fragment_stage, ReflectionDiscard::Wall.fragment_stage};
+    const u32 role = ReflectionNativeProbe::Match(draw.key);
+    const auto stages = pipeline.GetStages();
+    const auto& key = pipeline.GetGraphicsKey();
+    constexpr u32 vs = u32(Shader::SwStage::Vertex), ps = u32(Shader::SwStage::Fragment);
+    return role != ReflectionNativeProbe::NoWitness && !key.foliage_mask &&
+        stages[vs] && stages[ps] && stages[vs]->pgm_hash == draw.key.vs && stages[ps]->pgm_hash == draw.key.ps &&
+        key.stage_hashes[vs] == vs_ids[role] && key.stage_hashes[ps] == ps_ids[role];
+}
+
+struct ReflectionDiscardGate {
+    const Rasterizer* owner{};
+    const GraphicsPipeline* pipeline{};
+    ReflectionFirstHit::Stamp stamp;
+    u64 tick{}, stage{};
+    bool shared_discard{}, alpha{};
+};
+
+std::array<ReflectionDiscardGate, ReflectionNativeProbe::WitnessCount>& ReflectionDiscardGates() {
+    // EffectsCaptureDraw and EffectsAfterDraw are in the same direct DrawRecord call.
+    static thread_local std::array<ReflectionDiscardGate, ReflectionNativeProbe::WitnessCount> gates{};
+    return gates;
+}
+
+std::array<std::atomic_bool, ReflectionNativeProbe::WitnessCount> reflection_discard_reported{};
+
+void RememberReflectionDiscard(const Rasterizer* owner, const GraphicsPipeline& pipeline,
+                               const ReflectionFirstHit::Stamp& stamp, const RtShadow::Draw& draw,
+                               u32 first, u64 tick, bool shared_discard) {
+    const auto role = ReflectionNativeProbe::Match({draw.shader, draw.pixel_shader, draw.index_count, first});
+    if (role == ReflectionNativeProbe::NoWitness || reflection_discard_reported[role].load()) return;
+    auto& gate = ReflectionDiscardGates()[role];
+    gate = {};
+    if (!stamp.valid_native || !tick || !draw.camera_pass || !draw.triangles || draw.restart ||
+        draw.strip || draw.instances != 1 || draw.first_vertex != 0 || draw.first_instance != 0) {
+        return;
+    }
+    gate = {owner, &pipeline, stamp, tick,
+            pipeline.GetGraphicsKey().stage_hashes[u32(Shader::SwStage::Fragment)],
+            shared_discard, draw.alpha};
+}
+
+void FinishReflectionDiscard(const Rasterizer* owner, const PipelineCache& cache,
+                             ReflectionNativeProbe::Key key, const GraphicsPipeline* source,
+                             const GraphicsPipeline& raster, const ReflectionFirstHit::Stamp& stamp,
+                             u64 tick) {
+    const u32 role = ReflectionNativeProbe::Match(key);
+    if (role == ReflectionNativeProbe::NoWitness || reflection_discard_reported[role].load()) return;
+    const auto gate = std::exchange(ReflectionDiscardGates()[role], {});
+    constexpr u32 vs = u32(Shader::SwStage::Vertex), ps = u32(Shader::SwStage::Fragment);
+    const auto& graphics_key = raster.GetGraphicsKey();
+    if (gate.owner != owner || gate.pipeline != source || source != &raster || gate.stamp != stamp ||
+        gate.tick != tick || !gate.stage || gate.stage != graphics_key.stage_hashes[ps] ||
+        graphics_key.foliage_mask || !raster.HandleIfReady()) {
+        return;
+    }
+
+    ReflectionDiscard::Pipeline proof{};
+    const bool unchanged = cache.CaptureProofUnchanged();
+    const bool joined = unchanged && raster.GetReflectionDiscardProof(&cache, gate.stage, proof) &&
+                        proof.fragment.id.guest == key.ps && cache.CaptureProofUnchanged();
+    const auto& module = proof.fragment;
+    const bool scanned = joined && module.opcodes.valid;
+    if (reflection_discard_reported[role].exchange(true)) return;
+    const auto u = [](u64 x) { return static_cast<unsigned long long>(x); };
+    // Command recording selected the original graphics pipeline. This is a static opcode fact,
+    // not a visibility test for an individual GPU fragment invocation.
+    std::printf("Reflection fragment discard (t201): role=%s status=%s generation=%llu frame=%llu pass=%llu "
+                "tick=%llu vs=%llx ps=%llx count=%u first=%u vs_stage=%llx ps_stage=%llx "
+                "pipeline_key=%llx pipeline=%llx shared=%u alpha=%u joined=%u permutation=%lld "
+                "module=%llx module_gen=%llu route=%s bytes=%zu xxh3=%016llx warm_raw_discard=%d "
+                "scan=%u kill=%u terminate=%u demote=%u\n",
+                ReflectionNativeProbe::labels[role],
+                !unchanged ? "hot-replacement" : !joined ? "module-unjoined" :
+                !scanned ? "scan-unavailable" : "recorded",
+                u(stamp.generation), u(stamp.frame), u(stamp.pass), u(tick), u(key.vs), u(key.ps),
+                key.count, key.first, u(graphics_key.stage_hashes[vs]), u(gate.stage),
+                u(std::hash<GraphicsPipelineKey>{}(graphics_key)), u(std::bit_cast<u64>(raster.HandleIfReady())),
+                u32(gate.shared_discard), u32(gate.alpha), u32(joined),
+                joined ? static_cast<long long>(module.permutation) : -1ll,
+                u(joined ? module.id.handle : 0), u(joined ? module.id.generation : 0),
+                joined ? ReflectionDiscard::Name(module.route) : "unknown", joined ? module.bytes : 0,
+                u(scanned ? module.effective_xxh3 : 0), joined && module.warm_raw_discard ? *module.warm_raw_discard : -1,
+                u32(scanned), scanned ? module.opcodes.kill : 0, scanned ? module.opcodes.terminate : 0,
+                scanned ? module.opcodes.demote : 0);
+}
+
+void TraceExactReflectionObjects(const ReflectionNativeProbe::Draw& draw, const char* status) {
+    using namespace ReflectionNativeProbe;
+    static std::array<u32, WitnessCount> rows{};
+    static std::array<const char*, WitnessCount> last{};
+    const u32 role = Match(draw.key);
+    if (role == NoWitness || rows[role] == 12 || last[role] == status) {
+        return;
+    }
+    ++rows[role];
+    last[role] = status;
+    const auto& exact = *draw.exact;
+    const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+    std::printf("Reflection exact target=%s status=%s generation=%llu frame=%llu pass=%llu "
+                "object0=%u/%u/%llu/%u/%u object3=%u/%u/%llu/%u/%u\n",
+                labels[role], status, u(draw.stamp.generation), u(draw.stamp.frame), u(draw.stamp.pass),
+                u32(exact.binding0.complete), exact.binding0.slot, u(exact.binding0.range),
+                exact.binding0.adjust, u32(exact.binding0.origin),
+                u32(exact.binding3.complete), exact.binding3.slot, u(exact.binding3.range),
+                exact.binding3.adjust, u32(exact.binding3.origin));
+}
+} // namespace
+
+bool Rasterizer::ReflectionCapture(const AmdGpu::Regs& regs, const GraphicsPipeline& pipeline,
+                                   const RtShadow::Draw& draw, u32 first,
+                                   RtShadow::ReflectionDrawToken& token) {
+
+    auto* retire = ReflectionFirstRetire::Current(this);
+    if (retire) retire->capture = "preflight-refused";
+    auto& probe = *reflection_probe;
+    const auto& stamp = *probe.stamp;
+    const auto& vs = pipeline.GetStage(Shader::SwStage::Vertex);
+    const auto* ps = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    const auto& fetch = pipeline.GetFetchShader();
+    const bool exact_mirror = draw.shader == 0x9da6aacb && draw.pixel_shader == 0xca7226ec &&
+                              draw.index_count == 24 && first == 2440816;
+    const auto target = JoinCount(draw.index_count) && ReflectionJoinTraceOn()
+        ? JoinTarget(draw.shader, draw.pixel_shader, draw.index_count, first)
+        : ReflectionJoinTarget::None;
+    const auto trace = [&](std::string_view stage, std::string_view gate, u64 a = 0, u64 b = 0) {
+        TraceReflectionJoin(target, stamp.frame, probe.last_request, draw.shader, draw.pixel_shader,
+                            draw.index_count, first, stage, gate, regs,
+                            pipeline.GetGraphicsKey().mrt_mask, &draw, a, b);
+    };
+    const auto refused = [&](bool test, std::string_view gate) {
+        if (test && retire) retire->capture = gate;
+        if (test && target != ReflectionJoinTarget::None) {
+            trace("draw", gate);
+        }
+        return test;
+    };
+    if (ps && JoinCount(draw.index_count) && ReflectionDiscard::On()) {
+        RememberReflectionDiscard(this, pipeline, stamp, draw, first, scheduler.CurrentTick(), ps->has_discard);
+    }
+    const auto* placed = draw.palette_placed && draw.reflection_native && ReflectionFirstHit::PlacedOn()
+        ? ReflectionNativeProbe::PlacedBinding(*draw.reflection_native) : nullptr;
+    // Other vertex programs stay in the direct census, except the independently fingerprinted
+    // wall whose native direct shader is still to be identified.
+    if (refused(draw.shader != 0x9da6aacb && draw.index_count != 42441, "vertex-program") ||
+        refused(!fetch, "fetch-missing") || refused(!ps, "fragment-missing") ||
+        refused(!vs.images.empty(), "vertex-samples-image") || refused(!draw.camera_pass, "non-camera") ||
+        refused(!draw.solid, "non-solid") || refused(draw.glass, "glass-capture") ||
+        refused(draw.glass_entry && !exact_mirror, "glass-registry") || refused(draw.alpha, "discard") ||
+        refused(draw.skinned, "skinned") || refused(draw.skeleton_bones, "skeleton-bones") ||
+        refused(draw.palette_placed && !placed, "gpu-placed-palette") || refused(!draw.positions, "positions-missing") ||
+        refused(!draw.constants, "camera-constants-missing") || refused(!draw.indices, "indices-missing") ||
+        refused(draw.indices % draw.index_size, "indices-unaligned") ||
+        refused(draw.instances != 1, "instance-count") || refused(draw.first_instance != 0, "first-instance") ||
+        refused(draw.restart, "primitive-restart") || refused(draw.strip, "triangle-strip") ||
+        refused(!draw.triangles, "non-triangle") || refused(draw.index_count < 3, "index-count-short") ||
+        refused(draw.index_count % 3, "index-count-not-triangles") ||
+        refused(draw.index_count > 200000, "index-count-cap") ||
+        refused(regs.index_buffer_type.swap_mode != AmdGpu::IndexSwapMode::None, "index-swap") ||
+        refused(!regs.depth_control.depth_enable, "depth-test-off") ||
+        refused(regs.depth_control.depth_func == AmdGpu::CompareFunc::Always, "depth-test-always") ||
+        refused(regs.color_target_mask.GetMask(0) != 0xf, "cb0-write-mask") ||
+        refused(!(pipeline.GetGraphicsKey().mrt_mask & 1u), "cb0-attachment-missing") ||
+        refused(std::ranges::any_of(regs.blend_control, [](const auto& control) {
+            return control.enable != 0;
+        }), "any-blend-register")) {
+        ++probe.input_refused;
+        return false;
+    }
+    const auto& vp = regs.viewports[0];
+    const auto* constants = draw.constants;
+    if (placed && (buffer_cache.IsRegionGpuModified(reinterpret_cast<VAddr>(constants), 864) ||
+                   !memory->IsValidGpuMapping(reinterpret_cast<VAddr>(constants), 0) ||
+                   memory->ClampRangeSize(reinterpret_cast<VAddr>(constants), 864) != 864)) {
+        trace("camera-buffer", "placed-camera-range");
+        ++probe.input_refused;
+        return false;
+    }
+    if (refused(!std::equal(stamp.view.begin(), stamp.view.end(), constants + 8), "camera-view") ||
+        refused(stamp.projection != std::array{constants[52] * (vp.xscale < 0.f ? -1.f : 1.f),
+                                              constants[57] * (vp.yscale < 0.f ? -1.f : 1.f),
+                                              constants[62], constants[63]}, "camera-projection")) {
+        ++probe.input_refused;
+        return false;
+    }
+    // A frame may read at most 24 MiB of local guest inputs; reserve half for the three
+    // witnesses so unrelated draws cannot starve the actual claim. Refusals are counted.
+    constexpr u64 Bytes = 24 << 20;
+    const bool witness = draw.index_count == 24 || draw.index_count == 18282 || draw.index_count == 42441;
+    const u64 limit = witness ? Bytes : Bytes / 2;
+    if ((!witness && ++probe.source_attempts > 256) || probe.input_bytes >= limit) {
+        trace("source", "input-budget", probe.input_bytes, limit);
+        ++probe.input_refused;
+        return false;
+    }
+    const auto readable = [&](VAddr address, u64 bytes, std::string_view stage) {
+        const auto reject = [&](bool test, std::string_view gate) {
+            if (test && target != ReflectionJoinTarget::None) {
+                trace(stage, gate, bytes, probe.input_bytes);
+            }
+            return test;
+        };
+        if (reject(!address || !bytes, "empty-range") ||
+            reject(bytes > limit - probe.input_bytes, "byte-budget") ||
+            reject(!memory->IsValidGpuMapping(address, 0), "unmapped") ||
+            reject(memory->ClampRangeSize(address, bytes) != bytes, "short-mapping") ||
+            reject(buffer_cache.IsRegionGpuModified(address, bytes), "gpu-modified")) {
+            return false;
+        }
+        probe.input_bytes += bytes;
+        return true;
+    };
+    const auto index_bytes = u64(draw.index_count) * draw.index_size;
+    if (!readable(draw.indices, index_bytes, "index-range")) {
+        ++probe.input_refused;
+        return false;
+    }
+    const auto bounds = [&]<typename Index>(const Index* p) {
+        const auto [lo, hi] = std::ranges::minmax(std::span{p, draw.index_count});
+        return std::pair{u32(lo), u32(hi)};
+    };
+    const auto [lo, hi] = draw.index_size == 2
+        ? bounds(reinterpret_cast<const u16*>(draw.indices))
+        : bounds(reinterpret_cast<const u32*>(draw.indices));
+    const std::array<u64, 6> binding{draw.shader, draw.positions, draw.indices, first,
+                                     draw.first_vertex, draw.index_size};
+    u64 hash = XXH3_64bits(binding.data(), sizeof(binding));
+    auto* delta_trace = placed ? FireplacePlacementDelta(draw.reflection_native) : nullptr;
+    auto* delta = delta_trace ? &delta_trace->Pending() : nullptr;
+    if (delta) {
+        delta->Begin(stamp);
+        delta->Tuple(DeltaPart::Binding, 0, binding, hash);
+    }
+
+    namespace Object3 = ReflectionOrdinal3;
+    auto* sample = placed && retire && Object3::On() &&
+        Object3::state.working.sequence == retire->sequence &&
+        Object3::Active(this, stamp.generation, retire->sequence) ? &Object3::state.working : nullptr;
+    if (sample) {
+        sample->frame = stamp.frame;
+        sample->pass = stamp.pass;
+        sample->generation = stamp.generation;
+        sample->pose = {.depth_uid = stamp.depth_uid, .cb0_uid = stamp.cb0_uid,
+            .depth_image = std::bit_cast<u64>(stamp.depth_image), .cb0_image = std::bit_cast<u64>(stamp.cb0_image),
+            .view = stamp.view, .projection = stamp.projection, .jitter = stamp.jitter, .extent = stamp.extent,
+            .native = stamp.valid_native, .preview = camera_motion->PreviewFrame(),
+            .loading = BbEngine::Loading::ScreenUp()};
+        sample->palette = {.guest = placed->guest, .bytes = placed->guest_bytes,
+            .handle = std::bit_cast<u64>(placed->handle), .offset = placed->descriptor_offset,
+            .range = placed->descriptor_range, .slot = placed->slot, .adjust = placed->adjust,
+            .flags = u32(placed->range_known) | (u32(placed->gpu_dirty) << 1) |
+                (u32(placed->in_place) << 2) | (u32(placed->writable) << 3)};
+        sample->palette_current = placed->buffer->Handle() == placed->handle;
+        // Independent of the canonical/fallback seed. The tuple also carries the actual index span.
+        sample->geometry = hash;
+    }
+    auto* native = placed && draw.reflection_native->exact ? draw.reflection_native : nullptr;
+    ReflectionNativeProbe::ExactObjects* exact = nullptr;
+    if (native) {
+        const auto matches = [&](u32 ordinal, const auto& note, const auto& owned) {
+            if (!note.complete || ordinal >= vs.buffers.size() ||
+                !(vs.buffers[ordinal].GetSharp(vs) == note.sharp) ||
+                !memory->IsValidGpuMapping(note.address, owned.size()) ||
+                !memory->IsValidMapping(note.address, owned.size()) ||
+                buffer_cache.IsRegionGpuModified(note.address, owned.size())) {
+                return false;
+            }
+            return std::memcmp(reinterpret_cast<const void*>(note.address), owned.data(), owned.size()) == 0;
+        };
+        auto& objects = *native->exact;
+        if (delta) {
+            delta->origin0 = u32(objects.binding0.origin);
+            delta->origin3 = u32(objects.binding3.origin);
+        }
+        // Without a foliage attachment the direct draw uses this pipeline. Check the
+        // actual recorded draw again before the existing placed submission observes it.
+        const auto match_object3 = [&] {
+            if (sample) {
+                auto& chosen = Object3::state.chosen;
+                if (chosen.active && chosen.draw.sequence == sample->sequence) {
+                    chosen.classify_seen = true;
+                    chosen.classify_complete = Object3::writer.Cutoff(Object3::Classified);
+                    chosen.capture_tick = scheduler.CurrentTick();
+                }
+            }
+            return matches(3, objects.binding3, objects.object3);
+        };
+        const char* status = foliage_mask || !pipeline.HandleIfReady() ||
+                                     !ExactReflectionStages(pipeline, *native) ||
+                                     regs.clipper_control.user_clip_plane_enable
+            ? "pipeline-refused" : !matches(0, objects.binding0, objects.object0)
+            ? "object0-refused" : !match_object3()
+            ? "object3-refused" : "objects-qualified";
+        if (sample) {
+            sample->geometry = XXH3_64bits_withSeed(reinterpret_cast<const void*>(draw.indices),
+                                                  index_bytes, sample->geometry);
+            sample->object0_complete = objects.binding0.complete;
+            sample->object3_complete = objects.binding3.complete;
+            sample->native_origin0 = u32(objects.binding0.origin);
+            sample->native_origin3 = u32(objects.binding3.origin);
+            sample->active_words = ExactReflectionActiveWordsOn();
+            if (objects.binding0.complete) {
+                sample->object0_digest = XXH3_64bits(objects.object0.data(), objects.object0.size());
+            }
+            if (objects.binding3.complete) sample->bytes = objects.object3;
+
+            auto& chosen = Object3::state.chosen;
+            if (chosen.active && chosen.draw.sequence == sample->sequence) {
+                chosen.ready_handle = std::bit_cast<u64>(pipeline.HandleIfReady());
+                chosen.sharp_same = vs.buffers.size() > 3 &&
+                    vs.buffers[3].GetSharp(vs) == objects.binding3.sharp;
+                const auto address = sample->object3.guest;
+                const bool gpu_mapped = address && memory->IsValidGpuMapping(address, Object3::Bytes);
+                const bool mapped = gpu_mapped && memory->IsValidMapping(address, Object3::Bytes) &&
+                    memory->ClampRangeSize(address, Object3::Bytes) == Object3::Bytes;
+                const bool gpu_clean = mapped && !buffer_cache.IsRegionGpuModified(address, Object3::Bytes);
+                const bool cpu_clean = mapped && !buffer_cache.IsOrdinal3CpuModified(address, Object3::Bytes);
+                chosen.guest_protections = u32(chosen.sharp_same) | (u32(gpu_mapped) << 1) |
+                    (u32(mapped) << 2) | (u32(gpu_clean) << 3) | (u32(cpu_clean) << 4);
+                // Require a live engine-owned seal for an independent guest snapshot.
+                // Dirty/mapping checks alone cannot establish stable guest backing.
+                u32 seal{}, seal_generation{};
+                u64 seal_base{};
+                if (chosen.guest_protections == 0x1f && chosen.expected_descriptor && !chosen.competing &&
+                    BbEngine::GxObjects::SealedFind(address, Object3::Bytes, &seal, &seal_generation, &seal_base) &&
+                    BbEngine::GxObjects::SealedValid(seal, seal_generation)) {
+                    Object3::Payload owned;
+                    std::memcpy(owned.data(), reinterpret_cast<const void*>(address), owned.size());
+                    if (BbEngine::GxObjects::SealedValid(seal, seal_generation) &&
+                        !buffer_cache.IsOrdinal3CpuModified(address, owned.size()) &&
+                        !buffer_cache.IsRegionGpuModified(address, owned.size())) {
+                        chosen.guest_protections |= 1u << 5;
+                        chosen.guest = owned;
+                        chosen.guest_available = true;
+                    }
+                }
+                const auto descriptor = chosen.draw.object3;
+                chosen.draw = *sample;
+                chosen.draw.object3 = descriptor;
+            }
+        }
+        TraceExactReflectionObjects(*native, status);
+        if (retire) retire->exact = status;
+        if (std::string_view{status} == "objects-qualified") {
+            exact = &objects;
+            constexpr std::string_view domain = "exact placed reflection t184";
+            hash = XXH3_64bits_withSeed(domain.data(), domain.size(), hash);
+            if (delta) {
+                delta->canonical = true;
+                delta->Add(DeltaPart::Mode, 0, hash, 0, domain.size(), domain.data(), 1);
+            }
+        }
+    }
+    auto* placement_sample = placed
+        ? StartPlacementSample(ReflectionNativeProbe::Match(draw.reflection_native->key), stamp) : nullptr;
+    if (placement_sample) {
+        placement_sample->descriptors[0] = hash;
+        placement_sample->Add(PlacementPart::Binding, 0, sizeof(binding), hash);
+    }
+    auto* input_trace = placed && OrdinalZeroFor(*draw.reflection_native)
+        ? ReflectionInputsFor(ReflectionNativeProbe::Match(draw.reflection_native->key)) : nullptr;
+    if (input_trace) {
+        auto& sample = input_trace->current;
+        sample.binding = binding;
+        sample.generation = stamp.generation;
+        sample.frame = stamp.frame;
+        sample.pass = stamp.pass;
+        sample.hashed = 0;
+        sample.used = 0;
+        sample.unique = 0;
+        sample.overflow = false;
+        sample.fetch_unsupported = false;
+        sample.Add({.fields = {lo, hi, u32(regs.index_buffer_type.index_type),
+                               u32(regs.index_buffer_type.swap_mode)},
+                    .guest = draw.indices, .bytes = index_bytes, .part = ReflectionInputPart::Index},
+                   true, input_trace->remaining);
+    }
+    hash = XXH3_64bits_withSeed(reinterpret_cast<const void*>(draw.indices), index_bytes, hash);
+    if (delta) {
+        delta->Add(DeltaPart::Index, 0, hash, draw.indices, index_bytes);
+    }
+    if (placement_sample) {
+        placement_sample->Add(PlacementPart::Index, 0, index_bytes, hash);
+    }
+    bool camera_seen = false;
+    bool palette_seen = false;
+    for (const auto& resource : vs.buffers) {
+        if (resource.buffer_type == Shader::BufferType::Flatbuf) {
+            continue;
+        }
+        if (placed && resource.buffer_type == Shader::BufferType::ClipPlanes) {
+            // LowerUserClipPlanes always declares this host buffer for the hardware vertex stage.
+            // A zero user-plane mask specializes away its reads, and BindBuffers binds it null.
+            const u32 user_planes = regs.clipper_control.user_clip_plane_enable;
+            const auto& output = regs.vs_output_control;
+            const u32 distance_exports = (output.vs_out_ccdist0_enable ? 0x0fu : 0u) |
+                                         (output.vs_out_ccdist1_enable ? 0xf0u : 0u);
+            const u32 guest_clip = output.clip_distance_enable & distance_exports;
+            const u32 guest_cull = output.cull_distance_enable & distance_exports;
+            const bool stored_clip = vs.stores.GetAny(Shader::IR::Attribute::ClipDistance);
+            const bool stored_cull = vs.stores.GetAny(Shader::IR::Attribute::CullDistance);
+            const auto stages = pipeline.GetStages();
+            const bool plain_vertex = vs.hw_stage == Shader::HwStage::Vertex &&
+                                      !stages[u32(Shader::SwStage::Geometry)] &&
+                                      !stages[u32(Shader::SwStage::TessellationControl)] &&
+                                      !stages[u32(Shader::SwStage::TessellationEval)];
+            const bool inert = plain_vertex && !resource.is_written && !user_planes &&
+                               !guest_clip && !guest_cull && !stored_clip && !stored_cull;
+            // value_a is UCP_ENA. value_b packs guest clip/cull masks and the refusal flags.
+            const u32 evidence = guest_clip | (guest_cull << 8) | (u32(stored_clip) << 16) |
+                                 (u32(stored_cull) << 17) | (u32(!plain_vertex) << 18) |
+                                 (u32(resource.is_written) << 19);
+            trace("vertex-buffer", inert ? "inert-clip-planes" : "unsupported-clip-planes",
+                  user_planes, evidence);
+            if (!inert) {
+                ++probe.input_refused;
+                return false;
+            }
+            continue;
+        }
+        if (resource.IsSpecial() || resource.is_written) {
+            trace("vertex-buffer", "special-or-written", u32(resource.buffer_type), resource.is_written);
+            ++probe.input_refused;
+            return false;
+        }
+        const auto buffer = resource.GetSharp(vs);
+        const u32 size = buffer.GetSize();
+        const auto input_object = [&](ReflectionInputPart part, bool clean) {
+            if (input_trace) {
+                const u32 flags = u32(resource.is_uniform) | (u32(resource.is_formatted) << 1) |
+                                  (u32(resource.only_const_reads) << 2);
+                const auto& fetch = resource.sharp_fetch;
+                input_trace->current.Add({.sharp = buffer,
+                    .fields = {u32(resource.buffer_type), flags, u32(resource.used_types),
+                               u32(resource.post_op), resource.post_op_dw1_mask, fetch.load_mask},
+                    .guest = buffer.base_address, .bytes = size,
+                    .ordinal = u32(&resource - vs.buffers.data()), .part = part},
+                    clean, input_trace->remaining);
+            }
+        };
+        if (!buffer.Valid() || size == 0) {
+            input_object(ReflectionInputPart::UnboundObject, false);
+            continue;
+        }
+        if (size == 864 && buffer.base_address == reinterpret_cast<VAddr>(constants)) {
+            if (camera_seen || !readable(buffer.base_address, size, "camera-buffer")) {
+                if (camera_seen) {
+                    trace("camera-buffer", "duplicate");
+                }
+                ++probe.input_refused;
+                return false;
+            }
+            input_object(ReflectionInputPart::Camera, false);
+            camera_seen = true;
+            continue;
+        }
+        if (placed && u32(&resource - vs.buffers.data()) == placed->ordinal) {
+            const std::array<u64, 2> binding_key{placed->guest, ReflectionFirstHit::PaletteBytes};
+            if (buffer.base_address != placed->guest || size != placed->guest_bytes ||
+                buffer.GetStride() != 16 ||
+                draw.palette != XXH3_64bits_withSeed(binding_key.data(), sizeof(binding_key), 0)) {
+                trace("object-buffer", "placed-palette-provenance");
+                ++probe.input_refused;
+                return false;
+            }
+            // Its actual bytes are GPU-owned. Read them only through the effective descriptor.
+            hash = XXH3_64bits_withSeed(binding_key.data(), sizeof(binding_key), hash);
+            if (delta) {
+                delta->Tuple(DeltaPart::PaletteGuest, u16(placed->ordinal), binding_key, hash);
+            }
+            if (exact) {
+                const std::array<u64, 5> effective{placed->slot, placed->adjust, placed->descriptor_offset,
+                                                   placed->descriptor_range, std::bit_cast<u64>(placed->handle)};
+                hash = XXH3_64bits_withSeed(effective.data(), sizeof(effective), hash);
+                if (delta) {
+                    delta->Tuple(DeltaPart::PaletteBinding, u16(placed->ordinal), effective, hash);
+                }
+            }
+            if (placement_sample) {
+                placement_sample->Descriptor(2, PlacementPart::PaletteDescriptor, u16(placed->ordinal),
+                                             binding_key, hash);
+            }
+            if (input_trace) {
+                input_trace->current.Add({.sharp = buffer,
+                    .fields = {placed->slot, placed->adjust, placed->descriptor_offset,
+                               placed->descriptor_range, placed->effective_bytes,
+                               std::bit_cast<u64>(placed->handle)},
+                    .guest = placed->guest, .bytes = placed->guest_bytes, .ordinal = placed->ordinal,
+                    .part = ReflectionInputPart::Palette}, false, input_trace->remaining);
+            }
+            palette_seen = true;
+            continue;
+        }
+        if (size > 64 * 1024 || !readable(buffer.base_address, size, "object-buffer")) {
+            if (size > 64 * 1024) {
+                trace("object-buffer", "size-cap", size, 64 * 1024);
+            }
+            ++probe.input_refused;
+            return false;
+        }
+        // The actual submitted ordinal0 copy is already covered by t177.
+        input_object(ReflectionInputPart::Object, true);
+        const u16 ordinal = u16(&resource - vs.buffers.data());
+        const bool relocating = exact && (ordinal == 0 || ordinal == 3);
+        const std::array<u64, 2> desc{relocating ? 0 : buffer.base_address, size};
+        hash = XXH3_64bits_withSeed(desc.data(), sizeof(desc), hash);
+        if (delta) {
+            delta->Tuple(DeltaPart::ObjectRange, ordinal, desc, hash);
+        }
+        if (exact) {
+            auto sharp = buffer;
+            if (relocating) {
+                sharp.base_address = 0;
+            }
+            const u32 flags = u32(resource.is_uniform) | (u32(resource.is_formatted) << 1) |
+                              (u32(resource.only_const_reads) << 2);
+            const std::array<u64, 6> metadata{ordinal, u32(resource.buffer_type), flags, u32(resource.used_types),
+                                              u32(resource.post_op), resource.post_op_dw1_mask};
+            hash = XXH3_64bits_withSeed(&sharp, sizeof(sharp), hash);
+            if (delta) {
+                delta->Tuple(DeltaPart::ObjectSharp, ordinal, std::bit_cast<std::array<u32, 4>>(sharp), hash);
+            }
+            hash = XXH3_64bits_withSeed(metadata.data(), sizeof(metadata), hash);
+            if (delta) {
+                delta->Tuple(DeltaPart::ObjectResource, ordinal, metadata, hash);
+            }
+        }
+        if (placed && ordinal == 0) {
+            if (auto* proof = OrdinalZeroFor(*draw.reflection_native)) {
+                proof->preflight = true;
+                proof->exact_sharp = proof->sharp == buffer;
+                proof->preflight_address = buffer.base_address;
+                proof->preflight_size = size;
+                // The original preflight has just verified this clean guest span. This is
+                // still only a guest snapshot when no completed owned copy was observed.
+                if (size <= OrdinalZeroByteLimit && memory->IsValidMapping(buffer.base_address, size)) {
+                    proof->guest_bytes = size;
+                    proof->guest_digest = XXH3_64bits(reinterpret_cast<const void*>(buffer.base_address), size);
+                }
+            }
+        }
+        if (placement_sample) {
+            placement_sample->Descriptor(1, PlacementPart::ObjectDescriptor, ordinal, desc, hash);
+        }
+        if (relocating) {
+            hash = HashExactObject(*exact, ordinal, hash, delta);
+            if (retire) retire->objects[ordinal == 0 ? 0 : 1].hashed = true;
+        } else {
+            hash = XXH3_64bits_withSeed(reinterpret_cast<const void*>(buffer.base_address), size, hash);
+            if (delta) {
+                delta->Add(DeltaPart::ObjectPayload, ordinal, hash, buffer.base_address, size);
+            }
+        }
+        if (sample && ordinal == 0) sample->ordinary_object0_prefix = hash;
+        if (sample && ordinal == 3) sample->ordinary_object3_prefix = hash;
+        if (placement_sample) {
+            placement_sample->Add(PlacementPart::ObjectContent, ordinal, size, hash);
+        }
+    }
+    bool position_seen = false;
+    const s64 first_vertex = s32(draw.first_vertex);
+    if (first_vertex + lo < 0) {
+        trace("vertex-fetch", "negative-relative-index");
+        ++probe.input_refused;
+        return false;
+    }
+    std::array<std::array<u64, 2>, 16> ranges{};
+    u32 range_count = 0;
+    for (const auto& attribute : fetch->attributes) {
+        const auto buffer = attribute.GetSharp(vs);
+        const auto stride = buffer.GetStride();
+        const u64 start = u64(first_vertex + lo) * stride;
+        const u64 end = u64(first_vertex + hi + 1) * stride;
+        if (!buffer.Valid() || !stride || end > buffer.GetSize() || start >= end) {
+            trace("vertex-fetch", "descriptor-span", attribute.semantic, buffer.GetSize());
+            ++probe.input_refused;
+            return false;
+        }
+        position_seen |= attribute.semantic == 0 && buffer.base_address == draw.positions;
+        const std::array<u64, 2> range{buffer.base_address + start, end - start};
+        const std::array<u64, 4> placement{range[0], range[1], attribute.semantic, stride};
+        hash = XXH3_64bits_withSeed(placement.data(), sizeof(placement), hash);
+        if (sample) sample->geometry = XXH3_64bits_withSeed(placement.data(), sizeof(placement), sample->geometry);
+        const u16 ordinal = u16(&attribute - fetch->attributes.data());
+        if (delta) {
+            delta->Tuple(DeltaPart::FetchRange, ordinal, placement, hash);
+        }
+        if (exact) {
+            const std::array<u64, 6> metadata{ordinal, attribute.dest_vgpr, attribute.num_elements,
+                u64(attribute.sgpr_base) << 32 | attribute.dword_offset,
+                u64(attribute.inst_offset) << 32 | attribute.instance_data,
+                u64(attribute.data_format) << 32 | attribute.num_format};
+            hash = XXH3_64bits_withSeed(&buffer, sizeof(buffer), hash);
+            if (delta) {
+                delta->Tuple(DeltaPart::FetchSharp, ordinal, std::bit_cast<std::array<u32, 4>>(buffer), hash);
+            }
+            hash = XXH3_64bits_withSeed(metadata.data(), sizeof(metadata), hash);
+            if (delta) {
+                delta->Tuple(DeltaPart::FetchResource, ordinal, metadata, hash);
+            }
+        }
+        if (placement_sample) {
+            placement_sample->Descriptor(3, PlacementPart::FetchDescriptor, ordinal, placement, hash);
+        }
+        const auto input_fetch = [&] {
+            if (input_trace) {
+                input_trace->current.Add({.sharp = buffer,
+                    .fields = {attribute.semantic, attribute.dest_vgpr, attribute.num_elements,
+                               u64(attribute.sgpr_base) << 32 | attribute.dword_offset,
+                               u64(attribute.inst_offset) << 32 | attribute.instance_data,
+                               u64(attribute.data_format) << 32 | attribute.num_format},
+                    .guest = range[0], .bytes = range[1], .ordinal = ordinal,
+                    .part = ReflectionInputPart::Fetch}, true, input_trace->remaining);
+            }
+        };
+        const auto checked = std::span{ranges}.first(range_count);
+        if (std::ranges::find(checked, range) != checked.end()) {
+            input_fetch();
+            continue;
+        }
+        if (range_count == ranges.size() || !readable(range[0], range[1], "vertex-range")) {
+            if (range_count == ranges.size()) {
+                trace("vertex-range", "range-count-cap", range_count);
+            }
+            ++probe.input_refused;
+            return false;
+        }
+        ranges[range_count++] = range;
+        input_fetch();
+        hash = XXH3_64bits_withSeed(reinterpret_cast<const void*>(range[0]), range[1], hash);
+        if (sample) sample->fetch_prefix = hash;
+        if (delta) {
+            delta->Add(DeltaPart::FetchPayload, ordinal, hash, range[0], range[1]);
+        }
+        if (placement_sample) {
+            placement_sample->Add(PlacementPart::FetchContent, ordinal, range[1], hash);
+        }
+    }
+    if (!camera_seen || !position_seen || (placed && !palette_seen)) {
+        trace("source", !camera_seen ? "camera-unbound" :
+                        !position_seen ? "position-unbound" : "placed-palette-unbound");
+        ++probe.input_refused;
+        return false;
+    }
+    if (input_trace) {
+        input_trace->current.FinishFetch(input_trace->remaining, [&](VAddr address, u64 bytes) {
+            // The full union has to remain in one clean CPU-readable guest mapping.
+            // These diagnostic checks do not consume the original capture's read budget.
+            return memory->IsValidGpuMapping(address, bytes) &&
+                   memory->IsValidMapping(address, bytes) &&
+                   !buffer_cache.IsRegionGpuModified(address, bytes);
+        });
+    }
+    token.placement = hash ? hash : 1;
+    if (sample) {
+        sample->canonical = exact != nullptr;
+        sample->final_key = token.placement;
+        auto& chosen = Object3::state.chosen;
+        if (chosen.active && chosen.draw.sequence == sample->sequence) {
+            chosen.draw.canonical = sample->canonical;
+            chosen.draw.final_key = sample->final_key;
+            chosen.draw.ordinary_object0_prefix = sample->ordinary_object0_prefix;
+            chosen.draw.ordinary_object3_prefix = sample->ordinary_object3_prefix;
+            chosen.draw.fetch_prefix = sample->fetch_prefix;
+            chosen.draw.geometry = sample->geometry;
+        }
+    }
+    if (delta) {
+        delta->key = token.placement;
+        token.placement_delta.enabled = true;
+    }
+    if (exact) {
+        exact->placement = true;
+    }
+    if (placement_sample) {
+        placement_sample->final = token.placement;
+    }
+    if (placed) {
+        token.placed = ReflectionFirstHit::PlacedSource(ReflectionNativeProbe::Match(draw.reflection_native->key));
+    }
+    token.first = first;
+    token.min_index = lo;
+    token.max_index = hi;
+    trace("source", "accepted", lo, hi);
+    return true;
+}
+
+namespace {
+template <typename Integer>
+bool ReflectionNumber(std::string_view text, Integer& result) {
+    if (text.empty()) {
+        return false;
+    }
+    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), result);
+    return ec == std::errc{} && end == text.data() + text.size();
+}
+
+std::string_view ReflectionPart(std::string_view& input, char delimiter) {
+    const auto split = input.find(delimiter);
+    const auto part = input.substr(0, split);
+    input = split == std::string_view::npos ? std::string_view{} : input.substr(split + 1);
+    return part;
+}
+
+bool ParseReflectionRequest(std::string_view spec, ReflectionFirstHit::Request& request) {
+    using ReflectionFirstHit::Mode;
+    if (spec.size() > 256 || spec.ends_with(';') ||
+        !ReflectionNumber(ReflectionPart(spec, ':'), request.serial) || !request.serial ||
+        spec.empty()) {
+        return false;
+    }
+    // Authored placed mirror plane independently joined to native depth (R362).
+    request.receiver_plane_normal = {-0.8996664f, -0.17364765f, -0.40055816f};
+    while (!spec.empty()) {
+        if (request.count == ReflectionFirstHit::PixelLimit) {
+            return false;
+        }
+        auto item = ReflectionPart(spec, ';');
+        auto& pixel = request.pixels[request.count];
+        if (item.ends_with('/') || !ReflectionNumber(ReflectionPart(item, '/'), pixel.x) ||
+            !ReflectionNumber(ReflectionPart(item, '/'), pixel.y)) {
+            return false;
+        }
+        const auto mode = ReflectionPart(item, '/');
+        if (mode == "d") {
+            pixel.mode = Mode::Direct;
+        } else if (mode == "s") {
+            pixel.mode = Mode::Shaded;
+        } else if (mode == "p") {
+            pixel.mode = Mode::Planar;
+        } else {
+            return false;
+        }
+        if (!item.empty() && (!ReflectionNumber(item, pixel.farther) || pixel.farther > 2)) {
+            return false;
+        }
+        ++request.count;
+    }
+    return true;
+}
+
+void LogReflectionReport(const ReflectionFirstHit::Report& report) {
+    using namespace ReflectionFirstHit;
+    const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+    const auto& stamp = report.stamp;
+    std::printf("Reflection result request=%llu generation=%llu frame=%llu pass=%llu "
+                "depth_uid=%llu cb0_uid=%llu extent=%u/%u jitter=%.8g/%.8g "
+                "retained_scene=%llu current_scene=%llu direct_evidence_only=1 placed_mask=%u\n",
+                u(report.request.serial), u(stamp.generation), u(stamp.frame), u(stamp.pass),
+                u(stamp.depth_uid), u(stamp.cb0_uid), stamp.extent[0], stamp.extent[1],
+                double(stamp.jitter[0]), double(stamp.jitter[1]),
+                u(report.scenes[0].serial), u(report.scenes[1].serial), report.placed_mask);
+    for (u32 row = 0; row < 3; ++row) {
+        const auto* v = stamp.view.data() + 4 * row;
+        std::printf("Reflection camera request=%llu row=%u view=%.9g/%.9g/%.9g/%.9g projection=%.9g/%.9g/%.9g/%.9g\n",
+                    u(report.request.serial), row, double(v[0]), double(v[1]), double(v[2]), double(v[3]),
+                    double(stamp.projection[0]), double(stamp.projection[1]),
+                    double(stamp.projection[2]), double(stamp.projection[3]));
+    }
+    const auto hex_digit = [](u8 n) { return "0123456789abcdef"[n]; };
+    for (u32 arm = 0; arm < report.scenes.size(); ++arm) {
+        const auto& scene = report.scenes[arm];
+        for (u32 i = 0; i < scene.members.size(); ++i) {
+            const auto& member = scene.members[i];
+            const auto& id = member.identity;
+            char hash[65]{};
+            for (u32 j = 0; j < id.topology_sha256.size(); ++j) {
+                hash[2 * j] = hex_digit(id.topology_sha256[j] >> 4);
+                hash[2 * j + 1] = hex_digit(id.topology_sha256[j] & 0xf);
+            }
+            std::printf("Reflection member request=%llu arm=%u scene=%llu id=%u "
+                        "surface=%016llx placement=%016llx allocation=%llu revision=%llu "
+                        "vs=%08x ps=%08x count=%u first=%u sha256=%s receiver=%u wall=%u current=%u age=%llu "
+                        "placed_source=%u palette_build_cookie=%llu palette_draw_cookie=%llu\n",
+                        u(report.request.serial), arm, u(scene.serial), i, u(id.surface), u(id.placement),
+                        u(id.allocation), u(id.revision), id.vs, id.ps, id.count, id.first, hash,
+                        u32(id.receiver), u32(id.wall_witness), u32(member.current),
+                        u(stamp.frame - member.last_submit_frame), u32(id.placed), u(member.placement_build_cookie),
+                        u(member.placement_cookie));
+        }
+    }
+    const auto log_hit = [&](u32 sample, const char* kind, u32 arm, const Hit& hit) {
+        std::printf("Reflection hit request=%llu sample=%u kind=%s arm=%u id=%u geometry=%u "
+                    "primitive=%u t=%.9g bary=%.9g/%.9g view_z=%.9g world=%.9g/%.9g/%.9g\n",
+                    u(report.request.serial), sample, kind, arm, hit.instance, hit.geometry, hit.primitive,
+                    double(hit.distance[0]), double(hit.distance[1]), double(hit.distance[2]),
+                    double(hit.distance[3]), double(hit.world[0]), double(hit.world[1]), double(hit.world[2]));
+    };
+    for (u32 i = 0; i < report.request.count; ++i) {
+        const auto& sample = report.samples[i];
+        const auto& raw = sample.cb0_bytes;
+        const auto& native = sample.native_point_depth;
+        const auto& origin = sample.origin_t;
+        const auto& dir = sample.direction_depth_delta;
+        std::printf("Reflection sample request=%llu sample=%u pixel=%u/%u mode=%u outcome=%u "
+                    "cb0=%u/%u/%u/%u native=%.9g/%.9g/%.9g depth=%.9g origin=%.9g/%.9g/%.9g "
+                    "receiver_t=%.9g direction=%.9g/%.9g/%.9g depth_delta=%.9g\n",
+                    u(report.request.serial), i, sample.x, sample.y, u32(sample.mode), u32(sample.outcome),
+                    raw[0], raw[1], raw[2], raw[3], double(native[0]), double(native[1]), double(native[2]),
+                    double(native[3]), double(origin[0]), double(origin[1]), double(origin[2]),
+                    double(origin[3]), double(dir[0]), double(dir[1]), double(dir[2]), double(dir[3]));
+        log_hit(i, "receiver", 0, sample.receiver);
+        for (u32 arm = 0; arm < report.scenes.size(); ++arm) {
+            log_hit(i, "world", arm, sample.world[arm]);
+            if (report.request.pixels[i].farther) {
+                log_hit(i, report.request.pixels[i].farther == 2 ? "wall-only" : "farther",
+                        arm, sample.farther[arm]);
+            }
+        }
+    }
+}
+} // namespace
+
+void Rasterizer::ReflectionPollRequest() {
+    auto& probe = *reflection_probe;
+#if BB_WIND_TWIGS_LIVE
+    const u32 generation = BbLiveKnobs::Generation();
+    if (probe.knob_generation == generation) {
+        return;
+    }
+    probe.knob_generation = generation;
+    const auto value = BbLiveKnobs::Lookup("BB_REFLECTION_FIRST_HIT_REQUEST");
+    const char* text = value.Get();
+#else
+    if (probe.knob_generation == 0) {
+        return;
+    }
+    probe.knob_generation = 0;
+    const char* text = std::getenv("BB_REFLECTION_FIRST_HIT_REQUEST");
+#endif
+    if (!text || !*text) {
+        return;
+    }
+    ReflectionFirstHit::Request request;
+    if (!ParseReflectionRequest(text, request)) {
+        std::printf("Reflection refused reason=invalid-request-format expected=serial:x/y/s[|p|d][/1|/2];...\n");
+        return;
+    }
+    if (request.serial <= probe.last_request) {
+        return;
+    }
+    probe.last_request = request.serial;
+    if (probe.request) {
+        std::printf("Reflection refused request=%llu reason=request-already-pending\n",
+                    static_cast<unsigned long long>(request.serial));
+        return;
+    }
+    probe.request = request;
+    probe.request_frame = rt_shadow->WindowDiagnosticFrame();
+}
+
+void Rasterizer::ReflectionBlendedScene() {
+    auto& probe = *reflection_probe;
+    ReflectionPollRequest();
+    const auto view = camera_motion->PassMatrices();
+    if (!probe.stamp || probe.tainted || probe.blended_pass == probe.stamp->pass ||
+        probe.stamp->frame != rt_shadow->WindowDiagnosticFrame() ||
+        probe.stamp->generation != BbEngine::Loading::Generation() || BbEngine::Loading::ScreenUp() ||
+        !view.valid || view.view != probe.stamp->view || view.proj != probe.stamp->projection ||
+        db_desc.first != probe.stamp->depth || camera_motion->Depth() != probe.stamp->depth ||
+        camera_motion->PreviewFrame() || scene_targets->Reduced() || point_shadow->Apart() ||
+        (upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{}) != probe.stamp->jitter) {
+        return;
+    }
+    const auto stamp = *probe.stamp;
+    probe.blended_pass = stamp.pass;
+    rt_shadow->ReflectionFlush(stamp);
+    if (probe.request) {
+        const auto request = *probe.request;
+        probe.request.reset();
+        const auto status = probe.pass.Submit(stamp, request);
+        rt_shadow->ReflectionAdmissions(request.serial);
+        std::printf("Reflection dispatch request=%llu status=%s input_bytes=%llu input_refused=%llu bad_stamp=%llu\n",
+                    static_cast<unsigned long long>(request.serial), ReflectionFirstHit::StatusName(status),
+                    static_cast<unsigned long long>(probe.input_bytes),
+                    static_cast<unsigned long long>(probe.input_refused),
+                    static_cast<unsigned long long>(probe.bad_stamp));
+    }
+}
+
+void Rasterizer::ReflectionFrameEnd() {
+    auto& probe = *reflection_probe;
+    ReflectionPollRequest();
+    const u64 frame = rt_shadow->WindowDiagnosticFrame();
+    if (probe.stamp && (probe.stamp->generation != BbEngine::Loading::Generation() ||
+        BbEngine::Loading::ScreenUp() || camera_motion->PreviewFrame() ||
+        (frame > probe.stamp->frame && frame - probe.stamp->frame > 1))) {
+        rt_shadow->ReflectionCloseEpoch();
+        probe.stamp.reset();
+    }
+    if (probe.request && frame >= probe.request_frame && frame - probe.request_frame >= 30) {
+        std::printf("Reflection refused request=%llu reason=no-matched-native-blended-pass bad_stamp=%llu\n",
+                    static_cast<unsigned long long>(probe.request->serial),
+                    static_cast<unsigned long long>(probe.bad_stamp));
+        probe.request.reset();
+    }
+    for (u32 slot = 0; slot < 2; ++slot) {
+        ReflectionFirstHit::Report result;
+        const auto status = probe.pass.Poll(result);
+        if (status == ReflectionFirstHit::Status::Pending) {
+            break;
+        }
+        if (status == ReflectionFirstHit::Status::Recorded) {
+            LogReflectionReport(result);
+        } else {
+            std::printf("Reflection readback refused reason=%s\n", ReflectionFirstHit::StatusName(status));
+        }
+    }
+}
+
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+std::optional<BottleCold::Closed> BottleColdSource177::CloseBeforeDisplay(
+    const Rasterizer& owner, Scheduler& scheduler, const SceneTargets& targets,
+    const RtShadow& rt, const ObjectMotion& objects, const CameraMotion& camera,
+    const TemporalUpscaler& upscaler, VideoCore::TextureCache& textures) {
+    const u32 request = BottleSource::Run();
+    if (!request) return {};
+    const auto frame = BottleCutFrame(&owner, request, scheduler, targets, rt, objects);
+    BottleCold::Image depth{}, color{};
+    if (BottleCutNativeScope(targets)) {
+        const auto depth_id = camera.Depth();
+        const auto color_id = upscaler.SceneColor();
+        depth = BottleCutImage(targets, depth_id, textures.TryGetImage(depth_id, 0), true);
+        const auto* current = textures.TryGetImage(color_id, 0);
+        if (current && current->info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+            color = BottleCutImage(targets, color_id, current, false);
+        }
+    }
+    // The upscaler has finished its jittered draws here. Compare the current pass pose;
+    // each ordinary opportunity retains the actual jitter sampled at its own branch.
+    bool read_backing_current = false;
+#if defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (const auto* read = Current().ReadFor(frame); read && depth && color) {
+        const auto c = targets.InspectSewerProxy(upscaler.SceneColor(), color.uid, read->color.view);
+        const auto d = targets.InspectSewerProxy(camera.Depth(), depth.uid, read->depth.view);
+        // Merge may invalidate logical proxy content. Only the actual retained image/view
+        // ownership needs to survive unchanged for this earlier raw consumer observation.
+        read_backing_current = read->tick <= scheduler.CurrentTick() &&
+            c.target.image == read->color.image && c.target.view == read->color.view &&
+            d.target.image == read->depth.image && d.target.view == read->depth.view &&
+            c.incarnation == read->color.incarnation && d.incarnation == read->depth.incarnation &&
+            c.extent == vk::Extent3D{1920, 1080, 1} && d.extent == c.extent;
+    }
+#endif
+    auto closed = Current().Close(frame, depth, color, BottleCutCamera(camera, camera.Jitter()),
+                                  true, read_backing_current);
+    if (closed) Report(*closed);
+    return closed;
+}
+#endif
+
 void Rasterizer::EffectsAfterTargets(const GraphicsPipeline* pipeline) {
     const auto& key = pipeline->GetGraphicsKey();
     const bool gbuffer = std::popcount(key.mrt_mask) >= 5 && db_desc.first;
+    if (rt_shadow->ActiveLampPane()) {
+        LampPaneTargets(pipeline, gbuffer);
+    }
     if (gbuffer) {
+        if (ReflectionFirstHit::On() && !reflection_probe) {
+            if (instance.IsRayQuerySupported()) {
+                reflection_probe = std::make_unique<ReflectionProbe>(instance, scheduler,
+                                                                    texture_cache, runtime);
+                rt_shadow->ReflectionAttach(&reflection_probe->pass);
+                std::printf("Reflection first hit armed (native direct draws, no colour)\n");
+            } else {
+                static const bool reported = [] {
+                    std::printf("Reflection first hit refused reason=ray-query-unavailable\n");
+                    return true;
+                }();
+                (void)reported;
+            }
+        }
         depth_of_field->Reset();
         if (heat_haze) { // bbport (r97_heat-haze): the lamps of the last G-buffer pass only
             heat_haze->ClearLights();
@@ -3006,12 +6442,43 @@ void Rasterizer::EffectsAfterTargets(const GraphicsPipeline* pipeline) {
             }
             glass_tri_depth = db_desc.first;
         }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        const auto bottle_master = BottleCaustic::ReadCutMaster();
+        if (bottle_master.on) {
+#else
+        if (BottleCaustic::On()) {
+#endif
+            if (!bottle_caustic) {
+                bottle_caustic = std::make_unique<BottleCaustic::Pass>(
+                    instance, scheduler, texture_cache, runtime, *scene_targets,
+                    *camera_motion, *point_shadow, *rt_shadow);
+            }
+            bottle_caustic->OnTargets(db_desc.first, cb_descs[0].first, cb_descs[2].first);
+        }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle_master && gbuffer_draw && camera_motion->Depth() == db_desc.first &&
+            BottleCutNativeScope(*scene_targets)) {
+            const auto* depth = texture_cache.TryGetImage(db_desc.first, 0);
+            if (const auto depth_key = BottleCutImage(*scene_targets, db_desc.first, depth, true)) {
+                const auto* normal = (key.mrt_mask & 1u) ? texture_cache.TryGetImage(cb_descs[0].first, 0) : nullptr;
+                const auto* albedo = (key.mrt_mask & 4u) ? texture_cache.TryGetImage(cb_descs[2].first, 0) : nullptr;
+                BottleCold::Current().GBuffer(
+                    BottleCutFrame(this, BottleSource::Run(), scheduler, *scene_targets, *rt_shadow, *object_motion),
+                    {depth_key, BottleCutImage(*scene_targets, cb_descs[0].first, normal, false),
+                                BottleCutImage(*scene_targets, cb_descs[2].first, albedo, false)},
+                    scheduler.CurrentTick(), bottle_master);
+            }
+        }
+#endif
         if (caustics) { // bbport (r107_caustics): cb 1 holds the gloss; arms its pass
             caustics->OnGBufferDraw(db_desc.first, cb_descs[1].first, cb_descs[2].first,
                                     cb_descs[3].first); // r107b: albedo, light sets
         }
         if (drawn_look_wanted) { // bbport (r45_drawn-look): cb 0 holds the world normals
             drawn_look->OnGBufferDraw(db_desc.first, cb_descs[0].first);
+        }
+        if (foliage_glow) { // bbport (r131a_foliage-translucency): cb 0 holds the world normals, cb 2 the albedo; arms its pass
+            foliage_glow->OnGBufferDraw(db_desc.first, cb_descs[0].first, cb_descs[2].first);
         }
         if (ambient_particles) { // bbport (r98c_particles-visible): the last pass's lamps only
             ambient_particles->ClearLamps();
@@ -3032,22 +6499,104 @@ void Rasterizer::EffectsAfterTargets(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::EffectsBlendedScene() {
+    if (reflection_probe) {
+        ReflectionBlendedScene();
+    }
     if (surface_probe_on) {
         SurfaceProbeBlendedScene(); // bbport (r64b_surface-probe-more): its readback, log only
+        SurfaceProbeRect(false); // bbport (t70b_mirror-probe, TOOL): BB_REFLECT_PROBE_RECT's readback, log only
     }
     if (effects_wanted) {
         ssgi->OnOpaqueScene(cb_descs[0].first, db_desc.first, upscaler->Jitter());
     }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    using Branch = BottleSource::Guard::Branch;
+    const auto bottle_master = bottle_caustic ? BottleCaustic::ReadCutMaster() : BottleSource::MasterRead{};
+    std::optional<BottleSource::Opportunity> bottle_opportunity;
+#if defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    std::shared_ptr<BottleRawApply180::Receipt> raw_phase;
+#endif
+    if (const u32 request = BottleSource::Run(); request && BottleCutNativeScope(*scene_targets)) {
+        const auto color_id = cb_descs[0].first;
+        const auto depth_id = db_desc.first;
+        const auto* color = texture_cache.TryGetImage(color_id, 0);
+        const auto* depth = texture_cache.TryGetImage(depth_id, 0);
+        const auto color_key = upscaler->SceneColor() == color_id && color &&
+                               color->info.pixel_format == vk::Format::eR16G16B16A16Sfloat
+            ? BottleCutImage(*scene_targets, color_id, color, false) : BottleCold::Image{};
+        const auto depth_key = camera_motion->Depth() == depth_id
+            ? BottleCutImage(*scene_targets, depth_id, depth, true) : BottleCold::Image{};
+        const auto camera = BottleCutCamera(*camera_motion, upscaler->Jitter());
+        const auto bindings = color_key && depth_key
+            ? BottleCutBoundAttachments(scheduler, *scene_targets, color_id, *color, depth_id, *depth)
+            : BottleCutBindings{};
+        const auto branch = !bottle_caustic ? Branch::NoPassObject
+                                          : (bottle_master.on ? Branch::MasterOn : Branch::MasterOff);
+        const auto latest = bottle_caustic ? BottleSource::MasterRead{} : BottleCaustic::LatestCutMaster();
+        const void* reader = nullptr;
+#if defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        if (upscaler->BottleRawSearchRequested()) reader = upscaler.get();
+#endif
+        const auto frame = BottleCutFrame(this, request, scheduler, *scene_targets, *rt_shadow, *object_motion);
+        bottle_opportunity = BottleCold::Current().Observe(
+            frame, depth_key, color_key, scheduler.CurrentTick(), camera, bindings.color, bindings.depth,
+            {branch, bottle_master}, latest, reader);
+#if defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+        if (reader && bottle_opportunity)
+            raw_phase = BottleRawApply180::CurrentBudget().Begin(
+                BottleRawApply180::Selected(request), *bottle_opportunity, frame, color_key, depth_key);
+#endif
+    }
+    if (bottle_master.on) {
+        bottle_caustic->Apply(cb_descs[0].first, db_desc.first, upscaler->Jitter(),
+                              bottle_opportunity ? &*bottle_opportunity : nullptr
+#if defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+                              , raw_phase
+#endif
+                              );
+    }
+#if defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    if (raw_phase) BottleRawApply180::CurrentBudget().Finish(*raw_phase);
+#endif
+    if (bottle_opportunity) BottleCold::Current().Add(*bottle_opportunity);
+#else
+    if (bottle_caustic && BottleCaustic::On()) {
+        bottle_caustic->Apply(cb_descs[0].first, db_desc.first, upscaler->Jitter());
+    }
+#endif
     // bbport (r107_caustics): BB_CAUSTICS only: the water caustics, once after each G-buffer
     // pass, after the indirect light is in (they move the lit surface's light) and before the
     // drawn look paints it.
     if (caustics) {
-        caustics->Apply(cb_descs[0].first, db_desc.first, upscaler->Jitter(), wind.Get().wind);
+        caustics->Apply(cb_descs[0].first, db_desc.first, upscaler->Jitter(), wind.Get().wind,
+                        sewer_receiver ? this : nullptr);
+    }
+    // bbport (r131a_foliage-translucency): the back-lit glow of leaves and grass, once after each G-buffer pass's opaque lighting, right after the
+    // caustics and before the blood sheen, the glass view and the drawn look (off: one null pointer test).
+    if (foliage_glow) {
+        const auto mask = foliage_mask ? FoliageDiagnosticView() : vk::ImageView{};
+        foliage_glow->Apply(cb_descs[0].first, db_desc.first, upscaler->Jitter(), {},
+                            mask, {mask_receivers.key.width, mask_receivers.key.height});
     }
     // bbport (r100d_blood-sheen-gbuffer): BB_BLOOD_SHEEN=show only: the pixels the wet film took
     // painted over the lit scene, once after each wet-ground pass (vk_blood_sheen.h).
     if (blood_sheen) {
         blood_sheen->Show(cb_descs[0].first, point_shadow->Pending());
+    }
+    // bbport (r129a_glass-registry): BB_GLASS_VIEW on only (off: one null pointer test): the tagged pixels of the registry's
+    // G-buffer hit draws painted over the lit scene, once after each G-buffer pass's opaque lighting (vk_glass_view.h).
+    if (glass_view) {
+        glass_view->Show(cb_descs[0].first, point_shadow->Pending());
+    }
+    // bbport (r131c_cabinet-glass-clear): BB_GLASS_CLEAR on only (off: one null pointer test): the cabinet's pane put back as a glass
+    // layer over the lit scene, once after each G-buffer pass's opaque lighting that had a redirected pane draw (vk_glass_clear.h).
+    if (glass_clear) {
+        glass_clear->Composite(cb_descs[0].first, db_desc.first, upscaler->Jitter(), point_shadow->Pending());
+    }
+    // bbport (t129c_sun-term-view, TOOL): BB_RT_SUN_TERM_VIEW on only (off: one null pointer test): the lit scene overwritten with
+    // the ray traced sun/moon shadow term as grey (vk_sun_term_view.h).
+    if (sun_term_view) {
+        sun_term_view->Show(cb_descs[0].first, point_shadow->Pending());
     }
     // bbport (r45_drawn-look): after the indirect light is in: the strokes take the lit surface.
     if (drawn_look_wanted) {
@@ -3133,6 +6682,22 @@ void Rasterizer::EffectsBeforeUpscaler(u64 compute_hash) {
             halation->Apply(upscaler->SceneColor(), strength);
         }
     }
+    // bbport (r128b_lrt-caustics-water): the water caustics' strengths are settings
+    // (graphics_water_caustics_sun_strength, graphics_water_caustics_lamps_strength; BB_CAUSTICS and
+    // BB_CAUSTICS_LAMPS win when set), read every frame. The Caustics is made at the start when a strength is
+    // above 0 and here, at the first frame one is, when it was not; it is kept. At 0 its passes return at
+    // once. Without an object at 0: four relaxed loads and a few compares.
+    if (compute_hash == upscaler->TriggerHash()) {
+        Caustics::StrengthLine();
+        if (!caustics && Caustics::Wanted()) {
+            caustics = std::make_unique<Caustics>(instance, scheduler, texture_cache, runtime,
+                                                  *scene_targets, *camera_motion, *point_shadow,
+                                                  upscaler->Enabled());
+        }
+        if (caustics) {
+            caustics->Refresh();
+        }
+    }
     // bbport (r97e_heat-haze-option): the haze's strength is a setting (HeatHaze::Strength: the key
     // graphics_heat_haze_strength, or BB_HEAT_HAZE when set), read every frame. The HeatHaze is made at
     // the first frame above 0 when it was not made at the start, and kept; at 0 the lamps are not
@@ -3152,8 +6717,9 @@ void Rasterizer::EffectsBeforeUpscaler(u64 compute_hash) {
     // composite (the fog behind a flame shimmers too), before the upscaler and the HUD.
     if (heat_haze && compute_hash == upscaler->TriggerHash() && HeatHaze::Wanted()) { // r97e
         heat_haze->Apply(upscaler->SceneColor(), camera_motion->Depth(), upscaler->Jitter(),
-                         BbWind::Felt(BbWind::Follower::Haze, wind.Get(),
-                                      camera_motion->CameraMatrices().inv_view)); // bbport (r116)
+                         BbWindFelt::Felt(BbWind::Follower::Haze, wind.Get(),
+                                          camera_motion->CameraMatrices().inv_view,
+                                          wind_shelter ? wind_shelter->CameraOpen() : 1.0f)); // bbport (r116, r97g): in sheltered air the haze rises straight
     }
     // bbport (r117_wind-shelter): BB_WIND_SHELTER only: the wind shelter field's passes, after the
     // heat haze, with the sway region's address (0 without the region: nothing is made).
@@ -3164,6 +6730,12 @@ void Rasterizer::EffectsBeforeUpscaler(u64 compute_hash) {
                                       u64(Shader::MotionVectors::ParamsCapacity) * 32u
                                 : 0u,
                             wind.Get());
+    }
+    if (auto* pane = rt_shadow->ActiveLampPane(); pane && compute_hash == upscaler->TriggerHash()) {
+        LampPaneDepth(*pane);
+    }
+    if (window_receiver && compute_hash == upscaler->TriggerHash()) {
+        CaptureWindowDepth();
     }
     // bbport (r120_test-camera-lookat, TOOL): BB_TEST_WORLD_AT and BB_TEST_CAMERA=lookat:centre: the world under pixels, from the
     // scene's depth (made at the first wanted read; off: one relaxed load of a false flag).
@@ -3540,6 +7112,158 @@ CardDraw ResolveCardDraw(const AmdGpu::Regs& regs, const Shader::Info& ps, bool 
 }
 } // namespace
 
+// t132a: only called for a noted draw of the armed rectangle. This also works when RT capture
+// is off. ResolveCardDraw uses the existing checked constant reads and returns a value.
+BloodPoolProbe::FoliageFacts Rasterizer::FoliageProbeFacts(
+    const GraphicsPipeline& pipeline, bool camera_gbuffer, bool indirect, bool is_indexed,
+    u32 index_offset) {
+    using Texture = BloodPoolProbe::FoliageTexture;
+    using Source = Texture::Source;
+    BloodPoolProbe::FoliageFacts out;
+    const auto& regs = Regs();
+    const auto& vs = pipeline.GetStage(Shader::SwStage::Vertex);
+    out.vs = vs.pgm_hash;
+    out.camera_gbuffer = camera_gbuffer;
+    out.indirect = indirect;
+    out.indexed = is_indexed;
+    out.primitive = u32(regs.primitive_type);
+    out.restart = regs.enable_primitive_restart != 0;
+    if (is_indexed) {
+        out.index_base = regs.index_base_address.Address<VAddr>();
+        out.index_type = u32(regs.index_buffer_type.index_type);
+    }
+    // Indirect arguments may have been written by the GPU. Use no range or offset register
+    // as a substitute for the arguments of that command.
+    if (!indirect) {
+        out.first_index = is_indexed ? index_offset : 0;
+        out.count = regs.num_indices;
+        out.instances = regs.num_instances.NumInstances();
+        out.first_vertex = regs.index_offset;
+        out.offsets_known = true;
+    }
+    if (const auto& fetch = pipeline.GetFetchShader()) {
+        if (!indirect) {
+            const auto data = vs.UserData();
+            const auto offset = [&](s32 sgpr, u32& value) {
+                if (sgpr == -1) {
+                    return;
+                }
+                if (sgpr < 0 || u32(sgpr) >= data.size()) {
+                    out.offsets_known = false;
+                    return;
+                }
+                value = data[sgpr];
+            };
+            if (out.first_vertex == 0) {
+                offset(fetch->vertex_offset_sgpr, out.first_vertex);
+            }
+            offset(fetch->instance_offset_sgpr, out.first_instance);
+        }
+        for (const auto& attribute : fetch->attributes) {
+            if (attribute.semantic == 0) {
+                const auto stream = attribute.GetSharp(vs);
+                out.position_base = stream.base_address;
+                out.position_size = stream.GetSize();
+                out.stride = stream.GetStride();
+                out.position_data_format = stream.data_format;
+                out.position_number_format = stream.num_format;
+                out.position_valid = stream.Valid() && out.position_base && out.position_size;
+                break;
+            }
+        }
+    }
+    const auto* ps = pipeline.GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!ps) {
+        return out;
+    }
+    out.has_ps = true;
+    out.ps = ps->pgm_hash;
+    out.discard = ps->has_discard;
+    out.verdict = u32(ps->cutout.verdict);
+    out.num_inputs = regs.num_interp;
+    for (u32 i = 0; i < std::min({out.num_inputs, u32(out.input_offsets.size()),
+                                  u32(regs.ps_inputs.size())}); ++i) {
+        const auto& input = regs.ps_inputs[i];
+        out.input_offsets[i] = u8(input.input_offset);
+        out.default_inputs |= input.use_default ? 1u << i : 0u;
+        out.flat_inputs |= input.flat_shade ? 1u << i : 0u;
+    }
+    if (camera_gbuffer && out.discard) {
+        const CardDraw card = ResolveCardDraw(regs, *ps, true, *memory, buffer_cache);
+        out.resolved = true;
+        out.card_valid = card.valid;
+        out.miss = u32(card.miss);
+        out.selector = card.selector;
+        out.stored_channel = card.stored_channel;
+        out.card_format = card.data_format;
+        out.op = u32(card.op);
+        out.tsharp = card.tsharp;
+        for (u32 i = 0; i < card.affine.size(); ++i) {
+            out.card_words[i] = std::bit_cast<u32>(card.affine[i]);
+        }
+        out.card_words[4] = std::bit_cast<u32>(card.reference);
+        out.card_words[5] = std::bit_cast<u32>(card.dither_scale);
+        out.card_words[6] = std::bit_cast<u32>(card.ref_dwords[0]);
+        out.card_words[7] = std::bit_cast<u32>(card.ref_dwords[1]);
+        out.dither = card.dither;
+        out.fade_left_out = card.fade_left_out;
+        out.nonzero = card.nonzero;
+        out.clamp_u = card.clamp_u;
+        out.clamp_v = card.clamp_v;
+        out.uv_hash = card.uv_hash;
+        out.constants_hash = card.constants_hash;
+    }
+
+    const auto& bound = Dc().card_bound;
+    out.texture_count = u32(ps->images.size());
+    out.binding_enabled = card_bound_on;
+    out.bindings_exact = card_bound_on && bound.stage == ps &&
+                         bound.count == out.texture_count && bound.count <= bound.ids.size();
+    out.binding_count = out.bindings_exact ? bound.count : 0;
+    for (u32 i = 0; i < out.texture_count; ++i) {
+        if (i >= out.textures.size() && !out.card_valid) {
+            break;
+        }
+        const auto& res = ps->images[i];
+        const auto sharp = res.GetSharp(*ps);
+        const auto words = std::bit_cast<std::array<u32, 8>>(sharp);
+        // Match the same full T# as NoteCardLayer. Record ambiguity if more than one
+        // resource matches, since the shader may use different views for the same T#.
+        const bool alpha = out.card_valid && words == out.tsharp;
+        out.alpha_matches += alpha;
+        if (i >= out.textures.size() && (!alpha || out.alpha_matches != 1)) {
+            continue;
+        }
+        Texture value;
+        value.sharp = words;
+        value.view = BloodPoolProbe::FoliageView::From(VideoCore::ImageViewInfo(sharp, res));
+        if (out.bindings_exact) {
+            const auto id = bound.ids[i];
+            value.id = id.index;
+            value.uid = bound.uids[i];
+            if (id && value.uid) {
+                const auto* image = texture_cache.TryGetImage(id, value.uid);
+                if (image && texture_cache.IsRegisteredImage(id, value.uid)) {
+                    value.write_seq = image->write_seq;
+                    value.source = Source::Registered;
+                } else {
+                    value.source = Source::Unverified;
+                }
+            } else {
+                value.source = !id && !sharp ? Source::Null : Source::Unverified;
+            }
+        }
+        if (i < out.textures.size()) {
+            out.textures[i] = value;
+        }
+        if (alpha && out.alpha_matches == 1) {
+            out.alpha = value;
+            out.alpha_slot = i;
+        }
+    }
+    return out;
+}
+
 // bbport (r62_leaf-stage3): BB_RT_CARD_ALPHA=2: the image a cut-out draw's card reads its alpha
 // from, for its layer (CardAlpha::NoteDraw). This draw's own binding of its pixel shader's
 // textures (BindTextures, before EffectsCaptureDraw) left what it found in the draw context
@@ -3569,8 +7293,123 @@ void Rasterizer::NoteCardLayer(CardDraw& card, const Shader::Info& ps) {
     card_alpha->NoteNoSource(card);
 }
 
+void Rasterizer::InitColdWindowPane() {
+    using namespace WindowPathProbe;
+    const char* text = std::getenv("BB_WINDOW_PATH_COLD_PANE");
+    if (!text || !*text) {
+        return;
+    }
+    PixelRequest request;
+    if (!ParsePixelRequest(text, request) || request.count != 1) {
+        std::printf("Window cold pane (t132f): invalid startup request (id:width:height:x:y)\n");
+        return;
+    }
+    const auto pixel = request.pixels[0];
+    window_cold_pane.Arm({request.id, request.width, request.height, pixel.x, pixel.y},
+                         ColdPaneWatch::Clock::now());
+    std::printf("Window cold pane (t132f): req=%u prearmed native=%ux%u xy=%u,%u deadline=120s\n",
+                request.id, request.width, request.height, pixel.x, pixel.y);
+}
+
+void Rasterizer::ExpireColdWindowPane() {
+    using namespace WindowPathProbe;
+    if (window_cold_pane.Active() && window_cold_pane.Expired(ColdPaneWatch::Clock::now())) {
+        std::printf("Window cold pane (t132f): req=%u unresolved (no exact indexed camera draw before startup deadline)\n",
+                    window_cold_pane.pixels.id);
+        window_cold_pane.pixels = {};
+    }
+}
+
+void Rasterizer::ArmWindowPane(WindowPathProbe::ReceiverCapture& capture, bool wait_for_natural) {
+    using namespace WindowPathProbe;
+    capture.pane = std::make_unique<PaneAcquisition>(instance, scheduler);
+    capture.pane->stages.arm_frame = object_motion->Frame();
+    capture.pane->stages.arm_rt = rt_shadow->WindowDiagnosticFrame();
+    if (wait_for_natural) {
+        capture.pane->natural.Arm(capture.request.id, capture.pane->stages.arm_frame,
+                                   NaturalPanePair::Clock::now());
+    }
+    rt_shadow->WatchWindowPane(capture.pane.get());
+}
+
+void Rasterizer::NoteWindowPaneDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
+                                    bool indexed, u32 first) {
+    using namespace WindowPathProbe;
+    auto* pane = window_receiver ? window_receiver->pane.get() : nullptr;
+    if (!pane && !window_cold_pane.Active()) {
+        return;
+    }
+    const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!ps || ps->pgm_hash != WindowPaneDrawKey.ps ||
+        pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash != WindowPaneDrawKey.vs) {
+        return;
+    }
+    if (regs.num_indices != WindowPaneDrawKey.count || first != WindowPaneDrawKey.first) {
+        if (pane) {
+            pane->stages.guard |= PaneStages::Range;
+        }
+        return;
+    }
+    const auto& dc = Dc();
+    if (window_cold_pane.Active() && !window_receiver && indexed && gbuffer_draw) {
+        ExpireColdWindowPane();
+        const auto launch = window_cold_pane.Take(true, ColdPaneWatch::Clock::now());
+        if (launch.id) {
+            PixelRequest request{.id = launch.id, .width = launch.width, .height = launch.height, .count = 1};
+            request.pixels[0] = {launch.x, launch.y};
+            window_receiver = std::make_unique<ReceiverCapture>(instance, scheduler, runtime, request);
+            auto& capture = *window_receiver;
+            capture.pane_sample = 0;
+            capture.scene.textures = &texture_cache;
+            ArmWindowPane(capture, true);
+            pane = capture.pane.get();
+            const char* owner = std::getenv("BB_WINDOW_PATH_PANE_OWNER");
+            if (owner && std::string_view(owner) == "1" && launch.width == 1920 &&
+                launch.height == 1080 && launch.x == 1003 && launch.y == 281) {
+                pane->owner = std::make_unique<PaneOwnerAcquisition>(instance, scheduler);
+            }
+            window_receiver_last_request = std::max(window_receiver_last_request, launch.id);
+            std::printf("Window cold pane (t132f): req=%u first exact indexed camera draw frame=%llu/%llu capture=%u\n",
+                        launch.id, static_cast<unsigned long long>(pane->stages.arm_frame),
+                        static_cast<unsigned long long>(pane->stages.arm_rt), unsigned(bool(dc.capture_draw)));
+        }
+    }
+    if (!pane) {
+        return;
+    }
+    auto& stage = pane->stages;
+    if (window_receiver->pending.request) {
+        PaneStages::Count(stage.exact_after);
+        if (pane->natural.Latched() && gbuffer_draw &&
+            pane->natural.build.object_frame == object_motion->Frame() &&
+            pane->natural.build.rt_frame == rt_shadow->WindowDiagnosticFrame()) {
+            stage.guard |= PaneStages::Duplicate;
+            pane->Refuse("duplicate exact pane draw after sample");
+        }
+        return;
+    }
+    PaneStages::Count(stage.exact_before);
+    stage.motion = pipeline->GetGraphicsKey().motion_vectors;
+    stage.geometry = unsigned(bool(dc.motion_geometry));
+    if (!indexed) {
+        stage.guard |= PaneStages::NotIndexed;
+    }
+    if (!gbuffer_draw) {
+        stage.guard |= PaneStages::CameraPass;
+    }
+    if (!dc.capture_draw) {
+        stage.guard |= PaneStages::CaptureHookOff;
+        stage.Refuse("outer-capture-draw-off", object_motion->Frame(), rt_shadow->WindowDiagnosticFrame());
+    } else {
+        PaneStages::Count(stage.hook);
+    }
+}
+
 void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline,
-                                    bool is_indexed, u32 index_offset) {
+                                    bool is_indexed, u32 index_offset, RtShadow::BottleDrawToken& bottle,
+                                    RtShadow::ReflectionDrawToken& reflection,
+                                    ReflectionDiscard::StockRole original_stock_role,
+                                    vk::Pipeline& classified_stock) {
     auto& dc = Dc();
     const u32 mode = pipeline->GetGraphicsKey().motion_vectors;
     if (Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth) {
@@ -3610,7 +7449,32 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
         RtGlassFind::NoteVerdict(pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, glass_ps->pgm_hash,
                                  scene_started ? RtGlassFind::Shape : RtGlassFind::Outside, nullptr);
     }
-    if (!rt_shadow->Wanted() || !dc.motion_geometry) {
+    const bool rt_wanted = rt_shadow->Wanted();
+    if (!rt_wanted || !dc.motion_geometry) {
+        if (reflection_probe && gbuffer_draw && is_indexed && JoinCount(regs.num_indices) &&
+            ReflectionJoinTraceOn()) {
+            const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            const u64 frag = ps ? ps->pgm_hash : 0;
+            TraceReflectionJoin(JoinTarget(vs.pgm_hash, frag, regs.num_indices, index_offset),
+                                rt_shadow->WindowDiagnosticFrame(), reflection_probe->last_request,
+                                vs.pgm_hash, frag, regs.num_indices, index_offset, "capture",
+                                !rt_wanted ? "ordinary-rt-not-wanted" : "motion-geometry-missing",
+                                regs, pipeline->GetGraphicsKey().mrt_mask);
+        }
+        if (window_receiver && window_receiver->pane && !window_receiver->pending.request &&
+            regs.num_indices == WindowPathProbe::WindowPaneDrawKey.count &&
+            index_offset == WindowPathProbe::WindowPaneDrawKey.first) {
+            const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+            if (ps && ps->pgm_hash == WindowPathProbe::WindowPaneDrawKey.ps &&
+                pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash == WindowPathProbe::WindowPaneDrawKey.vs) {
+                auto& stage = window_receiver->pane->stages;
+                stage.guard |= (!rt_wanted ? WindowPathProbe::PaneStages::RtUnwanted : 0u) |
+                               (!dc.motion_geometry ? WindowPathProbe::PaneStages::NoMotionGeometry : 0u);
+                stage.Refuse(!rt_wanted ? "capture-rt-unwanted" : "capture-motion-geometry-missing",
+                             object_motion->Frame(), rt_shadow->WindowDiagnosticFrame());
+            }
+        }
         if (glass_hook) { // bbport (r83b_glass-pane-probe)
             RtGlassProbe::Add(RtGlassProbe::NoGeometry);
             if (RtGlassFind::On()) { // bbport (r86g_glint-find-bottles)
@@ -3633,6 +7497,7 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
         }
     }
     const u32 index_size = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
+    const bool shared_alpha = ps && ps->has_discard;
     RtShadow::Draw draw{
         .shader = vs.pgm_hash,
         .geometry = dc.motion_geometry,
@@ -3650,33 +7515,79 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
                        regs.depth_buffer.Height() >= 1024,
         .camera_pass = gbuffer_draw,
         .solid = regs.depth_control.depth_write_enable != 0 && !regs.blend_control[0].enable,
-        .alpha = ps && ps->has_discard,
+        .alpha = shared_alpha,
         .textured = ps && !ps->images.empty(),
         // bbport (r14_cascade_rt): the sun cascade of a shadow pass draw (RtShadow::SunCascade)
         .viewport = {regs.viewports[0].xoffset, regs.viewports[0].yoffset,
                      regs.viewports[0].xscale, regs.viewports[0].yscale},
         .target = regs.depth_buffer.Height(),
         .pixel_shader = ps ? ps->pgm_hash : 0, // bbport (r50_leaf-stage1)
+        .glass_entry = dc.glass_hit, // bbport (r129a_glass-registry): 0 while the registry is off (S1 reads it)
     };
     // bbport (r50b_leaf-matcher): with BB_RT_CARD_ALPHA_LOG=1, the memory constants of a
     // matched cut-out pixel shader as this draw holds them (once per pgm_hash).
     static const bool cutout_log = Shader::Optimization::CutoutLogOn(); // (r54)
-    if (cutout_log && ps && ps->has_discard) {
+    if (cutout_log && shared_alpha) {
         LogCutoutConstants(regs, *ps, *memory, buffer_cache);
     }
     // bbport (r54_leaf-stage2): with BB_RT_CARD_ALPHA=1 (a capture pipeline with CaptureUv), a
     // cut-out pixel shader's card data as this draw holds it, for RtShadow::PrepareDraw (the
     // entry's UV capture). Kept on this stack until PrepareDraw returns: nothing is allocated.
     std::optional<CardDraw> card;
-    if ((mode & Shader::MotionVectors::CaptureUv) != 0 && ps && ps->has_discard &&
-        (draw.camera_pass || draw.shadow_pass)) {
-        card = ResolveCardDraw(regs, *ps, draw.camera_pass, *memory, buffer_cache);
-        draw.card = &*card;
-        // bbport (r62_leaf-stage3): BB_RT_CARD_ALPHA=2: the card's alpha layer
-        if (card->valid && card_bound_on) {
-            NoteCardLayer(*card, *ps);
+    const auto resolve_card = [&](bool cutout) {
+        if ((mode & Shader::MotionVectors::CaptureUv) != 0 && ps && cutout &&
+            (draw.camera_pass || draw.shadow_pass)) {
+            card = ResolveCardDraw(regs, *ps, draw.camera_pass, *memory, buffer_cache);
+            draw.card = &*card;
+            // bbport (r62_leaf-stage3): BB_RT_CARD_ALPHA=2: the card's alpha layer
+            if (card->valid && card_bound_on) {
+                NoteCardLayer(*card, *ps);
+            }
         }
+    };
+
+    auto* retire = ReflectionFirstRetire::Current(this);
+    const auto stock_gate = [&](bool accepted, const char* name) {
+        if (!accepted && retire) retire->candidate = name;
+        return accepted;
+    };
+    const bool stock_candidate = stock_gate(original_stock_role != ReflectionDiscard::StockRole::None, "original-role") &&
+        stock_gate(bool(dc.reflection_native), "native-probe") &&
+        stock_gate(is_indexed, "not-indexed") &&
+        stock_gate(draw.camera_pass, "non-camera") &&
+        stock_gate(draw.solid, "non-solid") &&
+        stock_gate(!draw.glass_entry, "glass-registry") &&
+        stock_gate(draw.triangles, "non-triangle") &&
+        stock_gate(!draw.strip, "strip") &&
+        stock_gate(!draw.restart, "restart") &&
+        stock_gate(draw.instances == 1, "instances") &&
+        stock_gate(!first_vertex, "base-vertex") &&
+        stock_gate(!first_instance, "first-instance") &&
+        stock_gate(regs.depth_control.depth_enable, "depth-disabled") &&
+        stock_gate(regs.depth_control.depth_func != AmdGpu::CompareFunc::Always, "depth-always") &&
+        stock_gate(regs.color_target_mask.GetMask(0) == 0xf, "cb0-mask") &&
+        stock_gate(pipeline->GetGraphicsKey().mrt_mask & 1u, "cb0-mrt") &&
+        stock_gate(std::ranges::none_of(regs.blend_control, [](const auto& control) { return control.enable; }), "blend") &&
+        stock_gate(ExactReflectionStages(*pipeline, *dc.reflection_native), "exact-stages") &&
+        stock_gate(!surface_probe_on || !ReflectProbeHide(draw.shader, draw.pixel_shader, false, true,
+                                               draw.index_count, index_offset, false), "surface-hide");
+    const auto ready_stock = stock_candidate ? pipeline->HandleIfReady() : vk::Pipeline{};
+    const auto stock_verdict = ready_stock
+        ? pipeline->GetStockFragmentVerdict(pipeline_cache, original_stock_role, ready_stock)
+        : ReflectionDiscard::Verdict::Unknown;
+    const bool defer_card = stock_verdict != ReflectionDiscard::Verdict::Unknown;
+    if (retire) {
+        if (stock_candidate) retire->candidate = ready_stock ? "passed" : "pipeline-unready";
+        retire->ready = std::bit_cast<u64>(ready_stock);
+        retire->verdict = stock_verdict;
+        retire->shared = shared_alpha;
+        retire->defer_card = defer_card;
+        retire->decision = defer_card ? "reflection-pass-unavailable" : "shared-untouched";
+        retire->draw_flags |= u32(draw.camera_pass) | (u32(draw.shadow_pass) << 1) |
+            (u32(draw.solid) << 2) | (u32(draw.triangles) << 3) | (u32(draw.strip) << 4) |
+            (u32(draw.restart) << 5) | (u32(draw.glass_entry) << 6);
     }
+    if (!defer_card) resolve_card(shared_alpha);
     if (fetch) {
         for (const auto& attribute : fetch->attributes) {
             if (attribute.semantic == 0) {
@@ -3709,6 +7620,12 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
                       : address && memory->IsValidGpuMapping(address, 0) &&
                             memory->ClampRangeSize(address, bytes) == bytes) {
             draw.indices = address;
+            draw.lamp_affine_candidate =
+                rt_shadow->LampAffineAvailable() && draw.camera_pass && draw.solid && !draw.alpha &&
+                index_offset == 0 && first_vertex == 0 && first_instance == 0 &&
+                draw.index_size == 2 && draw.triangles && !draw.strip && !draw.restart &&
+                RtLampPane::Target(draw.shader, draw.pixel_shader, draw.index_count, draw.instances) &&
+                !buffer_cache.IsRegionGpuModified(address, bytes);
         }
     }
     for (const auto& resource : vs.buffers) {
@@ -3915,7 +7832,8 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
                 RtGlassStatic::Add(RtGlassStatic::Skinned);
                 return true;
             }
-            if (draw.palette_placed) {
+            if (draw.palette_placed && // bbport (r130g_glass-light-forward): a registered pane may keep a placed palette
+                !(draw.glass_placed = rt_shadow->GlassPlacedAllowed(draw.glass_entry))) {
                 RtGlassStatic::Add(RtGlassStatic::PlacedPalette);
                 return true;
             }
@@ -3982,9 +7900,261 @@ void Rasterizer::EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipe
             RtGlassFind::NoteVerdict(vs.pgm_hash, ps->pgm_hash, RtGlassFind::Skinned, nullptr);
         }
     }
+    if (window_receiver && window_receiver->pane && !window_receiver->pending.request) {
+        using namespace WindowPathProbe;
+        auto& pane = *window_receiver->pane;
+        const DrawKey key{draw.shader, draw.pixel_shader, draw.index_count, index_offset};
+        if (key == WindowPaneDrawKey && draw.camera_pass) {
+            const u64 frame = object_motion->Frame();
+            if (!pane.tick && !pane.natural.Latched() && pane.source_frame != frame) {
+                pane.source_frame = frame;
+                pane.draw_count = 0;
+                pane.param = 0;
+                pane.refusal = nullptr;
+            }
+            const bool expired = pane.natural.Active() &&
+                pane.natural.Expired(frame, ReceiverCapture::FrameBudget, NaturalPanePair::Clock::now());
+            if (pane.source_frame == frame && ++pane.draw_count == 1 && !pane.tick && !expired &&
+                !pane.natural.Latched()) {
+                const u32 registry = ExactRegistry(GlassRegistryRules::Load(), key);
+                const auto matrices = camera_motion->PassMatrices();
+                const auto depth = camera_motion->Depth();
+                const auto* image = depth ? texture_cache.TryGetImage(depth, 0) : nullptr;
+                const auto render = camera_motion->RenderSize();
+                const auto& request = window_receiver->request;
+                const auto& viewport = regs.viewports[0];
+                const float* constants = draw.constants;
+                const auto jitter = upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{};
+                if (!registry || dc.glass_hit != registry || !is_indexed || !draw.solid ||
+                    draw.alpha || draw.skinned || draw.restart || draw.strip || !draw.indices ||
+                    !image || db_desc.first != depth || !matrices.valid || trees_pick_rect_on ||
+                    scene_targets->Reduced() || render[0] != request.width || render[1] != request.height ||
+                    !constants || !std::equal(matrices.view.begin(), matrices.view.end(), constants + 8) ||
+                    matrices.proj[0] != constants[52] * (viewport.xscale < 0.f ? -1.f : 1.f) ||
+                    matrices.proj[1] != constants[57] * (viewport.yscale < 0.f ? -1.f : 1.f) ||
+                    matrices.proj[2] != constants[62] || matrices.proj[3] != constants[63] ||
+                    target_scale != std::array<float, 2>{1.f, 1.f} ||
+                    target_offset != std::array<float, 2>{0.f, 0.f} ||
+                    !std::isfinite(jitter[0]) || !std::isfinite(jitter[1]) ||
+                    std::abs(jitter[0]) > 1.f || std::abs(jitter[1]) > 1.f) {
+                    auto& stage = pane.stages;
+                    const auto failed = [&](bool test, PaneStages::Guard bit) {
+                        if (test) stage.guard |= bit;
+                    };
+                    failed(!registry || dc.glass_hit != registry, PaneStages::Registry);
+                    failed(!is_indexed, PaneStages::NotIndexed);
+                    failed(!draw.solid, PaneStages::NotSolid);
+                    failed(draw.alpha, PaneStages::Alpha);
+                    failed(draw.skinned, PaneStages::Skinned);
+                    failed(draw.restart, PaneStages::Restart);
+                    failed(draw.strip, PaneStages::Strip);
+                    failed(!draw.indices, PaneStages::NoIndices);
+                    failed(!image || db_desc.first != depth, PaneStages::DepthImage);
+                    failed(!matrices.valid, PaneStages::InvalidCamera);
+                    failed(trees_pick_rect_on, PaneStages::Scissored);
+                    failed(scene_targets->Reduced(), PaneStages::Reduced);
+                    failed(render[0] != request.width || render[1] != request.height, PaneStages::Extent);
+                    failed(!constants, PaneStages::NoConstants);
+                    if (constants) {
+                        failed(!std::equal(matrices.view.begin(), matrices.view.end(), constants + 8),
+                               PaneStages::View);
+                        failed(matrices.proj[0] != constants[52] * (viewport.xscale < 0.f ? -1.f : 1.f) ||
+                               matrices.proj[1] != constants[57] * (viewport.yscale < 0.f ? -1.f : 1.f) ||
+                               matrices.proj[2] != constants[62] || matrices.proj[3] != constants[63],
+                               PaneStages::Projection);
+                    }
+                    failed(target_scale != std::array<float, 2>{1.f, 1.f} ||
+                           target_offset != std::array<float, 2>{0.f, 0.f}, PaneStages::TargetTransform);
+                    failed(!std::isfinite(jitter[0]) || !std::isfinite(jitter[1]) ||
+                           std::abs(jitter[0]) > 1.f || std::abs(jitter[1]) > 1.f, PaneStages::Jitter);
+                    stage.Refuse("pane-admission-guard", frame, rt_shadow->WindowDiagnosticFrame());
+                    pane.refusal = "exact registry, native camera/attachment or static triangle draw unavailable";
+                } else {
+                    pane.depth_uid = image->image_uid;
+                    pane.camera = {matrices.view, matrices.inv_view, matrices.proj};
+                    pane.jitter = jitter;
+                    draw.window_pane_observe = true;
+                    PaneStages::Count(pane.stages.observed);
+                }
+            } else if (pane.source_frame == frame && pane.draw_count > 1) {
+                pane.stages.guard |= PaneStages::Duplicate;
+                pane.stages.Refuse("duplicate-exact-draw", frame, rt_shadow->WindowDiagnosticFrame());
+                pane.refusal = "multiple exact indexed pane draws in the sampled frame";
+            }
+        }
+    }
+    if (bottle_caustic && BottleCaustic::On() && BottleCaustic::ExactDraw(
+            draw.shader, draw.pixel_shader, index_offset, draw.index_count) &&
+        bottle_caustic->Capturing(db_desc.first) && draw.camera_pass && is_indexed && rt_shadow->TryBottleDraw() &&
+        draw.solid && !draw.glass && !draw.alpha && !draw.skinned && draw.triangles && !draw.strip && !draw.restart &&
+        draw.index_size == 4 && draw.instances == 1 && draw.indices &&
+        (draw.indices % alignof(u32) == 0) &&
+        !buffer_cache.IsRegionGpuModified(draw.indices, u64(draw.index_count) * sizeof(u32))) {
+        draw.bottle_candidate = true;
+        draw.bottle_delivery = &bottle;
+    }
+    if (auto* pane = rt_shadow->ActiveLampPane()) {
+        draw.lamp_pane_observe = LampPaneDraw(*pane, regs, pipeline, is_indexed, index_offset, draw);
+    }
+    auto* retry = dc.reflection_native && dc.reflection_native->stamp_retry &&
+                  !dc.reflection_native->stamp_retry->attempted
+        ? &*dc.reflection_native->stamp_retry : nullptr;
+    const bool current_stamp = reflection_probe && gbuffer_draw && is_indexed && ReflectionStamp(regs);
+    if (retry) {
+        auto& note = *dc.reflection_native;
+        retry->attempted = true;
+        retry->reporting = ClaimStampRetryTrace(this, *retry);
+        retry->failure = !current_stamp ? "pass-unpublished" :
+            note.trace ? "tracing-draw" : note.stamped ? "already-stamped" :
+            note.placement_safe ? "already-safe" :
+            note.key != ReflectionNativeProbe::Key{draw.shader, draw.pixel_shader, draw.index_count, index_offset}
+                ? "draw-key-changed" :
+            original_stock_role != ReflectionDiscard::StockRole::Fireplace || !stock_candidate
+                ? "original-candidate" :
+            !ready_stock ? "pipeline-unready" :
+            stock_verdict == ReflectionDiscard::Verdict::DiscardPresent ? "positive-discard" :
+            stock_verdict != ReflectionDiscard::Verdict::CertifiedClear ? "stock-uncertified" :
+            draw.glass || draw.glass_entry ? "glass" :
+            draw.skinned || draw.skeleton_bones ? "skinned" :
+            !draw.palette_placed || !draw.palette ? "palette-unplaced" :
+            ReflectionNativeProbe::RetryStampRefusal(*retry, *reflection_probe->stamp);
+        if (!retry->failure) {
+            retry->current = true;
+            // The validator still owns stamping and the normal placement-safety bit.
+            // This marker cannot take its tracing branch or arm again.
+            ReflectionNativeBeforeDraw(note);
+            retry->safe = note.stamped && note.placement_safe;
+            if (!retry->safe && !retry->failure) {
+                retry->failure = StampRetryValidatorRefusal(retry->validator_reject);
+            }
+        }
+    }
+    if (current_stamp) {
+        if (dc.reflection_native && dc.reflection_native->stamped &&
+            dc.reflection_native->stamp == *reflection_probe->stamp) {
+            draw.reflection_native = dc.reflection_native;
+        }
+        if (retire) {
+            const auto& stamp = *reflection_probe->stamp;
+            retire->generation = stamp.generation;
+            retire->frame = stamp.frame;
+            retire->pass = stamp.pass;
+            retire->depth_uid = stamp.depth_uid;
+            retire->cb0_uid = stamp.cb0_uid;
+            retire->stamped = stamp.valid_native;
+            if (draw.reflection_native) retire->palette.flags |= 1u;
+            if (defer_card) {
+                retire->decision = draw.glass ? "glass" : !draw.palette_placed ? "palette-unplaced" :
+                    !draw.palette ? "palette-empty" : draw.skinned ? "skinned" :
+                    draw.skeleton_bones ? "skeleton-bones" :
+                    !draw.reflection_native ? "native-stamp-unjoined" : "palette-binding-refused";
+            }
+        }
+        if (defer_card && !draw.glass && draw.palette_placed && draw.palette &&
+            !draw.skinned && !draw.skeleton_bones && draw.reflection_native) {
+            const auto* placement = ReflectionNativeProbe::PlacedBinding(*draw.reflection_native);
+            if (retire && placement) {
+                retire->palette.flags |= 1u << 8;
+                retire->decision = "palette-handle-mismatch";
+            }
+            if (placement && placement->buffer->Handle() == placement->handle) {
+                classified_stock = ready_stock;
+                draw.alpha = ReflectionDiscard::EffectiveAlpha(stock_verdict, shared_alpha);
+                if (retire) {
+                    retire->palette.flags |= 1u << 9;
+                    retire->decision = stock_verdict == ReflectionDiscard::Verdict::CertifiedClear
+                        ? "certified-clear-applied" : "positive-discard-applied";
+                }
+                if (ReflectionJoinTraceOn()) {
+                    const auto& stamp = *reflection_probe->stamp;
+                    const auto& key = draw.reflection_native->key;
+                    TraceReflectionJoin(JoinTarget(key.vs, key.ps, key.count, key.first), stamp.frame,
+                        reflection_probe->last_request, key.vs, key.ps, key.count,
+                        index_offset, "fragment-classification", shared_alpha ? "shared-discard-1"
+                                                                             : "shared-discard-0",
+                        regs, pipeline->GetGraphicsKey().mrt_mask, &draw);
+                }
+            }
+        }
+        if (defer_card) resolve_card(classified_stock ? draw.alpha : shared_alpha);
+        if (draw.palette_placed && JoinCount(draw.index_count) && ReflectionFirstHit::PlacedOn()) {
+            const auto role = ReflectionNativeProbe::Match({draw.shader, draw.pixel_shader,
+                                                           draw.index_count, index_offset});
+            if (ReflectionInputsFor(role) && (!draw.reflection_native ||
+                    !ReflectionNativeProbe::PlacedBinding(*draw.reflection_native))) {
+                TraceReflectionPlacedRefusal(role, reflection_probe->last_request, *reflection_probe->stamp,
+                                             dc.reflection_native);
+            }
+        }
+        if (ReflectionCapture(regs, *pipeline, draw, index_offset, reflection)) {
+            draw.reflection = &reflection;
+            if (retire) retire->capture = "accepted";
+        }
+    } else if (defer_card) {
+        resolve_card(shared_alpha);
+    }
+
+    if (retire) {
+        retire->effective = draw.alpha;
+        retire->placement = reflection.placement;
+        if (dc.reflection_native) {
+            const auto& native = *dc.reflection_native;
+            retire->palette.count = native.binding_count;
+            retire->palette.flags |= (u32(native.placement_safe) << 1) | (u32(native.overflow) << 2);
+            for (const auto& binding : std::span{native.bindings}.first(native.binding_count)) {
+                if (binding.ordinal != 1) continue;
+                retire->palette.buffer = std::bit_cast<u64>(binding.handle);
+                retire->palette.offset = binding.descriptor_offset;
+                retire->palette.range = binding.descriptor_range;
+                retire->palette.guest = binding.guest;
+                retire->palette.ordinal = binding.ordinal;
+                retire->palette.slot = binding.slot;
+                retire->palette.adjust = binding.adjust;
+                retire->palette.guest_bytes = binding.guest_bytes;
+                retire->palette.effective_bytes = binding.effective_bytes;
+                retire->palette.flags |= (u32(binding.range_known) << 3) | (u32(binding.gpu_dirty) << 4) |
+                    (u32(binding.in_place) << 5) | (u32(binding.writable) << 6) |
+                    (u32(bool(binding.buffer)) << 7);
+            }
+        }
+    }
     BbSections::Scope prepare_scope{BbSections::RtPrepare};
     const u32 param = rt_shadow->PrepareDraw(draw);
     prepare_scope.End();
+    if (retire) {
+        retire->cookie = reflection.cookie;
+        retire->allocation = reflection.allocation;
+    }
+    if (retry) {
+        retry->alpha = draw.alpha;
+        retry->classified = ready_stock && classified_stock == ready_stock;
+        if (!retry->failure) {
+            retry->failure = !retry->classified ? "classification-unjoined" :
+                !draw.reflection || !reflection.placement ? "capture-unjoined" :
+                !reflection.cookie ? "entry-unjoined" : "none";
+        }
+        TraceStampRetry(retry->safe ? "prepared" : "refused", this, *retry,
+                        current_stamp ? &*reflection_probe->stamp : nullptr,
+                        scheduler.CurrentTick(), reflection);
+    }
+    if (draw.reflection && reflection.placed != ReflectionFirstHit::PlacedSource::None) {
+        FinishPlacementSample(*reflection_probe->stamp, reflection, param);
+        if (auto* proof = OrdinalZeroFor(*draw.reflection_native)) {
+            proof->param = param;
+        }
+    }
+    if (draw.reflection && JoinCount(draw.index_count) && ReflectionJoinTraceOn()) {
+        TraceReflectionJoin(JoinTarget(draw.shader, draw.pixel_shader, draw.index_count, index_offset),
+                            rt_shadow->WindowDiagnosticFrame(), reflection_probe->last_request,
+                            draw.shader, draw.pixel_shader, draw.index_count, index_offset,
+                            "prepare", reflection.cookie ? "entry-joined" : "no-entry-join", regs,
+                            pipeline->GetGraphicsKey().mrt_mask, &draw, param,
+                            reflection.cookie != 0);
+    }
+    if (draw.window_pane_observe && window_receiver && window_receiver->pane &&
+        window_receiver->pane->natural.Latched() && !window_receiver->pane->refusal) {
+        rt_shadow->WatchWindowScene(&window_receiver->scene);
+    }
     if (box_pane) { // bbport (r86j_glint-same-game): did the box pane get its record
         const bool made = RtGlassProbe::Get().counts[RtGlassProbe::Note].load(std::memory_order_relaxed) != box_notes;
         (made ? RtGlassFind::Chain().recorded : RtGlassFind::Chain().not_recorded)
@@ -4122,7 +8292,7 @@ const u32* Rasterizer::LampFlickerBind(const GraphicsPipeline* pipeline, const S
         return nullptr;
     }
     const RingBinding* ring = dc.num_ring_stages ? FindRingBinding(ps, 1) : nullptr;
-    if (ring && (info.buffer != constant_ring->Handle() || info.offset != ring->offset ||
+    if (ring && (info.buffer != constant_ring->Handle() || info.offset != ring->Offset() ||
                  adjust != 0 || ring->address != lights || range > ring->size)) {
         flicker.Skipped(LampFlicker::Skip::Binding);
         return nullptr;
@@ -4259,9 +8429,16 @@ void Rasterizer::EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipel
         if (cb_descs[0].first && !dc.buffer_infos.empty() && dc.buffer_infos[0].buffer) {
             const bool has_ubo = dc.buffer_infos.size() > 1 && dc.buffer_infos[1].buffer;
             const bool has_map = dc.image_infos.size() > 1 && dc.image_infos[1].imageView;
-            contact_shadow->OnShadowDraw(
-                cb_descs[0].first,
-                {.constants = dc.buffer_infos[0].buffer,
+            const auto& ps = pipeline->GetStage(Shader::SwStage::Fragment);
+            // The shader's constant word 0 is the sharp's base address (buf_offsets[0] is only
+            // the alignment remainder the shader adds to the aligned binding). Copy the floats
+            // Bend's CPU dispatch layout needs now: Flush runs after the blur draw, by which
+            // time the game may have reused this memory.
+            const VAddr constants = !ps.buffers.empty() && !ps.buffers[0].IsSpecial()
+                                        ? ps.buffers[0].GetSharp(ps).base_address
+                                        : 0;
+            ContactShadow::Inputs inputs{
+                 .constants = dc.buffer_infos[0].buffer,
                  .constants_offset = dc.buffer_infos[0].offset,
                  .constants_range = dc.buffer_infos[0].range,
                  .uniforms = has_ubo ? dc.buffer_infos[1].buffer : vk::Buffer{},
@@ -4270,7 +8447,15 @@ void Rasterizer::EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipel
                  .shadow_map = has_map ? dc.image_infos[1].imageView : vk::ImageView{},
                  .shadow_layout = has_map ? dc.image_infos[1].imageLayout : vk::ImageLayout::eUndefined,
                  .constants_offset_word = PackedOffsets(dc.push_data),
-                 .frame_index = shadow_frame++});
+                 .frame_index = shadow_frame++};
+            constexpr u64 bytes = sizeof(inputs.constants_cpu);
+            if (constants && memory->IsValidGpuMapping(constants, bytes) &&
+                memory->ClampRangeSize(constants, bytes) == bytes) {
+                std::memcpy(inputs.constants_cpu.data(), reinterpret_cast<const void*>(constants),
+                            bytes);
+                inputs.has_constants_cpu = true;
+            }
+            contact_shadow->OnShadowDraw(cb_descs[0].first, inputs);
         }
     } else if (tile_lights != 0) {
         const auto& ps = pipeline->GetStage(Shader::SwStage::Fragment);
@@ -4306,6 +8491,10 @@ void Rasterizer::EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipel
                     ambient_particles->AddLamps(
                         flickered ? flickered : reinterpret_cast<const u32*>(lights), tile_lights);
                 }
+                if (bottle_caustic && BottleCaustic::On() && rt_shadow->BottleObserved()) {
+                    bottle_caustic->AddLights(flickered ? flickered : reinterpret_cast<const u32*>(lights),
+                                             tile_lights);
+                }
                 // bbport (r107b_caustics-visible): the lamps the water caustics reflect (as drawn)
                 if (caustics && caustics->LampsWanted()) {
                     caustics->AddLights(flickered ? flickered : reinterpret_cast<const u32*>(lights),
@@ -4325,6 +8514,9 @@ void Rasterizer::EffectsBeforeBind(const AmdGpu::Regs& regs, const GraphicsPipel
                 if (glass_glint) { // bbport (r86b_glass-visible): the lamps of its glints (as drawn)
                     glass_glint->AddLights(flickered ? flickered : reinterpret_cast<const u32*>(lights),
                                            tile_lights);
+                }
+                if (foliage_glow) { // bbport (r131a_foliage-translucency): the lamps the back-lit glow takes (as drawn)
+                    foliage_glow->AddLights(flickered ? flickered : reinterpret_cast<const u32*>(lights), tile_lights);
                 }
             }
         }
@@ -4441,9 +8633,770 @@ void Rasterizer::HqAoAfterDraw(const GraphicsPipeline* pipeline, const RenderSta
     }
 }
 
+
+bool Rasterizer::SampleWindowOwner(const RenderState& state, const LampMaterialDelivery& draw, bool after) {
+    using namespace WindowPathProbe;
+    using namespace RtLampPane;
+    auto& capture = *window_receiver;
+    auto& pane = *capture.pane;
+    auto& owner = *pane.owner;
+    const auto& build = pane.natural.build;
+    const auto& regs = Regs();
+    const auto* ps = draw.original->GetStages()[u32(Shader::SwStage::Fragment)];
+    if (!pane.natural.Latched() || pane.refusal || !draw.indexed || !ps ||
+        DrawKey{draw.original->GetStage(Shader::SwStage::Vertex).pgm_hash, ps->pgm_hash,
+                regs.num_indices, draw.first} != WindowPaneDrawKey ||
+        build.object_frame != object_motion->Frame() || build.rt_frame != rt_shadow->WindowDiagnosticFrame() ||
+        !pane.natural.MatchBuild(build.rt_frame, pane.param, build.ordinal, pane.key) ||
+        pane.draw_count != 1 || owner.material.refusal) {
+        return false;
+    }
+    const auto& depth_attachment = state.depth_stencil_attachment;
+    if (state.num_color_attachments <= 2 || Dc().clear_draw ||
+        state.color_attachments[2].is_clear || depth_attachment.depth_clear ||
+        depth_attachment.stencil_clear) {
+        std::printf("Window pane owner (t132f): req=%u pre-sample attachments=%u glass-clear=%u "
+                    "albedo-clear=%u depth-clear=%u stencil-clear=%u albedo-view=%u gbuffer=%u\n",
+                    capture.request.id, u32(state.num_color_attachments), u32(Dc().clear_draw),
+                    u32(state.color_attachments[2].is_clear), u32(depth_attachment.depth_clear),
+                    u32(depth_attachment.stencil_clear),
+                    u32(bool(state.color_attachments[2].image_view)), u32(gbuffer_draw));
+        owner.material.refusal = "selected draw clears or has no albedo attachment";
+        return false;
+    }
+    // Scope is the single 1920x1080 church texel, no display scaling.
+    constexpr RawDrawPixel pixel{1003, 281};
+    const auto scissor = DrawScissor(0);
+    const auto contains = [](u32 value, s32 start, u32 extent) {
+        return s64(value) >= start && s64(value) - start < extent;
+    };
+    if (state.width != capture.request.width || state.height != capture.request.height ||
+        !gbuffer_draw || !contains(pixel.x, scissor.offset.x, scissor.extent.width) ||
+        !contains(pixel.y, scissor.offset.y, scissor.extent.height)) {
+        owner.material.refusal = "selected texel not inside native G-buffer draw";
+        return false;
+    }
+    // This is the request-local draw ordinal. 'build.ordinal' is a different identity.
+    const Identity stamp{capture.request.id, owner.draws_before + 1, build.ordinal, db_desc.first.index,
+                         build.object_frame, build.rt_frame, pane.depth_uid};
+    if (!after) owner.stamp = stamp;
+    DrawRawRead read{owner.material, stamp, pane.camera, pane.jitter, std::span(&pixel, 1),
+                     owner.buffer, [&] { return owner.Allocate(); }, 0, capture.request.width,
+                     capture.request.height, owner.stamp.draw, draw.first, draw.base, draw.first_instance,
+                     WindowPaneDrawKey.vs, WindowPaneDrawKey.ps, WindowPaneDrawKey.count, pane.instances, true};
+    if (!SampleDrawRaw(read, state, draw, after)) return false;
+    if (after) {
+        u32 i = 0;
+        for (const auto target : {RawAlbedo, RawDepth}) {
+            const auto& source = owner.material.sources[target].backing;
+            const auto* image = texture_cache.TryGetImage(VideoCore::ImageId{source.id}, source.uid);
+            if (!image) {
+                owner.material.refusal = "selected attachment disappeared after draw";
+                return false;
+            }
+            owner.after_writes[i++] = image->write_seq;
+        }
+    }
+    return true;
+}
+
+void Rasterizer::NoteWindowOwnerTargets(const GraphicsPipeline* pipeline) {
+    using namespace RtLampPane;
+    using WindowPathProbe::PaneOwnerGap;
+    auto& owner = *window_receiver->pane->owner;
+    if (owner.final_tick || owner.material.refusal) return;
+    if (!owner.material.phases.after_tick) {
+        // Count only while the cold acquisition is active. The trigger itself may
+        // precede construction of this optional observer.
+        ++owner.draws_before;
+        return;
+    }
+    if (object_motion->Frame() != owner.stamp.scene) return;
+    if (owner.draws_after == 4096) {
+        if (NoteWindowOwnerGap(PaneOwnerGap::DrawCap)) {
+            LogWindowOwnerGap("draw-cap", "limit=4096");
+        }
+        return;
+    }
+    ++owner.draws_after;
+    if (owner.first_writer) return;
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& regs = Regs();
+    const auto possible = [&](const RenderTargetInfo& target, const char* attachment, u32 slot) {
+        const auto& [id, desc] = target;
+        if (!id) return false;
+        const auto* image = texture_cache.TryGetImage(id, 0);
+        if (!image || !image->backing || image->guest_end <= image->guest_begin ||
+            !image->GetImage()) {
+            if (NoteWindowOwnerGap(PaneOwnerGap::NonresidentTarget)) {
+                const char* reason = "no-vk-image";
+                if (!image) {
+                    reason = "missing-image";
+                } else if (!image->backing) {
+                    reason = "no-backing";
+                } else if (image->guest_end <= image->guest_begin) {
+                    reason = "invalid-range";
+                }
+                const auto& range = desc.view_info.range;
+                LogWindowOwnerGap("nonresident-target",
+                                  fmt::format("attachment={} slot={} id={} uid={} reason={} "
+                                              "dst={:#x}+{:#x} stencil-dst={:#x} mip={} layer={} layers={}",
+                                              attachment, slot, id.index, image ? image->image_uid : 0,
+                                              reason, desc.info.guest_address, desc.info.guest_size,
+                                              desc.info.stencil_addr, range.base.level, range.base.layer,
+                                              range.extent.layers).c_str());
+            }
+            return false;
+        }
+        const MaterialBacking write{
+            .image = std::bit_cast<u64>(VkImage(image->GetImage())),
+            .backing = u64(reinterpret_cast<std::uintptr_t>(image->backing)),
+            .begin = image->guest_begin, .end = image->guest_end,
+            .stencil_begin = image->info.stencil_addr,
+            .stencil_end = image->info.stencil_addr + image->info.stencil_size,
+            .id = id.index, .uid = image->image_uid,
+        };
+        return MaterialAlias(write, owner.material.sources[RawAlbedo].backing) ||
+               MaterialAlias(write, owner.material.sources[RawDepth].backing);
+    };
+    for (u32 slot = 0; slot < cb_descs.size(); ++slot) {
+        if ((key.mrt_mask & (1u << slot)) && possible(cb_descs[slot], "color", slot)) {
+            owner.first_writer = owner.stamp.draw + owner.draws_after;
+            return;
+        }
+    }
+    const bool clear = regs.depth_render_control.depth_clear_enable;
+    const bool depth_write = regs.depth_control.depth_enable && regs.depth_control.depth_write_enable;
+    if ((clear || depth_write) && possible(db_desc, "depth", 0)) {
+        owner.first_writer = owner.stamp.draw + owner.draws_after;
+        owner.later_clear = clear;
+    }
+}
+
+bool Rasterizer::NoteWindowOwnerGap(WindowPathProbe::PaneOwnerGap kind) {
+    auto& owner = *window_receiver->pane->owner;
+    // Compute/copy/clear paths can use aliases whose targets are not in cb_descs or db_desc.
+    if (!owner.final_tick && owner.material.phases.after_tick && object_motion->Frame() == owner.stamp.scene) {
+        owner.coverage_gap = true;
+        const auto bit = static_cast<u8>(kind);
+        if (owner.logged_gap_kinds & bit) return false;
+        owner.logged_gap_kinds |= bit;
+        return true;
+    }
+    return false;
+}
+
+void Rasterizer::LogWindowOwnerGap(const char* kind, const char* identity) {
+    const auto& owner = *window_receiver->pane->owner;
+    std::printf("Window pane owner gap (t132f): req=%u obj=%llu rt=%llu selected=%u later=%u "
+                "kind=%s %s\n",
+                window_receiver->request.id, static_cast<unsigned long long>(owner.stamp.scene),
+                static_cast<unsigned long long>(owner.stamp.rt), owner.stamp.draw, owner.draws_after,
+                kind, identity);
+}
+
+void Rasterizer::FinalWindowOwner(u64 directional, u64 depth_uid, u64 depth_tick) {
+    using namespace RtLampPane;
+    auto& owner = *window_receiver->pane->owner;
+    if (owner.material.refusal || owner.final_tick) return;
+    if (!owner.material.phases.Complete(owner.stamp) ||
+        !SameDepth(owner.stamp, window_receiver->request.id, object_motion->Frame(),
+                   db_desc.first.index, depth_uid) ||
+        owner.stamp.rt != rt_shadow->WindowDiagnosticFrame() || !depth_tick) {
+        owner.material.refusal = "A/B not delivered on the exact directional sample frame";
+        return;
+    }
+    std::array<VideoCore::Image*, MaterialTargets> images{};
+    u32 i = 0;
+    for (const auto target : {RawAlbedo, RawDepth}) {
+        const auto& saved = owner.material.sources[target];
+        const auto id = VideoCore::ImageId{saved.backing.id};
+        auto* image = texture_cache.TryGetImage(id, saved.backing.uid);
+        if (!image || !image->backing || !texture_cache.IsRegisteredImage(id, saved.backing.uid) ||
+            image->binding.needs_rebind || image->scene_proxy || scene_targets->Tracks(saved.backing.uid) ||
+            scene_targets->NativeStale(*image) ||
+            std::bit_cast<u64>(VkImage(image->GetImage())) != saved.backing.image ||
+            u64(reinterpret_cast<std::uintptr_t>(image->backing)) != saved.backing.backing ||
+            image->guest_begin != saved.backing.begin || image->guest_end != saved.backing.end ||
+            !image->backing->subresource_states.empty() ||
+            image->backing->image.image_ci.format != saved.created_format ||
+            image->backing->state.layout == vk::ImageLayout::eUndefined) {
+            owner.material.refusal = "final attachment lost exact native image or subresource identity";
+            return;
+        }
+        const auto exact_view = [&](auto view_id) {
+            const auto& view = texture_cache.GetImageView(view_id);
+            return view.image_view.get() == saved.view && view.info == saved.info;
+        };
+        if (!std::ranges::any_of(image->backing->image_view_ids, exact_view)) {
+            owner.material.refusal = "final attachment lost native view";
+            return;
+        }
+        owner.final_writes[i++] = image->write_seq;
+        if (target == RawAlbedo) images[target] = image;
+    }
+    // DirectionalReadback has already ended the pass and copied C-depth.
+    // No other guest command can be inserted between those samples.
+    constexpr RawDrawPixel pixel{1003, 281};
+    std::array<u64, MaterialTargets> offsets{};
+    offsets[RawAlbedo] = RawFinalAlbedo;
+    owner.directional = directional;
+    owner.final_depth_tick = depth_tick;
+    owner.final_tick = scheduler.CurrentTick();
+    RecordDrawRaw(images, std::span(&pixel, 1), vk::Buffer{owner.buffer}, offsets);
+}
+
+void Rasterizer::CaptureWindowReceiver(const AmdGpu::Regs& regs, u64 ps_hash) {
+    using namespace WindowPathProbe;
+    auto& capture = *window_receiver;
+    if (capture.pending.request ||
+        (capture.pane && !capture.pane->CanSample(capture.request.id, object_motion->Frame(),
+                                         rt_shadow->WindowDiagnosticFrame(), ReceiverCapture::FrameBudget))) {
+        return;
+    }
+    if (!camera_motion->Enabled() || scene_targets->Reduced() || ui_pass.active ||
+        !db_desc.first || db_desc.first != camera_motion->Depth() ||
+        !regs.depth_control.depth_enable || regs.depth_control.depth_write_enable ||
+        regs.depth_render_control.depth_clear_enable || target_scale[0] != 1.f || target_scale[1] != 1.f ||
+        target_offset[0] != 0.f || target_offset[1] != 0.f || !cb_descs[0].first || !capture.set_id) {
+        capture.refusal = "original native depth or bound directional light-set unavailable";
+        return;
+    }
+    auto* depth = texture_cache.TryGetImage(db_desc.first, 0);
+    auto* sets = texture_cache.TryGetImage(capture.set_id, capture.set_uid);
+    auto* output = texture_cache.TryGetImage(cb_descs[0].first, 0);
+    const auto render = camera_motion->RenderSize();
+    const auto scissor = DrawScissor(0);
+    const auto matrices = camera_motion->PassMatrices();
+    if (!depth || !sets || !output || !matrices.valid || !capture.ordinal ||
+        !object_motion->Frame() || !output->image_uid ||
+        render[0] != capture.request.width || render[1] != capture.request.height ||
+        output->info.size.width != render[0] || output->info.size.height != render[1] ||
+        scissor.offset.x != 0 || scissor.offset.y != 0 ||
+        scissor.extent.width != render[0] || scissor.extent.height != render[1]) {
+        capture.refusal = "directional draw identity, native render size or full scissor unavailable";
+        return;
+    }
+    if (capture.pane && capture.pane->natural.Active() &&
+        !capture.pane->SameSampleState(depth->image_uid, {matrices.view, matrices.inv_view, matrices.proj},
+            upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{})) {
+        capture.refusal = "natural pane sample camera, jitter or depth identity changed";
+        capture.pane->stages.Refuse(capture.refusal, object_motion->Frame(), rt_shadow->WindowDiagnosticFrame());
+        return;
+    }
+    const u64 view = XXH3_64bits(matrices.view.data(), sizeof(matrices.view));
+    const u64 stamp = XXH3_64bits_withSeed(matrices.proj.data(), sizeof(matrices.proj), view);
+    // Generation remains zero for this independent receiver lookup. It does
+    // not claim a guarded scene association or a measured contribution.
+    const DirectionalSource source{
+        .stamp = {capture.request.id, object_motion->Frame(), 0, stamp, depth->image_uid},
+        .fragment_hash = ps_hash, .draw = capture.ordinal, .set_uid = sets->image_uid,
+        .output_uid = output->image_uid, .width = render[0], .height = render[1], .matched_native_inputs = true,
+    };
+    const auto result = capture.copy.Submit(source, capture.request.Points(), matrices,
+                                           *depth, db_desc.second.view_info, sets, &capture.set_view);
+    if (result == Status::Ready) {
+        capture.pending = source.stamp;
+        capture.sampled_draw = source.draw;
+        if (capture.pane && capture.pane->owner) {
+            FinalWindowOwner(source.draw, source.stamp.depth_uid, scheduler.CurrentTick());
+        }
+        if (capture.pane) {
+            if (capture.pane->natural.Active()) {
+                capture.pane->natural.sampled = true;
+            }
+            capture.pane->stages.sample = "directional";
+            capture.pane->stages.sample_rt = rt_shadow->WindowDiagnosticFrame();
+        }
+        capture.depth_camera = {matrices.view, matrices.inv_view, matrices.proj};
+        capture.depth_jitter = upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{};
+    } else {
+        capture.refusal = Name(result);
+    }
+}
+
+void Rasterizer::CaptureWindowDepth() {
+    using namespace WindowPathProbe;
+    auto& capture = *window_receiver;
+    if (capture.pending.request || !camera_motion->Enabled() || scene_targets->Reduced() ||
+        (capture.pane && !capture.pane->CanSample(capture.request.id, object_motion->Frame(),
+                                         rt_shadow->WindowDiagnosticFrame(), ReceiverCapture::FrameBudget))) {
+        return;
+    }
+    const auto render = camera_motion->RenderSize();
+    const auto matrices = camera_motion->PassMatrices();
+    const auto id = camera_motion->Depth();
+    auto* depth = id ? texture_cache.TryGetImage(id, 0) : nullptr;
+    if (!depth || !matrices.valid || !object_motion->Frame() ||
+        render[0] != capture.request.width || render[1] != capture.request.height) {
+        return;
+    }
+    if (capture.pane && capture.pane->natural.Active() &&
+        !capture.pane->SameSampleState(depth->image_uid, {matrices.view, matrices.inv_view, matrices.proj},
+            upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{})) {
+        capture.refusal = "natural pane sample camera, jitter or depth identity changed";
+        capture.pane->stages.Refuse(capture.refusal, object_motion->Frame(), rt_shadow->WindowDiagnosticFrame());
+        return;
+    }
+    const u64 view = XXH3_64bits(matrices.view.data(), sizeof(matrices.view));
+    const u64 stamp = XXH3_64bits_withSeed(matrices.proj.data(), sizeof(matrices.proj), view);
+    const DirectionalSource source{
+        .stamp = {capture.request.id, object_motion->Frame(), 0, stamp, depth->image_uid},
+        .width = render[0], .height = render[1], .matched_native_inputs = true, .depth_only = true,
+    };
+    VideoCore::ImageViewInfo depth_view;
+    depth_view.format = depth->info.pixel_format;
+    const auto result = capture.copy.Submit(source, capture.request.Points(), matrices, *depth, depth_view);
+    if (result == Status::Ready) {
+        capture.pending = source.stamp;
+        if (capture.pane) {
+            if (capture.pane->natural.Active()) {
+                capture.pane->natural.sampled = true;
+            }
+            capture.pane->stages.sample = "depth-only";
+            capture.pane->stages.sample_rt = rt_shadow->WindowDiagnosticFrame();
+        }
+        capture.depth_camera = {matrices.view, matrices.inv_view, matrices.proj};
+        capture.depth_jitter = upscaler->Enabled() ? upscaler->Jitter() : std::array<float, 2>{};
+    }
+}
+
+void Rasterizer::PollWindowReceiver() {
+    using namespace WindowPathProbe;
+    ExpireColdWindowPane();
+    const u32 generation = BbLiveKnobs::Generation();
+    if (generation != window_receiver_generation) {
+        window_receiver_generation = generation;
+        const auto value = BbLiveKnobs::Lookup("BB_WINDOW_PATH_PIXELS");
+        if (const char* text = value.Get(); text && *text) {
+            PixelRequest request;
+            if (!ParsePixelRequest(text, request)) {
+                std::printf("Window path (t132f): invalid BB_WINDOW_PATH_PIXELS (id:width:height:x:y[:x:y...])\n");
+            } else if (request.id > window_receiver_last_request) {
+                window_receiver_last_request = request.id;
+                if (window_receiver || window_cold_pane.Active()) {
+                    std::printf("Window path (t132f): req=%u receiver unresolved (request busy)\n", request.id);
+                } else {
+                    window_receiver = std::make_unique<ReceiverCapture>(instance, scheduler, runtime, request);
+                    const auto pane_value = BbLiveKnobs::Lookup("BB_WINDOW_PATH_PANE_PIXEL");
+                    bool wait_for_natural = false;
+                    if (const char* pane_text = pane_value.Get(); pane_text && *pane_text) {
+                        std::string_view spec = pane_text;
+                        constexpr std::string_view option = ":natural";
+                        wait_for_natural = spec.ends_with(option);
+                        if (wait_for_natural) {
+                            spec.remove_suffix(option.size());
+                        }
+                        PixelRequest pane_request;
+                        if (ParsePixelRequest(spec, pane_request) && pane_request.id == request.id &&
+                            pane_request.width == request.width && pane_request.height == request.height &&
+                            pane_request.count == 1) {
+                            auto& capture = *window_receiver;
+                            const auto point = pane_request.pixels[0];
+                            const auto points = capture.request.Points();
+                            const auto found = std::ranges::find(points, point);
+                            if (found != points.end()) {
+                                capture.pane_sample = u32(found - points.begin());
+                            } else if (capture.request.count < WP_RECEIVERS) {
+                                capture.pane_sample = capture.request.count;
+                                capture.request.pixels[capture.request.count++] = point;
+                            }
+                            if (capture.pane_sample != WP_NONE) {
+                                ArmWindowPane(capture, wait_for_natural);
+                            } else {
+                                std::printf("Window path (t132f): req=%u pane unresolved (eight-texel budget)\n", request.id);
+                            }
+                        } else {
+                            std::printf("Window path (t132f): req=%u pane unresolved (pane request identity/extent)\n", request.id);
+                        }
+                    }
+                    if (wait_for_natural && !window_receiver->pane) {
+                        window_receiver.reset(); // invalid paired request, no default sample
+                        return;
+                    }
+                    window_receiver->scene.textures = &texture_cache;
+                    if (!wait_for_natural) {
+                        rt_shadow->WatchWindowScene(&window_receiver->scene);
+                    } else {
+                        std::printf("Window natural pane (t132f): req=%u waiting for first ordinary build (90 frames/20 s)\n",
+                                    request.id);
+                    }
+                    std::printf("Window path (t132f): armed req=%u native=%ux%u samples=%u\n",
+                                request.id, request.width, request.height, request.count);
+                    return;
+                }
+            }
+        }
+    }
+    if (!window_receiver) {
+        return;
+    }
+    auto& capture = *window_receiver;
+    const auto finish = [&] {
+        rt_shadow->WatchWindowScene(nullptr);
+        rt_shadow->WatchWindowPane(nullptr);
+        if (capture.pane) {
+            const auto& pane = *capture.pane;
+            const auto& d = pane.stages;
+            const auto u = [](u64 value) { return static_cast<unsigned long long>(value); };
+            std::printf("Window pane stages (t132f): req=%u arm=%llu/%llu sample=%s:%llu/%llu finish=%s:%llu/%llu "
+                        "pane=%llu/%llu draws=%u exact-before/after=%u/%u hook=%u motion=%#x geometry=%u "
+                        "guard=%#x observe=%u prepare=%u first-prepare=\"%s\" entry=%llx base=%llx flags=%#x "
+                        "needs/reuse=%u/%u param=%u/%u build=%u added=%u match=%u left-out=%u probe=%u "
+                        "span-ok=%u queue=%u tick=%llu first-refusal=\"%s\":%llu/%llu final-refusal=\"%s\"\n",
+                        capture.request.id, u(d.arm_frame), u(d.arm_rt), d.sample, u(capture.pending.frame),
+                        u(d.sample_rt), d.finish, u(object_motion->Frame()), u(rt_shadow->WindowDiagnosticFrame()),
+                        u(pane.source_frame), u(pane.rt_frame), pane.draw_count, d.exact_before, d.exact_after,
+                        d.hook, d.motion, d.geometry, d.guard, d.observed, d.prepare,
+                        d.first_prepare ? d.first_prepare : "unobserved", u(d.entry), u(d.base), d.entry_flags,
+                        d.ordinary_needs, d.ordinary_reuse, d.param, pane.param, d.build, d.build_added,
+                        d.matching_build, d.build_left_out, d.probe_only, d.span_ok, d.queued, u(pane.tick),
+                        d.first_refusal ? d.first_refusal : "none", u(d.first_frame), u(d.first_rt),
+                        pane.refusal ? pane.refusal : "none");
+            if (pane.natural.Active()) {
+                const auto& build = pane.natural.build;
+                std::printf("Window natural pane (t132f): req=%u finish=%s latched=%u frame=%llu/%llu "
+                            "entry=%llx base=%llx new-entry=%s param=%u build=%u sample=%u copy-tick=%llu\n",
+                            capture.request.id, d.finish, unsigned(pane.natural.Latched()),
+                            u(build.object_frame), u(build.rt_frame), u(build.entry), u(build.base),
+                            !pane.natural.Latched() ? "unknown" : build.new_entry ? "yes" : "no",
+                            build.param, build.ordinal, unsigned(pane.natural.sampled), u(pane.tick));
+            }
+        }
+        const auto& root = capture.scene;
+        if (root.scene) {
+            std::printf("Window path (t132f): req=%u observed guarded scene frame=%llu serial=%llu records=%zu "
+                        "paired_receiver=unresolved\n", capture.request.id,
+                        static_cast<unsigned long long>(root.scene->frame),
+                        static_cast<unsigned long long>(root.scene->serial), root.facts.size());
+        } else {
+            const char* reason = root.status == SceneStatus::UnattestedReuse ? "unattested reuse" :
+                                 root.status == SceneStatus::Budget ? "metadata budget" : "no attested new emission";
+            std::printf("Window path (t132f): req=%u guarded scene unresolved (%s)\n",
+                        capture.request.id, reason);
+        }
+        std::printf("Window path (t132f): req=%u path unresolved (pane primitive witness, receiver owner/triangle and production segment absent)\n",
+                    capture.request.id);
+        if (capture.pane && capture.pane->owner && !capture.pane->owner->reported) {
+            const auto& owner = *capture.pane->owner;
+            std::printf("Window pane owner (t132f): req=%u ambiguous (%s)\n", capture.request.id,
+                        owner.material.refusal ? owner.material.refusal : "complete A/B/C and primitive join unavailable");
+        }
+        window_receiver.reset();
+    };
+    if (auto* pane = capture.pane.get(); pane && pane->natural.Active()) {
+        const auto rt_frame = rt_shadow->WindowDiagnosticFrame();
+        const auto object_frame = object_motion->Frame();
+        if (pane->natural.Expired(object_frame, ReceiverCapture::FrameBudget, NaturalPanePair::Clock::now())) {
+            pane->stages.finish = !pane->natural.Latched() ? "no-natural-build" :
+                !capture.pending.request ? "no-same-frame-depth" :
+                !pane->tick ? "no-matching-world-copy" : "paired-readback-deadline";
+            finish();
+            return;
+        }
+        if (pane->natural.Latched()) {
+            if (!pane->natural.Closed(rt_frame)) {
+                return; // this poll precedes the RT frame handoff
+            }
+            if (!capture.pending.request) {
+                pane->stages.finish = pane->refusal ? "pane-refused" : "no-same-frame-depth";
+                finish();
+                return;
+            }
+        }
+    }
+    if (!capture.pending.request) {
+        capture.ordinal = 0;
+        if (++capture.frames >= ReceiverCapture::FrameBudget) {
+            std::printf("Window path (t132f): req=%u receiver unresolved (%s)\n",
+                        capture.request.id, capture.refusal);
+            if (capture.pane) {
+                capture.pane->stages.finish = "no-depth-sample";
+            }
+            finish();
+        }
+        return;
+    }
+    if (capture.pane && capture.pane->tick && !capture.pane->Ready() &&
+        capture.frames + 1 < ReceiverCapture::FrameBudget) {
+        ++capture.frames;
+        return;
+    }
+    if (capture.pane && capture.pane->owner) {
+        const auto& owner = *capture.pane->owner;
+        if (owner.final_tick && !owner.Ready() && capture.frames + 1 < ReceiverCapture::FrameBudget) {
+            ++capture.frames;
+            return;
+        }
+    }
+    DirectionalBatch output;
+    const auto result = capture.copy.Poll(capture.pending, output);
+    if (result == Status::Busy) {
+        if (++capture.frames >= ReceiverCapture::FrameBudget) {
+            std::printf("Window path (t132f): req=%u receiver unresolved (readback deadline)\n",
+                        capture.request.id);
+            if (capture.pane) {
+                capture.pane->stages.finish = "sample-fence-timeout";
+            }
+            finish();
+        }
+        return;
+    }
+    if (result == Status::Ready) {
+        const auto u = [](u64 value) { return static_cast<unsigned long long>(value); };
+        if (!output.set_uid) {
+            std::printf("Window path (t132f): req=%u light-set unresolved (%s)\n", capture.request.id, capture.refusal);
+        }
+        for (u32 i = 0; i < output.count; ++i) {
+            const auto& pixel = output.pixels[i];
+            char set[16];
+            if (pixel.raw_light_set == WP_NONE) {
+                std::snprintf(set, sizeof(set), "unavailable");
+            } else {
+                std::snprintf(set, sizeof(set), "%u", pixel.raw_light_set);
+            }
+            std::printf("Window path (t132f): req=%llu frame=%llu directional=%llu camera=%llx depth_uid=%llu "
+                        "set_uid=%llu xy=%u,%u depth=%.8f world_valid=%u world=%.5f,%.5f,%.5f "
+                        "raw_set=%s receiver_owner=unresolved direct=unavailable\n",
+                        u(output.stamp.request), u(output.stamp.frame), u(capture.sampled_draw), u(output.stamp.camera),
+                        u(output.stamp.depth_uid), u(output.set_uid), pixel.pixel.x, pixel.pixel.y,
+                        double(pixel.raw_depth), unsigned(pixel.world_valid), double(pixel.world[0]),
+                        double(pixel.world[1]), double(pixel.world[2]), set);
+        }
+        if (capture.pane) {
+            auto& pane = *capture.pane;
+            const auto pane_world = pane.Read();
+            if (!pane.refusal && capture.pane_sample < output.count && !pane_world.empty() &&
+                pane.source_frame == output.stamp.frame && pane.depth_uid == output.stamp.depth_uid &&
+                pane.camera == capture.depth_camera && pane.jitter == capture.depth_jitter) {
+                const auto& point = output.pixels[capture.pane_sample];
+                const RtLampPane::Request size{.width = capture.request.width, .height = capture.request.height};
+                const auto pixel = RtLampPane::Texel(size, {s32(point.pixel.x), s32(point.pixel.y)},
+                                                     size.width, size.height, pane.jitter);
+                const PaneRead read{
+                    .capture = output.stamp, .sample = output.stamp, .draw = WindowPaneDrawKey,
+                    .owner = pane.key, .vertices_per_instance = pane.vertices, .instances = pane.instances,
+                    .world = pane_world, .expanded_indices = {pane.indices.data(), size_t(pane.triangles) * 3},
+                    .camera = pane.camera, .pixel = pixel, .raw_depth = point.raw_depth,
+                    .final_gbuffer_owner = false, .triangle_list = true,
+                };
+                Witness local;
+                const auto matched = SamplePanePrimitive(read, GlassRegistryRules::Load(),
+                                                         BbTestCamera::WorldFromDepth, local);
+                const char* final_owner = "unresolved";
+                if (auto* owner = pane.owner.get(); owner && !owner->material.refusal && owner->final_tick &&
+                    owner->directional == capture.sampled_draw && owner->stamp.build == pane.natural.build.ordinal &&
+                    owner->stamp.scene == output.stamp.frame && owner->stamp.uid == output.stamp.depth_uid) {
+                    OwnerTexel a, b, c{.depth = std::bit_cast<u32>(point.raw_depth)};
+                    if (owner->Read(a, b, c.albedo)) {
+                        const bool later = owner->first_writer || owner->after_writes != owner->final_writes;
+                        const auto verdict = ClassifyPaneOwner(true, matched == Status::Ready, a, b, c,
+                                                              later, owner->coverage_gap || owner->later_clear);
+                        final_owner = OwnerName(verdict);
+                        owner->reported = true;
+                        const auto& albedo = owner->material.sources[RawAlbedo];
+                        const auto& phase = owner->material.phases;
+                        std::printf("Window pane owner (t132f): req=%u %s xy=%u,%u obj=%llu rt=%llu draw=%u build=%u "
+                                    "param=%u world=%llu ticks=%llu/%llu/%llu/%llu later=%u writer=%u clear=%u gap=%u "
+                                    "pair=97f2d384:2390c887 count=246 first=0 mip=0 layer=0 "
+                                    "albedo=%u/%llu format=%u depth=%u/%llu cam=%llx jitter=%.6f,%.6f "
+                                    "raw-albedo=%08x/%08x/%08x raw-depth=%08x/%08x/%08x "
+                                    "writes=%llu/%llu->%llu/%llu\n",
+                                    capture.request.id, final_owner, point.pixel.x, point.pixel.y,
+                                    u(owner->stamp.scene), u(owner->stamp.rt), owner->stamp.draw, owner->stamp.build,
+                                    pane.param, u(pane.tick), u(phase.before_tick), u(phase.after_tick),
+                                    u(owner->final_tick), u(owner->final_depth_tick), owner->draws_after,
+                                    owner->first_writer, unsigned(owner->later_clear), unsigned(owner->coverage_gap),
+                                    albedo.backing.id, u(albedo.backing.uid), u32(albedo.created_format),
+                                    owner->stamp.image, u(owner->stamp.uid), u(output.stamp.camera),
+                                    pane.jitter[0], pane.jitter[1], a.albedo, b.albedo, c.albedo, a.depth, b.depth, c.depth,
+                                    u(owner->after_writes[0]), u(owner->after_writes[1]),
+                                    u(owner->final_writes[0]), u(owner->final_writes[1]));
+                    }
+                }
+                pane.stages.finish = matched == Status::Ready ?
+                    (std::string_view(final_owner) == "proven" ? "primitive-with-final-owner" :
+                     "primitive-with-owner-unresolved") : Name(matched);
+                if (matched == Status::Ready) {
+                    const u32 each = pane.triangles / pane.instances;
+                    std::printf("Window path (t132f): req=%u pane xy=%u,%u depth-matched primitive=%u instance=%u local=%u "
+                                "key=%llx draw=97f2d384:2390c887 idx=246 first=0 final_owner=%s\n",
+                                capture.request.id, point.pixel.x, point.pixel.y, local.triangle.primitive,
+                                local.triangle.primitive / each, local.triangle.primitive % each,
+                                u(pane.key), final_owner);
+                    const auto& root = capture.scene;
+                    if (root.scene && root.scene->frame == pane.rt_frame &&
+                        root.scene->camera == Roof::Camera{pane.camera.view, pane.camera.inverse} &&
+                        root.projection == pane.camera.proj && root.depth_uid == pane.depth_uid &&
+                        root.facts.size() == root.scene->records.size()) {
+                        const auto same = [&](const RecordFacts& fact) {
+                            return fact.key == pane.key && fact.capture_frame == pane.rt_frame &&
+                                   fact.triangles == pane.triangles;
+                        };
+                        const auto record = std::ranges::find_if(root.facts, same);
+                        if (record != root.facts.end() && std::none_of(record + 1, root.facts.end(), same)) {
+                            const auto id = size_t(record - root.facts.begin());
+                            std::printf("Window path (t132f): req=%u pane observed record=%zu serial=%llu mask=%#x custom=%#x\n",
+                                        capture.request.id, id, u(root.scene->serial),
+                                        root.scene->records[id].flags & 0xffu, record->custom_index);
+                        }
+                    }
+                } else {
+                    std::printf("Window path (t132f): req=%u pane unresolved (%s)\n", capture.request.id, Name(matched));
+                }
+            } else {
+                std::printf("Window path (t132f): req=%u pane unresolved (%s)\n", capture.request.id,
+                            pane.refusal ? pane.refusal : !pane.tick ? "no bounded ordinary world capture" :
+                            "same-frame camera, depth identity or world fence unavailable");
+                pane.stages.finish = pane.refusal ? "pane-refused" :
+                    !pane.tick ? (pane.natural.Active() ? "no-matching-world-copy" : "no-world-queue") :
+                    "world-sample-join-unavailable";
+            }
+        }
+    } else {
+        std::printf("Window path (t132f): req=%u receiver unresolved (%s)\n", capture.request.id, Name(result));
+        if (capture.pane) {
+            capture.pane->stages.finish = Name(result);
+        }
+    }
+    finish();
+}
+
+
+void ReflectionFirstRetire::ReadModule(Row& row, const PipelineCache& cache, const GraphicsPipeline& pipeline) {
+    if (!cache.CaptureProofUnchanged()) {
+        row.module = "hot-replacement";
+        return;
+    }
+    ReflectionDiscard::Pipeline proof{};
+    const bool found = row.raster_ps && pipeline.GetReflectionDiscardProof(&cache, row.raster_ps, proof);
+    if (!cache.CaptureProofUnchanged()) {
+        row.module = "hot-replacement";
+        return;
+    }
+    if (!found || proof.fragment.id.guest != row.key.ps || proof.fragment.id.stage != row.raster_ps ||
+        std::bit_cast<u64>(proof.handle) != row.handle || !proof.vertex) {
+        row.module = "module-unjoined";
+        return;
+    }
+    row.proof = proof;
+    row.module = proof.fragment.opcodes.valid ? "scanned" : "scan-unavailable";
+    const auto* stock = ReflectionDiscard::StockFragmentForStages(row.raster_vs, row.raster_ps);
+    const auto& fragment = proof.fragment;
+    if (stock && stock->vertex_guest == row.key.vs && stock->fragment_guest == row.key.ps &&
+        stock->permutation == fragment.permutation) {
+        row.observed_certificate = ReflectionDiscard::Classify(*stock, fragment.opcodes,
+            fragment.route, fragment.bytes, fragment.effective_xxh3);
+    }
+}
+
 void Rasterizer::EffectsAfterDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
-                                  u32 num_indices, u32 num_instances, u32 first_vertex) {
+                                  u32 num_indices, u32 num_instances, u32 first_vertex,
+                                  const RtShadow::ReflectionDrawToken& reflection,
+                                  const GraphicsPipeline& raster_pipeline, bool classified_stock_issued) {
     auto& dc = Dc();
+    if (reflection_probe && gbuffer_draw && is_indexed && ReflectionStamp(regs)) {
+        const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const auto& stamp = *reflection_probe->stamp;
+        if (ps && dc.capture_draw && num_instances == 1 && first_vertex == 0 && JoinCount(num_indices) &&
+            ReflectionDiscard::On() && dc.draw_jitter == stamp.jitter && !BbEngine::Loading::ScreenUp() &&
+            stamp.generation == BbEngine::Loading::Generation()) {
+            FinishReflectionDiscard(this, pipeline_cache,
+                {pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, ps->pgm_hash,
+                 num_indices, dc.draw_inputs.index_offset}, pipeline, raster_pipeline, stamp,
+                scheduler.CurrentTick());
+        }
+        if (dc.reflection_native) {
+            auto& note = *dc.reflection_native;
+            note.submission_stamp = note.stamped && note.stamp == stamp &&
+                note.key == ReflectionNativeProbe::Key{
+                    pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, ps ? ps->pgm_hash : 0,
+                    num_indices, dc.draw_inputs.index_offset};
+        }
+        if (JoinCount(num_indices) && ReflectionJoinTraceOn()) {
+            const auto vs = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
+            const auto frag = ps ? ps->pgm_hash : 0;
+            const u32 first = dc.draw_inputs.index_offset;
+            const char* gate = !dc.capture_draw ? "capture-hook-inactive"
+                               : !reflection.placement ? "capture-preflight-unjoined"
+                               : !reflection.cookie ? "entry-unjoined"
+                               : dc.draw_jitter != stamp.jitter ? "draw-jitter"
+                               : "draw-confirmed";
+            TraceReflectionJoin(JoinTarget(vs, frag, num_indices, first), stamp.frame,
+                                reflection_probe->last_request, vs, frag, num_indices, first,
+                                "submitted", gate, regs, pipeline->GetGraphicsKey().mrt_mask,
+                                nullptr, dc.capture_draw, reflection.cookie != 0);
+        }
+        const RtShadow::ReflectionDrawToken empty;
+        const auto* placed = dc.reflection_native && dc.reflection_native->submission_stamp &&
+                             reflection.placed != ReflectionFirstHit::PlacedSource::None
+            ? ReflectionNativeProbe::PlacedBinding(*dc.reflection_native) : nullptr;
+        const auto* exact = dc.reflection_native && dc.reflection_native->exact
+            ? &*dc.reflection_native->exact : nullptr;
+        const bool exact_ok = classified_stock_issued && (!exact || !exact->placement ||
+            (exact->submitted && ExactReflectionStages(raster_pipeline, *dc.reflection_native)));
+        if (!exact_ok && exact) {
+            TraceExactReflectionObjects(*dc.reflection_native, "submission-refused");
+        }
+        if (!classified_stock_issued && dc.reflection_native && ReflectionJoinTraceOn()) {
+            const auto& key = dc.reflection_native->key;
+            const auto target = JoinTarget(key.vs, key.ps, key.count, key.first);
+            const char* gate = target == ReflectionJoinTarget::WallCandidate
+                ? "classified-wall-route-mismatch" : "classified-fireplace-route-mismatch";
+            TraceReflectionJoin(target, stamp.frame, reflection_probe->last_request,
+                                key.vs, key.ps, key.count, key.first, "submitted", gate,
+                                regs, pipeline->GetGraphicsKey().mrt_mask);
+        }
+        const bool placed_live = placed && placed->handle == placed->buffer->Handle();
+        const bool joined = rt_shadow->ReflectionSubmitted(
+            stamp, dc.draw_jitter == stamp.jitter && exact_ok ? reflection : empty,
+            pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash, ps ? ps->pgm_hash : 0, num_indices,
+            dc.draw_inputs.index_offset, placed_live ? placed : nullptr);
+        if (dc.reflection_native && dc.reflection_native->stamp_retry &&
+            dc.reflection_native->stamp_retry->reporting && dc.reflection_native->stamp_retry->safe) {
+            auto& retry = *dc.reflection_native->stamp_retry;
+            const auto* row = ReflectionFirstRetire::Current(this);
+            const bool original = retry.classified && classified_stock_issued && row && row->original;
+            const bool exact_issued = exact && exact->placement && exact_ok;
+            retry.handle = placed_live;
+            if (std::string_view{retry.failure} == "none") {
+                retry.failure = !dc.reflection_native->submission_stamp ? "submission-stamp" :
+                    dc.draw_jitter != stamp.jitter ? "submission-jitter" :
+                    !original ? "submission-original" : !exact_issued ? "submission-exact" :
+                    !placed_live ? "submission-binding" : !joined ? "submission-unjoined" : "none";
+            }
+            TraceStampRetry("submitted", this, retry, &stamp, scheduler.CurrentTick(),
+                            reflection, original, exact_issued, joined);
+        }
+        if (auto* retire = ReflectionFirstRetire::Current(this)) {
+            retire->confirmed = joined && exact_ok && reflection.cookie && reflection.placement;
+        }
+        if (ReflectionOrdinal3::On()) {
+            auto* row = ReflectionFirstRetire::Current(this);
+            auto& witness = ReflectionOrdinal3::state;
+            const auto& resident = witness.resident;
+            auto& sample = witness.working;
+            if (row && ReflectionOrdinal3::Active(this, stamp.generation, row->sequence) &&
+                row->original && row->stamped && exact && exact->placement && exact_ok && joined &&
+                sample.sequence == row->sequence && sample.frame == stamp.frame && sample.pass == stamp.pass &&
+                sample.object0_complete && sample.object3_complete && sample.native_origin3 == 1 &&
+                sample.palette_current && reflection.cookie && reflection.placement == resident.placement &&
+                reflection.allocation == resident.allocation) {
+                sample.cookie = reflection.cookie;
+                sample.placement = reflection.placement;
+                sample.allocation = reflection.allocation;
+                sample.tick = row->record_tick;
+                witness.predecessor = sample;
+            }
+        }
+        if (reflection.placement_delta.enabled) {
+            SubmitPlacementDelta(dc.reflection_native, stamp, reflection, joined);
+        }
+        if (placed && placed->handle == placed->buffer->Handle() && dc.draw_jitter == stamp.jitter && exact_ok) {
+            SubmitOrdinalZero(*dc.reflection_native, stamp, reflection, raster_pipeline,
+                              regs.clipper_control.user_clip_plane_enable);
+        }
+    }
     if (blood_pool_probe) { // bbport (r100c_blood-pool-probe, TOOL): the compare right after the draw
         blood_pool_probe->AfterDraw();
     }
@@ -4536,6 +9489,9 @@ void Rasterizer::EffectsAfterDraw(const AmdGpu::Regs& regs, const GraphicsPipeli
             if (caustics) {
                 caustics->OnShadowResolve(cb_descs[0].first, light.world, light.valid);
             }
+            if (foliage_glow) { // bbport (r131a_foliage-translucency): the sun's or moon's direction for the glow
+                foliage_glow->OnSun(light.world, light.valid);
+            }
             // bbport (r105_cloud-shadows): the light and the camera (null when off)
             if (cloud_shadow) {
                 cloud_shadow->SetSunLight(light.world, light.view_to_world, light.valid);
@@ -4603,6 +9559,16 @@ void Rasterizer::EffectsAfterDraw(const AmdGpu::Regs& regs, const GraphicsPipeli
                 memory->ClampRangeSize(table, bytes) == bytes) {
                 caustics->OnLightSets(reinterpret_cast<const float*>(table), u32(bytes / 4),
                                       ps_info->images[0].GetSharp(*ps_info).Address());
+            }
+        }
+        // bbport (r131a_foliage-translucency): the light sets' table again for the glow's sun colour (the brightest set's light 0)
+        if (foliage_glow && !ps_info->buffers.empty() && !ps_info->buffers[0].IsSpecial()) {
+            const u64 skip = dc.push_data.buf_offsets[0] & 255u;
+            const u64 bytes = std::min<u64>(
+                dc.buffer_infos[0].range > skip ? dc.buffer_infos[0].range - skip : 0, 256ull * 288ull);
+            const VAddr table = ps_info->buffers[0].GetSharp(*ps_info).base_address;
+            if (bytes >= 288 && memory->IsValidGpuMapping(table, 0) && memory->ClampRangeSize(table, bytes) == bytes) {
+                foliage_glow->OnLightSets(reinterpret_cast<const float*>(table), u32(bytes / 4));
             }
         }
     } else if (const u32 count = PointLightCount(hash);
@@ -6026,6 +10992,416 @@ std::string ProbeFitText(const float* world, const std::vector<u32>& indices, u3
 }
 } // namespace
 
+namespace {
+// bbport (t70b, t167, t171, t174, TOOL): Startup hide knobs skip selected direct draws.
+// BB_REFLECT_PROBE_RECT reads a G-buffer rectangle once a second. These knobs require BB_SURFACE_PROBE=1.
+constexpr u32 ReflectProbeRows = 32; ///< rows of the rectangle read (evenly spaced inside it)
+constexpr u32 ReflectProbeCols = 64; ///< columns decoded of each row (evenly spaced across it)
+constexpr double ReflectProbeSeconds = 1.0;
+
+struct ReflectProbeItem {
+    const char* name = "-";
+    vk::Format format = vk::Format::eUndefined;
+    ProbeTexel texel = ProbeTexel::None;
+    u32 width = 0, height = 0; ///< the target (or its reduced proxy)
+    u32 x0 = 0, cols = 0, y0 = 0, y1 = 0;
+    u64 offset = 0, row_bytes = 0;
+    bool read = false, proxy = false;
+    const char* why = "-";
+};
+
+constexpr std::array ReflectProbeHideKnobs{
+    "BB_REFLECT_PROBE_HIDE", "BB_REFLECT_PROBE_HIDE2", "BB_REFLECT_PROBE_HIDE3"};
+
+constexpr const char* ReflectProbeHideRanges = "BB_REFLECT_PROBE_HIDE_RANGES";
+
+struct ReflectProbeHidePair {
+    bool on = false;
+    u32 index_count = 0, first_index = 0; ///< zero count means legacy unrestricted selection
+    u64 vs = 0, ps = 0;
+    std::atomic<u64> skipped{0}, indirect{0}, pair_not_exact{0};
+    u64 shown = 0;
+};
+
+struct ReflectProbeState {
+    std::mutex lock;
+    std::array<ReflectProbeHidePair, ReflectProbeHideKnobs.size()> hide{};
+    bool rect_on = false;
+    std::array<double, 4> rect{}; ///< as given
+    bool started = false;
+    u64 frames = 0;
+    std::chrono::steady_clock::time_point start{}, last_hide{}, last_rect{};
+    // The readback on its way (under `lock`).
+    bool pending = false;
+    std::vector<ReflectProbeItem> items; ///< cb0, cb1, depth
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VmaAllocation allocation{};
+    const u8* mapped = nullptr;
+    u64 tick = 0, frame = 0;
+    double t = 0.0;
+    u32 ref_w = 0, ref_h = 0;
+    std::array<double, 4> fraction{}; ///< the rectangle as fractions of the full-size G-buffer
+    std::string clock, cam;
+};
+
+bool ReflectProbeParseExactPair(std::string_view text, ReflectProbeHidePair& pair) {
+    const auto separator = text.find(':');
+    if (separator == std::string_view::npos) {
+        return false;
+    }
+    const auto parse_hash = [](std::string_view hash, u64& value) {
+        if (hash.empty() || hash.size() > 16) {
+            return false;
+        }
+        const auto end = hash.data() + hash.size();
+        const auto parsed = std::from_chars(hash.data(), end, value, 16);
+        return parsed.ec == std::errc{} && parsed.ptr == end;
+    };
+    return parse_hash(text.substr(0, separator), pair.vs) &&
+           parse_hash(text.substr(separator + 1), pair.ps);
+}
+
+bool ReflectProbeParseRanges(std::string_view text, ReflectProbeState& s) {
+    if (text.empty() || text.back() == ';') {
+        return false;
+    }
+    for (std::size_t i = 0; i < s.hide.size(); ++i) {
+        const auto item = ReflectionPart(text, ';');
+        const auto shader_sep = item.find(':');
+        if (shader_sep == std::string_view::npos) {
+            return false;
+        }
+        const auto range_sep = item.find(':', shader_sep + 1);
+        if (range_sep == std::string_view::npos) {
+            return false;
+        }
+        auto& pair = s.hide[i];
+        auto range = item.substr(range_sep + 1);
+        if (!ReflectProbeParseExactPair(item.substr(0, range_sep), pair) ||
+            !ReflectionNumber(ReflectionPart(range, ':'), pair.index_count) || pair.index_count == 0 ||
+            !ReflectionNumber(range, pair.first_index)) {
+            return false;
+        }
+        if (std::any_of(s.hide.begin(), s.hide.begin() + i, [&pair](const auto& prior) {
+                return prior.vs == pair.vs && prior.ps == pair.ps;
+            })) {
+            std::printf("[reflect-probe] %s repeats shader pair %08llx:%08llx; all hides off\n",
+                        ReflectProbeHideRanges, (unsigned long long)pair.vs, (unsigned long long)pair.ps);
+            return false;
+        }
+    }
+    if (!text.empty()) {
+        return false;
+    }
+    for (auto& pair : s.hide) {
+        pair.on = true;
+    }
+    return true;
+}
+
+void ReflectProbeParseLegacyHide(ReflectProbeState& s) {
+    auto& primary = s.hide[0];
+    if (const char* h = std::getenv("BB_REFLECT_PROBE_HIDE"); h && h[0]) {
+        char* end = nullptr;
+        const u64 vs = std::strtoull(h, &end, 16);
+        if (end != h && *end == ':') {
+            char* end_ps = nullptr;
+            const u64 ps = std::strtoull(end + 1, &end_ps, 16);
+            if (end_ps != end + 1) {
+                primary.on = true;
+                primary.vs = vs;
+                primary.ps = ps;
+            }
+        }
+    }
+    for (std::size_t i = 1; i < s.hide.size(); ++i) {
+        const char* knob = ReflectProbeHideKnobs[i];
+        const char* text = std::getenv(knob);
+        if (!text) {
+            continue;
+        }
+        auto& pair = s.hide[i];
+        if (!ReflectProbeParseExactPair(text, pair)) {
+            std::printf("[reflect-probe] %s needs 1-16 hex digits per hash in vs:ps form; off\n", knob);
+            continue;
+        }
+        const auto duplicate = std::find_if(s.hide.begin(), s.hide.end(), [&pair](const auto& prior) {
+            return prior.on && prior.vs == pair.vs && prior.ps == pair.ps;
+        });
+        if (duplicate != s.hide.end()) {
+            std::printf("[reflect-probe] %s duplicates %s; off\n", knob,
+                        ReflectProbeHideKnobs[duplicate - s.hide.begin()]);
+            continue;
+        }
+        pair.on = true;
+    }
+}
+
+void ReflectProbeParse(ReflectProbeState& s) {
+    if (const char* text = std::getenv(ReflectProbeHideRanges)) {
+        if (std::any_of(ReflectProbeHideKnobs.begin(), ReflectProbeHideKnobs.end(),
+                        [](const char* knob) { return std::getenv(knob) != nullptr; })) {
+            std::printf("[reflect-probe] %s cannot be combined with legacy hide knobs; all hides off\n",
+                        ReflectProbeHideRanges);
+        } else if (!ReflectProbeParseRanges(text, s)) {
+            std::printf("[reflect-probe] %s requires three unique hex vs:ps pairs with decimal count:first; all hides off\n",
+                        ReflectProbeHideRanges);
+        }
+    } else {
+        ReflectProbeParseLegacyHide(s);
+    }
+    if (const char* v = std::getenv("BB_REFLECT_PROBE_RECT"); v && v[0]) {
+        std::array<double, 4> a{};
+        u32 n = 0;
+        const char* at = v;
+        while (n < 4) {
+            while (*at == ',' || *at == ';' || *at == ':' || *at == ' ') {
+                ++at;
+            }
+            char* end = nullptr;
+            const double d = std::strtod(at, &end);
+            if (end == at) {
+                break;
+            }
+            a[n++] = d;
+            at = end;
+        }
+        if (n == 4 && a[0] >= 0.0 && a[1] >= 0.0 && a[2] > a[0] && a[3] > a[1]) {
+            s.rect_on = true;
+            s.rect = a;
+        }
+    }
+}
+
+ReflectProbeState& ReflectProbe() {
+    static ReflectProbeState state;
+    static std::once_flag once;
+    std::call_once(once, [] { ReflectProbeParse(state); });
+    return state;
+}
+
+void ReflectProbeAnnounce(bool surface_probe) {
+    const bool asked_hide = std::getenv("BB_REFLECT_PROBE_HIDE");
+    const bool asked_rect = std::getenv("BB_REFLECT_PROBE_RECT");
+    const bool asked_extra = std::any_of(ReflectProbeHideKnobs.begin() + 1, ReflectProbeHideKnobs.end(),
+                                         [](const char* knob) { return std::getenv(knob) != nullptr; });
+    const bool asked_ranges = std::getenv(ReflectProbeHideRanges);
+    if (!asked_hide && !asked_rect && !asked_extra && !asked_ranges) {
+        return;
+    }
+    if (!surface_probe) {
+        std::printf("[reflect-probe] a knob is set but BB_SURFACE_PROBE=1 is not: nothing happens\n");
+        return;
+    }
+    const auto& s = ReflectProbe();
+    const auto& primary = s.hide[0];
+    if (asked_ranges) {
+        for (const auto& pair : s.hide) {
+            if (pair.on) {
+                std::printf("[reflect-probe] %s on (%08llx:%08llx count=%u guest_first=%u), indexed direct draws only\n",
+                            ReflectProbeHideRanges, (unsigned long long)pair.vs, (unsigned long long)pair.ps,
+                            pair.index_count, pair.first_index);
+            }
+        }
+        return;
+    }
+    if (asked_hide || asked_rect) {
+        std::printf("[reflect-probe] on (t70b, TOOL, log only): hide=%s (%08llx:%08llx), rect=%s (%.3f,%.3f,%.3f,%.3f"
+                    "; fractions when all four are 1 or less). A \"rect\" group of lines once a second, a \"hide\" "
+                    "line once a second\n",
+                    primary.on ? "on" : "off", (unsigned long long)primary.vs, (unsigned long long)primary.ps,
+                    s.rect_on ? "on" : "off", s.rect[0], s.rect[1], s.rect[2], s.rect[3]);
+        if ((asked_hide && !primary.on) || (asked_rect && !s.rect_on)) {
+            std::printf("[reflect-probe] a knob was set but could not be read (HIDE is hex vs:ps; RECT is four numbers "
+                        "x0;y0;x1;y1 with x1 > x0 and y1 > y0): that one is off\n");
+        }
+    }
+    for (std::size_t i = 1; i < s.hide.size(); ++i) {
+        const auto& pair = s.hide[i];
+        if (pair.on) {
+            std::printf("[reflect-probe] %s on (%08llx:%08llx), direct draws only\n", ReflectProbeHideKnobs[i],
+                        (unsigned long long)pair.vs, (unsigned long long)pair.ps);
+        }
+    }
+}
+
+/// True when a direct draw matches an enabled pair and its optional guest index range.
+bool ReflectProbeHide(u64 vs, u64 ps, bool indirect, bool indexed, u32 index_count, u32 first_index,
+                      bool record) {
+    for (auto& pair : ReflectProbe().hide) {
+        if (!pair.on || vs != pair.vs || ps != pair.ps) {
+            continue;
+        }
+        if (indirect) {
+            if (record) pair.indirect.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (pair.index_count != 0 &&
+            (!indexed || index_count != pair.index_count || first_index != pair.first_index)) {
+            if (record) pair.pair_not_exact.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (record) pair.skipped.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+/// Stats of a channel over the samples added: min, max, mean and standard deviation.
+struct ReflectProbeStats {
+    std::array<double, 4> sum{}, sum2{};
+    std::array<float, 4> lo{}, hi{};
+    u64 n = 0;
+    ReflectProbeStats() {
+        lo.fill(std::numeric_limits<float>::infinity());
+        hi.fill(-std::numeric_limits<float>::infinity());
+    }
+    void Add(const std::array<float, 4>& c, u32 channels) {
+        for (u32 i = 0; i < channels; ++i) {
+            if (!std::isfinite(c[i])) {
+                return;
+            }
+        }
+        ++n;
+        for (u32 i = 0; i < channels; ++i) {
+            sum[i] += c[i];
+            sum2[i] += double(c[i]) * double(c[i]);
+            lo[i] = std::min(lo[i], c[i]);
+            hi[i] = std::max(hi[i], c[i]);
+        }
+    }
+    std::string Text(u32 channels) const {
+        static constexpr const char* names[] = {"r", "g", "b", "a"};
+        std::string out;
+        for (u32 i = 0; i < channels && i < 4; ++i) {
+            if (n == 0) {
+                out += fmt::format(" {}=-", names[i]);
+                continue;
+            }
+            const double mean = sum[i] / double(n);
+            const double var = std::max(0.0, sum2[i] / double(n) - mean * mean);
+            out += fmt::format(" {}={:.4f},{:.4f},{:.4f},{:.4f}", names[i], lo[i], hi[i], mean, std::sqrt(var));
+        }
+        return out;
+    }
+};
+
+/// The "rect" lines of a finished readback (r.mapped holds its rows; null: nothing was read).
+std::vector<std::string> ReflectProbeLines(const ReflectProbeState& r) {
+    std::vector<std::string> lines;
+    constexpr u32 count = ReflectProbeRows * ReflectProbeCols;
+    std::array<std::vector<std::array<float, 4>>, 3> samples;
+    for (u32 i = 0; i < 3 && i < r.items.size(); ++i) {
+        const ReflectProbeItem& item = r.items[i];
+        if (!r.mapped || !item.read) {
+            continue;
+        }
+        const u32 bytes = ProbeTexelBytes(item.texel);
+        samples[i].reserve(count);
+        for (u32 k = 0; k < ReflectProbeRows; ++k) {
+            const u8* row = r.mapped + item.offset + u64(k) * item.row_bytes;
+            for (u32 j = 0; j < ReflectProbeCols; ++j) {
+                const u64 x = (u64(2 * j + 1) * item.cols) / (2ull * ReflectProbeCols);
+                std::array<float, 4> c{};
+                ProbeDecode(item.texel, row + x * bytes, c);
+                samples[i].push_back(c);
+            }
+        }
+    }
+    const bool depth_ok = samples[2].size() == count;
+    // A sample with geometry: its depth is not the clear value (0 or 1); with no depth, every sample.
+    const auto geometry = [&](u32 s) {
+        if (!depth_ok) {
+            return true;
+        }
+        const float d = samples[2][s][0];
+        return std::isfinite(d) && d != 0.0f && d != 1.0f;
+    };
+    u64 geo = 0;
+    for (u32 s = 0; s < count; ++s) {
+        geo += geometry(s) ? 1u : 0u;
+    }
+    lines.push_back(fmt::format(
+        "[reflect-probe] rect t={:.1f} frame={} clock={} cam={} rect={:.3f},{:.3f},{:.3f},{:.3f} of {}x{} "
+        "grid={}x{} samples={} geometry={} depth={}",
+        r.t, r.frame, r.clock, r.cam, r.fraction[0], r.fraction[1], r.fraction[2], r.fraction[3], r.ref_w, r.ref_h,
+        ReflectProbeRows, ReflectProbeCols, count, geo, depth_ok ? "yes" : "no"));
+    const float mirror_gloss = ProbeGlossFor(0.12f); // MIRROR_ROUGHNESS, as the surface probe's gloss line
+    for (u32 i = 0; i < 3 && i < r.items.size(); ++i) {
+        const ReflectProbeItem& item = r.items[i];
+        const std::string format =
+            item.format == vk::Format::eUndefined ? std::string("-") : vk::to_string(item.format);
+        if (samples[i].size() != count) {
+            lines.push_back(fmt::format("[reflect-probe] rect-{} read=0 why={} format={}", item.name, item.why, format));
+            continue;
+        }
+        const u32 channels = ProbeChannels(item.texel);
+        ReflectProbeStats stats;
+        for (u32 s = 0; s < count; ++s) {
+            if (geometry(s)) {
+                stats.Add(samples[i][s], channels);
+            }
+        }
+        std::string extra;
+        const std::string_view name = item.name;
+        if (name == "cb0" && channels >= 3) {
+            // A guess at the code: rgb*2-1 is the normal. Mean direction and the mean angle to it.
+            std::vector<std::array<double, 3>> dirs;
+            std::array<double, 3> sum{};
+            for (u32 s = 0; s < count; ++s) {
+                if (!geometry(s)) {
+                    continue;
+                }
+                const auto& c = samples[i][s];
+                std::array<double, 3> v{2.0 * c[0] - 1.0, 2.0 * c[1] - 1.0, 2.0 * c[2] - 1.0};
+                const double len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+                if (!std::isfinite(len) || len < 1e-6) {
+                    continue;
+                }
+                for (auto& x : v) {
+                    x /= len;
+                }
+                dirs.push_back(v);
+                for (u32 a = 0; a < 3; ++a) {
+                    sum[a] += v[a];
+                }
+            }
+            const double mean_len = std::sqrt(sum[0] * sum[0] + sum[1] * sum[1] + sum[2] * sum[2]);
+            if (!dirs.empty() && mean_len > 1e-9) {
+                const std::array<double, 3> m{sum[0] / mean_len, sum[1] / mean_len, sum[2] / mean_len};
+                double angle = 0.0;
+                for (const auto& v : dirs) {
+                    angle += std::acos(std::clamp(v[0] * m[0] + v[1] * m[1] + v[2] * m[2], -1.0, 1.0));
+                }
+                extra = fmt::format(" normal_guess=({:.3f},{:.3f},{:.3f}) spread_deg={:.2f} (guess: rgb*2-1; read "
+                                    "the raw ranges if cb0 is coded otherwise)",
+                                    m[0], m[1], m[2], angle / double(dirs.size()) * 57.29577951308232);
+            }
+        } else if (name == "cb1") {
+            u64 near_one = 0, mirror = 0, total = 0;
+            for (u32 s = 0; s < count; ++s) {
+                const float g = samples[i][s][0];
+                if (!geometry(s) || !std::isfinite(g)) {
+                    continue;
+                }
+                ++total;
+                near_one += g >= 0.9375f ? 1u : 0u;
+                mirror += g >= mirror_gloss ? 1u : 0u;
+            }
+            extra = fmt::format(" gloss_mean={:.4f} gloss_ge_0.9375={:.4f} gloss_ge_{:.3f}={:.4f}",
+                                stats.n != 0 ? stats.sum[0] / double(stats.n) : 0.0,
+                                total ? double(near_one) / double(total) : 0.0, mirror_gloss,
+                                total ? double(mirror) / double(total) : 0.0);
+        }
+        lines.push_back(fmt::format("[reflect-probe] rect-{} format={} size={}x{} proxy={} px={},{},{},{} n={} "
+                                    "(min,max,mean,std){}{}",
+                                    item.name, format, item.width, item.height, item.proxy ? 1 : 0, item.x0, item.y0,
+                                    item.x0 + item.cols, item.y1, stats.n, stats.Text(channels), extra));
+    }
+    return lines;
+}
+} // namespace
+
 bool Rasterizer::SurfaceProbeWanted() {
     const char* value = std::getenv("BB_SURFACE_PROBE");
     const bool on = value && value[0] == '1' && value[1] == '\0';
@@ -6070,6 +11446,7 @@ bool Rasterizer::SurfaceProbeWanted() {
                                   : "the pairs of BB_SURFACE_PROBE_PAIRS",
                     ProbeFitsPerWindow);
     }
+    ReflectProbeAnnounce(on); // bbport (t70b_mirror-probe, TOOL): its note or its "on" line
     return on;
 }
 
@@ -6080,6 +11457,12 @@ void Rasterizer::SurfaceProbeDraw(const GraphicsPipeline* pipeline, bool indirec
     const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u64 vs_hash = pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash;
     const u64 ps_hash = ps ? ps->pgm_hash : 0;
+    // The direct call records the original guest index offset in DrawInputs before binding.
+    const auto& inputs = dc.draw_inputs;
+    if (ReflectProbeHide(vs_hash, ps_hash, indirect, !indirect && inputs.pipeline == pipeline && inputs.is_indexed,
+                         regs.num_indices, indirect ? 0 : inputs.index_offset)) {
+        hang_proof_hide = true; // the engine's own leave-this-draw-out word (turned into effect_skip_draw after this call)
+    }
     // The render state, hashed (FNV-1a) into one word that is part of the pair's key: on GCN blend,
     // write mask, depth, stencil and cull are set per draw, so a see-through pane or a blood layer
     // drawn with an opaque surface's shaders under another state gets a line of its own.
@@ -7408,6 +12791,250 @@ void Rasterizer::SurfaceProbeBlendedScene() {
     job->tick = scheduler.CurrentTick();
     guard.lock();
     p.readback = std::move(job); // the frame ends see to it from here (SurfaceProbeFrameEnd)
+}
+
+// bbport (t70b, t167, TOOL): At a blended draw, start one readback of BB_REFLECT_PROBE_RECT per second.
+// At frame end, report any finished readback and emit one counter line per enabled hide pair each second.
+// The callers require BB_SURFACE_PROBE=1.
+void Rasterizer::SurfaceProbeRect(bool frame_end) {
+    auto& r = ReflectProbe();
+    const bool hide_on = std::any_of(r.hide.begin(), r.hide.end(), [](const auto& pair) { return pair.on; });
+    if (!r.rect_on && !hide_on) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto seconds = [](std::chrono::steady_clock::duration d) {
+        return std::chrono::duration<double>(d).count();
+    };
+    if (frame_end) {
+        std::scoped_lock guard{r.lock};
+        if (!r.started) {
+            r.started = true;
+            r.start = r.last_hide = now;
+        }
+        ++r.frames;
+        if (r.pending && scheduler.IsFree(r.tick)) {
+            vmaInvalidateAllocation(instance.GetAllocator(), r.allocation, 0, VK_WHOLE_SIZE);
+            for (const auto& line : ReflectProbeLines(r)) {
+                BbReport::Printf("%s\n", line.c_str());
+            }
+            vmaDestroyBuffer(instance.GetAllocator(), r.buffer, r.allocation);
+            r.buffer = VK_NULL_HANDLE;
+            r.mapped = nullptr;
+            r.pending = false;
+        }
+        if (hide_on && seconds(now - r.last_hide) >= ReflectProbeSeconds) {
+            r.last_hide = now;
+            for (auto& pair : r.hide) {
+                if (!pair.on) {
+                    continue;
+                }
+                const u64 total = pair.skipped.load(std::memory_order_relaxed);
+                if (pair.index_count != 0) {
+                    BbReport::Printf("[reflect-probe] hide-range %08llx:%08llx count=%u guest_first=%u "
+                                     "t=%.1f frames=%llu exact_matches_suppressed=%llu (since the last line %llu) "
+                                     "pair_not_exact_retained=%llu indirect_draws_not_hidden=%llu\n",
+                                     (unsigned long long)pair.vs, (unsigned long long)pair.ps,
+                                     pair.index_count, pair.first_index, seconds(now - r.start),
+                                     (unsigned long long)r.frames, (unsigned long long)total,
+                                     (unsigned long long)(total - pair.shown),
+                                     (unsigned long long)pair.pair_not_exact.load(std::memory_order_relaxed),
+                                     (unsigned long long)pair.indirect.load(std::memory_order_relaxed));
+                    pair.shown = total;
+                    continue;
+                }
+                BbReport::Printf("[reflect-probe] hide %08llx:%08llx t=%.1f frames=%llu hidden_draws=%llu (since the "
+                                 "last line %llu) indirect_draws_not_hidden=%llu\n",
+                                 (unsigned long long)pair.vs, (unsigned long long)pair.ps,
+                                 seconds(now - r.start), (unsigned long long)r.frames, (unsigned long long)total,
+                                 (unsigned long long)(total - pair.shown),
+                                 (unsigned long long)pair.indirect.load(std::memory_order_relaxed));
+                pair.shown = total;
+            }
+        }
+        return;
+    }
+    if (!r.rect_on) {
+        return;
+    }
+    std::scoped_lock guard{r.lock};
+    if (r.pending || seconds(now - r.last_rect) < ReflectProbeSeconds) {
+        return;
+    }
+    // The targets of the frame's last G-buffer pass (the surface probe follows them), once the pass is
+    // in (as SurfaceProbeBlendedScene waits for it).
+    std::array<VideoCore::ImageId, 3> ids{};
+    {
+        auto& p = Probe();
+        std::scoped_lock probe_guard{p.lock};
+        if (p.gbuffer_passes == 0 || p.gbuffer_passes < p.passes_last || !p.gb[0] || !p.gb[1] || !p.gb_depth) {
+            return;
+        }
+        ids = {p.gb[0], p.gb[1], p.gb_depth};
+    }
+    r.last_rect = now; // one try a second
+    const bool reduced = scene_targets->Reduced();
+    const auto& reference = texture_cache.GetImage(ids[0]);
+    r.ref_w = reference.info.size.width;
+    r.ref_h = reference.info.size.height;
+    if (r.ref_w == 0 || r.ref_h == 0) {
+        return;
+    }
+    const bool fractions = r.rect[0] <= 1.0 && r.rect[1] <= 1.0 && r.rect[2] <= 1.0 && r.rect[3] <= 1.0;
+    r.fraction = {fractions ? r.rect[0] : r.rect[0] / double(r.ref_w), fractions ? r.rect[1] : r.rect[1] / double(r.ref_h),
+                  fractions ? r.rect[2] : r.rect[2] / double(r.ref_w), fractions ? r.rect[3] : r.rect[3] / double(r.ref_h)};
+    for (auto& f : r.fraction) {
+        f = std::clamp(f, 0.0, 1.0);
+    }
+    static constexpr const char* names[3] = {"cb0", "cb1", "depth"};
+    r.items.assign(3, ReflectProbeItem{});
+    u64 bytes = 0;
+    for (u32 i = 0; i < 3; ++i) {
+        ReflectProbeItem& item = r.items[i];
+        item.name = names[i];
+        const auto& image = texture_cache.GetImage(ids[i]);
+        item.format = image.info.pixel_format;
+        item.texel = ProbeTexelOf(item.format);
+        item.proxy = reduced && scene_targets->Eligible(image) && scene_targets->ProxyCurrent(image);
+        item.width = image.info.size.width;
+        item.height = image.info.size.height;
+        if (item.proxy) {
+            const auto size = scene_targets->ProxySize(image);
+            item.width = size.width;
+            item.height = size.height;
+        }
+        if (item.width == 0 || item.height == 0) {
+            item.why = "size";
+            continue;
+        }
+        item.x0 = std::min<u32>(u32(r.fraction[0] * double(item.width)), item.width - 1);
+        const u32 x1 = std::clamp<u32>(u32(std::ceil(r.fraction[2] * double(item.width))), item.x0 + 1, item.width);
+        item.cols = x1 - item.x0;
+        item.y0 = std::min<u32>(u32(r.fraction[1] * double(item.height)), item.height - 1);
+        item.y1 = std::clamp<u32>(u32(std::ceil(r.fraction[3] * double(item.height))), item.y0 + 1, item.height);
+        item.row_bytes = (u64(item.cols) * ProbeTexelBytes(item.texel) + 3) & ~u64(3);
+        item.offset = (bytes + 255) & ~u64(255);
+        if (item.texel == ProbeTexel::None) {
+            item.why = "format";
+        } else if (image.info.num_samples > 1) {
+            item.why = "multisampled";
+        } else if (!item.proxy && !(image.usage_flags & vk::ImageUsageFlagBits::eTransferSrc)) {
+            item.why = "usage";
+        } else if (item.offset + item.row_bytes * ReflectProbeRows > ProbeReadbackMaxBytes) {
+            item.why = "size";
+        } else {
+            item.read = true;
+            bytes = item.offset + item.row_bytes * ReflectProbeRows;
+        }
+    }
+    r.clock = ProbeClock();
+    r.t = seconds(now - (r.started ? r.start : now));
+    r.frame = r.frames;
+    {
+        const auto m = camera_motion->CameraMatrices();
+        r.cam = m.valid ? fmt::format("{:.2f},{:.2f},{:.2f}", m.inv_view[3], m.inv_view[7], m.inv_view[11])
+                        : std::string("-");
+    }
+    VkBuffer buffer{};
+    VmaAllocation allocation{};
+    VmaAllocationInfo info{};
+    if (bytes != 0) {
+        const VkBufferCreateInfo buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = bytes,
+            .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        };
+        const VmaAllocationCreateInfo alloc_ci{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+        };
+        if (vmaCreateBuffer(instance.GetAllocator(), &buffer_ci, &alloc_ci, &buffer, &allocation, &info) !=
+                VK_SUCCESS ||
+            !info.pMappedData) {
+            if (buffer) {
+                vmaDestroyBuffer(instance.GetAllocator(), buffer, allocation);
+            }
+            buffer = VK_NULL_HANDLE;
+            for (auto& item : r.items) {
+                if (item.read) {
+                    item.read = false;
+                    item.why = "no-host-memory";
+                }
+            }
+        }
+    }
+    if (!buffer) {
+        r.mapped = nullptr;
+        for (const auto& line : ReflectProbeLines(r)) {
+            BbReport::Printf("%s\n", line.c_str());
+        }
+        return;
+    }
+    struct Copy {
+        vk::Image image;
+        vk::ImageLayout layout{};
+        std::vector<vk::BufferImageCopy> regions;
+    };
+    auto copies = std::make_shared<std::vector<Copy>>();
+    scheduler.EndRendering();
+    for (u32 i = 0; i < 3; ++i) {
+        ReflectProbeItem& item = r.items[i];
+        if (!item.read) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(ids[i]);
+        Copy copy;
+        if (item.proxy) {
+            VideoCore::ImageViewInfo view_info;
+            view_info.format = item.format;
+            const auto target = scene_targets->Read(ids[i], view_info, vk::PipelineStageFlagBits2::eTransfer,
+                                                    vk::AccessFlagBits2::eTransferRead);
+            if (!(target.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+                item.read = false;
+                item.why = "proxy-usage";
+                continue;
+            }
+            copy.image = target.image;
+            copy.layout = target.layout;
+        } else {
+            runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eTransfer,
+                            vk::AccessFlagBits2::eTransferRead);
+            copy.image = image.GetImage();
+            copy.layout = vk::ImageLayout::eTransferSrcOptimal;
+        }
+        const auto aspect =
+            i == 2 ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+        for (u32 k = 0; k < ReflectProbeRows; ++k) {
+            const u32 y = item.y0 + u32((u64(2 * k + 1) * (item.y1 - item.y0)) / (2ull * ReflectProbeRows));
+            copy.regions.push_back(vk::BufferImageCopy{
+                .bufferOffset = item.offset + u64(k) * item.row_bytes,
+                .imageSubresource = {aspect, 0, 0, 1},
+                .imageOffset = {s32(item.x0), s32(y), 0},
+                .imageExtent = {item.cols, 1, 1},
+            });
+        }
+        copies->push_back(std::move(copy));
+    }
+    runtime.FlushBarriers();
+    const vk::Buffer target_buffer{buffer};
+    scheduler.RecordCrumb({.name = "Reflect probe readback"},
+                          [copies, target_buffer](vk::CommandBuffer cmdbuf) {
+                              for (const Copy& copy : *copies) {
+                                  cmdbuf.copyImageToBuffer(copy.image, copy.layout, target_buffer, copy.regions);
+                              }
+                              const vk::MemoryBarrier2 to_host{
+                                  .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                                  .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                                  .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                                  .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+                              };
+                              cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &to_host});
+                          });
+    r.buffer = buffer;
+    r.allocation = allocation;
+    r.mapped = static_cast<const u8*>(info.pMappedData);
+    r.tick = scheduler.CurrentTick();
+    r.pending = true;
 }
 
 // bbport (r64b_surface-probe-more): the ray traced scene at the last frame of a window, before

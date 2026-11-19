@@ -71,7 +71,7 @@
 #define AP_MAX_LAMPS 16
 #define AP_MAX_FLAMES 8
 #define AP_FLAME_SLOTS 16
-#define AP_LAMP_BLOCK_BYTES 672
+#define AP_LAMP_BLOCK_BYTES 928 // bbport (r98e_moths-at-lamps): was 672, plus 16 vec4 (the moths)
 // Dust lit by a lamp: the lamp pass's colour x the game's curve (1 - d / reach)^2 x a halo
 // 1 / (1 + (d / AP_LAMP_HALO)^2) (d in m) x forward scattering (Henyey-Greenstein with AP_PHASE_G,
 // 1 seen from the side, at most AP_PHASE_MAX) x AP_LAMP_EXPOSURE x the lamp gain; its largest
@@ -124,5 +124,32 @@
 // faded.
 #define AP_DARK_LO 0.12
 #define AP_DARK_HI 0.40
+
+// bbport (r98e_moths-at-lamps): moths round the lit lamps (renderer_vulkan/ambient_particles_moths.h
+// decides which lamps, ambient_particles.vert flies them: the Lamps block's moth_info, one vec4 a lamp
+// slot: x moths (0 to AP_MOTH_SLOTS), y seed, z loop scale, w calm). AP_MOTH_SLOTS instances a lamp slot
+// of the block, after the flames' ember instances (AP_MOTH_INSTANCES in all); at most AP_MOTH_LAMPS lamps
+// carry moths at once. A moth is a point of radius AP_MOTH_RADIUS m (the lamp's light on it, flickering
+// with the wing beat), seen in full up to AP_MOTH_FAR0 m from the camera and not from AP_MOTH_FAR1 m,
+// and not nearer than AP_NEAR0 as every mote. Its flight: a loop of AP_MOTH_ORBIT_MIN to
+// AP_MOTH_ORBIT_MAX m (times the lamp's scale) round the lamp, turning AP_MOTH_TURN_MIN to
+// AP_MOTH_TURN_MAX rad/s either way, with surges of AP_MOTH_SURGE rad and a jitter of AP_MOTH_JITTER m;
+// in shelter (w = 1) all of it AP_MOTH_CALM of the way slower (time x (1 - AP_MOTH_CALM)); it leans
+// downwind by AP_MOTH_LEAN s x the horizontal drift (lamp_wind.xyz), at most AP_MOTH_LEAN_MAX m.
+#define AP_MOTH_SLOTS 6
+#define AP_MOTH_LAMPS 6
+#define AP_MOTH_INSTANCES (AP_MAX_LAMPS * AP_MOTH_SLOTS)
+#define AP_MOTH_RADIUS 0.012
+#define AP_MOTH_FAR0 8.0
+#define AP_MOTH_FAR1 13.0
+#define AP_MOTH_ORBIT_MIN 0.20
+#define AP_MOTH_ORBIT_MAX 0.55
+#define AP_MOTH_TURN_MIN 1.2
+#define AP_MOTH_TURN_MAX 2.4
+#define AP_MOTH_SURGE 0.6
+#define AP_MOTH_JITTER 0.06
+#define AP_MOTH_CALM 0.45
+#define AP_MOTH_LEAN 0.08
+#define AP_MOTH_LEAN_MAX 0.35
 
 #endif

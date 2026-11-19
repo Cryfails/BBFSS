@@ -21,6 +21,17 @@
 // bbport (r100e_blood-sheen-visible): EDIT: the normal target is bound and RGBA8 (the pixels' normals
 // are flattened); SHOW (not the test view): the picked pixels are dimmed and reddened (push `darken`).
 #define BLOOD_SHEEN_FLAG_NORMAL 32u
+// r129b_sheen-no-glow: EDIT, a test knob (BB_BLOOD_SHEEN_RIM_FULL, live): a gap-fill (rim) pixel levels its normal by the
+// fill weight, as r100h to r100k did; without it, by its specular weight (fill squared times the rim share).
+#define BLOOD_SHEEN_FLAG_RIM_FULL 64u
+// r130a_sheen-colour: EDIT, a test knob (BB_BLOOD_SHEEN_TINT 0, live): the specular target is untinted (the root in all three
+// channels, f0 0.20 grey): the probe of the red cast.
+#define BLOOD_SHEEN_FLAG_TINT_OFF 128u
+// r130a_sheen-colour: EDIT and SHOW, the fix value (BB_BLOOD_SHEEN_TINT 2): EDIT writes a clear film specular (CLEAR_ROOT,
+// grey); SHOW weights the dimming by the pixel's redness.
+#define BLOOD_SHEEN_FLAG_TINT_CLEAR 256u
+// EDIT: direct albedo picks from the automatic ground selector must face up.
+#define BLOOD_SHEEN_FLAG_AUTO_GROUND 512u
 // A counter slot's words, sums. MARK: pixels the keyed draws changed (each draw's own, summed).
 // EDIT: of the pixels a keyed draw changed, those that still hold what it wrote (kept) and those a
 // later draw changed again (lost); pixels the albedo rule was asked about and passed; pixels made wet.
@@ -36,8 +47,8 @@
 #define BLOOD_SHEEN_WORD_GLOSS_SUM 5u
 #define BLOOD_SHEEN_WORD_ROOT_SUM 6u
 #define BLOOD_SHEEN_WORD_GLOSSY 7u
-// The tag after EDIT: a pixel made wet; a keyed draw's pixel the albedo rule left out (SHOW paints
-// both). Before EDIT the tag holds, where a keyed draw changed the pixel, its print with bit 0 set.
+// The tag after EDIT: a pixel made wet; a kept keyed pixel left out (SHOW paints both).
+// Before EDIT a keyed draw's changed pixel holds its print with bit 0 set.
 #define BLOOD_SHEEN_TAG_WET 1u
 #define BLOOD_SHEEN_TAG_LEFT_OUT 2u
 // EDIT: the gloss (G-buffer target 1, red; exponent 2^(13 g) in the game's lighting) and the root of
@@ -60,6 +71,10 @@
 #define BLOOD_SHEEN_TINT_R 0.85
 #define BLOOD_SHEEN_TINT_G 0.35
 #define BLOOD_SHEEN_TINT_B 0.30
+// r130a_sheen-colour: the clear film's specular root (BB_BLOOD_SHEEN_TINT 2): f0 0.0225, grey, a liquid surface (about
+// water's 0.02); it does not grow with the strength. The film's reflection keeps the light's colour; the red belongs to the
+// body under it.
+#define BLOOD_SHEEN_CLEAR_ROOT 0.15
 // EDIT, the normal (target 0, xyz*2-1, world space, Y up): a picked pixel's unit normal goes this share
 // (times the strength, at most 1, times smoothstep(UP_LO, UP_HI, its own normal.y)) of the way to the
 // world up vector: a liquid film lies level. The weight is a function of the pixel's own normal only,
@@ -92,12 +107,27 @@
 // back to the body's value deep inside the pool. A pixel that passes the albedo rule is not a gap: share 1.
 #define BLOOD_SHEEN_FILL_SPEC 0.35
 // r100k_sheen-no-hot-spot: the gap-fill pixel's specular weight is also multiplied by its fill weight again (a squared
-// falloff toward the rim's outer edge). SHOW, the picked pixels of the lit scene: a soft luminance ceiling,
-// PEAK (BB_BLOOD_SHEEN_PEAK, default 0.7); luminance up to KNEE x PEAK is untouched, above it rolls off
-// exponentially toward PEAK (colour scaled, hue kept). A near light's tight highlight on the wet lobe cannot
-// blow out; the moonlit dark red sheet (below the knee) is as before. PEAK 0: no ceiling.
-#define BLOOD_SHEEN_PEAK_DEFAULT 0.7
+// falloff toward the rim's outer edge). SHOW, the picked pixels of the lit scene: a soft ceiling on the MAX CHANNEL
+// (r129b_sheen-no-glow; r100k had the luminance, which counts red at 0.21, so a red highlight passed it). PEAK
+// (BB_BLOOD_SHEEN_PEAK, default 6) is a MULTIPLE of the dry scene's own reference (the REF_* words below): the ceiling is
+// PEAK x reference. Up to KNEE x ceiling the pixel is untouched, above it the max channel rolls off exponentially toward
+// the ceiling (colour scaled, hue kept). A near light's tight highlight on the wet lobe cannot blow out; the moonlit
+// dark red sheet (below the knee) is as before. PEAK 0: no ceiling.
+#define BLOOD_SHEEN_PEAK_DEFAULT 6.0
 #define BLOOD_SHEEN_PEAK_KNEE 0.5
+// r129b_sheen-no-glow: the reference is measured by SHOW itself, one frame late, on the GPU: every 8x8 group adds the code
+// (log2(max(m, REF_MIN)) + REF_BIAS) x REF_SCALE (clamped to 0..REF_MAX_CODE, truncated) of the max channel m of its first
+// untagged (dry) pixel to a sum and counts it; the reference is 2^(sum / samples / REF_SCALE - REF_BIAS), the geometric
+// mean. The words: 2 slots (by show parity) of REF_SLOT_WORDS (sum, samples, wet pixels rolled off) from word REF_BASE (after
+// the counters' 2 x SLOT_WORDS); a show writes its slot and reads the OTHER one. PEAK_FALLBACK: the ceiling's max channel
+// before there is a reference (the first show). 4K: 129,600 groups x 2047 stays below 2^32.
+#define BLOOD_SHEEN_PEAK_FALLBACK 0.25
+#define BLOOD_SHEEN_REF_BASE 16u
+#define BLOOD_SHEEN_REF_SLOT_WORDS 3u
+#define BLOOD_SHEEN_REF_BIAS 16.0
+#define BLOOD_SHEEN_REF_SCALE 64.0
+#define BLOOD_SHEEN_REF_MAX_CODE 2047.0
+#define BLOOD_SHEEN_REF_MIN 0.000244140625
 // SHOW (not the test view): a picked pixel of the lit scene is multiplied by (RED, OTHER, OTHER) times
 // the share darken x (1 - smoothstep(LO, HI, luminance)), so dim diffuse goes deeper and redder and a
 // bright highlight stays as it is.

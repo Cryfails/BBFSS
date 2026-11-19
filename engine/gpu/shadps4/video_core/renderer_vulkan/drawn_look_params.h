@@ -9,13 +9,13 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 
 namespace Vulkan::DrawnLookParams {
 
 /// The push constants of the drawn look's passes (host_shaders/paint_*.comp). 128 bytes: what
-/// every GPU takes, and all of it used. The ink's two knobs (Knobs::outlines, ink_world), which
-/// no pass reads yet, gave their places to the camera of the frame before
-/// (r45b_drawn-look-fixes).
+/// every GPU takes, and all of it used. The ink pass (paint_ink.comp, r55_drawn-look-lines)
+/// takes the same block, three of its floats with other meanings (MakeInk).
 struct Params {
     std::array<float, 12> inv_view; ///< view to world, 3x4 rows
     std::array<float, 4> proj;      ///< x scale, y scale, z scale, z offset
@@ -48,9 +48,10 @@ constexpr std::uint32_t ViewOf(std::uint32_t flags) {
     return (flags >> ViewShift) & 7u;
 }
 
-/// graphics_drawn_look_debug (BB_DRAWN_LOOK_VIEW). 1, 2 and 4 paint every stroke in a flat
-/// colour of its own: with the sizes the look mixes, all fine, all bold. 3 is kept for the ink
-/// lines' view; until they are built it shows the look, as 0 does.
+/// The test view, BB_DRAWN_LOOK_VIEW only (r55_drawn-look-lines: no key in the ini, where a test
+/// view would stay on). 1, 2 and 4 paint every stroke in a flat colour of its own: with the sizes
+/// the look mixes, all fine, all bold. 3 is the ink page: no strokes, the frame's key as a grey
+/// on everything that is not sky, and the ink lines dark on it, every line at weight 1.
 enum View : int { ViewOff = 0, ViewStrokes = 1, ViewFine = 2, ViewInk = 3, ViewBold = 4, ViewMax = 4 };
 
 /// A stroke's cell on a screen of 2160 lines, in pixels, at stroke size 1.0 (a stroke is about
@@ -63,9 +64,10 @@ struct Knobs {
     float strength = 0.6f;
     float stroke_size = 1.0f;
     float texture = 1.0f;
-    float outlines = 0.35f; ///< the ink is not built: not among the passes' words
-    float ink_world = 0.0f; ///< the same
+    float outlines = 0.35f;  ///< handed to the ink pass (MakeInk), which does not read it yet
+    float ink_world = 0.35f; ///< (r55_drawn-look-lines) how dark the ink lines are; 0: none
     float characters = 0.5f;
+    float line_scale = 1.0f; ///< BB_DRAWN_LOOK_LINE (LineScaleOf): a factor on the lines' width
     int view = ViewOff;
 };
 
@@ -84,6 +86,67 @@ struct Previous {
 constexpr bool SmallTransparent(bool blend, bool blend_bypass, bool depth_write, bool depth_test,
                                 bool depth_always) {
     return blend && !blend_bypass && !depth_write && depth_test && !depth_always;
+}
+
+/// (r55_drawn-look-lines) The look runs on a frame: its switch is on, and it has strokes
+/// (`strength`) or ink lines (`ink_world`) to draw. A number that is none counts as 0.
+constexpr bool Wanted(bool on, float strength, float ink_world) {
+    return on && (strength > 0.0f || ink_world > 0.0f);
+}
+
+/// (r55_drawn-look-lines) The passes a painted frame records after the copy, the marks and the
+/// key (those run on every painted frame).
+struct Passes {
+    bool strokes = false; ///< paint_strokes.comp
+    bool lock = false;    ///< paint_lock.comp, after the strokes
+    bool ink = false;     ///< paint_ink.comp, last
+};
+/// Strokes with a strength above 0 or in a stroke test view (1, 2, 4); the colour lock after them
+/// without a test view (a test view's flat colours have none to keep); ink lines with ink_world
+/// above 0 or in the ink page (view 3), which lays no strokes. No ink on a frame painted right
+/// before the upscaler (`before_upscaler`): fog and particles are in the scene there, and the
+/// lines would be drawn over them where the surfaces behind have edges.
+constexpr Passes PassesFor(const Knobs& knobs, bool before_upscaler) {
+    const int view = std::clamp(knobs.view, int(ViewOff), int(ViewMax));
+    const bool page = view == ViewInk;
+    const bool strokes = !page && (knobs.strength > 0.0f || view != ViewOff);
+    return {.strokes = strokes,
+            .lock = strokes && view == ViewOff,
+            .ink = !before_upscaler && (knobs.ink_world > 0.0f || page)};
+}
+
+/// BB_DRAWN_LOOK_LINE, a factor on the ink lines' width for the owner's tests (never saved).
+inline constexpr float LineScaleMin = 0.5f, LineScaleMax = 2.0f;
+/// The variable's text as that factor: 1 without it or without a number in it, else clamped.
+inline float LineScaleOf(const char* text) {
+    if (!text) {
+        return 1.0f;
+    }
+    char* end = nullptr;
+    const float value = std::strtof(text, &end);
+    if (end == text || !std::isfinite(value)) {
+        return 1.0f;
+    }
+    return std::clamp(value, LineScaleMin, LineScaleMax);
+}
+
+/// The ink pass's block: the frame's (Make) with three floats given other meanings
+/// (paint_ink.comp's INK_WORLD, INK_CHARS, LINE_SCALE). The ink page (view 3) draws every line
+/// at weight 1.
+constexpr Params MakeInk(Params look, float ink_world, float outlines, float line_scale) {
+    look.strength = ViewOf(look.flags) == std::uint32_t(ViewInk) ? 1.0f : ink_world;
+    look.brush = outlines;
+    look.characters = line_scale;
+    return look;
+}
+
+/// The upscaler's extra sharpening (vk_temporal_upscaler.cpp, ExtraSharpenStrength) sharpens the
+/// ink lines as it sharpens any edge. `ink`: the weight of the ink lines the frame recorded
+/// (BbSettings' drawn_look_ink_drawn, MakeInk's strength; 0 on a frame without them). Above 0
+/// the sharpening is multiplied by 1 - InkSharpenShare * ink (ink taken at most 1), else by 1.
+inline constexpr float InkSharpenShare = 0.5f;
+constexpr float InkSharpen(float ink) {
+    return ink > 0.0f ? 1.0f - InkSharpenShare * std::min(ink, 1.0f) : 1.0f;
 }
 
 /// The scene's `height` is the upscaler's input (render) height: its output has the same

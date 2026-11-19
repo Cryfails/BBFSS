@@ -14,6 +14,55 @@
 #endif
 #endif
 
+#ifdef CARDS
+// bbport (r128c_lrt-cutout-props) FEATURE: the CARDS builds (rt_shadow_cards_comp and rt_shadow_half_cards_comp, made only with BB_RT_CARD_SUN=1,
+// renderer_vulkan/rt_card_sun.h): the sun's rays cross the cut-out cards (leaves, weeds, a hook or a grille drawn as a textured card) where the
+// game's alpha test drops the texel and stop where it keeps it, as the lamp rays of point_shadow_ray.comp's CARDS builds do (cardTraceShadow in
+// rt_cards.glsl). The card tables are bindings 6 to 9 of the same push set (renderer_vulkan/vk_rt_shadow.cpp CardSunNow). The builds without CARDS
+// are the pass as before, word for word.
+#ifdef GLASS_LIGHT
+#error "CARDS is not made with GLASS_LIGHT (the two share the counter words 16 and up)"
+#endif
+#ifndef COVERAGE_SKIP
+#error "CARDS needs COVERAGE_SKIP (its r25 flags and counters)"
+#endif
+#extension GL_GOOGLE_include_directive : require
+#define CARD_SET 0
+#define CARD_BINDING_ROWS 6
+#define CARD_BINDING_POOL 7
+#define CARD_BINDING_LAYER_INFO 8
+#define CARD_BINDING_ALPHA 9
+#ifdef FOLIAGE
+// bbport (r131a_foliage-translucency) FEATURE: the FOLIAGE builds (COVERAGE_SKIP=1 [HALF=1] CARDS=1 FOLIAGE=1, made only with the light through leaves
+// on for the sun): a kept leaf texel passes a share of the sun, tinted by the leaf (CARD_TRANSMIT, rt_cards.glsl). The grey part (the luma of what got
+// through) is the pixel's shadow term as before, only softer; the hue goes into sun_hue (binding 11), which the glow pass adds as a term of zero luma
+// (the game's own sun light takes a scalar). The colour layers are binding 10.
+#define CARD_TRANSMIT
+#define CARD_BINDING_COLOUR 10
+#endif
+#define CARD_TRACE_SHADOW
+#define CARD_SUN_SELF
+#include "rt_cards.glsl"
+#include "rt_card_sun_layout.h"
+#ifdef FOLIAGE
+// bbport (r131a_foliage-translucency): sun_hue: rgb half the mean hue (0 to 2 stored in 0 to 1) of the rays that passed a leaf, a the share of the full
+// sun that came through leaves; one texel a pixel the trace shaded (the host clears the image first). lit_f, leaf_f and hue_sum: this pixel's rays;
+// f_*: the counts; r131_n: the group's four counters (CARD_SUN_FOLIAGE_WORDS), flushed after the CARDS ones.
+layout(set = 0, binding = 11, rgba8) uniform writeonly image2D sun_hue;
+float lit_f = 0.0, leaf_f = 0.0;
+vec3 hue_sum = vec3(0.0);
+uint f_rays = 0u, f_pass = 0u, f_floor = 0u, f_grey = 0u;
+shared uint r131_n[CARD_SUN_FOLIAGE_WORDS];
+#endif
+// What this invocation's ray(s) met (Shade adds to them, once a pixel): rays that met a card candidate, layer reads, rays a kept texel stopped, rays
+// stopped at the cap. r128_n: the workgroup's counters (CARD_SUN_WORDS), flushed into r25_buf at CARD_SUN_FIRST_WORD by main.
+uint sun_rays_met = 0u;
+uint sun_reads = 0u;
+uint sun_rays_kept = 0u;
+uint sun_rays_cap = 0u;
+shared uint r128_n[CARD_SUN_WORDS];
+#endif
+
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(scalar, set = 0, binding = 0) readonly buffer Cb { uint d[]; } cbuf;
@@ -43,6 +92,12 @@ layout(push_constant) uniform Constants {
 #ifdef COVERAGE_SKIP
     int far_radius; // the filter's radius; < 0: every pixel is traced (the old behaviour)
     uint r25_flags; // bbport (r25_rt-sun-trace): R25_* below
+#ifdef FOLIAGE
+    float pass_share; // bbport (r131a_foliage-translucency): T, the hue mix and the floor (BB_FOLIAGE_*)
+    float pass_tint;
+    float pass_floor;
+    uint pass_pad;
+#endif
 #endif
 };
 
@@ -275,6 +330,63 @@ uint Shade(ivec2 pixel, int radius, bool fill) {
         float r = sqrt((float(i) + 0.5) * radius_scale) * light_tan;
         float a = float(i) * 2.399963 + phi;
         vec3 ray = normalize(dir + (cos(a) * tangent + sin(a) * bitangent) * r);
+#ifdef CARDS
+#ifdef FOLIAGE
+        if (i == 0u) { // bbport (r131a_foliage-translucency): a new pixel
+            lit_f = 0.0;
+            leaf_f = 0.0;
+            hue_sum = vec3(0.0);
+            f_rays = 0u;
+            f_pass = 0u;
+            f_floor = 0u;
+            f_grey = 0u;
+        }
+#endif
+        // bbport (r128c_lrt-cutout-props) FEATURE: the ray crosses the cut-out cards of the scene (mask CARD_LAMP_MASK, built FORCE_NO_OPAQUE: a leaf,
+        // a weed, a hook or a grille drawn as a card) where the game's alpha test drops the texel and stops where it keeps it, as the lamp rays do
+        // (cardTraceShadow, rt_cards.glsl). The solid casters (mask 1, opaque) end the ray at the first hit as before. The reading is the lamp
+        // pass's default: the reference of an above-the-reference rule times CARD_SUN_REF and the largest texel of the bilinear footprint (a thin
+        // blade keeps its shadow), level 0 (no footprint: the sun's soft edge comes from the rays' disc and the filter), at most CARD_SUN_CAP
+        // candidates with data. A card within max(CARD_SUN_SELF_M, reach) of the ray's start is the pixel's own surface: passed.
+        card_ref_scale = CARD_SUN_REF;
+        card_dilate = true;
+        card_skip_below = max(CARD_SUN_SELF_M, reach);
+#ifdef FOLIAGE
+        card_pass_share = pass_share; // bbport (r131a_foliage-translucency)
+        card_pass_tint = pass_tint;
+        card_pass_floor = pass_floor;
+        card_pass = vec3(1.0);
+        card_pass_n = 0u;
+        card_pass_floor_n = 0u;
+#endif
+        const CardRay sun_hit = cardTraceShadow(scene, gl_RayFlagsTerminateOnFirstHitEXT, 0x01u | CARD_LAMP_MASK, origin,
+                                                reach * 0.5, ray, max_distance, CARD_SUN_CAP, 0.0, 0.0);
+        card_ref_scale = 1.0;
+        card_dilate = false;
+        sun_rays_met += sun_hit.seen != 0u ? 1u : 0u;
+        sun_reads += sun_hit.tested;
+        sun_rays_kept += sun_hit.how == CARD_RAY_KEPT ? 1u : 0u;
+        sun_rays_cap += sun_hit.how == CARD_RAY_CAP ? 1u : 0u;
+        if (sun_hit.t < 0.0) {
+            ++lit;
+        }
+#ifdef FOLIAGE
+        if (sun_hit.t < 0.0) { // bbport (r131a_foliage-translucency): what got through, in luma; the leaves' hue
+            const float through = dot(card_pass, vec3(0.299, 0.587, 0.114));
+            lit_f += through;
+            if (card_pass_n != 0u) {
+                leaf_f += through;
+                hue_sum += card_pass;
+            }
+        }
+        f_rays += 1u;
+        f_pass += card_pass_n != 0u ? 1u : 0u;
+        f_floor += card_pass_floor_n;
+        f_grey += card_pass_grey;
+        card_pass_grey = 0u;
+#endif
+    }
+#else
         rayQueryEXT query;
         rayQueryInitializeEXT(query, scene,
                               gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0x01u,
@@ -285,6 +397,7 @@ uint Shade(ivec2 pixel, int radius, bool fill) {
             ++lit;
         }
     }
+#endif
 #ifdef GLASS_LIGHT
     // bbport (r86_glass-light-stage2a): the panes along the sun's direction, where it was reached
     float vis = float(lit) * radius_scale;
@@ -314,7 +427,47 @@ uint Shade(ivec2 pixel, int radius, bool fill) {
     }
     imageStore(raw_img, pixel, vec4(vis));
 #else
+#ifdef CARDS
+    // bbport (r128c_lrt-cutout-props) FEATURE: the answer. In the half-resolution build a first-pass pixel whose ray met a card candidate stores
+    // it 1/255 towards 0.5: the second pass shares a block's first-pass answer only where the nine first-pass answers around it are one value
+    // (HalfAnswer), so the pixels around a marked one trace their own rays (a thin blade's shadow lies between the first-pass pixels, r62o). The
+    // filter reads the value: 1/255 of the shadow term is below the output's 8-bit step.
+#ifdef FOLIAGE
+    float sun_vis = lit_f * radius_scale; // bbport (r131a_foliage-translucency): the luma of the sun that got through
+#else
+    float sun_vis = float(lit) * radius_scale;
+#endif // FOLIAGE (r131a sun_vis)
+#ifdef HALF
+    const bool sun_marked = !fill && sun_rays_met != 0u;
+    if (sun_marked) {
+        sun_vis += sun_vis >= 0.5 ? -(1.0 / 255.0) : (1.0 / 255.0);
+    }
+#endif
+    imageStore(raw_img, pixel, vec4(sun_vis));
+#ifdef FOLIAGE
+    imageStore(sun_hue, pixel, vec4(0.5 * hue_sum / max(leaf_f, 1e-4), leaf_f * radius_scale)); // bbport (r131a_foliage-translucency)
+#endif
+    if ((r25_flags & R25_COUNT) != 0u) { // counted sun traces only (one in 8): CARD_SUN_FIRST_WORD + 0 to 7 of the r25 counters
+        atomicAdd(r128_n[0], 1u);
+        atomicAdd(r128_n[1], sun_rays_met != 0u ? 1u : 0u);
+        atomicAdd(r128_n[2], sun_reads);
+        atomicAdd(r128_n[3], sun_rays_kept);
+        atomicAdd(r128_n[4], sun_rays_kept != 0u ? 1u : 0u);
+        atomicAdd(r128_n[5], card_self_skips);
+        atomicAdd(r128_n[6], sun_rays_cap);
+#ifdef FOLIAGE
+        atomicAdd(r131_n[0], f_rays); // bbport (r131a_foliage-translucency): rays, rays that passed a leaf, rays that ended at the floor, leaves without colour
+        atomicAdd(r131_n[1], f_pass);
+        atomicAdd(r131_n[2], f_floor);
+        atomicAdd(r131_n[3], f_grey);
+#endif
+#ifdef HALF
+        atomicAdd(r128_n[7], sun_marked ? 1u : 0u);
+#endif
+    }
+#else
     imageStore(raw_img, pixel, vec4(float(lit) * radius_scale));
+#endif
 #endif
     return fill ? CLS_FILL_RAY : CLS_RAY;
 }
@@ -361,6 +514,16 @@ void main() {
         r86_n[gl_LocalInvocationIndex] = 0u;
     }
 #endif
+#ifdef CARDS
+    if (count && gl_LocalInvocationIndex < CARD_SUN_WORDS) { // bbport (r128c_lrt-cutout-props)
+        r128_n[gl_LocalInvocationIndex] = 0u;
+    }
+#ifdef FOLIAGE
+    if (count && gl_LocalInvocationIndex < CARD_SUN_FOLIAGE_WORDS) { // bbport (r131a_foliage-translucency)
+        r131_n[gl_LocalInvocationIndex] = 0u;
+    }
+#endif
+#endif
     barrier();
     invMat = shared_inverse;
 #ifdef HALF
@@ -381,6 +544,17 @@ void main() {
             atomicAdd(r25_buf.n[RT_GLASS_LIGHT_FIRST_WORD + gl_LocalInvocationIndex],
                       r86_n[gl_LocalInvocationIndex]);
         }
+#endif
+#ifdef CARDS
+        // bbport (r128c_lrt-cutout-props): R25Count's barrier made the group's counts whole
+        if (gl_LocalInvocationIndex < CARD_SUN_WORDS && r128_n[gl_LocalInvocationIndex] != 0u) {
+            atomicAdd(r25_buf.n[CARD_SUN_FIRST_WORD + gl_LocalInvocationIndex], r128_n[gl_LocalInvocationIndex]);
+        }
+#ifdef FOLIAGE
+        if (gl_LocalInvocationIndex < CARD_SUN_FOLIAGE_WORDS && r131_n[gl_LocalInvocationIndex] != 0u) { // bbport (r131a_foliage-translucency)
+            atomicAdd(r25_buf.n[CARD_SUN_FIRST_WORD + CARD_SUN_WORDS + gl_LocalInvocationIndex], r131_n[gl_LocalInvocationIndex]);
+        }
+#endif
 #endif
     }
 }

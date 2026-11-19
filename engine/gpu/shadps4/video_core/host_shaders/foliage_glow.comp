@@ -1,0 +1,290 @@
+#version 460
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r131a_foliage-translucency) FEATURE (BB_FOLIAGE_GLOW, graphics_foliage_translucency bit 2; renderer_vulkan/vk_foliage_glow.cpp): the
+// back-lit glow of leaves and grass, added over the lit scene (RGBA16F, read-modify-write), once after each G-buffer pass's opaque lighting.
+// Per pixel (8x8 groups, the scene's size):
+//  1. The sky and a pixel without a G-buffer normal: nothing.
+//  2. The sun's hue term (the hue image of the sun trace's FOLIAGE builds, rt_shadow.comp): the light that came through leaves is tinted by
+//     them; the game's own sun light carries only its brightness (a scalar), so the tint is added here as a term of zero luma:
+//     sun colour x albedo x k x max(N.L, 0) x a x (2 hue - 1). Every pixel it covers, leaf or not.
+//  3. Foliage: a SHORT camera ray (mask CARD_LAMP_MASK, from depth - tol to depth + tol) with the card test (cardTestLod, the game's rule, level 0)
+//     finds a kept texel at the depth the game drew: the pixel is a leaf or a blade. It is no G-buffer bit: the capture (the TLAS) says so.
+//  4. For the sun and the two strongest lamps behind the leaf (back = clamp((-N.L + W) / (1 + W), 0, 1), N turned to face the camera): one
+//     visibility ray from 3 cm on the light's side of the leaf toward the light, with the cut-out cards (cardTraceShadow; with FG_FLAG_TRANSMIT
+//     also the light that passes further leaves, tinted by them: CARD_TRANSMIT).
+//  5. scene += light colour x leaf albedo x STRENGTH x T x back x falloff x visibility. T (BB_FOLIAGE_PASS) is the same luma share a leaf passes
+//     for A. Honest name: thin-leaf diffuse transmission on the front leaf in screen space; not volumetric subsurface scattering.
+// Counters (FG_C_*) per group, flushed once.
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#define CARD_BINDING_ROWS 5
+#define CARD_BINDING_POOL 6
+#define CARD_BINDING_LAYER_INFO 7
+#define CARD_BINDING_ALPHA 8
+#define CARD_BINDING_COLOUR 9
+#define CARD_TRACE_SHADOW
+#define CARD_TRANSMIT
+#include "rt_cards.glsl"
+#include "foliage_glow_layout.h"
+
+layout(local_size_x = FG_GROUP, local_size_y = FG_GROUP) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(set = 0, binding = 1) uniform texture2D depth_tex;
+layout(set = 0, binding = 2, rgba16f) uniform image2D color;
+layout(set = 0, binding = 3) uniform texture2D normal_tex; // G-buffer cb0: world normal * 0.5 + 0.5
+layout(set = 0, binding = 4) uniform texture2D albedo_tex; // G-buffer cb2: albedo
+// bindings 5 to 9: the card tables (rt_cards.glsl), the colour layers last
+layout(set = 0, binding = 10, std430) buffer Data {
+    uint d[];
+} data;
+#if defined(FOLIAGE_MASK)
+layout(set = 0, binding = 12) uniform texture2D foliage_mask_tex;
+#endif
+layout(set = 0, binding = 11) uniform texture2D hue_tex; // the sun trace's hue image (bound to the depth's view without FG_FLAG_HUE)
+
+layout(push_constant) uniform Push {
+    vec4 proj;       // CameraMotion's: x scale, y scale, z scale, z offset
+    vec4 rot0;       // the camera's world to view matrix, rows (the rotation in xyz)
+    vec4 rot1;
+    vec4 rot2;
+    vec2 jitter;     // render pixels, x right, y down
+    uvec2 size;
+    uint flags;      // FG_FLAG_*
+    uint slot;       // the data block
+    float strength;  // BB_FOLIAGE_GLOW_STRENGTH
+    float wrap;      // BB_FOLIAGE_WRAP
+    float pass_share; // T
+    float pass_tint;
+    float pass_floor;
+    float unused;
+} pc;
+
+shared uint g_n[FG_COUNTER_WORDS];
+
+void count(uint i, uint n) {
+    atomicAdd(g_n[i], n);
+}
+
+// A texel of `tex` at the scene's pixel p, at the texture's own size when it is not the scene's.
+ivec2 texelOf(texture2D tex, ivec2 p) {
+    const ivec2 s = textureSize(tex, 0);
+    ivec2 t = p;
+    if (any(greaterThanEqual(t, s))) {
+        t = ivec2((vec2(p) + 0.5) / vec2(pc.size) * vec2(s));
+    }
+    return min(t, s - 1);
+}
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+// The light that reaches `p` of a leaf from the direction `dir` (unit, toward the light) up to `tmax`: 0 blocked, else 1 (the light through
+// leaves passed, in each channel, with FG_FLAG_TRANSMIT).
+vec3 visibility(vec3 p, vec3 face, vec3 dir, float tmax, uint mask) {
+    const vec3 origin = p - face * float(FG_RAY_START);
+    card_ref_scale = float(FG_REF_SCALE);
+    card_dilate = true;
+    card_pass = vec3(1.0);
+    card_pass_n = 0u;
+    card_pass_floor_n = 0u;
+    card_pass_share = (pc.flags & FG_FLAG_TRANSMIT) != 0u ? pc.pass_share : 0.0;
+    card_pass_tint = pc.pass_tint;
+    card_pass_floor = pc.pass_floor;
+    const CardRay hit = cardTraceShadow(scene, gl_RayFlagsTerminateOnFirstHitEXT, mask, origin, float(FG_RAY_TMIN), dir, tmax,
+                                        CARD_RAY_CAP_DEFAULT, 0.0, 0.0);
+    card_ref_scale = 1.0;
+    card_dilate = false;
+    return hit.t < 0.0 ? card_pass : vec3(0.0);
+}
+
+float back(vec3 face, vec3 dir) {
+    return clamp((-dot(face, dir) + pc.wrap) / (1.0 + pc.wrap), 0.0, 1.0);
+}
+
+void shade(ivec2 p) {
+#if defined(FOLIAGE_MASK)
+    if ((pc.flags & FG_FLAG_MASK_DIAG) != 0u) {
+        if (texelFetch(foliage_mask_tex, p, 0).r > 0.5) {
+            count(FG_C_FOLIAGE, 1u);
+            if ((pc.flags & FG_FLAG_MASK_VIEW) != 0u) {
+                const vec4 scene_color = imageLoad(color, p);
+                imageStore(color, p, vec4(mix(scene_color.rgb, vec3(1.0, 0.0, 1.0), 0.5),
+                                          scene_color.a));
+            }
+        }
+        // The diagnostic may share this pass with independent sun hue.
+        if ((pc.flags & FG_FLAG_HUE) == 0u) {
+            return;
+        }
+    }
+    bool foliage = false;
+    // The host supplies a valid descriptor even when this branch is disabled.
+    if ((pc.flags & FG_FLAG_GLOW) != 0u) {
+        foliage = texelFetch(foliage_mask_tex, p, 0).r > 0.5;
+    }
+    if (!foliage && (pc.flags & FG_FLAG_HUE) == 0u) {
+        return;
+    }
+#endif
+    const float depth = texelFetch(depth_tex, p, 0).r;
+    if (!(depth < 1.0)) {
+        return; // the sky
+    }
+    count(FG_C_PIXELS, 1u);
+    // camera_motion.comp's reconstruction (as rt_card_view.comp): ndc +y down, the jitter taken out
+    const vec2 size = vec2(pc.size);
+    const vec2 scene_uv = (vec2(p) + 0.5) / size - pc.jitter / size;
+    const vec2 ndc = scene_uv * 2.0 - 1.0;
+    const float z = pc.proj.w / min(depth - pc.proj.z, -1e-8);
+    const vec3 point = vec3(ndc.x * z / pc.proj.x, ndc.y * z / pc.proj.y, z);
+    const float depth_t = length(point);
+    const vec3 view_dir = point / max(depth_t, 1e-6);
+    // the G-buffer's normal (ssgi.comp gbufferNormal): world to view, turned to face the camera
+    vec3 wn = texelFetch(normal_tex, texelOf(normal_tex, p), 0).xyz * 2.0 - 1.0;
+    if (dot(wn, wn) <= 0.25) {
+        return;
+    }
+    wn = normalize(wn);
+    vec3 face = normalize(vec3(dot(pc.rot0.xyz, wn), dot(pc.rot1.xyz, wn), dot(pc.rot2.xyz, wn)));
+    if (dot(face, point) > 0.0) {
+        face = -face;
+    }
+    const vec3 albedo = texelFetch(albedo_tex, texelOf(albedo_tex, p), 0).rgb;
+    const uint base = FG_COUNTER_WORDS + pc.slot * FG_DATA_WORDS;
+    const bool have_sun = (pc.flags & FG_FLAG_SUN) != 0u;
+    const vec3 sun_dir = uintBitsToFloat(uvec3(data.d[base + FG_DATA_SUN], data.d[base + FG_DATA_SUN + 1u], data.d[base + FG_DATA_SUN + 2u]));
+    const float sun_k = uintBitsToFloat(data.d[base + FG_DATA_SUN_K]);
+    const vec3 sun_col = uintBitsToFloat(uvec3(data.d[base + FG_DATA_SUN_COLOUR], data.d[base + FG_DATA_SUN_COLOUR + 1u],
+                                               data.d[base + FG_DATA_SUN_COLOUR + 2u]));
+    vec3 add = vec3(0.0);
+
+    // 2. the sun's hue term, a term of zero luma (every pixel the hue image has a share at)
+    if ((pc.flags & FG_FLAG_HUE) != 0u && have_sun) {
+        const vec4 h = texelFetch(hue_tex, p, 0);
+        if (h.a > 0.0) {
+            const float nl = max(dot(face, sun_dir), 0.0);
+            add += sun_col * albedo * (sun_k * nl * h.a) * (2.0 * h.rgb - 1.0);
+            count(FG_C_HUE, 1u);
+        }
+    }
+
+#if !defined(FOLIAGE_MASK)
+    // 3. is this pixel a leaf: a kept card texel at the depth the game drew
+    bool foliage = false;
+    if ((pc.flags & FG_FLAG_GLOW) != 0u) {
+        count(FG_C_ID_RAYS, 1u);
+        const float tol = float(CARD_VIEW_TOL_REL) * depth_t + float(CARD_VIEW_TOL_ABS);
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, CARD_LAMP_MASK, vec3(0.0), max(depth_t - tol, 0.0), view_dir,
+                              depth_t + tol);
+        while (rayQueryProceedEXT(query)) {
+            if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+                continue;
+            }
+            const uint slot = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, false));
+            if (slot == 0u) {
+                continue;
+            }
+            const CardResult c = cardTestLod(slot, uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, false)),
+                                             rayQueryGetIntersectionBarycentricsEXT(query, false), 0.0);
+            if (c.status == CARD_KEPT) {
+                foliage = true;
+                rayQueryTerminateEXT(query);
+                break;
+            }
+        }
+    }
+#endif
+    if (foliage) {
+        count(FG_C_FOLIAGE, 1u);
+        bool lit = false;
+        // 4. the sun, then the two strongest lamps behind the leaf
+        if (have_sun) {
+            const float b = back(face, sun_dir);
+            if (b > 0.0) {
+                lit = true;
+                count(FG_C_SUN_RAYS, 1u);
+                const vec3 vis = visibility(point, face, sun_dir, 800.0, 0x01u | CARD_LAMP_MASK);
+                add += sun_col * albedo * (pc.strength * pc.pass_share * sun_k * b) * vis;
+            }
+        }
+        const uint lamps = min(data.d[base + FG_DATA_LAMP_COUNT], uint(FG_MAX_LAMPS));
+        float best_score[2] = float[2](0.0, 0.0);
+        uint best_at[2] = uint[2](0u, 0u);
+        for (uint k = 0u; k < lamps; ++k) {
+            const uint w = base + FG_DATA_LAMPS + k * 8u;
+            const vec3 lp = uintBitsToFloat(uvec3(data.d[w], data.d[w + 1u], data.d[w + 2u]));
+            const float inv_r2 = uintBitsToFloat(data.d[w + 3u]);
+            const vec3 to = lp - point;
+            const float t2 = dot(to, to) * inv_r2;
+            if (!(t2 < 1.0)) {
+                continue;
+            }
+            float f = 1.0 - sqrt(t2);
+            f *= f;
+            const vec3 lc = uintBitsToFloat(uvec3(data.d[w + 4u], data.d[w + 5u], data.d[w + 6u]));
+            const float score = luma(lc) * f * back(face, to * inversesqrt(max(dot(to, to), 1e-8)));
+            if (score > best_score[0]) {
+                best_score[1] = best_score[0];
+                best_at[1] = best_at[0];
+                best_score[0] = score;
+                best_at[0] = w;
+            } else if (score > best_score[1]) {
+                best_score[1] = score;
+                best_at[1] = w;
+            }
+        }
+        for (uint i = 0u; i < uint(FG_PIXEL_LAMPS); ++i) {
+            if (!(best_score[i] > 0.0)) {
+                continue;
+            }
+            const uint w = best_at[i];
+            const vec3 lp = uintBitsToFloat(uvec3(data.d[w], data.d[w + 1u], data.d[w + 2u]));
+            const float inv_r2 = uintBitsToFloat(data.d[w + 3u]);
+            const vec3 lc = uintBitsToFloat(uvec3(data.d[w + 4u], data.d[w + 5u], data.d[w + 6u]));
+            const vec3 to = lp - point;
+            const float len = length(to);
+            const vec3 dir = to / max(len, 1e-6);
+            float f = 1.0 - sqrt(len * len * inv_r2);
+            f *= f;
+            const float b = back(face, dir);
+            lit = true;
+            count(FG_C_LAMP_RAYS, 1u);
+            const vec3 vis = visibility(point, face, dir, max(len - 0.05, 0.0), 0x04u | CARD_LAMP_MASK);
+            add += lc * albedo * (pc.strength * pc.pass_share * f * b) * vis;
+        }
+        if (lit) {
+            count(FG_C_BACKLIT, 1u);
+        }
+    }
+
+    if (add != vec3(0.0)) {
+        count(FG_C_ADDED, uint(max(luma(add), 0.0) * 1000.0 + 0.5));
+        vec4 c = imageLoad(color, p);
+        if ((pc.flags & FG_FLAG_VIEW) != 0u) {
+            c.rgb = c.rgb * 0.25 + add * 8.0; // the test view: the term x8 over a dim scene
+        } else {
+            c.rgb = max(c.rgb + add, vec3(0.0)); // the hue term has negative channels: the scene stays >= 0
+        }
+        imageStore(color, p, c);
+    }
+}
+
+void main() {
+    if (gl_LocalInvocationIndex < uint(FG_COUNTER_WORDS)) {
+        g_n[gl_LocalInvocationIndex] = 0u;
+    }
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < int(pc.size.x) && p.y < int(pc.size.y)) {
+        shade(p);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex < uint(FG_COUNTER_WORDS) && g_n[gl_LocalInvocationIndex] != 0u) {
+        atomicAdd(data.d[gl_LocalInvocationIndex], g_n[gl_LocalInvocationIndex]);
+    }
+}

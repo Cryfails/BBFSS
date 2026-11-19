@@ -1188,6 +1188,16 @@ int main() {
         assert(std::abs(no_blue[0] - 0.5f) < 1e-5f && std::abs(no_blue[1] - 0.5f) < 1e-5f);
         const LampRgb dark = LampColourScale({0.1f, 0.9f, 0.3f}, 0.3f, {0.0f, 0.0f, 0.0f});
         assert(dark[0] == 0.3f && dark[1] == 0.3f && dark[2] == 0.3f);
+        // bbport (r131d_lamp-colour-blob): a grey ratio one rounding step above 1 (an averaged history) with a grey or coloured
+        // rc can yield NaN channels. This supplies the ratio to the CPU mirror. The in-game probe checks the shader.
+        const float above = std::nextafter(1.0f, 2.0f);
+        for (const LampRgb& rc_in : {LampRgb{1.0f, 1.0f, 1.0f}, LampRgb{0.7f, 0.7f, 0.7f}, LampRgb{0.2f, 0.5f, 0.9f}}) {
+            for (const LampRgb& lit : {LampRgb{1.0f, 1.0f, 1.0f}, LampRgb{0.8f, 0.6f, 0.3f}}) {
+                for (const float v : LampColourScale(rc_in, above, lit)) {
+                    assert(std::isfinite(v) && v >= 0.0f && v <= 1.0f);
+                }
+            }
+        }
     }
     // bbport (r93_lamp-shadow-spatial): BB_LAMP_SHADOW_SPATIAL is off unless set to 1 (2 or more: 1;
     // below 0 or text: off). It changes none of LampTuneWords' words nor the history block's: Flush

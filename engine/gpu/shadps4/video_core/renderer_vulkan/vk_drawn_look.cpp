@@ -7,8 +7,10 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "bbport_drawn_look_texts.h" // bbport (r55_drawn-look-lines)
 #include "bbport_settings.h"
 #include "bbport_toggles.h"
+#include "video_core/host_shaders/paint_ink_comp.h"
 #include "video_core/host_shaders/paint_key_comp.h"
 #include "video_core/host_shaders/paint_key_last_comp.h"
 #include "video_core/host_shaders/paint_lock_comp.h"
@@ -41,6 +43,14 @@ constexpr auto SampledImage = vk::DescriptorType::eSampledImage;
 constexpr auto StorageImage = vk::DescriptorType::eStorageImage;
 constexpr auto Sampled = vk::DescriptorType::eCombinedImageSampler;
 constexpr auto ReadWrite = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+// The knobs' defaults are written twice: for the renderer (DrawnLookParams::Knobs) and for the
+// ini (bbport_settings.h).
+static_assert(DrawnLookParams::Knobs{}.strength == BbSettings::DrawnLookStrengthDefault &&
+              DrawnLookParams::Knobs{}.stroke_size == BbSettings::DrawnLookStrokeSizeDefault &&
+              DrawnLookParams::Knobs{}.texture == BbSettings::DrawnLookTextureDefault &&
+              DrawnLookParams::Knobs{}.outlines == BbSettings::DrawnLookOutlinesDefault &&
+              DrawnLookParams::Knobs{}.ink_world == BbSettings::DrawnLookInkWorldDefault &&
+              DrawnLookParams::Knobs{}.characters == BbSettings::DrawnLookCharactersDefault);
 
 vk::DescriptorImageInfo Info(vk::ImageView view, vk::Sampler sampler = {}) {
     return {.sampler = sampler, .imageView = view, .imageLayout = vk::ImageLayout::eGeneral};
@@ -70,6 +80,7 @@ DrawnLook::DrawnLook(const Instance& instance_, Scheduler& scheduler_,
         env_view = std::clamp(std::atoi(env), int(DrawnLookParams::ViewOff),
                               int(DrawnLookParams::ViewMax));
     }
+    env_line = DrawnLookParams::LineScaleOf(std::getenv("BB_DRAWN_LOOK_LINE"));
 }
 
 DrawnLook::~DrawnLook() {
@@ -83,13 +94,13 @@ DrawnLook::~DrawnLook() {
 
 bool DrawnLook::Wanted() {
     const auto& s = BbSettings::Get();
-    return s.graphics_drawn_look.load(std::memory_order_relaxed) &&
-           s.graphics_drawn_look_strength.load(std::memory_order_relaxed) > 0.0f;
+    return DrawnLookParams::Wanted(s.graphics_drawn_look.load(std::memory_order_relaxed),
+                                   s.graphics_drawn_look_strength.load(std::memory_order_relaxed),
+                                   s.graphics_drawn_look_ink_world.load(std::memory_order_relaxed));
 }
 
 void DrawnLook::NoSceneHooks() {
-    BbSettings::Get().drawn_look_problem = "the upscaler is not available (BB_UPSCALER=none, or "
-                                           "this GPU cannot run it)";
+    BbSettings::Get().drawn_look_problem = BbSettings::DrawnLookTexts::NoUpscaler.english;
 }
 
 void DrawnLook::Fail(const char* why) {
@@ -155,9 +166,10 @@ bool DrawnLook::Ready() {
         CreatePass(lock_down, {Sampled, StorageImage}, PAINT_LOCK_DOWN_COMP,
                    "Drawn look lock levels") &&
         CreatePass(lock, {Sampled, SampledImage, SampledImage, StorageImage, Sampled},
-                   PAINT_LOCK_COMP, "Drawn look lock");
+                   PAINT_LOCK_COMP, "Drawn look lock") &&
+        CreatePass(ink, {Sampled, SampledImage, StorageImage}, PAINT_INK_COMP, "Drawn look ink");
     if (!made) {
-        Fail("this GPU cannot run the passes");
+        Fail(BbSettings::DrawnLookTexts::NoPasses.english);
         return false;
     }
     sampler = std::move(levels_sampler.value);
@@ -361,17 +373,20 @@ void DrawnLook::OnFrameEnd(bool wanted) {
     if (was_wanted) {
         ++results[frame_result];
         if (++frames >= 600) {
-            BbReport::Printf("Drawn look: of %u frames, strokes painted before the transparents "
-                             "on %u, before the fog composite (no transparents) on %u, before "
-                             "the upscaler (neither: fog and particles painted too) on %u; not "
-                             "painted: %u menu previews, %u without a camera, %u for want of "
-                             "video memory, %u without a scene; what moves by itself told "
+            BbReport::Printf("Drawn look: of %u frames, painted before the transparents on %u, "
+                             "before the fog composite (no transparents) on %u, before the "
+                             "upscaler (neither: fog and particles painted too, no ink) on %u; "
+                             "not painted: %u menu previews, %u without a camera, %u for want of "
+                             "video memory, %u without a scene, %u with ink lines alone right "
+                             "before the upscaler; ink lines on %u; what moves by itself told "
                              "against the camera of the frame before on %u\n",
                              frames, results[AtBlended], results[AtComposite],
                              results[AtBeforeUpscaler], results[Preview], results[NoCamera],
-                             results[NoRoom], results[NotReached], previous_frames);
+                             results[NoRoom], results[NotReached], results[LinesOnlyLate],
+                             ink_frames, previous_frames);
             results = {};
             frames = 0;
+            ink_frames = 0;
             previous_frames = 0;
         }
         // The camera the frame was painted with is the next frame's "frame before"; a frame
@@ -384,7 +399,8 @@ void DrawnLook::OnFrameEnd(bool wanted) {
             scene_depths[scene_depth_next++ % scene_depths.size()] = gbuffer_depth;
         }
         if (!wanted) {
-            // Switched off (or the strength set to 0): the images go, the pipelines are kept.
+            // Switched off (or the strength and the ink lines set to 0): the images go, the
+            // pipelines are kept.
             ReleaseAll();
             last_view = last_inputs = ~0u;
             input_lines = 0;
@@ -409,6 +425,11 @@ void DrawnLook::OnFrameEnd(bool wanted) {
     frame_pass_count = 0;
     gbuffer_depth = {};
     gbuffer_normal = {};
+    // (r55_drawn-look-lines) The next frame has no ink lines until it records them.
+    if (ink_published) {
+        BbSettings::Get().drawn_look_ink_drawn.store(0.0f, std::memory_order_relaxed);
+        ink_published = false;
+    }
 }
 
 void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::ImageId depth_id,
@@ -427,13 +448,31 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
         frame_result = NoCamera;
         return;
     }
+    const auto& s = BbSettings::Get();
+    const DrawnLookParams::Knobs knobs{
+        .strength = s.graphics_drawn_look_strength.load(std::memory_order_relaxed),
+        .stroke_size = s.graphics_drawn_look_stroke_size.load(std::memory_order_relaxed),
+        .texture = s.graphics_drawn_look_texture.load(std::memory_order_relaxed),
+        .outlines = s.graphics_drawn_look_outlines.load(std::memory_order_relaxed),
+        .ink_world = s.graphics_drawn_look_ink_world.load(std::memory_order_relaxed),
+        .characters = s.graphics_drawn_look_characters.load(std::memory_order_relaxed),
+        .line_scale = env_line,
+        .view = env_view >= 0 ? env_view : int(DrawnLookParams::ViewOff),
+    };
+    // (r55_drawn-look-lines) Ink lines alone have nothing to draw right before the upscaler:
+    // nothing is recorded, not even the copy.
+    const auto passes = DrawnLookParams::PassesFor(knobs, place == AtBeforeUpscaler);
+    if (!passes.strokes && !passes.ink) {
+        frame_result = LinesOnlyLate;
+        return;
+    }
     if (!Ready()) {
         return;
     }
     auto& color = texture_cache.GetImage(color_id);
     auto& depth = texture_cache.GetImage(depth_id);
     if (color.info.pixel_format != vk::Format::eR16G16B16A16Sfloat) {
-        Fail("the scene colour is not RGBA16F");
+        Fail(BbSettings::DrawnLookTexts::NotHalfFloat.english);
         return;
     }
     // The scene's size is the reduced one while a preset renders below the game's own size,
@@ -466,7 +505,7 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
             refused_width = width;
             refused_height = height;
             frame_result = NoRoom;
-            BbSettings::Get().drawn_look_problem = "not enough video memory at this render size";
+            BbSettings::Get().drawn_look_problem = BbSettings::DrawnLookTexts::NoRoom.english;
             std::printf("Drawn look: off - not enough video memory for a scene of %ux%u; asked "
                         "again when the scene's size changes or the look is switched off and "
                         "on\n", width, height);
@@ -497,7 +536,7 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
         depth_info.format = depth.info.pixel_format;
         const auto proxy = scene_targets.Read(color_id, color_info, Compute, ReadWrite);
         if (!(proxy.usage & vk::ImageUsageFlagBits::eStorage)) {
-            Fail("the reduced scene colour is not a storage image");
+            Fail(BbSettings::DrawnLookTexts::ReducedNotStorage.english);
             return;
         }
         color_view = proxy.view;
@@ -509,7 +548,7 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
         }
     } else {
         if (!(color.usage_flags & vk::ImageUsageFlagBits::eStorage)) {
-            Fail("the scene colour is not a storage image");
+            Fail(BbSettings::DrawnLookTexts::NotStorage.english);
             return;
         }
         color_view = CachedView(color, color.info.pixel_format, vk::ImageAspectFlagBits::eColor);
@@ -539,15 +578,6 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
     EnsureImage(lock_means, width / 4, height / 4, vk::Format::eR16G16B16A16Sfloat, "means");
     frame_result = place;
 
-    const auto& s = BbSettings::Get();
-    const DrawnLookParams::Knobs knobs{
-        .strength = s.graphics_drawn_look_strength.load(std::memory_order_relaxed),
-        .stroke_size = s.graphics_drawn_look_stroke_size.load(std::memory_order_relaxed),
-        .texture = s.graphics_drawn_look_texture.load(std::memory_order_relaxed),
-        .characters = s.graphics_drawn_look_characters.load(std::memory_order_relaxed),
-        .view = env_view >= 0 ? env_view
-                              : s.graphics_drawn_look_debug.load(std::memory_order_relaxed),
-    };
     // (r45b_drawn-look-fixes) The camera of the frame before, when that frame was painted: the
     // object motion's vectors are told from the camera's own move with it.
     const auto params = DrawnLookParams::Make(knobs, camera.inv_view, camera.proj, width, height,
@@ -558,10 +588,17 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
     previous_frames += (params.flags & DrawnLookParams::FlagPrevious) != 0;
     const u32 view = DrawnLookParams::ViewOf(params.flags);
     // A test view shows the strokes' places in colours of its own: no colours to lock.
-    const bool locked = view == DrawnLookParams::ViewOff || view == DrawnLookParams::ViewInk;
+    const bool locked = passes.lock;
+    // (r55_drawn-look-lines) The ink pass's words: the frame's, three of its floats given the
+    // ink's meanings (DrawnLookParams::MakeInk).
+    const auto ink_params =
+        DrawnLookParams::MakeInk(params, knobs.ink_world, knobs.outlines, knobs.line_scale);
     // The inputs may come and go from frame to frame (a frame painted right before the upscaler
-    // has no G-buffer normals): their line is printed a few times, not on every change.
-    const u32 inputs = params.flags & (DrawnLookParams::FlagNormals | DrawnLookParams::FlagMotion);
+    // has no G-buffer normals): their line is printed a few times, not on every change. So may
+    // the passes (r55_drawn-look-lines: no ink right before the upscaler).
+    const u32 inputs =
+        (params.flags & (DrawnLookParams::FlagNormals | DrawnLookParams::FlagMotion)) |
+        u32(passes.strokes) << 8 | u32(passes.ink) << 9;
     const bool resized = width != last_width || height != last_height || view != last_view;
     if (resized || (inputs != last_inputs && input_lines < 8)) {
         input_lines += !resized;
@@ -569,15 +606,26 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
         last_height = height;
         last_view = view;
         last_inputs = inputs;
-        std::printf("Drawn look: on at %ux%u (%s), stroke cells %.1f and %.1f pixels, normals "
-                    "from %s, object motion %s, %s\n",
+        char ink_text[64];
+        if (passes.ink) {
+            std::snprintf(ink_text, sizeof(ink_text), "ink lines %.2f (line scale %.2f)",
+                          ink_params.strength, knobs.line_scale);
+        } else {
+            std::snprintf(ink_text, sizeof(ink_text), "%s",
+                          knobs.ink_world > 0.0f ? "no ink lines here (right before the upscaler)"
+                                                 : "no ink lines");
+        }
+        std::printf("Drawn look: on at %ux%u (%s), %sstroke cells %.1f and %.1f pixels, normals "
+                    "from %s, object motion %s, %s, %s\n",
                     width, height, reduced ? "reduced scene" : "the game's scene",
-                    params.cell_bold, params.cell_fine, has_normal ? "the G-buffer" : "the depth",
-                    has_motion ? "read" : "not there",
+                    passes.strokes ? "" : "no strokes, ", params.cell_bold, params.cell_fine,
+                    has_normal ? "the G-buffer" : "the depth", has_motion ? "read" : "not there",
                     view == DrawnLookParams::ViewStrokes  ? "test view 1 (strokes, sizes as mixed)"
                     : view == DrawnLookParams::ViewFine   ? "test view 2 (strokes, all fine)"
+                    : view == DrawnLookParams::ViewInk    ? "test view 3 (the ink page)"
                     : view == DrawnLookParams::ViewBold   ? "test view 4 (strokes, all bold)"
-                                                          : "no test view");
+                                                          : "no test view",
+                    ink_text);
     }
 
     // Each level's view, for the closures below.
@@ -683,9 +731,9 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
                 run(key_pipeline, key_layout, writes, 8, 8);
             }
         });
-    EffectPass::Mark(12, "drawn look strokes and colour lock");
-    scheduler.RecordCrumb(
-        {.name = "drawn look"},
+    // (r55_drawn-look-lines) The strokes and the lock when the frame has strokes, then the ink
+    // lines in a row of their own.
+    auto stroke_pass =
         [params, width, height, locked, levels, color_view, depth_view, sampler = *sampler,
          // A pass without normals or motion binds the copy in their place; its flags tell the
          // shader not to read them.
@@ -747,6 +795,38 @@ void DrawnLook::Paint(Result place, VideoCore::ImageId color_id, VideoCore::Imag
                                         Write(4, Sampled, &infos[4])};
                 run(lock_pipeline, lock_layout, writes, width, height);
             }
+            EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite,
+                                      AllCommands,
+                                      vk::AccessFlagBits2::eMemoryRead |
+                                          vk::AccessFlagBits2::eMemoryWrite);
+        };
+    if (passes.strokes) {
+        EffectPass::Mark(12, "drawn look strokes and colour lock");
+        scheduler.RecordCrumb({.name = "drawn look"}, std::move(stroke_pass));
+    }
+    if (!passes.ink) {
+        return;
+    }
+    ++ink_frames;
+    // The upscaler's extra sharpening on this frame (DrawnLookParams::InkSharpen).
+    BbSettings::Get().drawn_look_ink_drawn.store(ink_params.strength, std::memory_order_relaxed);
+    ink_published = true;
+    EffectPass::Mark(13, "drawn look ink");
+    scheduler.RecordCrumb(
+        {.name = "drawn look ink"},
+        [ink_params, width, height, color_view, depth_view, sampler = *sampler,
+         prep_view = *prep_copy.view, ink_pipeline = *ink.pipeline,
+         ink_layout = *ink.layout](vk::CommandBuffer cmdbuf) {
+            // The scene colour (the strokes' crumb) and the key (the masks') are written.
+            EffectPass::ComputeBarrier(cmdbuf);
+            const std::array infos{Info(prep_view, sampler), Info(depth_view), Info(color_view)};
+            const std::array writes{Write(0, Sampled, &infos[0]), Write(1, SampledImage, &infos[1]),
+                                    Write(2, StorageImage, &infos[2])};
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, ink_pipeline);
+            cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, ink_layout, 0, writes);
+            cmdbuf.pushConstants(ink_layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                 sizeof(ink_params), &ink_params);
+            cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
             EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite,
                                       AllCommands,
                                       vk::AccessFlagBits2::eMemoryRead |

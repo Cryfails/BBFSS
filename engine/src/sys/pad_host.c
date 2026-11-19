@@ -425,8 +425,8 @@ static void apply_gyro(SDL_Gamepad *g, PadData *pad) {
 }
 
 // bbport: L3 + a D-pad direction is a chord of the overlay (BbOverlay::HandleEvent: Up the co-op
-// panel, Down scout mode's panel while scout mode is on, Left camera mode's clean shot, Right its
-// orbit). A D-pad press that fired a chord is not the game's until it is released, so a chord
+// panel, Down scout mode's panel while scout mode is on, Right camera mode; Left is the game's).
+// A D-pad press that fired a chord is not the game's until it is released, so a chord
 // never reaches the game (D-pad Left and Right switch the hunter's items). The overlay decides,
 // from SDL events (bbgpu_overlay_pad_chords); this pad reads the SDL state, which can show a press
 // before the overlay has handled its event. Such a press is held back, until the overlay has seen
@@ -559,17 +559,40 @@ static void read_gamepad(SDL_Gamepad *g, PadData *pad) {
     if (touch_right) pad_touch_click(pad, 1);
 }
 
-static void pc_layer(PadData *pad, const bool *keys, int gamepad_present) {
+static int controller_action(SDL_Gamepad *g) {
+    for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i)
+        if (SDL_GetGamepadButton(g, (SDL_GamepadButton)i)) return 1;
+    if (SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 0 ||
+        SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 0) return 1;
+    const int pads = SDL_GetNumGamepadTouchpads(g);
+    if (pads < 0 || pads > 4) return 1;
+    for (int i = 0; i < pads; ++i) {
+        const int fingers = SDL_GetNumGamepadTouchpadFingers(g, i);
+        if (fingers < 0 || fingers > 8) return 1;
+        for (int j = 0; j < fingers; ++j) {
+            bool down = false;
+            if (!SDL_GetGamepadTouchpadFinger(g, i, j, &down, NULL, NULL, NULL) || down) return 1;
+        }
+    }
+    return 0;
+}
+
+static void pc_layer(PadData *pad, const bool *keys, SDL_Gamepad *gamepad, BbPcRestWitness *rest) {
     int key_count = 0;
     if (keys) SDL_GetKeyboardState(&key_count);
+    if (rest) {
+        *rest = (BbPcRestWitness){.external = gamepad && controller_action(gamepad) ? BB_PC_REST_PAD : 0,
+            .buttons = pad->buttons, .present = gamepad != NULL, .lx = pad->left_x, .ly = pad->left_y,
+            .rx = pad->right_x, .ry = pad->right_y, .l2 = pad->l2, .r2 = pad->r2, .touch_count = pad->touch_count};
+    }
     BbPcPad pc = {.buttons = pad->buttons, .lx = pad->left_x, .ly = pad->left_y, .rx = pad->right_x,
-                  .ry = pad->right_y, .l2 = pad->l2, .r2 = pad->r2, .touch_count = pad->touch_count};
+                  .ry = pad->right_y, .l2 = pad->l2, .r2 = pad->r2, .touch_count = pad->touch_count, .rest = rest};
     for (int i = 0; i < pad->touch_count && i < 2; ++i) {
         pc.touch[i].x = pad->touches[i].x;
         pc.touch[i].y = pad->touches[i].y;
         pc.touch[i].id = pad->touches[i].id;
     }
-    if (bbgpu_pc_input(&pc, keys, key_count, gamepad_present)) {
+    if (bbgpu_pc_input(&pc, keys, key_count, gamepad != NULL)) {
         pad->buttons = pc.buttons;
         pad->left_x = pc.lx;
         pad->left_y = pc.ly;
@@ -612,7 +635,7 @@ static void report_guest_heap(void) {
            m.most_in_use / 1048576.0, m.from_system / 1048576.0, m.most_from_system / 1048576.0);
 }
 
-void pad_host_sample(PadData *pad) {
+void pad_host_sample(PadData *pad, BbPcRestWitness *rest) {
     report_guest_heap();
     memset(pad, 0, sizeof(*pad));
     pad->left_x = pad->left_y = pad->right_x = pad->right_y = 128;
@@ -622,10 +645,13 @@ void pad_host_sample(PadData *pad) {
     pad->timestamp = pad_now_us();
     SDL_Gamepad *g = current_gamepad();
     ensure_bindings();
-    if (bbgpu_overlay_captures_input()) return;
+    if (bbgpu_overlay_captures_input()) {
+        if (rest) rest->external |= BB_PC_REST_OVERLAY;
+        return;
+    }
     const bool *keys = SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     if (g) read_gamepad(g, pad);
-    pc_layer(pad, keys, g != NULL);
+    pc_layer(pad, keys, g, rest);
 }
 
 void pad_host_refresh(void) {

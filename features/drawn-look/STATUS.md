@@ -1,5 +1,15 @@
 # Drawn look
 
+## Development snapshot, 2026-11-19
+
+DRW 8%. Feature work is paused.
+
+- Verified scope. The painted stroke pass is present and has scoped timing.
+- Open scope. The visible style and clean combined acceptance remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 15%
 
 An optional painted, hand-drawn picture style, with V Rising as the reference. The owner wants the colours unchanged and found a full Kuwahara filter too strong. The first strokes exist but are hard to see. The ink lines that the plan puts first are drafted but not built. The rating follows the plan: most of it is not done.
@@ -43,3 +53,6 @@ Plan steps D3 to D9 have no scripts yet.
 - lamp-test-spot and dark-alley: cobbles, brick wall, the hunter, lantern edges.
 - graveyard-blood: foliage and railings for the ink limit per area.
 - Compare look off, strength 1 and the stroke test view.
+
+
+</details>

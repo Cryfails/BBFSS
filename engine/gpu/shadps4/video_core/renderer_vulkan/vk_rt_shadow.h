@@ -4,6 +4,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -15,18 +16,27 @@
 #include "video_core/renderer_vulkan/rt_card_uv.h"     // bbport (r54_leaf-stage2)
 #include "video_core/renderer_vulkan/rt_card_layers.h" // bbport (r62_leaf-stage3)
 #include "video_core/renderer_vulkan/rt_card_skinned.h" // bbport (r62n_cutout-skinned-blocker)
+#include "video_core/renderer_vulkan/rt_card_sun.h" // bbport (r128c_lrt-cutout-props)
+#include "video_core/renderer_vulkan/foliage_translucency.h" // bbport (r131a_foliage-translucency)
 #include "video_core/renderer_vulkan/rt_glass.h"       // bbport (r83_glass-water-stage1)
 #include "video_core/renderer_vulkan/rt_glass_light.h" // bbport (r86_glass-light-stage2a)
 #include "video_core/renderer_vulkan/rt_glass_static.h" // bbport (r121b_glass-pane-hang)
+#include "video_core/renderer_vulkan/glass_light_forward.h" // bbport (r130g_glass-light-forward)
 #include "video_core/renderer_vulkan/volumetric_occlusion.h" // bbport (r76_sun-fog-outdoors)
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_sun_vsm.h"
+#include "video_core/renderer_vulkan/bottle_caustic_topology.h"
+#include "video_core/renderer_vulkan/vk_reflection_first_hit.h"
+#include "video_core/renderer_vulkan/vk_reflection_native_probe.h"
 
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
 class CameraMotion;
+struct LampPaneProbe;
 class Instance;
+namespace InteriorRoof { class Probe; struct WatchRow; }
+namespace WindowPathProbe { struct SceneObservation; struct PaneAcquisition; struct LampSceneIdentity; }
 class ObjectMotion;
 class Scheduler;
 class SunVsm;
@@ -89,7 +99,72 @@ public:
     [[nodiscard]] bool Wanted() const;
     [[nodiscard]] bool Complete() const;
     // The sun's shadow is replaced by the VSM or the ray traced sun rather than left to the game.
+    // bbport (r130g_glass-light-forward): the rasterizer asks (before r121b's placed palette refusal) whether a pane draw whose
+    // registry hit is `hit` (Draw::glass_entry, index + 1) may be taken with a palette the GPU wrote; the lamp pass hands in the
+    // glass counter it read back. False at its first test while BB_GLASS_LIGHT is off.
+    [[nodiscard]] bool GlassPlacedAllowed(u8 hit) const;
+    void GlassRaysSeen(const std::array<u32, 10>& words) noexcept {
+        glass_rays_now = words;
+    }
     [[nodiscard]] bool SunWanted() const;
+    // bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT (glass_light.h), decided at start (GlassLightStart): the lamp pass makes its
+    // GLASS builds, PrepareScene rewrites the records of glass entries. GlassLightActive: this frame's knob is on and the last
+    // scene held glass records (the lamp rays then ask the glass query).
+    [[nodiscard]] bool GlassLightWanted() const noexcept {
+        return glass_light_mode != 0;
+    }
+    // bbport (r131c_cabinet-glass-clear): the rasterizer says each frame (SetGlassClear) whether BB_GLASS_CLEAR is on: PrepareScene
+    // then gives the glass record of a clearing kind (the cabinet's pane) RtGlassMask alone. GlassClearRecords: those records so far.
+    void SetGlassClear(bool on) noexcept {
+        glass_clear_now = on;
+    }
+    [[nodiscard]] u64 GlassClearRecords() const noexcept {
+        return glass_clear_records;
+    }
+    [[nodiscard]] bool GlassLightLive() const noexcept {
+        return glass_light_live;
+    }
+    [[nodiscard]] bool GlassLightActive() const noexcept {
+        return glass_light_mode != 0 && glass_light_now && glass_light_records_now != 0;
+    }
+    /// The lamp pass could not make its GLASS builds (no storage format): off for good, as if never asked.
+    void GlassLightOff() noexcept {
+        glass_light_mode = 0;
+    }
+    /// One repair pass pushed the glass words (`active`: with the glass flag), for the 600-frame line.
+    void NoteGlassLightPass(bool active) noexcept {
+        ++glass_counts.passes;
+        glass_counts.passes_glass += active ? 1u : 0u;
+    }
+
+    struct BottleDrawToken {
+        u32 private_param = 0;
+        bool observed = false;
+    };
+
+    struct ReflectionDrawToken {
+        const void* entry{};
+        u64 allocation{};
+        u64 cookie{};
+        u64 placement{};
+        u32 first{};
+        u32 min_index{};
+        u32 max_index{};
+        ReflectionFirstHit::PlacedSource placed = ReflectionFirstHit::PlacedSource::None;
+        struct {
+            u64 key{}, cookie{}, revision{}, pass{};
+            bool enabled{}, same_identity{};
+        } placement_delta;
+    };
+    void ReflectionAttach(ReflectionFirstHit::Pass*);
+    void ReflectionCloseEpoch();
+    bool ReflectionBeginPass(const ReflectionFirstHit::Stamp&);
+    bool ReflectionSubmitted(const ReflectionFirstHit::Stamp&, const ReflectionDrawToken&,
+                             u64 vs, u64 ps, u32 count, u32 first,
+                             const ReflectionNativeProbe::Binding* placed);
+    void ReflectionFlush(const ReflectionFirstHit::Stamp&);
+    void ReflectionAdmissions(u64 request) const;
+    void ReflectionNativeSubmitted(const ReflectionNativeProbe::Draw&);
 
     struct Draw {
         u64 shader = 0;
@@ -156,8 +231,27 @@ public:
         // it with `glass`); and the draw's blend / depth write / discard as RtGlassFind::Flag* bits (find only)
         bool box_candidate = false;
         u32 find_flags = 0;
+        // bbport (r129a_glass-registry): the registry entry of this draw, index + 1 (0: none; always 0 while the registry
+        // is off). Unread in r129a; S1 reads it in PrepareDraw to withhold LampMask/ShadowMask and for the instance's tint.
+        u8 glass_entry = 0;
+        // bbport (r130g_glass-light-forward): a registered pane let through r121b's placed palette refusal (set by the rasterizer
+        // from RtShadow::GlassPlacedAllowed; PrepareDraw then asks GlassPlacedSteady). Always false while BB_GLASS_LIGHT is off.
+        bool glass_placed = false;
+        bool lamp_pane_observe = false; // t132d test tool, carries no scene policy
+        bool window_pane_observe = false;
+        // True only for the ordinary indexed camera variant, with CPU-current bound indices.
+        bool lamp_affine_candidate = false;
+        bool bottle_candidate = false;
+        BottleDrawToken* bottle_delivery = nullptr;
+        ReflectionDrawToken* reflection = nullptr;
+        ReflectionNativeProbe::Draw* reflection_native = nullptr;
     };
     u32 PrepareDraw(const Draw& draw);
+    [[nodiscard]] bool LampAffineAvailable() const noexcept {
+        return bool(lamp_affine_pipeline);
+    }
+    [[nodiscard]] LampPaneProbe* ActiveLampPane() const noexcept;
+    void PollLampPane(u64 scene_frame);
     // bbport (r47_still-check): the draw PrepareDraw was last called for is left out by the
     // rasterizer after all (see the definition).
     void CaptureLeftOut(u32 motion_param, u32 mode);
@@ -202,14 +296,51 @@ public:
         r19_stats = {};
         return counters;
     }
-    void BindAddresses(vk::PipelineLayout layout, u32 mode);
+    void BindAddresses(vk::PipelineLayout layout, u32 mode, u32 bottle_param = 0);
+    [[nodiscard]] bool BottleCapturePending(u32 param) const noexcept;
+    void RecordBottleDraw(BottleDrawToken token);
     // bbport (r17_rt-upkeep): whether PrepareDraw wants Draw::inputs (BB_RT_UNCHANGED set).
     [[nodiscard]] bool InputsWanted() const;
     // bbport (r47c_review-fixes): BB_RT_PALETTE_PLACE (see the definition): whether a small bone
     // palette in memory the GPU wrote may be known by its address (Draw::palette_placed).
     [[nodiscard]] static bool PalettePlace();
 
-    bool PrepareScene();
+    // Optional diagnostic output from the same natural preparation. Its TLAS must be
+    // consumed on this scheduler before any later scene preparation.
+    bool PrepareScene(WindowPathProbe::SceneObservation* window = nullptr);
+    // Retain one historical CPU snapshot while a receiver capture is armed.
+    void WatchWindowScene(WindowPathProbe::SceneObservation* observer) noexcept {
+        window_scene_watch = observer;
+    }
+    bool TryWatchWindowScene(WindowPathProbe::SceneObservation* observer) noexcept {
+        if (!observer || (window_scene_watch && window_scene_watch != observer)) {
+            return false;
+        }
+        window_scene_watch = observer;
+        return true;
+    }
+    void UnwatchWindowScene(const WindowPathProbe::SceneObservation* observer) noexcept {
+        if (window_scene_watch == observer) {
+            window_scene_watch = nullptr;
+        }
+    }
+    [[nodiscard]] bool LampSceneMatches(const WindowPathProbe::SceneObservation& observation,
+                                      VideoCore::ImageId depth, u64 uid) const noexcept;
+    void WatchWindowPane(WindowPathProbe::PaneAcquisition* observer) noexcept {
+        window_pane_watch = observer;
+    }
+    struct BottleSceneView {
+        vk::AccelerationStructureKHR tlas{};
+        vk::Buffer corners{};
+        u32 ordinal{};
+    };
+    void ResetBottlePass(const std::array<u64, 3>& targets);
+    [[nodiscard]] bool TryBottleDraw();
+    void InvalidateBottleGeometry(u64 address);
+    [[nodiscard]] bool BottleObserved() const noexcept;
+    [[nodiscard]] BottleSceneView BottleScene(const std::array<float, 12>& view);
+    [[nodiscard]] u64 WindowDiagnosticFrame() const noexcept { return frame; }
+    [[nodiscard]] u64 WindowSceneSerial() const noexcept { return window_scene_active_serial; }
     [[nodiscard]] vk::AccelerationStructureKHR Scene() const noexcept {
         return tlas;
     }
@@ -335,8 +466,22 @@ public:
         vk::ImageView layers;
         vk::Sampler sampler;
         u32 instances = 0;
+        vk::ImageView colour; // bbport (r131a_foliage-translucency): the colour layers (null unless made)
     };
     [[nodiscard]] CardLampReaders CardLampReadersNow() const;
+    // bbport (r131a_foliage-translucency): BB_RT_CARD_SUN's own switch, for the foliage translucency's start line and the glow pass; and the
+    // sun trace's hue image (the FOLIAGE builds' second output, rt_shadow.comp): its view and size, empty unless the trace wrote it this frame or
+    // the one before.
+    [[nodiscard]] static bool CardSunOn() {
+        return CardSunWanted();
+    }
+    struct SunHueView {
+        vk::ImageView view;
+        u32 width = 0, height = 0;
+    };
+    [[nodiscard]] SunHueView SunHueNow() const noexcept {
+        return sun_hue_view && frame <= sun_hue_frame + 1 ? SunHueView{sun_hue_view, sun_hue_width, sun_hue_height} : SunHueView{};
+    }
     // A lamp pass that can bind a CARDS build is under way (PointShadow::CardLampSet): the cards
     // take CARD_LAMP_MASK only within CardLampHoldFrames of the last such pass (none: lamp rays
     // off, or no CARDS build made), so that no card is made non-opaque, or forces a full TLAS build,
@@ -482,6 +627,7 @@ public:
     }
 
 private:
+    struct Entry;
     struct Buffer {
         vk::Buffer buffer;
         VmaAllocation allocation{};
@@ -492,6 +638,27 @@ private:
     // cut-out draw): the card data and state (rt_card_uv.h), its block of the pool (VMA's
     // virtual allocator; `offset` in records) and card slot (stage 4's custom index), the frame
     // of its last UV capture, whether it is in card_pending.
+    BottleCaustic::Topology bottle_topology;
+    Buffer bottle_corners{};
+    const Entry* bottle_entry = nullptr;
+    u64 bottle_entry_address = 0;
+    u64 bottle_observed_frame = ~u64{0};
+    u64 bottle_pass_frame = ~u64{0};
+    u64 bottle_recorded_frame = ~u64{0};
+    u64 bottle_index = 0;
+    u64 bottle_stream = 0;
+    u64 bottle_stream_bytes = 0;
+    std::array<u64, 3> bottle_targets{};
+    u64 bottle_resident_address = 0;
+    u64 bottle_resident_capture = ~u64{0};
+    u64 bottle_scene_frame = ~u64{0};
+    u32 bottle_scene_ordinal = 0;
+    u32 bottle_scene_mask = 0;
+    std::array<float, 12> bottle_scene_view{};
+    bool bottle_ambiguous = false;
+    bool bottle_draw_seen = false;
+    bool bottle_refused_logged = false;
+
     struct CardUvEntry {
         CardUv uv;
         VmaVirtualAllocation block{};
@@ -531,6 +698,7 @@ private:
         u32 first_instance = 0;
         u64 scratch = 0;
         u64 update_scratch = 0;
+        vk::DeviceSize reflection_creation_size = 0;
         u64 bytes = 0;
         u64 scene_bytes = 0;
         u64 seen_frame = 0;
@@ -554,6 +722,8 @@ private:
         bool blas = false;
         // Unlike the current-pass mask, this survives camera-only frames of a shared entry.
         bool shadow = false;
+        // The one upload to indices matched the authoritative bottle topology.
+        bool bottle_index_verified = false;
         // Value of `copies` when the world copy was last written.
         u64 copied_at = 0;
         // World bounds measured by the sun VSM (min xyz, max xyz), when has_box.
@@ -587,6 +757,9 @@ private:
         u64 cut_camera_ps = 0;
         u64 cut_sun_ps = 0;
         u8 cut_noted = 0;
+        // bbport (r130c_glass-lamp-light): the registry entry of a glass draw of this entry (or of its sun shadow pass twin), index +
+        // 1, sticky for the entry's life (0: none; always 0 while BB_GLASS_LIGHT is off); PrepareScene reads it for the record.
+        u8 glass_light = 0;
         // bbport (r46b_plant-rule): the position stream of its draws (0: none), and what that
         // stream is taken for (LampLoneOf of lone_streams; Lone: a cut-out with a skeleton that
         // no sun shadow pass draws, a plant), as of lone_gen (looked up again by PrepareScene
@@ -661,6 +834,8 @@ private:
         // its first cut-out draw)
         std::unique_ptr<CardUvEntry> card_uv;
     };
+    InteriorRoof::WatchRow* RoofWatchEntry(const Entry& entry);
+
     struct Build {
         Entry* entry;
         u32 store;
@@ -684,6 +859,10 @@ private:
         u32 param = 0;
         std::array<float, 12> still_rows{};
         std::array<float, 3> still_origin{};
+        // An affine build shares the camera-relative rows with the still signature.
+        std::array<float, 2> lamp_affine_depth{};
+        bool lamp_affine = false;
+        bool bottle = false;
         // bbport (r54_leaf-stage2): the capture also stores the entry's card UVs at ring index
         // uv_base - 1 (0: none), for coordinates of this hash (CardCapture); uv_only: a probe
         // for the UVs alone (CardUvProbe), which r47's looks know nothing of
@@ -693,12 +872,77 @@ private:
         // bbport (r64b_surface-probe-more): 1 + the probe's host slot its world positions go to
         // (ProbeCopyBuild; 0: none)
         u32 probe_slot = 0;
+        u64 reflection_cookie = 0;
+        u64 reflection_native_cookie = 0;
+        u64 reflection_native_allocation = 0;
     };
+    struct ReflectionTrack {
+        ReflectionFirstHit::Identity observed{};
+        ReflectionFirstHit::Identity resident{};
+        u64 placement{};
+        u64 address{};
+        u64 cookie{};
+        u64 confirmed{};
+        u64 confirmed_pass{};
+        u32 direct_count{};
+        u32 pending{};
+    };
+    struct ReflectionTracker {
+        ReflectionFirstHit::Pass* pass{};
+        std::optional<ReflectionFirstHit::Stamp> stamp;
+        std::unordered_map<const Entry*, ReflectionTrack> tracks;
+        u64 allocation{}, revision{}, cookie{}, last_flushed{};
+        u32 mirror_direct{}, mirror_joined{}, fireplace_direct{}, wall_shape_direct{};
+        std::array<u32, ReflectionFirstHit::PlacedSourceCount> placed_direct{}, placed_joined{};
+        u64 direct{}, joined{}, changed{}, dropped{}, scheduled{}, cloned{}, refused{};
+        u64 ordinary_evicted{}, invalidated{}, track_limit{};
+    };
+    std::unique_ptr<ReflectionTracker> reflection_tracker;
+    struct ReflectionNativeEntry {
+        const Entry* entry{};
+        u64 address{}, allocation{}, revision{}, cookie{}, captured_frame{};
+        u64 confirmed_cookie{};
+        ReflectionNativeProbe::Key key{};
+    };
+    std::array<ReflectionNativeEntry, 12> reflection_native_entries{};
+    u64 reflection_native_epoch = ~u64{0};
+    u64 reflection_native_allocation{}, reflection_native_revision{};
+    u32 reflection_native_tracked{}, reflection_native_build_logs{};
+    void ReflectionNativeObserve(const Entry&, ReflectionNativeProbe::Draw&);
+    void ReflectionNativeRecordBuild(const Entry&, const Build&);
+    void ReflectionObserve(Entry&, const Draw&, bool eligible);
+    void ReflectionQueue(Entry&, const Draw&, Build&);
+    void ReflectionDropCapture(const Build&);
+    void ReflectionBuild(Entry&, const Build&);
+    void ReflectionRetire(Entry&, const char* reason);
+    static bool ReflectionStatic(const Entry&, ReflectionFirstHit::PlacedSource);
 
     bool Setup(const ObjectMotion& object_motion);
+    struct BottleEndpoint {
+        const Entry* entry = nullptr;
+        vk::AccelerationStructureKHR blas{};
+        u64 address = 0;
+        u64 capture = 0;
+        u64 index = 0;
+        u64 stream = 0;
+        u64 stream_bytes = 0;
+        bool operator==(const BottleEndpoint&) const = default;
+    };
+    struct BottleCold;
+    std::unique_ptr<BottleCold> bottle_cold;
+    BottleEndpoint bottle_failed;
+    BottleEndpoint bottle_scene_endpoint;
+    [[nodiscard]] BottleEndpoint BottleGeneration(const Entry& entry) const;
+    [[nodiscard]] bool BottleColdEligible(const Entry& entry) const;
+    [[nodiscard]] u32 NominateBottleSpan(const Entry& entry, const Draw& draw,
+                                        const std::array<float, 12>& to_world);
+    bool MakeBottleCold(BottleCold& cold, const Entry& entry);
+    void DiscardBottleCold();
+    void ConsumeBottleSpan();
+    void ValidateBottleCold();
     bool Make(Buffer& out, vk::DeviceSize size, bool host, VkBufferUsageFlags usage);
     void Free(Buffer& buffer);
-    void Destroy(Entry& entry);
+    void Destroy(Entry& entry, const char* reason);
     bool EnsureWorld(Entry& entry);
     bool ToWorld(const float* constants, bool perspective, std::array<float, 12>& out) const;
     bool MakeRaw(u32 width, u32 height);
@@ -732,6 +976,11 @@ private:
     vk::UniqueDescriptorSetLayout trace_set, filter_set, unproject_set;
     vk::UniquePipelineLayout trace_layout, filter_layout, unproject_layout;
     vk::UniquePipeline trace_pipeline, filter_pipeline, unproject_pipeline;
+    vk::UniqueDescriptorSetLayout lamp_affine_set;
+    vk::UniquePipelineLayout lamp_affine_layout;
+    vk::UniquePipeline lamp_affine_pipeline;
+    Buffer lamp_affine_bits;
+    u64 lamp_affine_raw_hash = 0;
     vk::UniqueSampler sampler;
     std::unique_ptr<SunVsm> vsm;
     bool vsm_tried = false;
@@ -914,6 +1163,12 @@ private:
     };
     std::array<ToWorldMemo, 8> r17_memo{};
     u32 r17_memo_next = 0, r17_memo_last = 0;
+    std::unique_ptr<InteriorRoof::Probe> roof_probe;
+    u64 observed_scene_serial = 0;
+    u64 window_scene_active_serial = 0;
+    [[nodiscard]] WindowPathProbe::LampSceneIdentity LampPhysicalScene() const noexcept;
+    WindowPathProbe::SceneObservation* window_scene_watch = nullptr;
+    WindowPathProbe::PaneAcquisition* window_pane_watch = nullptr;
     bool R17ToWorld(const float* constants, bool perspective, std::array<float, 12>& out);
     struct UpkeepStats {
         u64 frames = 0, refit = 0, refit_triangles = 0, rebuilt = 0, rebuilt_triangles = 0,
@@ -1007,6 +1262,7 @@ private:
     [[nodiscard]] u32 StillNow() const;
     u32 TakeStillSig(Entry& entry);
     bool StillWorld(const float* constants, Build& build) const;
+    bool LampAffineTopology(const Draw& draw);
     void StillAdmit(Entry& entry, u64 id);
     void ReadStillSigs(u32 slot);
     // bbport (r54_leaf-stage2): the card UVs (BB_RT_CARD_ALPHA=1; rt_card_uv.h, CardSetup and
@@ -1200,6 +1456,9 @@ private:
     // bbport (r86m_glint-pane-from-triangle, TOOL): the triangle route's state (made at the first want), the number of wants
     // that wait for a capture or a copy, and the triangle set MakeEntry keeps for the pane entry it makes now (null: all)
     std::unique_ptr<RtGlassTri::State> glass_tri;
+    std::unique_ptr<LampPaneProbe> lamp_pane;
+    u32 lamp_pane_generation = ~0u, lamp_pane_last_request = 0;
+    void ReportLampPane(const LampPaneProbe& probe);
     u32 glass_tri_active = 0;
     const std::vector<u32>* glass_tri_keep_now = nullptr;
     void GlassTriCopy(Entry& entry, u64 key, u32 build);
@@ -1209,6 +1468,39 @@ private:
     u64 card_lamp_user_frame = 0;
     bool card_lamp_user_seen = false;
     bool CardLampOn(Entry& entry);
+    // bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT. glass_light_mode: 0 off, 1 made (GlassLightStart); glass_light_live: the live
+    // knob decides each frame (glass_light_now); glass_light_records_now: glass records the last scene's TLAS got. glass_geo: the
+    // meshes of registry hits ({geometry, indices, index count | entry + 1 << 32}), for the shadow pass twins.
+    struct GlassLightCounts {
+        u64 window_start = 0, records = 0, twins = 0, kept_cards = 0, passes = 0, passes_glass = 0, live_off = 0, off_frame = 0;
+    };
+    u8 glass_light_mode = 0;
+    bool glass_light_live = false, glass_light_now = false;
+    u32 glass_light_records_now = 0;
+    GlassLightCounts glass_counts;
+    bool glass_clear_now = false; // bbport (r131c_cabinet-glass-clear)
+    u64 glass_clear_records = 0;
+    std::array<std::array<u64, 3>, 64> glass_geo{};
+    u32 glass_geo_n = 0;
+    void GlassLightStart();
+    bool GlassLightFrame(bool card_lamps);
+    void GlassLightNote(Entry& entry, const Draw& draw);
+    // bbport (r130g_glass-light-forward): the forward panes and the glass counter. glass_fwd: the 600-frame line's counts.
+    // glass_rays_now/last: the lamp pass's glass counter words (PointShadow::OnFrameEnd, GlassRaysSeen): [0] counted passes, then
+    // half_counts words GLASS_RAY_FIRST and on (asked, met, tinted, met beyond the old end, entries, view x y z bits, pane mm).
+    struct GlassFwdCounts {
+        u64 window_start = 0, placed_taken = 0, placed_unsteady = 0, placed_cap = 0, moving_left = 0, carried = 0;
+    };
+    GlassFwdCounts glass_fwd;
+    std::array<u32, 10> glass_rays_now{}, glass_rays_last{};
+    bool glass_rays_early = false;
+    GlassLight::SteadyMap glass_steady;
+    u32 glass_placed_frame_n = 0;
+    u64 glass_placed_frame = 0;
+    void GlassForwardStart();
+    void GlassForwardFrame();
+    void GlassRaysText(char* out, std::size_t size, const std::array<u32, 10>& now, const std::array<u32, 10>& last) const;
+    bool GlassPlacedSteady(u64 instance);
     /// A TLAS instance's custom index: its card slot once the slot's row is written, else 0.
     [[nodiscard]] u32 CardCustomIndex(const Entry& entry) const noexcept {
         return card_layers_on && entry.card_uv && entry.card_uv->row_written ? entry.card_uv->slot
@@ -1261,8 +1553,14 @@ private:
     // RtGlassLightWords words more, from RtGlassLightFirstWord (rt_shadow.comp's GLASS_LIGHT
     // builds)
     static_assert(RtGlassLightFirstWord >= R25Slots);
+    static_assert(CardSunFirstWord >= R25Slots); // bbport (r128c_lrt-cutout-props)
     static u32 R25Words() {
-        return RtGlassLightOn() ? RtGlassLightCounterWords : R25Slots;
+        // bbport (r128c_lrt-cutout-props): BB_RT_CARD_SUN=1 (not made with BB_RT_GLASS_LIGHT): the counters hold CardSunWords words more, from
+        // CardSunFirstWord
+        // bbport (r131a_foliage-translucency): the FOLIAGE builds add CARD_SUN_FOLIAGE_WORDS words after the CARDS ones
+        return RtGlassLightOn() ? RtGlassLightCounterWords
+               : CardSunWanted() ? CardSunCounterWords + (FoliageTranslucency::SunThrough() ? u32(CARD_SUN_FOLIAGE_WORDS) : 0u)
+                                 : R25Slots;
     }
     bool r25_half = false; ///< this sun trace runs at half resolution (R25HalfWanted)
     // bbport (r37_menu-options): BB_RT_SUN_HALF: -1 not set, 1 for "1", 0 for anything else; not
@@ -1279,6 +1577,38 @@ private:
     vk::UniqueDescriptorSetLayout r25_half_set;
     vk::UniquePipelineLayout r25_half_layout;
     vk::UniquePipeline r25_half_pipeline;
+    // bbport (r128c_lrt-cutout-props) FEATURE: BB_RT_CARD_SUN=1 (needs BB_RT_CARD_ALPHA=2 and BB_RT_CARD_LAMPS=1; not with BB_RT_GLASS_LIGHT): the sun's
+    // rays cross the cut-out cards as the lamp rays do (rt_shadow.comp's CARDS builds, rt_shadow_cards_comp and its half form, made when first
+    // wanted by CardSunNow). CardSunNow also tells the scene that a reader of the cards exists (NoteCardLampUser), and returns the build for this
+    // sun trace with the card tables, or nothing (the plain build is pushed as before).
+    struct CardSunUse {
+        vk::Pipeline pipeline;
+        vk::PipelineLayout layout;
+        vk::Buffer rows, pool, info;
+        vk::ImageView layers;
+        vk::Sampler sampler;
+        // bbport (r131a_foliage-translucency): the FOLIAGE build: the colour layers (binding 10) and the hue image (binding 11, cleared first)
+        bool foliage = false;
+        vk::ImageView colour, hue;
+        vk::Image hue_image;
+    };
+    [[nodiscard]] static bool CardSunWanted();
+    [[nodiscard]] CardSunUse CardSunNow(bool half);
+    vk::UniqueDescriptorSetLayout card_sun_set, card_sun_half_set;
+    vk::UniquePipelineLayout card_sun_layout, card_sun_half_layout;
+    vk::UniquePipeline card_sun_pipeline, card_sun_half_pipeline;
+    bool card_sun_tried = false, card_sun_half_tried = false;
+    u32 card_sun_cards = 0, card_sun_plain = 0; ///< sun traces since the last line that ran the cut-out build / the plain one
+    std::array<u32, CardSunWords> card_sun_last{}; ///< the counters' values at the last line
+    // bbport (r131a_foliage-translucency): the sun trace's hue image (RGBA8, the trace's size, made by MakeSunHue only with the light through leaves on
+    // for the sun), the frame the trace last wrote it, and the FOLIAGE counters at the last line
+    vk::Image sun_hue_image;
+    VmaAllocation sun_hue_allocation{};
+    vk::ImageView sun_hue_view;
+    u32 sun_hue_width = 0, sun_hue_height = 0;
+    u64 sun_hue_frame = 0;
+    std::array<u32, 4> foliage_sun_last{};
+    bool MakeSunHue(u32 width, u32 height);
     u64 scratch_align = 256;
     u64 blas_bytes = 0;
     u64 blas_limit = 320ull << 20;

@@ -13,6 +13,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "bbport_overlay.h"
+#include "bbport_live_knobs.h"
 #include "bbport_settings.h"
 #include "bbport_timeline.h"
 #include "bbport_toggles.h"
@@ -21,6 +22,18 @@
 #include "lantern_anti_lag.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_sewer_motion_present.h"
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#include "video_core/renderer_vulkan/vk_post_present_retirement.h"
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+#include "video_core/renderer_vulkan/vk_bottle_display_evidence_b182.h"
+#include "video_core/renderer_vulkan/vk_bottle_cut_present.h"
+#endif
+#include "engine/loading.h"
+#include <bit>
+#include <cstddef>
+#include <fmt/format.h>
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 
@@ -48,6 +61,956 @@
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+
+namespace SewerPresent {
+namespace {
+void CompleteCandidate(Candidate& proof, const char* why, u64 serial,
+                       std::optional<FencedFrame> frame = {}) {
+    auto complete = std::exchange(proof.complete, {});
+    proof.lease.reset();
+    const auto& key = proof.merge.key;
+    if (complete) {
+        const bool fenced = frame.has_value();
+        if (why) {
+            fmt::print("[sewer-motion] event=final-refused request={} checkpoint={} frame={} why={}\n",
+                       key.request, key.checkpoint, key.frame, why);
+        }
+        complete({key, fenced, why, serial}, std::move(frame));
+    }
+}
+
+class PendingCandidate {
+public:
+    bool Offer(Candidate& next) {
+        std::lock_guard lock(mutex);
+        const auto& key = next.merge.key;
+        const bool fresh = !accepted || (accepted->request == key.request &&
+            accepted->loading == key.loading && accepted->generation == key.generation &&
+            accepted->enabled == key.enabled && key.frame > accepted->frame && key.scene > accepted->scene &&
+            key.checkpoint > accepted->checkpoint);
+        if (pending || !lease.expired() || !fresh) return false;
+        next.lease = std::make_shared<CandidateLease>();
+        lease = next.lease;
+        accepted = key;
+        pending = std::move(next);
+        return true;
+    }
+
+    std::optional<Candidate> Take(u32 frame) {
+        std::lock_guard lock(mutex);
+        if (!pending || pending->merge.key.frame > frame) return {};
+        return std::exchange(pending, {});
+    }
+
+    void Cancel() {
+        std::optional<Candidate> cancelled;
+        {
+            std::lock_guard lock(mutex);
+            cancelled = std::exchange(pending, {});
+        }
+        if (cancelled) CompleteCandidate(*cancelled, "presenter-shutdown-before-prepare", 0);
+    }
+
+private:
+    std::mutex mutex;
+    std::optional<Candidate> pending;
+    std::optional<SewerMotion::Key> accepted;
+    std::weak_ptr<const CandidateLease> lease;
+};
+
+PendingCandidate& Candidates() {
+    static PendingCandidate candidates;
+    return candidates;
+}
+} // namespace
+
+bool OfferDisplayCandidate(Candidate proof) {
+    if (!SewerMotion::Enabled()) return false;
+    const auto& key = proof.merge.key;
+    const auto current = SewerMotion::CurrentMerge(proof.merge.timeline, key.frame, key.loading, key.generation);
+    if (!current || !proof.Valid(*current)) {
+        CompleteCandidate(proof, "display-candidate-merge-or-identity", 0);
+        return false;
+    }
+    const auto sample = SewerMotion::Find(proof.merge.timeline, key.frame, key.loading, key.generation);
+    if (!sample) {
+        CompleteCandidate(proof, "display-candidate-scene-expired", 0);
+        return false;
+    }
+    for (u32 i = 0; i < proof.regions.count; ++i) {
+        const auto [role, xy] = proof.regions.points[i];
+        const auto index = unsigned(role);
+        if (index > unsigned(Role::Dry)) continue;
+        const auto& q = sample->pose.output[index];
+        if (xy != vk::Offset2D{s32(q[0]), s32(q[1])}) {
+            CompleteCandidate(proof, "display-candidate-anchor-mismatch", 0);
+            return false;
+        }
+    }
+    if (Candidates().Offer(proof)) return true;
+    CompleteCandidate(proof, "display-candidate-repeated-or-capacity", 0);
+    return false;
+}
+
+bool PublishFinal(FencedFrame frame, const RenderRetirement& render) {
+    const auto& identity = frame.identity;
+    const auto& key = identity.merge.key;
+    if (!render.Joins(frame)) {
+        fmt::print("[sewer-motion] event=final-refused request={} checkpoint={} frame={} "
+                   "why=postgraph-render-retirement-unjoined\n", key.request, key.checkpoint, key.frame);
+        return false;
+    }
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    const auto& r = frame.resources;
+    const auto* wait = r.present.Wait(frame.source.ready, frame.source.ready_tick);
+    const auto* acquire = r.present.Wait(frame.acquire, 1);
+    fmt::print("[sewer-motion] event=final-resources request={} checkpoint={} frame={} "
+               "source_read={} draw_order={} blit_source={} app_submit={} same_queue_barrier={} "
+               "direct_transfer_wait={} draw_wait_stages={:#x} acquire_wait_stages={:#x} "
+               "prepare_submit={} app_submit_order={}\n",
+               key.request, key.checkpoint, key.frame, r.SourceRead(identity),
+               r.DrawOrder(frame.source.ready, frame.source.ready_tick), r.BlitSource(frame.source),
+               r.AppSubmission(frame.source, frame.acquire, frame.swap_ready, frame.present_timeline,
+                               frame.present_tick),
+               r.SameQueueBarrier(frame.source), r.TransferWait(frame.source),
+               wait ? u32(VkPipelineStageFlags(wait->stages)) : 0,
+               acquire ? u32(VkPipelineStageFlags(acquire->stages)) : 0, r.prepare.order, r.present.order);
+    if (!JoinsResources(frame, render)) {
+        fmt::print("[sewer-motion] event=final-refused request={} checkpoint={} frame={} "
+                   "why=ordinary-present-resource-dependency-unjoined\n",
+                   key.request, key.checkpoint, key.frame);
+        return false;
+    }
+#endif
+    const auto raw = [](auto handle) {
+        return std::bit_cast<u64>(static_cast<typename decltype(handle)::CType>(handle));
+    };
+    const auto& source = frame.source;
+    fmt::print("[sewer-motion] event=final-fenced request={} checkpoint={} frame={} scene={} "
+               "present_serial={} draw_tick={} ready_tick={} display={:x}/{:x} display_gen={} "
+               "display_write={} merge_write={} tonemap_write={} pp_input={:x} pp_format={} "
+               "prepared={:x}/{:x} prepared_gen={} ready_sem={:x} fence={:x} "
+               "present_sem={:x} present_tick={} swap_ready={:x} submit_ns={} result_ns={} "
+               "swap_epoch={} swap={:x} swap_index={} swap_image={:x} "
+               "format=bgra8-unorm colorspace=srgb size=3840x2160 mip=0 layer=0 regions={} "
+               "display_alloc={:x} acquire={:x} slot={} render_submit={} render_cmd={:x} render_incarnation={} "
+               "render_segment={} render_ordinal={} render_fence_tick={}\n",
+               key.request, key.checkpoint, key.frame, key.scene, frame.serial, identity.display.draw_tick,
+               source.ready_tick, raw(identity.display.image), raw(identity.attachment), identity.generation,
+               identity.write, identity.merge.write, render.tonemap_write, raw(frame.pp_input), u32(frame.pp_format),
+               raw(source.image), raw(source.view), source.frame_generation, raw(source.ready), raw(source.fence),
+               raw(frame.present_timeline), frame.present_tick, raw(frame.swap_ready), frame.submit_ns, frame.result_ns,
+               source.swap_generation, raw(frame.swap), frame.swap_index, raw(frame.swap_image), frame.regions.count,
+               identity.allocation, raw(frame.acquire), frame.slot, render.submission, raw(render.command), render.incarnation,
+               render.segment, render.ordinal, render.completed_tick);
+    std::array<char, 2 * PatchBytes + 1> words{};
+    constexpr char hex[] = "0123456789abcdef";
+    for (u32 i = 0; i < frame.regions.count; ++i) {
+        const auto [role, centre] = frame.regions.points[i];
+        for (u32 b = 0; b < PatchBytes; ++b) {
+            const auto value = std::to_integer<unsigned>(frame.bytes[i * PatchBytes + b]);
+            words[b * 2] = hex[value >> 4];
+            words[b * 2 + 1] = hex[value & 15u];
+        }
+        fmt::print("[sewer-motion] event=final-patch request={} checkpoint={} frame={} present_serial={} "
+                   "role={} centre={},{} side={} bgra={}\n",
+                   key.request, key.checkpoint, key.frame, frame.serial, unsigned(role),
+                   centre.x, centre.y, Side, words.data());
+    }
+    return true;
+}
+} // namespace SewerPresent
+#endif
+
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+namespace PostPresentResources {
+namespace {
+ResourceImage PreparedResource(const Frame& frame, u64 incarnation, vk::Format format) {
+    return {frame.image, frame.image_view, std::bit_cast<u64>(frame.allocation),
+            frame.post_present_backing, incarnation, format, {frame.width, frame.height}};
+}
+
+struct ResourceCapture {
+    ResourceCapture(NativeWriteSuffix::PostKey key, OrderTokens tokens)
+        : key{key}, tokens{tokens} {}
+
+    explicit ResourceCapture(const SewerPresent::Candidate& candidate)
+        : ResourceCapture({candidate.merge.key.request, u64(candidate.merge.key.checkpoint), candidate.merge.key.frame},
+                          {candidate.display_order, candidate.prepare_barrier_order,
+                           candidate.prepare_postprocess_order}) {}
+
+    bool ValidTokens() const { return tokens.Valid(); }
+
+    void ObservePrepare(const PostPresentSubmitObservation& actual, Scheduler& scheduler, u64 expected_tick) {
+        if (actual.key != key || actual.scheduler != &scheduler || actual.tick != expected_tick) return;
+        facts.prepare = DriverSubmission::Copy(actual.input, actual.tick, actual.ordered, actual.segments,
+                                               facts.postprocess_cmd);
+        if (ValidTokens()) {
+            const auto read = [&](NativeWriteSuffix::PostToken token) {
+                NativeWriteSuffix::PostReceipt receipt{};
+                return scheduler.ReadPostNativeOperation(token, receipt)
+                    ? ResourcePosition::From(receipt, token, key) : ResourcePosition{};
+            };
+            facts.display_order = read(tokens.display);
+            facts.barrier_order = read(tokens.barrier);
+            facts.postprocess_order = read(tokens.postprocess);
+        }
+        prepare_observed.store(true, std::memory_order_release);
+    }
+
+    void ObservePresent(const PostPresentSubmitObservation& actual, Scheduler& scheduler, u64 expected_tick) {
+        if (actual.key != key || actual.scheduler != &scheduler || actual.tick != expected_tick) return;
+        facts.present = DriverSubmission::Copy(actual.input, actual.tick, actual.ordered, actual.segments,
+                                               facts.blit_cmd);
+        present_observed.store(true, std::memory_order_release);
+    }
+
+    FrameResources Fenced(const ResourceImage& retired_target, bool presented) const {
+        // Each scheduler publishes only the fields produced on its own path.
+        // An absent observation cannot be replaced by the planned SubmitInfo.
+        const bool prepare_known = prepare_observed.load(std::memory_order_acquire);
+        const bool present_known = present_observed.load(std::memory_order_acquire);
+        auto retired = prepare_known && present_known ? facts : FrameResources{};
+        retired.key = key;
+        if (prepare_known && !present_known) retired.prepare = facts.prepare;
+        if (present_known && !prepare_known) retired.present = facts.present;
+        retired.retired_target = retired_target;
+        retired.app_present = presented;
+        retired.frame_fenced = true;
+        return retired;
+    }
+
+    NativeWriteSuffix::PostKey key;
+    OrderTokens tokens;
+    std::atomic_bool prepare_observed{}, present_observed{};
+    FrameResources facts;
+};
+
+void NotePreparedTransfer(ResourceCapture& capture, vk::CommandBuffer cmd, vk::Image swap,
+                          const vk::ImageBlit& blit, const vk::ImageMemoryBarrier& barrier,
+                          vk::PipelineStageFlags before, vk::PipelineStageFlags after) {
+    auto& r = capture.facts;
+    r.blit_cmd = cmd;
+    r.swap = swap;
+    r.blit = blit;
+    r.target_read = {
+        .srcStageMask = vk::PipelineStageFlags2{VkPipelineStageFlags(before)},
+        .srcAccessMask = vk::AccessFlags2{VkAccessFlags(barrier.srcAccessMask)},
+        .dstStageMask = vk::PipelineStageFlags2{VkPipelineStageFlags(after)},
+        .dstAccessMask = vk::AccessFlags2{VkAccessFlags(barrier.dstAccessMask)},
+        .oldLayout = barrier.oldLayout,
+        .newLayout = barrier.newLayout,
+        .srcQueueFamilyIndex = barrier.srcQueueFamilyIndex,
+        .dstQueueFamilyIndex = barrier.dstQueueFamilyIndex,
+        .image = barrier.image,
+        .subresourceRange = barrier.subresourceRange,
+    };
+    r.blit_encoded = true;
+}
+} // namespace
+} // namespace PostPresentResources
+
+#endif
+struct SewerPresent::Capture {
+    explicit Capture(Issued value) : proof(std::move(value)) {}
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    explicit Capture(Candidate value, u32 frame_slot) : candidate(std::move(value)), slot(frame_slot) {}
+#endif
+    ~Capture() {
+        if (buffer) vmaDestroyBuffer(allocator, buffer, allocation);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (candidate && candidate->complete)
+            CompleteCandidate(*candidate, refusal ? refusal : "present-abandoned-before-submit", serial);
+#endif
+        if (proof.complete) Finish(proof, false, refusal ? refusal : "present-abandoned-before-submit", serial);
+    }
+
+    Issued proof;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    std::optional<Candidate> candidate;
+    u32 slot{};
+    vk::Semaphore acquire{};
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    std::shared_ptr<PostPresentResources::ResourceCapture> resources;
+#endif
+    const Regions& CaptureRegions() const { return candidate ? candidate->regions : proof.regions; }
+    const Override& CapturedDisplay() const { return candidate ? candidate->display : proof.display; }
+    void FailCandidate(const char* why) {
+        if (candidate) CompleteCandidate(*candidate, why, serial);
+    }
+#endif
+    PresentSource source{};
+    vk::ImageView pp_input{};
+    vk::Format pp_input_format{};
+    std::atomic<bool> pp_encoded{};
+    vk::SwapchainKHR swap{};
+    vk::Image swap_image{};
+    vk::Semaphore present_timeline{}, swap_ready{};
+    u64 serial{}, submit_ns{}, result_ns{}, present_tick{};
+    u32 swap_index{};
+    bool presented{};
+    const char* refusal{};
+    VmaAllocator allocator{};
+    VmaAllocation allocation{};
+    VkBuffer buffer{};
+    const std::byte* mapped{};
+
+    bool Allocate(VmaAllocator vma) {
+        allocator = vma;
+        const VkBufferCreateInfo ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                                     .size = CaptureRegions().count * PatchBytes,
+#else
+                                    .size = proof.regions.count * PatchBytes,
+#endif
+                                    .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo ai{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO,
+        };
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(allocator, &ci, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+        mapped = static_cast<const std::byte*>(info.pMappedData);
+        return mapped != nullptr;
+    }
+
+    void Copy(vk::CommandBuffer cmd) const {
+        std::array<vk::BufferImageCopy, MaxPatches> regions{};
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        const auto& captured = CaptureRegions();
+        for (u32 i = 0; i < captured.count; ++i) {
+            const auto xy = captured.points[i].centre;
+#else
+        for (u32 i = 0; i < proof.regions.count; ++i) {
+            const auto xy = proof.regions.points[i].centre;
+#endif
+            regions[i] = {
+                .bufferOffset = i * PatchBytes,
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .imageOffset = {xy.x - s32(Side / 2), xy.y - s32(Side / 2), 0},
+                .imageExtent = {Side, Side, 1},
+            };
+        }
+        cmd.copyImageToBuffer(source.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(buffer),
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                              std::span(regions).first(captured.count));
+#else
+                              std::span(regions).first(proof.regions.count));
+#endif
+        const vk::MemoryBarrier2 memory{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &memory});
+    }
+
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    void Report(const PresentSource& retired, const ResourceImage& retired_target) {
+#else
+    void Report(const PresentSource& retired) {
+#endif
+        if (refusal) return;
+        if (!SameSource(source, retired) || !pp_encoded.load(std::memory_order_acquire)) {
+            refusal = "prepared-pp-source-or-fence-generation";
+            return;
+        }
+        if (!presented || !serial || !swap || !swap_image || !present_timeline || !swap_ready ||
+            !present_tick || !submit_ns || result_ns < submit_ns) {
+            refusal = "unsuccessful-or-unproved-present";
+            return;
+        }
+        if (vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+            refusal = "present-host-invalidate";
+            return;
+        }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (candidate) {
+            FencedFrame frame;
+            frame.identity = candidate->Identity();
+            frame.source = source;
+            frame.slot = slot;
+            frame.pp_input = pp_input;
+            frame.pp_format = pp_input_format;
+            frame.swap = swap;
+            frame.swap_image = swap_image;
+            frame.swap_ready = swap_ready;
+            frame.acquire = acquire;
+            frame.present_timeline = present_timeline;
+            frame.serial = serial;
+            frame.present_tick = present_tick;
+            frame.submit_ns = submit_ns;
+            frame.result_ns = result_ns;
+            frame.swap_index = swap_index;
+            frame.regions = candidate->regions;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+            if (resources) frame.resources = resources->Fenced(retired_target, presented);
+#endif
+            frame.lease = std::move(candidate->lease);
+            frame.bytes.assign(mapped, mapped + frame.regions.count * PatchBytes);
+            vmaDestroyBuffer(allocator, buffer, allocation);
+            buffer = {};
+            if (!frame.Valid()) return CompleteCandidate(*candidate, "frame-retirement-payload", serial);
+            // The caller retains these bytes until its actual postgraph render fence retires.
+            return CompleteCandidate(*candidate, nullptr, serial, std::move(frame));
+        }
+#endif
+        const auto raw = [](auto handle) {
+            return std::bit_cast<u64>(static_cast<typename decltype(handle)::CType>(handle));
+        };
+        const auto& key = proof.merge.key;
+        fmt::print("[sewer-motion] event=final-fenced request={} checkpoint={} frame={} scene={} "
+                   "present_serial={} draw_tick={} ready_tick={} display={:x}/{:x} display_gen={} "
+                   "display_write={} merge_write={} tonemap_write={} pp_input={:x} pp_format={} "
+                   "prepared={:x}/{:x} prepared_gen={} ready_sem={:x} fence={:x} "
+                   "present_sem={:x} present_tick={} swap_ready={:x} submit_ns={} result_ns={} "
+                   "swap_epoch={} swap={:x} swap_index={} swap_image={:x} "
+                   "format=bgra8-unorm colorspace=srgb size=3840x2160 mip=0 layer=0 regions={}\n",
+                   key.request, key.checkpoint, key.frame, key.scene, serial, proof.display.draw_tick,
+                   source.ready_tick, raw(proof.display.image), raw(proof.display_attachment),
+                   proof.display_generation, proof.display_write, proof.merge.write,
+                   proof.tonemap_output_write, raw(pp_input), u32(pp_input_format), raw(source.image),
+                   raw(source.view), source.frame_generation, raw(source.ready), raw(source.fence),
+                   raw(present_timeline), present_tick, raw(swap_ready), submit_ns, result_ns, source.swap_generation,
+                   raw(swap), swap_index, raw(swap_image), proof.regions.count);
+        for (u32 i = 0; i < proof.regions.count; ++i) {
+            const auto& point = proof.regions.points[i];
+            constexpr char hex[] = "0123456789abcdef";
+            std::string encoded(PatchBytes * 2, '\0');
+            for (u32 byte = 0; byte < PatchBytes; ++byte) {
+                const auto value = std::to_integer<unsigned>(mapped[i * PatchBytes + byte]);
+                encoded[byte * 2] = hex[value >> 4];
+                encoded[byte * 2 + 1] = hex[value & 15u];
+            }
+            fmt::print("[sewer-motion] event=final-patch request={} checkpoint={} frame={} present_serial={} "
+                       "role={} centre={},{} side={} bgra={}\n",
+                       key.request, key.checkpoint, key.frame, serial, unsigned(point.role),
+                       point.centre.x, point.centre.y, Side, encoded);
+        }
+        vmaDestroyBuffer(allocator, buffer, allocation);
+        buffer = {};
+        Finish(proof, true, "none", serial);
+    }
+};
+
+static SewerPresent::PresentSource SewerPreparedSource(const Frame& frame, u64 swap_generation) {
+    return {frame.image, frame.image_view, frame.present_done, frame.ready_semaphore,
+            frame.ready_tick, frame.sewer_prepared_generation, swap_generation,
+            {frame.width, frame.height}, frame.sewer_final_format};
+}
+
+static bool SewerDisplayFormat(vk::Format backing, vk::Format view) {
+    return (view == vk::Format::eB8G8R8A8Srgb &&
+            (backing == vk::Format::eB8G8R8A8Srgb || backing == vk::Format::eB8G8R8A8Unorm)) ||
+           (view == vk::Format::eR8G8B8A8Srgb &&
+            (backing == vk::Format::eR8G8B8A8Srgb || backing == vk::Format::eR8G8B8A8Unorm));
+}
+
+static void RetireSewerPresent(Frame& frame, u64 current_swap_generation) {
+    auto capture = std::exchange(frame.sewer_present_readback, {});
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    if (capture) capture->Report(SewerPreparedSource(frame, current_swap_generation),
+                                 PostPresentResources::PreparedResource(frame, frame.sewer_prepared_generation,
+                                                                       frame.sewer_final_format));
+#else
+    if (capture) capture->Report(SewerPreparedSource(frame, current_swap_generation));
+#endif
+}
+#ifdef BB_TEST_SHARED_POST_GRAPH
+
+void Presenter::InvalidatePostPresentSwap() {
+    if (SewerMotion::Enabled()) sewer_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+}
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+
+namespace BottleCutPresent {
+namespace {
+std::mutex window_mutex;
+std::unique_ptr<Window> window;
+bool window_started{};
+
+auto Raw(auto handle) {
+    return std::bit_cast<u64>(static_cast<typename decltype(handle)::CType>(handle));
+}
+
+void PrintSample(const Scene& scene, const Sample& s) {
+    const auto& a = s.attempt;
+    const auto count = s.raw ? s.raw->count : s.regions.count;
+    fmt::print("[bottle-cut-present] event={} request={} scene={} draw_frame={} present={} "
+               "display_address={:x} display={:x}/{:x} gen={} write={} draw_sem={:x} draw_tick={} "
+               "pp_input={:x}/{} prepared={:x}/{:x} slot={} incarnation={} ready_sem={:x} ready_tick={} fence={:x} "
+               "swap_gen={} swap={:x}/{} image={:x} acquire={:x} swap_ready={:x} "
+               "present_sem={:x} present_tick={} submit_ns={} result_ns={} "
+               "bgra8-unorm=3840x2160 mip=0 layer=0 regions={}\n",
+               s.raw ? "raw-search-fenced" : "fenced", scene.key.request, scene.key.scene, scene.draw_frame,
+               a.serial, s.display.address,
+               Raw(s.display.image), Raw(s.display_attachment), s.display_generation, s.display_write,
+               Raw(s.display.draw_timeline), s.display.draw_tick, Raw(s.sampled), u32(s.sampled_format),
+               Raw(s.source.image), Raw(s.source.view), s.source.slot, s.source.incarnation,
+               Raw(s.source.ready), s.source.ready_tick, Raw(s.source.fence), s.source.swap_generation,
+               Raw(a.swap), a.image_index, Raw(a.swap_image), Raw(a.acquire), Raw(a.ready),
+               Raw(a.timeline), a.tick, a.submit_ns, a.result_ns, count);
+    if (s.raw) {
+        const auto& raw = *s.raw;
+        fmt::print("[bottle-cut-present] event=raw-search-native-key request={} scene={} frame={} present={} "
+                   "state={} epoch={} native_timeline={:x} outer_tick={} app={} color_uid={} depth_uid={} "
+                   "parents={:x}/{:x} allocations={:x}/{:x} ordinary_read_tick={} "
+                   "ordinary_color={:x}/{:x}/{} ordinary_depth={:x}/{:x}/{}\n",
+                   scene.key.request, scene.key.scene, scene.draw_frame, a.serial, u32(scene.state),
+                   scene.last_epoch, Raw(raw.native_timeline), raw.native_tick, raw.native_application,
+                   raw.color_uid, raw.depth_uid, Raw(raw.color_parent), Raw(raw.depth_parent),
+                   raw.color_allocation, raw.depth_allocation, raw.ordinary_read_tick,
+                   Raw(raw.read_color), Raw(raw.read_color_view), raw.read_color_incarnation,
+                   Raw(raw.read_depth), Raw(raw.read_depth_view), raw.read_depth_incarnation);
+        const auto& camera = raw.camera;
+        for (u32 row = 0; row < 3; ++row) {
+            const auto* line = camera.view.data() + row * 4;
+            fmt::print("[bottle-cut-present] event=raw-search-view request={} scene={} row={} "
+                       "values={:.9g}/{:.9g}/{:.9g}/{:.9g}\n",
+                       scene.key.request, scene.key.scene, row, line[0], line[1], line[2], line[3]);
+        }
+        fmt::print("[bottle-cut-present] event=raw-search-projection request={} scene={} "
+                   "values={:.9g}/{:.9g}/{:.9g}/{:.9g} jitter={:.9g}/{:.9g}\n",
+                   scene.key.request, scene.key.scene, camera.projection[0], camera.projection[1],
+                   camera.projection[2], camera.projection[3], camera.jitter[0], camera.jitter[1]);
+    }
+    constexpr char hex[] = "0123456789abcdef";
+    std::array<char, 2 * PatchBytes + 1> words{};
+    for (u32 i = 0; i < count; ++i) {
+        for (u32 byte = 0; byte < PatchBytes; ++byte) {
+            const auto v = std::to_integer<unsigned>(s.bytes[i * PatchBytes + byte]);
+            words[2 * byte] = hex[v >> 4];
+            words[2 * byte + 1] = hex[v & 15];
+        }
+        if (s.raw) {
+            const auto xy = s.raw->centres[i];
+            fmt::print("[bottle-cut-present] event=raw-search-tile request={} scene={} present={} ordinal={} "
+                       "centre={},{} side={} bgra={}\n",
+                       scene.key.request, scene.key.scene, a.serial, i, xy.x, xy.y, Side, words.data());
+        } else {
+            const auto [role, xy] = s.regions.points[i];
+            fmt::print("[bottle-cut-present] event=patch request={} scene={} present={} role={} "
+                       "centre={},{} side={} bgra={}\n",
+                       scene.key.request, scene.key.scene, a.serial, u32(role), xy.x, xy.y, Side, words.data());
+        }
+    }
+}
+
+void PublishReady() {
+    std::unique_ptr<Window> finished;
+    {
+        std::lock_guard lock(window_mutex);
+        if (window && window->Settled()) finished = std::move(window);
+    }
+    if (!finished) return;
+    auto& w = *finished;
+    std::array<const Slot*, Capacity> ordered{};
+    u32 count = 0;
+    for (const auto& slot : w.slots) {
+        if (slot.progress != Progress::Empty) ordered[count++] = &slot;
+    }
+    const auto selected = std::span(ordered).first(count);
+    std::ranges::sort(selected, {}, [](const Slot* slot) { return slot->scene.key.scene; });
+    u64 prior_scene = w.evicted_last ? w.evicted_last : w.first_scene - 1;
+    u64 prior_attempt{}, prior_submit{};
+    for (const auto* slot : selected) {
+        const auto& scene = slot->scene;
+        const auto ordinal = scene.key.scene;
+        if (prior_scene + 1 < ordinal) w.Gap(prior_scene + 1, ordinal - 1);
+        prior_scene = ordinal;
+        const char* reason = slot->why ? slot->why : "none";
+        const auto* sample = slot->sample ? &*slot->sample : nullptr;
+        if (sample && (sample->attempt.serial <= prior_attempt || sample->attempt.submit_ns < prior_submit)) {
+            reason = "present-attempt-order";
+            w.Gap(ordinal, ordinal);
+            sample = nullptr;
+        }
+        if (sample && prior_attempt && sample->attempt.serial > prior_attempt + 1) {
+            w.Gap(ordinal, ordinal);
+            fmt::print("[bottle-cut-present] event=present-gap request={} before_scene={} first={} last={}\n",
+                       w.request, ordinal, prior_attempt + 1, sample->attempt.serial - 1);
+        }
+        fmt::print("[bottle-cut-present] event={} request={} scene={} load={} rt={} object={} "
+                   "targets_gen={} primary_pass={} draw_frame={} state={} epoch={}/{} present={} "
+                   "fenced={} reason={}\n",
+                   w.raw_search ? "raw-search-scene" : "scene", w.request, ordinal, scene.key.load,
+                   scene.key.rt_frame, scene.key.object_frame, scene.key.target_generation, scene.key.primary_pass, scene.draw_frame, u32(scene.state),
+                   scene.first_epoch, scene.last_epoch, slot->serial, bool(sample), reason);
+        if (sample) {
+            prior_attempt = sample->attempt.serial;
+            prior_submit = sample->attempt.submit_ns;
+            PrintSample(scene, *sample);
+        }
+    }
+    if (w.mode == Mode::Cut && w.last_on && !w.Find(w.last_on)) w.Gap(w.last_on, w.last_on);
+    if (prior_scene < w.end_scene) w.Gap(prior_scene + 1, w.end_scene);
+    const bool bracket = w.mode == Mode::AllOff ? w.first_off != 0 : w.last_on && w.first_off > w.last_on;
+    fmt::print("[bottle-cut-present] event={} request={} mode={} scenes={}/{} retained={} "
+               "pretrigger_evicted={}/{} on={}/{} off={}/{} gap={}/{} {}={}\n",
+               w.raw_search ? "raw-search-window" : "window", w.request, u32(w.mode), w.first_scene,
+               w.end_scene, count, w.evicted_first, w.evicted_last, w.first_on, w.last_on,
+               w.first_off, w.last_off, w.first_gap, w.last_gap,
+               w.raw_search ? "raw_complete" : "full", bracket && !w.first_gap);
+}
+
+void Complete(Issued& proof, const char* reason, u64 serial = 0, std::optional<Sample> sample = {}
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+              , std::optional<RawFenced> raw = {}
+#endif
+) {
+    auto callback = std::exchange(proof.complete, {});
+    const Result result{proof.scene, bool(sample), reason, serial, bool(proof.raw)};
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    auto resource = std::exchange(proof.resource, {});
+    bool retained{};
+#endif
+    {
+        std::lock_guard lock(window_mutex);
+        if (window && window->request == proof.scene.key.request) {
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+            retained = window->Finish(result, std::move(sample));
+#else
+            window->Finish(result, std::move(sample));
+#endif
+        }
+    }
+    if (reason) {
+        fmt::print("[bottle-cut-present] event=refused request={} scene={} draw_frame={} present={} reason={}\n",
+                   proof.scene.key.request, proof.scene.key.scene, proof.scene.draw_frame, serial, reason);
+    }
+    if (callback) callback(result);
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    if (resource && resource->complete) {
+        auto complete = std::move(resource->complete);
+        if (result.fenced && (!retained || !raw || raw->scene != proof.scene || raw->raw != proof.raw ||
+                              raw->attempt.serial != serial)) {
+            complete({proof.scene, false, "bottle-raw-retirement-not-owned", serial, bool(proof.raw)}, {});
+        } else {
+            complete(result, std::move(raw));
+        }
+    }
+#endif
+    PublishReady();
+}
+
+std::optional<Issued> Take(u32 draw_frame) {
+    std::array<std::optional<Issued>, Capacity> stale{};
+    u32 count{};
+    std::optional<Issued> selected;
+    {
+        std::lock_guard lock(window_mutex);
+        if (!window) return {};
+        for (auto& slot : window->slots) {
+            if (slot.scene.draw_frame > draw_frame) continue;
+            if (slot.progress == Progress::Pending) {
+                slot.progress = Progress::Active;
+                if (slot.scene.draw_frame == draw_frame) selected = std::exchange(slot.issued, {});
+                else stale[count++] = std::exchange(slot.issued, {});
+            } else if (slot.progress == Progress::Enrolled) {
+                slot.progress = Progress::Refused;
+                slot.why = "no-issued-display-before-prepare";
+                window->Gap(slot.scene.key.scene, slot.scene.key.scene);
+                fmt::print("[bottle-cut-present] event=refused request={} scene={} draw_frame={} reason={}\n",
+                           window->request, slot.scene.key.scene, slot.scene.draw_frame, slot.why);
+            }
+        }
+    }
+    for (u32 i = 0; i < count; ++i) Complete(*stale[i], "no-matching-prepare-frame");
+    PublishReady();
+    return selected;
+}
+
+void CancelWindow() {
+    std::array<std::optional<Issued>, Capacity> stale{};
+    u32 count{};
+    {
+        std::lock_guard lock(window_mutex);
+        if (!window) return;
+        auto& w = *window;
+        if (!w.closed) {
+            w.Gap(w.last_scene ? w.last_scene : w.first_scene, w.last_scene ? w.last_scene : w.first_scene);
+            w.end_scene = w.last_scene ? w.last_scene : w.first_scene;
+            w.closed = true;
+        }
+        for (auto& slot : w.slots) {
+            if (slot.progress == Progress::Pending) {
+                slot.progress = Progress::Active;
+                stale[count++] = std::exchange(slot.issued, {});
+            } else if (slot.progress == Progress::Enrolled || slot.progress == Progress::Active) {
+                slot.progress = Progress::Refused;
+                slot.why = "presenter-shutdown-before-fence";
+                w.Gap(slot.scene.key.scene, slot.scene.key.scene);
+            }
+        }
+    }
+    for (u32 i = 0; i < count; ++i) Complete(*stale[i], "presenter-shutdown-before-prepare");
+    PublishReady();
+}
+} // namespace
+
+static bool OpenWindow(u32 request, Mode mode, u64 first_scene, bool raw_search) {
+    if (!request || request != BottleCaustic::CutSource::Run() || !first_scene ||
+        (mode != Mode::Cut && mode != Mode::AllOff)) return false;
+    std::lock_guard lock(window_mutex);
+    if (window_started) return false;
+    window_started = true;
+    window = std::make_unique<Window>();
+    window->request = request;
+    window->mode = mode;
+    window->first_scene = first_scene;
+    window->raw_search = raw_search;
+    return true;
+}
+
+bool BeginWindow(u32 request, Mode mode, u64 first_scene) {
+    return OpenWindow(request, mode, first_scene, false);
+}
+
+bool BeginRawSearchWindow(u32 request, Mode mode, u64 first_scene) {
+    return OpenWindow(request, mode, first_scene, true);
+}
+
+static bool Enrol(Scene scene, const RawSearch* raw) {
+    if (!BottleCaustic::CutSource::Run()) return false;
+    const char* why;
+    u64 expected{};
+    {
+        std::lock_guard lock(window_mutex);
+        if (window && window->raw_search == bool(raw)) {
+            if (!window->closed && window->request == scene.key.request) {
+                expected = window->last_scene ? window->last_scene + 1 : window->first_scene;
+            }
+            why = raw ? window->EnrolRaw(*raw) : window->Enrol(scene);
+        } else {
+            why = window ? "window-purpose" : "no-window";
+        }
+    }
+    if (expected && scene.key.scene > expected) {
+        fmt::print("[bottle-cut-present] event=scene-gap request={} first={} last={} reason=scene-ordinal-missing\n",
+                   scene.key.request, expected, scene.key.scene - 1);
+    }
+    if (why) {
+        fmt::print("[bottle-cut-present] event=enrol-refused request={} scene={} reason={}\n",
+                   scene.key.request, scene.key.scene, why);
+    }
+    return !why;
+}
+
+bool EnrolScene(Scene scene) { return Enrol(scene, nullptr); }
+
+bool EnrolRawSearch(const RawSearch& raw) { return Enrol(raw.scene, &raw); }
+
+bool OfferIssuedDisplay(Issued proof) {
+    if (!BottleCaustic::CutSource::Run()) return false;
+    const char* why = "no-matching-enrolled-scene";
+    {
+        std::lock_guard lock(window_mutex);
+        if (window && window->request == proof.scene.key.request) {
+            auto* slot = window->Find(proof.scene.key.scene);
+            if (slot && slot->scene == proof.scene && slot->progress == Progress::Enrolled && !window->closed) {
+                const Epoch epoch{proof.display.address, proof.display.image, proof.display_generation,
+                                  proof.display_write};
+                const bool valid = proof.consume_epoch &&
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+                    (proof.resource ? proof.resource->Valid() && proof.scene.Known() : bool(proof.complete)) &&
+#else
+                    proof.complete &&
+#endif
+                    proof.display_attachment &&
+                    epoch.generation && epoch.write && Compatible(proof.display, proof.display) &&
+                    window->Accepts(*slot, proof);
+                if (valid && std::ranges::none_of(window->slots, [epoch](const Slot& item) {
+                        return item.epoch == epoch;
+                    })) {
+                    slot->epoch = epoch;
+                    slot->progress = Progress::Pending;
+                    slot->issued = std::move(proof);
+                    return true;
+                }
+                slot->progress = Progress::Refused;
+                slot->why = why = valid ? "issued-display-write-epoch-reused" : "invalid-issued-display-or-regions";
+                window->Gap(proof.scene.key.scene, proof.scene.key.scene);
+            } else if (slot && !window->closed) {
+                window->Gap(proof.scene.key.scene, proof.scene.key.scene);
+            }
+        }
+    }
+    // A rejected offer owns its own callback. It must not complete another offer's active slot.
+    fmt::print("[bottle-cut-present] event=offer-refused request={} scene={} draw_frame={} reason={}\n",
+               proof.scene.key.request, proof.scene.key.scene, proof.scene.draw_frame, why);
+    if (proof.complete) proof.complete({proof.scene, false, why, 0, bool(proof.raw)});
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    if (proof.resource && proof.resource->complete) {
+        auto complete = std::move(proof.resource->complete);
+        complete({proof.scene, false, why, 0, bool(proof.raw)}, {});
+    }
+#endif
+    return false;
+}
+
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+bool OfferResourceDisplay(Issued issued, ResourceIssue proof) {
+    if (!proof.Valid() || issued.resource || !BottleCaustic::CutSource::Run()) {
+        const Result refused{issued.scene, false, "invalid-or-disarmed-bottle-resource-offer", 0, bool(issued.raw)};
+        if (issued.complete) issued.complete(refused);
+        if (proof.complete) proof.complete(refused, {});
+        return false;
+    }
+    issued.resource = std::make_shared<ResourceIssue>(std::move(proof));
+    return OfferIssuedDisplay(std::move(issued));
+}
+#endif
+
+bool CloseWindow(u32 request, u64 last_scene) {
+    bool exact{};
+    {
+        std::lock_guard lock(window_mutex);
+        if (!window || window->request != request || window->closed || last_scene < window->first_scene) return false;
+        auto& w = *window;
+        exact = w.last_scene == last_scene;
+        if (!exact) {
+            if (!w.last_scene) w.Gap(w.first_scene, last_scene);
+            else w.Gap(std::min(w.last_scene, last_scene) + 1, std::max(w.last_scene, last_scene));
+        }
+        w.end_scene = last_scene;
+        w.closed = true;
+        for (auto& slot : w.slots) {
+            if (slot.progress == Progress::Enrolled) {
+                slot.progress = Progress::Refused;
+                slot.why = "window-ended-without-issued-display";
+                w.Gap(slot.scene.key.scene, slot.scene.key.scene);
+            }
+        }
+    }
+    PublishReady();
+    return exact;
+}
+
+struct Capture {
+    explicit Capture(Issued run) : proof(std::move(run)) {}
+    ~Capture() {
+        Release();
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        if (proof.complete || proof.resource)
+#else
+        if (proof.complete)
+#endif
+            Complete(proof, refusal ? refusal : "prepared-frame-abandoned", attempt.serial);
+    }
+
+    Issued proof;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    std::shared_ptr<PostPresentResources::ResourceCapture> resources;
+#endif
+    Source source{};
+    Attempt attempt{};
+    vk::ImageView pp_view{};
+    vk::Format pp_format{};
+    std::atomic<bool> pp_encoded{};
+    const char* refusal{};
+    VmaAllocator allocator{};
+    VmaAllocation allocation{};
+    VkBuffer buffer{};
+    const std::byte* mapped{};
+
+    u32 Bytes() const { return proof.Count() * PatchBytes; }
+
+    void Release() {
+        if (!buffer) return;
+        vmaDestroyBuffer(allocator, buffer, allocation);
+        buffer = {};
+    }
+
+    bool Allocate(VmaAllocator vma) {
+        allocator = vma;
+        const VkBufferCreateInfo ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                    .size = Bytes(), .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo ai{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO,
+        };
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(allocator, &ci, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+        mapped = static_cast<const std::byte*>(info.pMappedData);
+        return mapped != nullptr;
+    }
+
+    void Copy(vk::CommandBuffer cmd) const {
+        std::array<vk::BufferImageCopy, MaxPatches> regions{};
+        for (u32 i = 0; i < proof.Count(); ++i) {
+            const auto xy = proof.Centre(i);
+            regions[i] = {.bufferOffset = i * PatchBytes,
+                          .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                          .imageOffset = {xy.x - s32(Side / 2), xy.y - s32(Side / 2), 0},
+                          .imageExtent = {Side, Side, 1}};
+        }
+        cmd.copyImageToBuffer(source.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(buffer),
+                              std::span(regions).first(proof.Count()));
+        const vk::MemoryBarrier2 memory{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &memory});
+    }
+
+    void Fail(const char* why) { Complete(proof, why, attempt.serial); }
+
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    void Retire(const Source& current, const PostPresentResources::ResourceImage& backing) {
+#else
+    void Retire(const Source& current) {
+#endif
+        if (refusal) return Fail(refusal);
+        if (!ReadyToRead(source, current, pp_encoded.load(std::memory_order_acquire) && bool(pp_view), attempt)) {
+            return Fail(attempt.Valid() ? "prepared-postprocess-or-fence-incarnation"
+                                        : "unsuccessful-or-unproved-present");
+        }
+        if (vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+            return Fail("present-host-invalidate");
+        }
+        Sample sample{source, attempt, proof.display, proof.display_attachment, pp_view, pp_format,
+                      proof.display_generation, proof.display_write, proof.regions,
+                      std::vector<std::byte>(mapped, mapped + Bytes()), proof.raw};
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        if (proof.resource) {
+            RawFenced raw{proof.scene, source, attempt, proof.display, proof.display_attachment,
+                          pp_view, pp_format, proof.display_generation, proof.display_write,
+                          proof.resource->display_allocation, proof.regions,
+                          resources ? resources->Fenced(backing, attempt.success)
+                                    : PostPresentResources::FrameResources{}, proof.raw};
+            return Complete(proof, nullptr, attempt.serial, std::move(sample), std::move(raw));
+        }
+#endif
+        Complete(proof, nullptr, attempt.serial, std::move(sample));
+    }
+};
+} // namespace BottleCutPresent
+
+static BottleCutPresent::Source BottlePreparedSource(const Frame& frame, u64 swap_generation) {
+    return {frame.image, frame.image_view, frame.present_done, frame.ready_semaphore,
+            frame.ready_tick, frame.bottle_incarnation, swap_generation, frame.id,
+            {frame.width, frame.height}, frame.bottle_final_format};
+}
+
+static void RetireBottleCutPresent(Frame& frame, u64 swap_generation) {
+    auto capture = std::exchange(frame.bottle_present_readback, {});
+    if (capture) {
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        capture->Retire(BottlePreparedSource(frame, swap_generation),
+                        PostPresentResources::PreparedResource(frame, frame.bottle_incarnation,
+                                                               frame.bottle_final_format));
+#else
+        capture->Retire(BottlePreparedSource(frame, swap_generation));
+#endif
+        capture->Release();
+    }
+}
+#endif
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -312,6 +1275,43 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
+    if (SewerMotion::Enabled()) {
+        SewerPresent::pending.Cancel("presenter-destroyed-before-prepare");
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        SewerPresent::Candidates().Cancel();
+#endif
+        for (auto& frame : present_frames) {
+            frame.sewer_prepared.reset();
+            if (frame.sewer_present_readback) {
+                if (instance.GetDevice().getFenceStatus(frame.present_done) == vk::Result::eSuccess) {
+                    RetireSewerPresent(frame, sewer_swap_generation.load(std::memory_order_acquire));
+                } else {
+                    frame.sewer_present_readback->refusal = "present-fence-unavailable-at-shutdown";
+                    frame.sewer_present_readback.reset();
+                }
+            }
+        }
+    }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (BottleCaustic::CutSource::Run()) {
+        const auto epoch = bottle_swap_generation.load(std::memory_order_acquire);
+        for (auto& frame : present_frames) {
+            if (frame.bottle_prepared) frame.bottle_prepared->Fail("presenter-shutdown-before-present");
+            frame.bottle_prepared.reset();
+            if (frame.bottle_present_readback) {
+                if (instance.GetDevice().getFenceStatus(frame.present_done) == vk::Result::eSuccess) {
+                    RetireBottleCutPresent(frame, epoch);
+                } else {
+                    frame.bottle_present_readback->Fail("present-fence-unavailable-at-shutdown");
+                    frame.bottle_present_readback.reset();
+                }
+            }
+        }
+        BottleCutPresent::CancelWindow();
+    }
+#endif
+    ReportMotionAttempts();
+    if (motion_buffer) vmaDestroyBuffer(instance.GetAllocator(),motion_buffer,motion_allocation);
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
@@ -830,6 +1830,18 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     };
     auto view = Check<"create frame image view">(device.createImageView(view_info));
     frame->image_view = view;
+    if (SewerMotion::Enabled()) frame->sewer_final_format = image_info.format;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    bool resource_enabled = SewerMotion::Enabled();
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    resource_enabled |= BottleCaustic::CutSource::Run() != 0;
+#endif
+    if (resource_enabled)
+        frame->post_present_backing = post_present_next_backing.fetch_add(1, std::memory_order_relaxed) + 1;
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (BottleCaustic::CutSource::Run()) frame->bottle_final_format = image_info.format;
+#endif
     frame->width = width;
     frame->height = height;
 
@@ -859,6 +1871,12 @@ Frame* Presenter::PrepareLastFrame() {
                    "Device lost during waiting for a frame");
     }
 
+    if (frame->sewer_present_readback)
+        RetireSewerPresent(*frame, sewer_swap_generation.load(std::memory_order_acquire));
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (frame->bottle_present_readback)
+        RetireBottleCutPresent(*frame, bottle_swap_generation.load(std::memory_order_acquire));
+#endif
     auto& scheduler = flip_scheduler;
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -927,6 +1945,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     Frame* frame = GetRenderFrame();
+    frame->motion={};
+    frame->motion_swap_epoch=0;
     // bbport: native HDR output: the gain map made at this display buffer's display pass (for
     // the frame it holds, a frame earlier in the command stream) goes with the frame to the
     // present thread; the frame's old one, presented (its fence was waited above), goes back.
@@ -950,22 +1970,63 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = vk::ComponentSwizzle::eOne;
 
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    std::optional<SewerPresent::Candidate> resource_candidate;
+    std::shared_ptr<PostPresentResources::ResourceCapture> resources;
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    std::optional<BottleCutPresent::Issued> bottle_candidate;
+    std::shared_ptr<PostPresentResources::ResourceCapture> bottle_resources;
+    if (BottleCaustic::CutSource::Run()) {
+        bottle_candidate = BottleCutPresent::Take(BbStats::frame_number.load(std::memory_order_relaxed));
+        if (bottle_candidate && bottle_candidate->resource && upscaled) {
+            bottle_resources = std::make_shared<PostPresentResources::ResourceCapture>(
+                BottleCutPresent::ResourceKey(bottle_candidate->scene), bottle_candidate->resource->Tokens());
+        }
+    }
+#endif
+    if (SewerMotion::Enabled()) {
+        resource_candidate = SewerPresent::Candidates().Take(BbStats::frame_number.load(std::memory_order_relaxed));
+        if (resource_candidate && upscaled)
+            resources = std::make_shared<PostPresentResources::ResourceCapture>(*resource_candidate);
+    }
+#endif
     vk::ImageView image_view{};
     vk::Extent2D image_size{};
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    // Only DisplayOverride can transfer a selected diagnostic epoch into this preparation.
+    vk::Image prepared_source = display.image;
+    bool bottle_mutable_view{};
+#endif
     if (upscaled) {
         const auto device = instance.GetDevice();
-        image_view = Check(device.createImageView({
+        const vk::ImageViewCreateInfo view_create{
             .image = display.image,
             .viewType = vk::ImageViewType::e2D,
             .format = view_info.format,
             .components = {vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eIdentity,
                            vk::ComponentSwizzle::eIdentity, vk::ComponentSwizzle::eOne},
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
-        }));
+        };
+        image_view = Check(device.createImageView(view_create));
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+        if (display.bottle_scope.request || (bottle_candidate && bottle_candidate->raw)) {
+            bottle_mutable_view = BottleDisplay182::RawMutableView(
+                display.image, display.format, display.bottle_backing_flags, image_view, view_create);
+        }
+#endif
         draw_scheduler.DeferOperation([device, image_view] { device.destroyImageView(image_view); });
         image_size = vk::Extent2D{display.width, display.height};
         GrabFace(instance, draw_scheduler, display.image, display.width, display.height, display.format);
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        const auto& display_resources = resources ? resources : bottle_resources;
+#else
+        const auto& display_resources = resources;
+#endif
+        auto record_display_read = [image = display.image, resources = display_resources](vk::CommandBuffer cmdbuf) {
+#else
         draw_scheduler.Record([image = display.image](vk::CommandBuffer cmdbuf) {
+#endif
             const vk::ImageMemoryBarrier2 to_read{
                 .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                 .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
@@ -977,18 +2038,39 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
             };
             cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+            if (resources) {
+                resources->facts.display_read = to_read;
+                resources->facts.display_barrier_cmd = cmdbuf;
+            }
+        };
+        if (display_resources && display_resources->ValidTokens()) {
+            draw_scheduler.RecordPostNative(display_resources->tokens.barrier,
+                [record = std::move(record_display_read), token = display_resources->tokens.barrier](
+                    vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) {
+                    record(cmd);
+                    encoder.NotePost(token);
+                });
+        } else {
+            draw_scheduler.Record(std::move(record_display_read));
+        }
+#else
         });
+#endif
     } else {
         auto& image = texture_cache.GetImage(image_id);
         image_view = *image.FindView(view_info).image_view;
         image_size = vk::Extent2D{image.info.size.width, image.info.size.height};
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        if (display.bottle_scope.request) prepared_source = image.GetImage();
+#endif
         // bbport: BB_PRESENT_DUMP_TRIGGER for the game's own display buffer too.
         if (auto& upscaler = rasterizer->GetUpscaler(); upscaler.PresentDumpDue()) {
             runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
                             vk::AccessFlagBits2::eTransferRead);
             runtime.FlushBarriers();
             upscaler.DumpPresented(image.GetImage(), image_size.width, image_size.height,
-                                   view_info.format);
+                                   view_info.format, cpu_address);
         }
         if (BbFaceShot::Pending()) {
             runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eTransfer,
@@ -1000,6 +2082,27 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                         vk::PipelineStageFlagBits2::eFragmentShader,
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
+    }
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (const auto& selected = display.bottle_scope; selected.request) {
+        const bool acquired = bottle_candidate && bottle_candidate->raw &&
+            bottle_candidate->scene.key.request == selected.request && bottle_candidate->scene.key.scene == selected.scene &&
+            bottle_candidate->scene.draw_frame == selected.frame && bottle_candidate->scene.last_epoch == selected.epoch;
+        fmt::print("[bottle-cut] event=prepared-presenter-scope request={} scene={} frame={} epoch={} "
+                   "selected_address={:x} prepare_address={:x} override={} candidate={} matched={} "
+                   "image={:x} view={:x} format={} extent={}x{} prepare_tick={} backing_format={} "
+                   "backing_flags={:x} raw_mutable_view={}\n",
+                   selected.request, selected.scene, selected.frame, selected.epoch, selected.address,
+                   cpu_address, upscaled, bool(bottle_candidate), acquired, std::bit_cast<u64>(prepared_source),
+                   std::bit_cast<u64>(image_view), u32(view_info.format), image_size.width, image_size.height,
+                   draw_scheduler.CurrentTick(), u32(display.format),
+                   u32(VkImageCreateFlags(display.bottle_backing_flags)), bottle_mutable_view);
+    }
+#endif
+    if (workflow_present.Armed()) {
+        frame->workflow_display_override = upscaled;
+        frame->workflow_input_width = image_size.width;
+        frame->workflow_input_height = image_size.height;
     }
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
 
@@ -1072,9 +2175,173 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     if (profiler) {
         profiler->Mark(0xF6E0'0003ull, [] { return std::string{"presenter: post process"}; });
     }
+    if (upscaled && display.motion) {
+        const auto& m=display.motion;
+        const auto now=WorkflowPresent::Now();
+        if (m.draw_ns && now>=m.draw_ns && now-m.draw_ns<=33'333'334ull &&
+            m.writer==std::this_thread::get_id() &&
+            m.timeline==draw_scheduler.GetWorkSemaphore()->Handle() &&
+            m.draw_tick<=draw_scheduler.CurrentTick() && m.address==cpu_address &&
+            m.image==display.image && image_size==vk::Extent2D{3840,2160} &&
+            frame->width==3840 && frame->height==2160 && !frame->is_hdr && !fsr_settings.enable &&
+            rasterizer->GetUpscaler().MotionConsume(m)) {
+            frame->motion=m;
+            frame->motion_swap_epoch=motion_swap_epoch.load(std::memory_order_relaxed);
+        } else {
+            std::printf("[bottle-motion-t198] event=refused id=%u why=prepared-source-epoch\n",u32(m.id));
+        }
+    }
+    if (SewerMotion::Enabled()) {
+        const u32 draw_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+        const auto draw_timeline = draw_scheduler.GetWorkSemaphore()->Handle();
+        const SewerPresent::Override source{
+            cpu_address, upscaled ? display.image : vk::Image{}, upscaled ? display.format : vk::Format{},
+            image_size, draw_timeline, draw_scheduler.CurrentTick(),
+        };
+        auto proof = SewerPresent::pending.Take(source, draw_frame);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        if (auto candidate = std::move(resource_candidate)) {
+#else
+        if (auto candidate = SewerPresent::Candidates().Take(draw_frame)) {
+#endif
+            using namespace SewerPresent;
+            if (proof) {
+                Finish(*proof, false, "legacy-and-provisional-display-conflict");
+                proof.reset();
+                CompleteCandidate(*candidate, "legacy-and-provisional-display-conflict", 0);
+            } else {
+                const auto& key = candidate->merge.key;
+                const auto current_merge = SewerMotion::CurrentMerge(draw_timeline, draw_frame, key.loading, key.generation);
+                const bool match = key.frame == draw_frame && current_merge &&
+                    SameMerge(*current_merge, candidate->merge) && upscaled &&
+                    candidate->Identity().MatchesOverride(source) && !BbEngine::Loading::ScreenUp() &&
+                    key.loading == BbEngine::Loading::Generation() &&
+                    SewerDisplayFormat(display.format, view_info.format) &&
+                    image_view && frame->image && frame->image_view && frame->present_done &&
+                    frame->image != display.image && frame->sewer_final_format == Format &&
+                    frame->width == Extent.width && frame->height == Extent.height &&
+                    workflow_present.Armed() && !frame->is_hdr && !frame->hdr_native && !gen_job && !frame->motion &&
+                    !frame_gen->Enabled() && !FrameGenerator::DlssWanted() && !fsr_settings.enable &&
+                    pp_settings.gamma == 1.0f && pp_settings.hdr == 0 && pp_settings.srgb_input == 0;
+                if (!match) {
+                    CompleteCandidate(*candidate, "provisional-prepared-source-stale-or-replaced", 0);
+                } else if (!candidate->consume_epoch(source, candidate->display_generation, candidate->display_write)) {
+                    CompleteCandidate(*candidate, "provisional-prepared-write-epoch-replaced", 0);
+                } else {
+                    candidate->consume_epoch = {};
+                    frame->sewer_prepared_generation = ++sewer_next_frame_generation;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+                    if (resources) {
+                        resources->facts.input = {display.image, image_view, candidate->display_allocation,
+                            candidate->display_generation, candidate->display_write, view_info.format, image_size};
+                        resources->facts.epoch = true;
+                    }
+#endif
+                    frame->sewer_prepared = std::make_shared<Capture>(std::move(*candidate), frame->id);
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+                    frame->sewer_prepared->resources = std::move(resources);
+#endif
+                    frame->sewer_prepared->source.swap_generation = sewer_swap_generation.load(std::memory_order_acquire);
+                }
+            }
+        }
+#endif
+        if (proof) {
+            const bool match = upscaled && !BbEngine::Loading::ScreenUp() &&
+                proof->merge.key.loading == BbEngine::Loading::Generation() &&
+                SewerDisplayFormat(display.format, view_info.format) &&
+                image_view && frame->image && frame->image_view && frame->present_done &&
+                frame->image != display.image && frame->sewer_final_format == SewerPresent::Format &&
+                frame->width == SewerPresent::Extent.width && frame->height == SewerPresent::Extent.height &&
+                workflow_present.Armed() && !frame->is_hdr && !frame->hdr_native && !gen_job &&
+                !frame_gen->Enabled() && !FrameGenerator::DlssWanted() && !fsr_settings.enable &&
+                pp_settings.gamma == 1.0f && pp_settings.hdr == 0 && pp_settings.srgb_input == 0;
+            if (match) {
+                frame->sewer_prepared_generation = ++sewer_next_frame_generation;
+                frame->sewer_prepared = std::make_shared<SewerPresent::Capture>(std::move(*proof));
+                frame->sewer_prepared->source.swap_generation = sewer_swap_generation.load(std::memory_order_acquire);
+            } else {
+                SewerPresent::Finish(*proof, false, "ordinary-prepared-frame-scope");
+            }
+        }
+    }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (BottleCaustic::CutSource::Run()) {
+        using namespace BottleCutPresent;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        if (auto proof = std::move(bottle_candidate)) {
+#else
+        const u32 draw_frame = BbStats::frame_number.load(std::memory_order_relaxed);
+        if (auto proof = Take(draw_frame)) {
+#endif
+            const Override actual{cpu_address, display.image, display.format, image_size,
+                                  draw_scheduler.GetWorkSemaphore()->Handle(), draw_scheduler.CurrentTick()};
+            const bool display_view = SewerDisplayFormat(display.format, view_info.format)
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+                || (proof->raw && bottle_mutable_view)
+#endif
+                ;
+            const bool ordinary = upscaled && !BbEngine::Loading::ScreenUp() &&
+                proof->scene.key.load == BbEngine::Loading::Generation() &&
+                Compatible(proof->display, actual) && display_view &&
+                image_view && frame->image && frame->image_view && frame->present_done &&
+                frame->image != display.image && frame->bottle_final_format == Format &&
+                frame->width == Extent.width && frame->height == Extent.height &&
+                !frame->is_hdr && !frame->hdr_native && !gen_job && !frame->motion && !frame->sewer_prepared &&
+                !frame_gen->Enabled() && !FrameGenerator::DlssWanted() && !fsr_settings.enable &&
+                pp_settings.gamma == 1.0f && pp_settings.hdr == 0 && pp_settings.srgb_input == 0;
+            if (!ordinary) {
+                Complete(*proof, "ordinary-prepared-display-scope");
+            } else if (!proof->consume_epoch(proof->scene, actual, proof->display_generation, proof->display_write)) {
+                Complete(*proof, "prepared-display-epoch-replaced");
+            } else {
+                proof->consume_epoch = {};
+                frame->bottle_incarnation = ++bottle_next_incarnation;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+                if (bottle_resources) {
+                    bottle_resources->facts.input = {display.image, image_view, proof->resource->display_allocation,
+                        proof->display_generation, proof->display_write, view_info.format, image_size};
+                    bottle_resources->facts.epoch = true;
+                }
+#endif
+                frame->bottle_prepared = std::make_shared<Capture>(std::move(*proof));
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+                frame->bottle_prepared->resources = std::move(bottle_resources);
+#endif
+                frame->bottle_prepared->source.swap_generation =
+                    bottle_swap_generation.load(std::memory_order_acquire);
+            }
+        }
+    }
+#endif
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    auto prepared_resources = frame->sewer_prepared ? frame->sewer_prepared->resources : nullptr;
+    auto target = prepared_resources
+        ? PostPresentResources::PreparedResource(*frame, frame->sewer_prepared_generation, frame->sewer_final_format)
+        : PostPresentResources::ResourceImage{};
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (frame->bottle_prepared && frame->bottle_prepared->resources) {
+        prepared_resources = frame->bottle_prepared->resources;
+        target = PostPresentResources::PreparedResource(*frame, frame->bottle_incarnation, frame->bottle_final_format);
+    }
+#endif
+    auto record_postprocess = [this, frame, image_view, image_size, frame_subresources, stream,
+                               prepared_resources, target,
+#else
     draw_scheduler.Record([this, frame, image_view, image_size, frame_subresources, stream,
-                           fsr_crumb, pp_crumb, fsr = fsr_settings,
-                           pp = pp_settings](vk::CommandBuffer cmdbuf) {
+#endif
+                           fsr_crumb, pp_crumb, fsr = fsr_settings, pp = pp_settings,
+                           sewer = frame->sewer_prepared, sewer_image = frame->image,
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+                           bottle = frame->bottle_prepared,
+#endif
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+                           sewer_view = frame->image_view, sewer_input_format = view_info.format](
+                               vk::CommandBuffer cmdbuf, NativeWriteSuffix::Encoder* encoder) {
+#else
+                           sewer_view = frame->image_view, sewer_input_format = view_info.format](vk::CommandBuffer cmdbuf) {
+#endif
         // Frames of different submissions may be recorded on two threads at once.
         std::scoped_lock lock{passes_mutex};
         const auto pre_barrier = vk::ImageMemoryBarrier2{
@@ -1102,10 +2369,60 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, false);
         }
         pp_pass.Render(cmdbuf, input, image_size, *frame, pp);
+        if (sewer && input && input == image_view && frame->image == sewer_image &&
+            frame->image_view == sewer_view) {
+            sewer->pp_input = input;
+            sewer->pp_input_format = sewer_input_format;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+            if (sewer->resources && target == PostPresentResources::PreparedResource(
+                    *frame, frame->sewer_prepared_generation, frame->sewer_final_format)) {
+                auto& facts = prepared_resources->facts;
+                facts.target = target;
+                facts.target_attachment = pre_barrier;
+                facts.postprocess_cmd = cmdbuf;
+                facts.postprocess = true;
+                if (encoder) encoder->NotePost(prepared_resources->tokens.postprocess);
+            }
+#endif
+            sewer->pp_encoded.store(true, std::memory_order_release);
+        }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle && input && input == image_view && image_size == BottleCutPresent::Extent &&
+            frame->image == sewer_image && frame->image_view == sewer_view) {
+            bottle->pp_view = input;
+            bottle->pp_format = sewer_input_format;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+            if (bottle->resources && target == PostPresentResources::PreparedResource(
+                    *frame, frame->bottle_incarnation, frame->bottle_final_format)) {
+                auto& facts = prepared_resources->facts;
+                facts.target = target;
+                facts.target_attachment = pre_barrier;
+                facts.postprocess_cmd = cmdbuf;
+                facts.postprocess = true;
+                if (encoder) encoder->NotePost(prepared_resources->tokens.postprocess);
+            }
+#endif
+            bottle->pp_encoded.store(true, std::memory_order_release);
+        }
+#endif
         if (pp_crumb) {
             Breadcrumbs::Mark(cmdbuf, stream, pp_crumb, true);
         }
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    };
+    if (prepared_resources && prepared_resources->ValidTokens()) {
+        draw_scheduler.RecordPostNative(prepared_resources->tokens.postprocess,
+            [record = std::move(record_postprocess)](vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) {
+                record(cmd, &encoder);
+            });
+    } else {
+        draw_scheduler.Record([record = std::move(record_postprocess)](vk::CommandBuffer cmd) {
+            record(cmd, nullptr);
+        });
+    }
+#else
     });
+#endif
     if (profiler && (dlss_hudless || gen_job)) {
         profiler->Mark(0xF6E0'0004ull, [] {
             return std::string{"presenter: frame generation (DLSS-G slot copies and HUD-less "
@@ -1178,13 +2495,57 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     BbStats::frame_number.fetch_add(1, std::memory_order_relaxed); // bbport: game frames shown
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
+    if (frame->sewer_prepared) {
+        auto& sample = *frame->sewer_prepared;
+        sample.source = SewerPreparedSource(*frame, sample.source.swap_generation);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (sample.source.ready != sample.CapturedDisplay().draw_timeline ||
+            sample.source.ready_tick < sample.CapturedDisplay().draw_tick) {
+#else
+        if (sample.source.ready != sample.proof.display.draw_timeline ||
+            sample.source.ready_tick < sample.proof.display.draw_tick) {
+#endif
+            sample.refusal = "prepared-render-wait-epoch";
+            frame->sewer_prepared.reset();
+        }
+    }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (frame->bottle_prepared) {
+        auto& sample = *frame->bottle_prepared;
+        sample.source = BottlePreparedSource(*frame, sample.source.swap_generation);
+        if (!sample.source.Valid() || sample.source.ready != sample.proof.display.draw_timeline ||
+            sample.source.ready_tick < sample.proof.display.draw_tick) {
+            sample.Fail("prepared-render-wait-incarnation");
+            frame->bottle_prepared.reset();
+        }
+    }
+#endif
     if (generated) {
+        if (workflow_present.Armed()) {
+            generated->workflow_display_override = frame->workflow_display_override;
+            generated->workflow_input_width = frame->workflow_input_width;
+            generated->workflow_input_height = frame->workflow_input_height;
+        }
         generated->ready_semaphore = frame->ready_semaphore;
         generated->ready_tick = frame->ready_tick;
         generated->hdr_native = false;
         frame->generated = generated;
     }
     SubmitInfo info{};
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    if (prepared_resources && (frame->sewer_prepared
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+                               || frame->bottle_prepared
+#endif
+                               )) {
+        info.post_present_key = prepared_resources->key;
+        info.observe_post_present_submit =
+            [prepared_resources, owner = &draw_scheduler, tick = frame->ready_tick](
+                const PostPresentSubmitObservation& actual) {
+                prepared_resources->ObservePrepare(actual, *owner, tick);
+            };
+    }
+#endif
     draw_scheduler.Flush(info);
     BbTimeline::Note(BbTimeline::PipeTask, 5, frame->ready_tick);
     dlss_fg->OnFrameSubmitted(); // bbport: Reflex: this frame's render submit ended
@@ -1215,6 +2576,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     // Request a free presentation frame.
     Frame* frame = GetRenderFrame();
+    frame->sewer_prepared.reset();
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (frame->bottle_prepared) frame->bottle_prepared->Fail("prepared-frame-replaced-by-blank");
+    frame->bottle_prepared.reset();
+#endif
+    frame->motion={};
+    frame->motion_swap_epoch=0;
+    if (workflow_present.Armed()) {
+        frame->workflow_display_override = false;
+        frame->workflow_input_width = 0;
+        frame->workflow_input_height = 0;
+    }
     frame->hdr_native = false; // bbport: no game frame, no gain map
 
     auto& scheduler = present_thread ? present_scheduler : draw_scheduler;
@@ -1320,7 +2693,91 @@ bool Presenter::PresentGenerated(Frame* frame, Frame* generated) {
     return shown;
 }
 
+bool Presenter::MotionMarker(vk::CommandBuffer cb,vk::Image target,const BottleMotion::Mark& mark) {
+    using namespace BottleMotion;
+    if (!motion_buffer) {
+        const VkBufferCreateInfo ci{.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,.size=512,
+            .usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+        const VmaAllocationCreateInfo ai{.flags=VMA_ALLOCATION_CREATE_MAPPED_BIT|VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+            .usage=VMA_MEMORY_USAGE_AUTO_PREFER_HOST};
+        VmaAllocationInfo map{};
+        if (vmaCreateBuffer(instance.GetAllocator(),&ci,&ai,&motion_buffer,&motion_allocation,&map)!=VK_SUCCESS) {
+            motion_buffer=VK_NULL_HANDLE;
+            return false;
+        }
+        std::array<u32,128> words{};
+        std::fill_n(words.begin(),64,0xff202020u);
+        std::fill_n(words.begin()+64,64,0xffe0e0e0u);
+        if (!map.pMappedData) {
+            vmaDestroyBuffer(instance.GetAllocator(),motion_buffer,motion_allocation);
+            motion_buffer=VK_NULL_HANDLE;
+            return false;
+        }
+        std::memcpy(map.pMappedData,words.data(),sizeof(words));
+        if (vmaFlushAllocation(instance.GetAllocator(),motion_allocation,0,sizeof(words))!=VK_SUCCESS) {
+            vmaDestroyBuffer(instance.GetAllocator(),motion_buffer,motion_allocation);
+            motion_buffer=VK_NULL_HANDLE;
+            return false;
+        }
+    }
+    const vk::ImageMemoryBarrier2 barrier{
+        .srcStageMask=vk::PipelineStageFlagBits2::eAllTransfer,.srcAccessMask=vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask=vk::PipelineStageFlagBits2::eAllTransfer,.dstAccessMask=vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout=vk::ImageLayout::eTransferDstOptimal,.newLayout=vk::ImageLayout::eTransferDstOptimal,
+        .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,
+        .image=target,.subresourceRange={vk::ImageAspectFlagBits::eColor,0,1,0,1},
+    };
+    cb.pipelineBarrier2({.imageMemoryBarrierCount=1,.pImageMemoryBarriers=&barrier});
+    const u64 bits=Tile(mark.run,mark.id);
+    std::array<vk::BufferImageCopy,64> regions{};
+    for (u32 i=0;i<regions.size();++i) {
+        regions[i]={.bufferOffset=((bits>>(63-i))&1u)*256,
+                   .imageSubresource={vk::ImageAspectFlagBits::eColor,0,0,1},
+                   .imageOffset={TileX+s32(i%8)*Cell,TileY+s32(i/8)*Cell,0},
+                   .imageExtent={u32(Cell),u32(Cell),1}};
+    }
+    cb.copyBufferToImage(motion_buffer,target,vk::ImageLayout::eTransferDstOptimal,regions);
+    return true;
+}
+
+void Presenter::ReportMotionAttempts() {
+    using BottleMotion::P;
+    for (u32 i=0;i<motion_attempts_count;++i) {
+        const auto& a=motion_attempts[i];
+        const auto& m=a.mark;
+        std::printf("[bottle-motion-t198] event=present run=%u id=%u arm=%u scene=%llu ready_tick=%llu "
+                    "draw_tick=%llu submit_ns=%llu result_ns=%llu success=%u address=%llx write=%llu "
+                    "display_image=%llx swap=%llx swap_image=%llx swap_epoch=%llu swap_index=%u\n",
+                    u32(m.run),u32(m.id),m.arm,P(m.scene),P(a.ready_tick),P(m.draw_tick),P(a.submit_ns),
+                    P(a.result_ns),u32(a.success),P(m.address),P(m.write),
+                    P(std::bit_cast<u64>(VkImage(m.image))),P(std::bit_cast<u64>(VkSwapchainKHR(a.swap))),
+                    P(std::bit_cast<u64>(VkImage(a.swap_image))),P(a.swap_epoch),a.swap_index);
+    }
+    motion_attempts_count=0;
+}
+
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    const auto motion=std::exchange(frame->motion,{});
+    auto sewer = std::exchange(frame->sewer_prepared, {});
+    bool sewer_copy_recorded = false;
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    auto bottle = std::exchange(frame->bottle_prepared, {});
+    bool bottle_copy_recorded = false;
+#endif
+    vk::SwapchainKHR marker_swap{};
+    vk::Image marker_image{};
+    u32 marker_index{};
+    if (workflow_present.Armed()) {
+        static BbLiveKnobs::Knob<bool> finalize{"BB_WORKFLOW_PRESENT_FINALIZE", [](const char* value) {
+            return value && std::strcmp(value, "1") == 0;
+        }};
+        if (finalize.Get()) {
+            std::scoped_lock lock{Scheduler::submit_mutex};
+            workflow_present.Finalize();
+            ReportMotionAttempts();
+        }
+    }
     static FILE* const present_log = []() -> FILE* {
         const char* path = std::getenv("BB_PRESENT_LOG");
         if (!path || !*path) return nullptr;
@@ -1342,6 +2799,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             window.GetWidth() != 0 && window.GetHeight() != 0) {
             dlss_fg->BeforeSwapchainChange();
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
+            if (SewerMotion::Enabled()) sewer_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+            if (BottleCaustic::CutSource::Run()) bottle_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
+        if (BottleMotion::Run()) motion_swap_epoch.fetch_add(1,std::memory_order_relaxed);
             std::printf("Frame generation: swapchain of %u images\n", swapchain.GetImageCount());
         }
         if (Frame* generated = std::exchange(frame->generated, nullptr)) {
@@ -1367,6 +2829,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // bbport: nothing to present to while the window is minimised (a 0x0 surface, issue #31).
     if (window.GetWidth() == 0 || window.GetHeight() == 0) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (sewer) sewer->FailCandidate("provisional-present-minimized");
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle) bottle->Fail("minimized-before-present");
+#endif
         free_frame();
         return;
     }
@@ -1375,7 +2843,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         !swapchain.IsPresentable()) {
         dlss_fg->BeforeSwapchainChange();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (SewerMotion::Enabled()) sewer_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (BottleCaustic::CutSource::Run()) bottle_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
+        if (BottleMotion::Run()) motion_swap_epoch.fetch_add(1,std::memory_order_relaxed);
         if (!swapchain.IsPresentable()) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            if (sewer) sewer->FailCandidate("provisional-swapchain-unavailable");
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+            if (bottle) bottle->Fail("swapchain-unavailable-before-present");
+#endif
             free_frame();
             return;
         }
@@ -1385,9 +2864,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (!swapchain.AcquireNextImage()) {
         dlss_fg->BeforeSwapchainChange();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (SewerMotion::Enabled()) sewer_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (BottleCaustic::CutSource::Run()) bottle_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
+        if (BottleMotion::Run()) motion_swap_epoch.fetch_add(1,std::memory_order_relaxed);
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            if (sewer) sewer->FailCandidate("provisional-swap-image-not-acquired");
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+            if (bottle) bottle->Fail("acquire-failed-dropped-frame");
+#endif
             free_frame();
             return;
         }
@@ -1429,6 +2919,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             : BbSettings::HdrOutputHdr10,
         std::memory_order_relaxed);
     if (hdr_output) {
+        if (sewer) sewer->refusal = "actual-hdr-presentation";
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle) bottle->refusal = "actual-hdr-presentation";
+#endif
         const vk::Extent2D extent = swapchain.GetExtent();
         SetExpectedGameSize(s32(extent.width), s32(extent.height));
         PresentHdr(cmdbuf, frame, extent, real_game_frame && frame->dlss.inputs);
@@ -1464,9 +2958,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 .subresourceRange = color_range,
             },
         };
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        constexpr auto before_blit = vk::PipelineStageFlagBits::eAllCommands;
+        constexpr auto during_blit = vk::PipelineStageFlagBits::eTransfer;
+        cmdbuf.pipelineBarrier(before_blit, during_blit, vk::DependencyFlagBits::eByRegion,
+                               {}, {}, pre_barriers);
+#else
         cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
                                vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
                                {}, {}, pre_barriers);
+#endif
         // bbport: the black bars are only needed where the fitted blit leaves part of the image
         // uncovered; a frame of the swapchain's aspect (the usual case: the game renders at the
         // window size) overwrites every pixel, and the full-screen clear plus its barrier were
@@ -1491,12 +2992,145 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                    vk::PipelineStageFlagBits::eTransfer,
                                    vk::DependencyFlagBits::eByRegion, clear_done, {}, {});
         }
+        const bool sewer_overlay = sewer && BbOverlay::Visible();
+        if (sewer) {
+            using namespace SewerPresent;
+            const Gate gate{
+                .real = real_game_frame,
+                .blank = !is_game_frame,
+                .reused = is_reusing_frame,
+                .generated = generated_made || frame->generated || hdr_gain_source ||
+                             frame_gen->Enabled() || FrameGenerator::DlssWanted(),
+                .hdr = hdr_output || frame->is_hdr,
+                .overlays = sewer_overlay || bool(motion),
+                .secondary = fsr_settings.enable || always_clear,
+                .full_cover = covers,
+                .output = extent,
+                .surface = swapchain.GetSurfaceFormat(),
+            };
+            const auto current = SewerPreparedSource(*frame, sewer_swap_generation.load(std::memory_order_acquire));
+            if (!workflow_present.Armed() || !Ordinary(gate) || !SameSource(sewer->source, current) ||
+                sewer->source.ready != draw_scheduler.GetWorkSemaphore()->Handle() ||
+                !swapchain_image || swapchain_image == current.image || frame->sewer_present_readback) {
+                sewer->refusal = "ordinary-1to1-sdr-present-source";
+            } else if (instance.GetGraphicsQueueFamilyIndex() != instance.GetPresentQueueFamilyIndex()) {
+                sewer->refusal = "unproved-present-queue-family";
+            } else {
+                const auto swap = swapchain.GetHandle();
+                const auto [status, images] = instance.GetDevice().getSwapchainImagesKHR(swap);
+                const auto it = std::ranges::find(images, swapchain_image);
+                if (status != vk::Result::eSuccess || it == images.end() ||
+                    std::ranges::count(images, swapchain_image) != 1) {
+                    sewer->refusal = "actual-acquired-swap-image";
+                } else if (!sewer->Allocate(instance.GetAllocator())) {
+                    sewer->refusal = "present-staging-allocation";
+                } else {
+                    sewer->swap = swap;
+                    sewer->swap_image = swapchain_image;
+                    sewer->swap_index = u32(it - images.begin());
+                    sewer->present_timeline = scheduler.GetWorkSemaphore()->Handle();
+                    sewer->present_tick = scheduler.CurrentTick();
+                    sewer->swap_ready = swapchain.GetPresentReadySemaphore();
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                    if (sewer->candidate) sewer->acquire = swapchain.GetImageAcquiredSemaphore();
+#endif
+                    sewer->Copy(cmdbuf);
+                    sewer_copy_recorded = true;
+                }
+            }
+        }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle) {
+            using namespace BottleCutPresent;
+            const Gate gate{
+                .real = real_game_frame,
+                .blank = !is_game_frame,
+                .reused = is_reusing_frame,
+                .generated = generated_made || frame->generated || hdr_gain_source ||
+                             frame_gen->Enabled() || FrameGenerator::DlssWanted(),
+                .hdr = hdr_output || frame->is_hdr,
+                .overlay = BbOverlay::Visible() || bool(motion) || bool(sewer),
+                .secondary = fsr_settings.enable || always_clear,
+                .full_cover = covers,
+                .output = extent,
+                .surface = swapchain.GetSurfaceFormat(),
+            };
+            const auto current = BottlePreparedSource(*frame, bottle_swap_generation.load(std::memory_order_acquire));
+            if (!gate.Ordinary() || !current.Valid() || bottle->source != current ||
+                current.ready != draw_scheduler.GetWorkSemaphore()->Handle() ||
+                !swapchain_image || swapchain_image == current.image || frame->bottle_present_readback) {
+                bottle->refusal = "ordinary-prepared-1to1-sdr-present";
+            } else if (instance.GetGraphicsQueueFamilyIndex() != instance.GetPresentQueueFamilyIndex()) {
+                bottle->refusal = "unproved-present-queue-family";
+            } else {
+                const auto swap = swapchain.GetHandle();
+                const auto [status, images] = instance.GetDevice().getSwapchainImagesKHR(swap);
+                const auto it = std::ranges::find(images, swapchain_image);
+                if (status != vk::Result::eSuccess || it == images.end() ||
+                    std::ranges::count(images, swapchain_image) != 1) {
+                    bottle->refusal = "unproved-actual-acquired-image";
+                } else if (!bottle->Allocate(instance.GetAllocator())) {
+                    bottle->refusal = "present-staging-allocation";
+                } else {
+                    bottle->attempt = {.swap = swap, .swap_image = swapchain_image,
+                                       .acquire = swapchain.GetImageAcquiredSemaphore(),
+                                       .ready = swapchain.GetPresentReadySemaphore(),
+                                       .timeline = scheduler.GetWorkSemaphore()->Handle(),
+                                       .tick = scheduler.CurrentTick(), .image_index = u32(it - images.begin())};
+                    bottle->Copy(cmdbuf);
+                    bottle_copy_recorded = true;
+                }
+            }
+        }
+#endif
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        const auto blit_region = MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height);
+        cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
+                         vk::ImageLayout::eTransferDstOptimal, blit_region, vk::Filter::eLinear);
+        if (sewer_copy_recorded && sewer->resources)
+            PostPresentResources::NotePreparedTransfer(*sewer->resources, cmdbuf, swapchain_image,
+                                                       blit_region, pre_barriers[1], before_blit, during_blit);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle_copy_recorded && bottle->resources)
+            PostPresentResources::NotePreparedTransfer(*bottle->resources, cmdbuf, swapchain_image,
+                                                       blit_region, pre_barriers[1], before_blit, during_blit);
+#endif
+#else
         cmdbuf.blitImage(frame->image, vk::ImageLayout::eTransferSrcOptimal, swapchain_image,
                          vk::ImageLayout::eTransferDstOptimal,
                          MakeImageBlitFit(frame->width, frame->height, extent.width, extent.height),
                          vk::Filter::eLinear);
+#endif
         // bbport: the settings menu / FPS counter over the frame, at display resolution.
         const bool overlay = BbOverlay::Visible();
+        if (sewer_copy_recorded && overlay) sewer->refusal = "overlay-appeared-after-sample";
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle_copy_recorded && overlay) bottle->refusal = "overlay-appeared-after-sample";
+#endif
+        if (motion) {
+            const auto surface=swapchain.GetSurfaceFormat();
+            if (workflow_present.Armed() && real_game_frame && !generated_made && !frame->generated &&
+                motion.timeline==frame->ready_semaphore && motion.draw_tick<=frame->ready_tick &&
+                frame->motion_swap_epoch==motion_swap_epoch.load(std::memory_order_relaxed) &&
+                !overlay && !frame->is_hdr && !fsr_settings.enable &&
+                !frame_gen->Enabled() && !FrameGenerator::DlssWanted() &&
+                covers && extent==vk::Extent2D{3840,2160} && frame->width==3840 && frame->height==2160 &&
+                surface.format==vk::Format::eB8G8R8A8Unorm &&
+                surface.colorSpace==vk::ColorSpaceKHR::eSrgbNonlinear &&
+                motion_attempts_count<motion_attempts.size() && swapchain_image) {
+                const auto [status,images]=instance.GetDevice().getSwapchainImagesKHR(swapchain.GetHandle());
+                const auto it=std::ranges::find(images,swapchain_image);
+                if (status==vk::Result::eSuccess && it!=images.end() &&
+                    MotionMarker(cmdbuf,swapchain_image,motion)) {
+                    marker_swap=swapchain.GetHandle();
+                    marker_image=swapchain_image;
+                    marker_index=u32(it-images.begin());
+                }
+            }
+            if (!marker_image) {
+                std::printf("[bottle-motion-t198] event=refused id=%u why=present-sdr-marker-gate\n",u32(motion.id));
+            }
+        }
         const std::array post_barriers{
             vk::ImageMemoryBarrier{
                 .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
@@ -1575,8 +3209,43 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
-    info.AddSignal(swapchain.GetPresentReadySemaphore());
+    const auto swap_ready = swapchain.GetPresentReadySemaphore();
+    if (sewer_copy_recorded && sewer->swap_ready != swap_ready)
+        sewer->refusal = "present-ready-semaphore-replaced";
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (sewer_copy_recorded && sewer->candidate &&
+        (sewer->acquire != swapchain.GetImageAcquiredSemaphore() || sewer->slot != frame->id ||
+         sewer->source.fence != frame->present_done || sewer->source.ready != frame->ready_semaphore ||
+         sewer->source.ready_tick != frame->ready_tick || sewer->present_tick != scheduler.CurrentTick())) {
+        sewer->refusal = "provisional-actual-submit-sync-replaced";
+    }
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (bottle_copy_recorded && (bottle->attempt.ready != swap_ready ||
+        bottle->attempt.acquire != swapchain.GetImageAcquiredSemaphore() ||
+        bottle->source.ready_tick != frame->ready_tick || bottle->source.ready != frame->ready_semaphore ||
+        bottle->source.fence != frame->present_done || bottle->attempt.tick != scheduler.CurrentTick())) {
+        bottle->refusal = "actual-submit-sync-replaced";
+    }
+#endif
+    info.AddSignal(swap_ready);
     info.AddSignal(frame->present_done);
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    const auto observe = [&](const std::shared_ptr<PostPresentResources::ResourceCapture>& resources, u64 tick) {
+        info.post_present_key = resources->key;
+        info.observe_post_present_submit =
+            [resources, owner = &scheduler, tick](
+                const PostPresentSubmitObservation& actual) {
+                resources->ObservePresent(actual, *owner, tick);
+            };
+    };
+    if (sewer_copy_recorded && !sewer->refusal && sewer->resources)
+        observe(sewer->resources, sewer->present_tick);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (bottle_copy_recorded && !bottle->refusal && bottle->resources)
+        observe(bottle->resources, bottle->attempt.tick);
+#endif
+#endif
     scheduler.Flush(info);
     const auto submit_end = present_log ? FrameGenerator::Clock::now() : present_start;
 
@@ -1590,8 +3259,93 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     bool presented;
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        presented = swapchain.Present();
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        const bool bottle_same_swap = bottle_copy_recorded &&
+            bottle->source.swap_generation == bottle_swap_generation.load(std::memory_order_acquire) &&
+            bottle->attempt.swap == swapchain.GetHandle() && bottle->attempt.swap_image == swapchain.Image() &&
+            bottle->attempt.ready == swapchain.GetPresentReadySemaphore();
+        const auto note_bottle_attempt = [&](u64 start, u64 end) {
+            if (BottleCaustic::CutSource::Run()) ++bottle_present_serial;
+            if (bottle) {
+                bottle->attempt.serial = bottle_present_serial;
+                bottle->attempt.submit_ns = start;
+                bottle->attempt.result_ns = end;
+                bottle->attempt.success = presented && bottle_same_swap && bottle->attempt.swap == swapchain.GetHandle();
+            }
+        };
+#endif
+        if (workflow_present.Armed()) {
+            const auto output = swapchain.GetExtent();
+            const auto surface = swapchain.GetSurfaceFormat();
+            const auto mode = swapchain.GetPresentMode();
+            const char* role = hdr_gain_source ? "internal-generated"
+                             : real_game_frame ? "real"
+                             : is_reusing_frame ? "reuse" : "blank";
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            const bool current_candidate_swap = sewer_copy_recorded && sewer->candidate &&
+                sewer->swap == swapchain.GetHandle() && sewer->swap_image == swapchain.Image() &&
+                sewer->swap_ready == swapchain.GetPresentReadySemaphore() &&
+                sewer->source.swap_generation == sewer_swap_generation.load(std::memory_order_acquire);
+#endif
+            const auto submit_ns = WorkflowPresent::Now();
+            presented = swapchain.Present();
+            const auto result_ns = WorkflowPresent::Now();
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+            note_bottle_attempt(submit_ns, result_ns);
+#endif
+            if (SewerMotion::Enabled()) ++sewer_present_serial;
+            if (sewer_copy_recorded) {
+                sewer->serial = sewer_present_serial;
+                sewer->submit_ns = submit_ns;
+                sewer->result_ns = result_ns;
+                sewer->presented = presented && sewer->swap == swapchain.GetHandle();
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                if (sewer->candidate) {
+                    sewer->presented &= current_candidate_swap;
+                    if (!sewer->refusal && !sewer->presented) {
+                        sewer->refusal = presented ? "provisional-present-swap-replaced"
+                                                    : "provisional-app-present-failed";
+                    }
+                }
+#endif
+            }
+            if (marker_image) {
+                motion_attempts[motion_attempts_count++]={motion,frame->ready_tick,submit_ns,result_ns,
+                    frame->motion_swap_epoch,marker_swap,marker_image,marker_index,presented};
+            }
+            workflow_present.Record({frame->ready_tick, submit_ns, result_ns, presented, role,
+                output.width, output.height, u32(surface.format), u32(surface.colorSpace), u32(mode),
+                hdr_output, frame->workflow_input_width, frame->workflow_input_height,
+                frame->workflow_display_override, fsr_settings.enable, frame_gen->Enabled(),
+                FrameGenerator::DlssWanted(), BbSettings::Get().upscaler.load(std::memory_order_relaxed)});
+        } else {
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+            const auto bottle_start = bottle ? WorkflowPresent::Now() : 0;
+#endif
+            presented = swapchain.Present();
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+            note_bottle_attempt(bottle_start, bottle ? WorkflowPresent::Now() : 0);
+#endif
+            if (SewerMotion::Enabled()) ++sewer_present_serial;
+        }
     }
+    if (sewer_copy_recorded) frame->sewer_present_readback = std::move(sewer);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    else if (sewer && sewer->candidate) {
+        sewer->FailCandidate(is_reusing_frame ? "provisional-frame-reused" :
+                             sewer->refusal ? sewer->refusal : "provisional-frame-not-encoded");
+    }
+#endif
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (bottle_copy_recorded) {
+        if (!bottle->refusal && !bottle->attempt.success) {
+            bottle->refusal = presented ? "actual-present-swap-replaced" : "ordinary-present-failed";
+        }
+        frame->bottle_present_readback = std::move(bottle);
+    } else if (bottle) {
+        bottle->Fail(bottle->refusal ? bottle->refusal : "no-prepared-sdr-copy");
+    }
+#endif
     dlss_fg->AfterPresent(dlss_info);
     if (present_log) {
         const auto now = FrameGenerator::Clock::now();
@@ -1615,6 +3369,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     if (!presented) {
         dlss_fg->BeforeSwapchainChange();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        if (SewerMotion::Enabled()) sewer_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (BottleCaustic::CutSource::Run()) bottle_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
+        if (BottleMotion::Run()) motion_swap_epoch.fetch_add(1,std::memory_order_relaxed);
     }
 
     free_frame();
@@ -1692,6 +3451,12 @@ Frame* Presenter::GetRenderFrame() {
             continue;
         }
     }
+    if (frame->sewer_present_readback)
+        RetireSewerPresent(*frame, sewer_swap_generation.load(std::memory_order_acquire));
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    if (frame->bottle_present_readback)
+        RetireBottleCutPresent(*frame, bottle_swap_generation.load(std::memory_order_acquire));
+#endif
     NoteFrameWaits(got_frame - wait_start, std::chrono::steady_clock::now() - got_frame); // bbport
 
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
@@ -1718,3 +3483,25 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
 }
 
 } // namespace Vulkan
+
+
+// Keep Windows macros out of renderer and Vulkan headers above.
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+unsigned long long Vulkan::WorkflowPresent::Now() {
+#ifdef _WIN32
+    static const auto frequency = [] {
+        LARGE_INTEGER value{};
+        return QueryPerformanceFrequency(&value) && value.QuadPart > 0 ? value.QuadPart : 0;
+    }();
+    LARGE_INTEGER now{};
+    if (!frequency || !QueryPerformanceCounter(&now) || now.QuadPart < 0) return 0;
+    return (now.QuadPart / frequency) * 1'000'000'000ull +
+           (now.QuadPart % frequency) * 1'000'000'000ull / frequency;
+#else
+    return static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}

@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
+#include <chrono>
+#include "video_core/renderer_vulkan/vk_workflow_capture_proof.h"
+#include <cmath>
 #include "shader_recompiler/native/froyok_composite.h"
 #include "shader_recompiler/native/tone_curve.h"
 #include <condition_variable>
@@ -13,6 +17,8 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <sstream>
@@ -30,10 +36,16 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/pipeline_compile_queue.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_reflection_fragment_discard.h"
+#include "video_core/renderer_vulkan/ivy_material_probe.h"
+#include "video_core/renderer_vulkan/ivy_sample_witness.h"
+#include "video_core/renderer_vulkan/ivy_sample_witness_data.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include <vk_mem_alloc.h>
 
 namespace Vulkan {
 
@@ -143,15 +155,271 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
+namespace IvySampleWitness {
+
+bool MatchesEffective(const IvyMaterialProbe::Module& active) {
+    return std::ranges::equal(active.effective, IvyMaterialProbe::Words(OriginalWords));
+}
+
+static bool NormalViewWanted() {
+    static const bool wanted = [] {
+        const char* value = std::getenv("BB_IVY_NORMAL_VIEW_WITNESS");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return wanted;
+}
+
+static std::shared_ptr<const Variant> CreateVariant(
+    const Instance& instance, const vk::GraphicsPipelineCreateInfo& original,
+    const std::array<vk::DescriptorSetLayout, 2>& original_sets,
+    const vk::PushConstantRange& pushes, const IvyMaterialProbe::Module& active,
+    const Shader::Info& fragment, const Shader::Info& vertex) {
+    if (!MatchesEffective(active)) return {};
+
+    const bool normal_view = NormalViewWanted();
+    const u32 record_words = normal_view ? NormalViewRecordWords : RecordWords;
+    const auto physical = instance.GetPhysicalDevice();
+    const auto limits = physical.getProperties().limits;
+    // Count all existing buffers as storage for a conservative limit check.
+    const auto fragment_buffers = fragment.buffers.size();
+    if (!physical.getFeatures().fragmentStoresAndAtomics || limits.maxBoundDescriptorSets < 3 ||
+        limits.maxStorageBufferRange < BufferByteCount(record_words) ||
+        limits.maxPerStageDescriptorStorageBuffers <= fragment_buffers ||
+        limits.maxDescriptorSetStorageBuffers <= fragment_buffers + vertex.buffers.size() ||
+        limits.maxPerStageResources <=
+            fragment_buffers + fragment.images.size() + fragment.samplers.size()) {
+        std::printf("Ivy sample (t133h): refused storage features or limits\n");
+        return {};
+    }
+    // One test pipeline attempt across warm/cold creation. It stays outside all pipeline caches.
+    static std::atomic<bool> attempted{};
+    if (attempted.exchange(true, std::memory_order_relaxed)) return {};
+
+    const auto refused = [&](const char* step, vk::Result result) -> std::shared_ptr<const Variant> {
+        std::printf("Ivy sample (t133h): prepare stage=%llx original_module=%llx "
+                    "step=%s vk_result=%d\n", IvyMaterialProbe::Print64(active.stage),
+                    IvyMaterialProbe::Print64(active.handle), step, int(result));
+        return {};
+    };
+    const auto device = instance.GetDevice();
+    auto variant = std::make_shared<Variant>();
+    variant->record_words = record_words;
+    std::array<vk::DescriptorSetLayout, 3> layouts{original_sets[0], original_sets[1], {}};
+    if (!layouts[1]) {
+        auto [result, empty] = device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{});
+        if (result != vk::Result::eSuccess) return refused("set-one", result);
+        variant->empty_set_one = std::move(empty);
+        layouts[1] = *variant->empty_set_one;
+    }
+    // The original set 0 may be a push layout. Set 2 always uses an allocated descriptor set.
+    const vk::DescriptorSetLayoutBinding binding{
+        .binding = Binding, .descriptorType = vk::DescriptorType::eStorageBuffer,
+        .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eFragment,
+    };
+    auto [set_result, set] = device.createDescriptorSetLayoutUnique(
+        {.bindingCount = 1, .pBindings = &binding});
+    if (set_result != vk::Result::eSuccess) return refused("set-two", set_result);
+    variant->sample_set = std::move(set);
+    layouts[DescriptorSet] = *variant->sample_set;
+    auto [layout_result, layout] = device.createPipelineLayoutUnique({
+        .setLayoutCount = u32(layouts.size()), .pSetLayouts = layouts.data(),
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pushes,
+    });
+    if (layout_result != vk::Result::eSuccess) return refused("pipeline-layout", layout_result);
+    variant->layout = std::move(layout);
+
+    const std::span<const u32> shader_words =
+        normal_view ? std::span<const u32>{NormalViewWords} : std::span<const u32>{SampleWords};
+    auto [shader_result, shader] = device.createShaderModuleUnique(
+        {.codeSize = shader_words.size_bytes(), .pCode = shader_words.data()});
+    if (shader_result != vk::Result::eSuccess) return refused("shader-module", shader_result);
+    std::array<vk::PipelineShaderStageCreateInfo, 2> stages{
+        original.pStages[0], original.pStages[1],
+    };
+    stages[1].module = *shader;
+    auto create = original;
+    create.pStages = stages.data();
+    create.layout = *variant->layout;
+    const auto started = std::chrono::steady_clock::now();
+    auto [pipeline_result, pipeline] = device.createGraphicsPipelineUnique({}, create);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    std::printf("Ivy sample (t133h): prepare stage=%llx original_module=%llx "
+                "effective=%016llx witness=%016llx vk_result=%d pipeline_us=%lld\n",
+                IvyMaterialProbe::Print64(active.stage), IvyMaterialProbe::Print64(active.handle),
+                IvyMaterialProbe::Print64(active.effective_hash),
+                IvyMaterialProbe::Print64(IvyMaterialProbe::Digest(IvyMaterialProbe::Words(shader_words))),
+                int(pipeline_result), static_cast<long long>(elapsed));
+    if (pipeline_result != vk::Result::eSuccess) return {};
+    variant->pipeline = std::move(pipeline);
+    return variant;
+}
+
+Sample::~Sample() {
+    pool.reset();
+    if (buffer) vmaDestroyBuffer(allocator, buffer, allocation);
+}
+
+std::unique_ptr<Sample> Prepare(const Instance& instance, std::shared_ptr<const Variant> variant) {
+    auto sample = std::make_unique<Sample>();
+    sample->variant = std::move(variant);
+    const size_t buffer_bytes = BufferByteCount(sample->variant->record_words);
+    sample->allocator = instance.GetAllocator();
+    const VkBufferCreateInfo buffer_info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = buffer_bytes, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+    };
+    const VmaAllocationCreateInfo memory{
+        .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO,
+    };
+    VmaAllocationInfo allocation_info{};
+    if (vmaCreateBuffer(sample->allocator, &buffer_info, &memory, &sample->buffer,
+                        &sample->allocation, &allocation_info) != VK_SUCCESS ||
+        !allocation_info.pMappedData) {
+        return {};
+    }
+    std::array<u32, BufferWordCount(NormalViewRecordWords)> seed{};
+    seed[0] = RoiCount;
+    for (u32 i = 0; i < RoiCount; ++i) {
+        seed[2 + 2*i] = u32(Coordinates[i].x);
+        seed[3 + 2*i] = u32(Coordinates[i].y);
+    }
+    std::memcpy(allocation_info.pMappedData, seed.data(), buffer_bytes);
+    // The write and flush precede queue submission, which publishes the mapped initialization.
+    if (vmaFlushAllocation(sample->allocator, sample->allocation, 0, buffer_bytes) != VK_SUCCESS) {
+        return {};
+    }
+    sample->mapped = static_cast<const u32*>(allocation_info.pMappedData);
+
+    const auto device = instance.GetDevice();
+    const vk::DescriptorPoolSize size{vk::DescriptorType::eStorageBuffer, 1};
+    auto [pool_result, pool] = device.createDescriptorPoolUnique(
+        {.maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &size});
+    if (pool_result != vk::Result::eSuccess) return {};
+    sample->pool = std::move(pool);
+    const vk::DescriptorSetLayout layout = *sample->variant->sample_set;
+    const vk::DescriptorSetAllocateInfo allocate{
+        .descriptorPool = *sample->pool, .descriptorSetCount = 1, .pSetLayouts = &layout,
+    };
+    if (device.allocateDescriptorSets(&allocate, &sample->descriptor) != vk::Result::eSuccess) {
+        return {};
+    }
+    const vk::DescriptorBufferInfo desc{vk::Buffer{sample->buffer}, 0, buffer_bytes};
+    const vk::WriteDescriptorSet write{
+        .dstSet = sample->descriptor, .dstBinding = Binding, .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &desc,
+    };
+    device.updateDescriptorSets(write, {});
+    return sample;
+}
+
+// The fragment writer increments the count before storing and marks every slot beyond eight.
+static std::optional<u32> ValidatedRecordCount(std::span<const u32> words, u32 record_words) {
+    static_assert(RoiCount == 16 && PerCoordinate == 8 &&
+                  RecordWords == 30 && NormalViewRecordWords == 36);
+    constexpr u32 overflow_mask = (1u << RoiCount) - 1;
+    if (words.size_bytes() != BufferByteCount(record_words) || words[0] != RoiCount ||
+        (words[1] & ~overflow_mask) != 0) {
+        return std::nullopt;
+    }
+
+    u32 records = 0;
+    for (u32 i = 0; i < RoiCount; ++i) {
+        const u32 x = words[2 + 2 * i];
+        const u32 y = words[3 + 2 * i];
+        const u32 count = words[CountBase + i];
+        const bool overflow = (words[1] & (1u << i)) != 0;
+        if (x >= Width || y >= Height || x != u32(Coordinates[i].x) || y != u32(Coordinates[i].y) ||
+            overflow != (count > PerCoordinate)) {
+            return std::nullopt;
+        }
+        const u32 stored = std::min(count, PerCoordinate);
+        const auto fields = words.subspan(RecordBase + i * PerCoordinate * record_words,
+                                          stored * record_words);
+        for (const u32 bits : fields) {
+            if (!std::isfinite(std::bit_cast<float>(bits))) {
+                return std::nullopt;
+            }
+        }
+        records += stored;
+    }
+    return records;
+}
+
+void Retire(Scheduler& scheduler, const RenderState& state, std::unique_ptr<Sample> sample,
+            const IvyMaterialProbe::Snapshot& draw, u64 stage, u64 module) {
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    const u32 record_words = sample->variant->record_words;
+    const size_t buffer_bytes = BufferByteCount(record_words);
+    const bool visible = scheduler.SuspendRenderingForReadback(state);
+    if (visible) {
+        // This barrier must be outside rendering. Preserve attachment visibility on STORE/LOAD.
+        scheduler.Record([buffer = vk::Buffer{sample->buffer}, buffer_bytes](vk::CommandBuffer cmd) {
+            constexpr auto attachment_stages = Stage::eColorAttachmentOutput |
+                Stage::eEarlyFragmentTests | Stage::eLateFragmentTests;
+            constexpr auto attachment_writes = Access::eColorAttachmentWrite |
+                Access::eDepthStencilAttachmentWrite;
+            const vk::MemoryBarrier2 attachment{
+                .srcStageMask = attachment_stages, .srcAccessMask = attachment_writes,
+                .dstStageMask = attachment_stages, .dstAccessMask = attachment_writes |
+                    Access::eColorAttachmentRead | Access::eDepthStencilAttachmentRead,
+            };
+            const vk::BufferMemoryBarrier2 read{
+                .srcStageMask = Stage::eFragmentShader, .srcAccessMask = Access::eShaderStorageWrite,
+                .dstStageMask = Stage::eHost, .dstAccessMask = Access::eHostRead,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .buffer = buffer, .offset = 0, .size = buffer_bytes,
+            };
+            cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &attachment,
+                                  .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &read});
+        });
+    }
+    const auto tick = scheduler.CurrentTick();
+    scheduler.DeferOperation([sample = std::move(sample), visible, record_words, buffer_bytes, serial = draw.serial,
+                              frame = draw.frame, ordinal = draw.ordinal, tick, stage, module] {
+        using namespace IvyMaterialProbe;
+        const auto [jitter_x, jitter_y] = sample->draw_jitter;
+        // Give every chunk the captured draw identity. The SSBO itself carries no phase tag.
+        char identity[256];
+        std::snprintf(identity, sizeof(identity),
+                      " serial=%llu frame=%u draw=%u stage=%llx original_module=%llx tick=%llu "
+                      "coords=native extent=%ux%u jitter=%.6f,%.6f jitter_bits=%08x,%08x ownership=unjoined",
+                      Print64(serial), frame, ordinal, Print64(stage), Print64(module), Print64(tick),
+                      Width, Height, double(jitter_x), double(jitter_y),
+                      std::bit_cast<u32>(jitter_x), std::bit_cast<u32>(jitter_y));
+        if (!visible || vmaInvalidateAllocation(sample->allocator, sample->allocation, 0,
+                                                buffer_bytes) != VK_SUCCESS) {
+            std::printf("Ivy sample (t133h):%s status=unavailable reason=%s\n", identity,
+                        visible ? "invalidate" : "visibility");
+            return;
+        }
+        const std::span<const u32> words{sample->mapped, BufferWordCount(record_words)};
+        const auto records = ValidatedRecordCount(words, record_words);
+        if (!records) {
+            std::printf("Ivy sample (t133h):%s status=unavailable reason=invalid-ssbo\n", identity);
+            return;
+        }
+        const char* status = words[1] ? "overflow" : (*records ? "delivered" : "empty");
+        const char* layout = record_words == NormalViewRecordWords ? " layout=t170-normal-view" : "";
+        std::printf("Ivy sample (t133h):%s records=%u overflow=%04x bytes=%zu status=%s pipeline=private%s\n",
+                    identity, *records, words[1], words.size_bytes(), status, layout);
+        PrintBlob("sample-ssbo", 0, Words(words), identity);
+    }, "t133h ivy sample", false);
+}
+} // namespace IvySampleWitness
+
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
+    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading,
+    WorkflowCapture::Route capture_proof_, const PipelineCache* module_owner)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
-      fetch_shader{std::move(fetch_shader_)} {
+      capture_proof{capture_proof_}, fetch_shader{std::move(fetch_shader_)} {
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
@@ -165,6 +433,7 @@ GraphicsPipeline::GraphicsPipeline(
     uses_froyok_bloom = std::ranges::any_of(stages, [](const Shader::Info* info) {
         return info && info->uses_froyok_bloom;
     });
+    ASSERT(!key.foliage_mask || (!uses_tone_curve && !uses_froyok_bloom));
     const vk::PushConstantRange push_constants = {
         .stageFlags = AllGraphicsStageBits,
         .offset = 0,
@@ -172,7 +441,8 @@ GraphicsPipeline::GraphicsPipeline(
                                            sizeof(Shader::Native::FroyokPush)
                                      : uses_tone_curve ? Shader::Native::ToneCurvePushOffset +
                                                              sizeof(Shader::Native::ToneCurvePush)
-                                                       : sizeof(Shader::PushData)),
+                                                       : key.foliage_mask ? Shader::FoliageMaskOutput::PushSize
+                                                                          : sizeof(Shader::PushData)),
     };
 
     std::array<vk::DescriptorSetLayout, 2> set_layouts{*desc_layout, {}};
@@ -356,6 +626,9 @@ GraphicsPipeline::GraphicsPipeline(
     }
     stage = u32(Shader::SwStage::Fragment);
     if (infos[stage]) {
+        if (infos[stage]->pgm_hash == IvyMaterialProbe::Fragment && IvyMaterialProbe::Wanted()) {
+            ivy_fragment_module = std::bit_cast<u64>(modules[stage]);
+        }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
@@ -375,6 +648,35 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    constexpr auto bottle_vs = u32(Shader::SwStage::Vertex), bottle_ps = u32(Shader::SwStage::Fragment);
+    constexpr auto bottle_tcs = u32(Shader::SwStage::TessellationControl);
+    constexpr auto bottle_tes = u32(Shader::SwStage::TessellationEval);
+    if (is_rect_list && module_owner && !key.foliage_mask && infos[bottle_vs] && infos[bottle_ps] &&
+        infos[bottle_vs]->pgm_hash == BottleDisplay182::Vertex &&
+        infos[bottle_ps]->pgm_hash == BottleDisplay182::Fragment &&
+        !infos[bottle_tcs] && !infos[bottle_tes] && shader_stages.size() == 4 &&
+        shader_stages[0].stage == vk::ShaderStageFlagBits::eVertex &&
+        shader_stages[1].stage == vk::ShaderStageFlagBits::eTessellationControl &&
+        shader_stages[2].stage == vk::ShaderStageFlagBits::eTessellationEvaluation &&
+        shader_stages[3].stage == vk::ShaderStageFlagBits::eFragment &&
+        module_owner->BottleDisplayEvidenceEnabled()) {
+        using namespace BottleDisplay182;
+        bottle_display_program = std::make_unique<const BottleDisplay182::Program>(BottleDisplay182::Program{{
+            module_owner->FindBottleDisplayModule(shader_stages[0].module, Vertex, key.stage_hashes[bottle_vs]),
+            Effective(shader_stages[1].module, 0, 0, sdata.tcs, preloading ? "warm-rect-tcs" : "cold-rect-tcs"),
+            Effective(shader_stages[2].module, 0, 0, sdata.tes, preloading ? "warm-rect-tes" : "cold-rect-tes"),
+            module_owner->FindBottleDisplayModule(shader_stages[3].module, Fragment, key.stage_hashes[bottle_ps]),
+        }});
+    }
+
+#endif
+
+    if (WorkflowCapture::Atomic(capture_proof) &&
+        (shader_stages.size() != 2 || shader_stages[0].stage != vk::ShaderStageFlagBits::eVertex ||
+         shader_stages[1].stage != vk::ShaderStageFlagBits::eFragment)) {
+        capture_proof = WorkflowCapture::Route::Scope;
+    }
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
         .requiredSubgroupSize = 64,
     };
@@ -382,11 +684,47 @@ GraphicsPipeline::GraphicsPipeline(
         stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
     }
 
+    constexpr u32 discard_vs = u32(Shader::SwStage::Vertex), discard_ps = u32(Shader::SwStage::Fragment);
+    const bool original_pair = module_owner && infos[discard_vs] && infos[discard_ps] &&
+        !key.foliage_mask && shader_stages.size() == 2 &&
+        shader_stages[0].stage == vk::ShaderStageFlagBits::eVertex &&
+        shader_stages[1].stage == vk::ShaderStageFlagBits::eFragment && modules[discard_vs] &&
+        shader_stages[0].module == modules[discard_vs] && shader_stages[1].module == modules[discard_ps];
+    if (original_pair) {
+        const auto* role = ReflectionDiscard::StockFragmentForStages(
+            key.stage_hashes[discard_vs], key.stage_hashes[discard_ps]);
+        if (role && infos[discard_vs]->pgm_hash == role->vertex_guest &&
+            infos[discard_ps]->pgm_hash == role->fragment_guest) {
+            stock_fragment_verdict = module_owner->ResolveStockFragment(*role, shader_stages[1].module);
+            if (stock_fragment_verdict != ReflectionDiscard::Verdict::Unknown) {
+                stock_fragment_role = role->role;
+                stock_fragment_owner = module_owner;
+            }
+        }
+    }
+    if (original_pair && ReflectionDiscard::On() &&
+        ReflectionDiscard::GuestRole(infos[discard_ps]->pgm_hash) < ReflectionDiscard::RoleCount) {
+        const auto module = ReflectionDiscard::Find(module_owner, infos[discard_ps]->pgm_hash,
+            key.stage_hashes[discard_ps], shader_stages[1].module);
+        if (module) {
+            reflection_discard = std::make_unique<const ReflectionDiscard::Pipeline>(
+                ReflectionDiscard::Pipeline{.fragment = *module, .vertex = shader_stages[0].module});
+        }
+    }
+
     const auto depth_format =
         instance.GetSupportedFormat(LiverpoolToVK::DepthFormat(key.z_format, key.stencil_format),
                                     vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
+    const u32 host_attachment_count = key.HostColorAttachmentCount();
+    const auto is_mask = [&](u32 i) {
+        return key.foliage_mask && i == Shader::FoliageMaskOutput::Location;
+    };
     std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats;
-    for (s32 i = 0; i < key.num_color_attachments; ++i) {
+    for (u32 i = 0; i < host_attachment_count; ++i) {
+        if (is_mask(i)) {
+            color_formats[i] = vk::Format::eR8Unorm;
+            continue;
+        }
         const auto& col_buf = key.color_buffers[i];
         const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format);
         const auto color_format =
@@ -406,7 +744,7 @@ GraphicsPipeline::GraphicsPipeline(
                            : vk::SampleCountFlagBits::e1;
     });
     const vk::AttachmentSampleCountInfoAMD mixed_samples = {
-        .colorAttachmentCount = key.num_color_attachments,
+        .colorAttachmentCount = host_attachment_count,
         .pColorAttachmentSamples = color_samples.data(),
         .depthStencilAttachmentSamples =
             LiverpoolToVK::NumSamples(key.depth_samples, instance.GetDepthSampleCounts()),
@@ -414,7 +752,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::PipelineRenderingCreateInfo pipeline_rendering_ci = {
         .pNext = instance.IsMixedDepthSamplesSupported() ? &mixed_samples : nullptr,
-        .colorAttachmentCount = key.num_color_attachments,
+        .colorAttachmentCount = host_attachment_count,
         .pColorAttachmentFormats = color_formats.data(),
         .depthAttachmentFormat = key.z_format != AmdGpu::DepthBuffer::ZFormat::Invalid
                                      ? depth_format
@@ -425,7 +763,11 @@ GraphicsPipeline::GraphicsPipeline(
     };
 
     std::array<vk::PipelineColorBlendAttachmentState, AmdGpu::NUM_COLOR_BUFFERS> attachments;
-    for (u32 i = 0; i < key.num_color_attachments; i++) {
+    for (u32 i = 0; i < host_attachment_count; i++) {
+        if (is_mask(i)) {
+            attachments[i] = {.colorWriteMask = key.HostWriteMask(i)};
+            continue;
+        }
         const auto& control = key.blend_controls[i];
 
         const auto src_color = LiverpoolToVK::BlendFactor(control.color_src_factor);
@@ -527,7 +869,7 @@ GraphicsPipeline::GraphicsPipeline(
         .logicOpEnable =
             instance.IsLogicOpSupported() && key.logic_op != AmdGpu::ColorControl::LogicOp::Copy,
         .logicOp = LiverpoolToVK::LogicOp(key.logic_op),
-        .attachmentCount = key.num_color_attachments,
+        .attachmentCount = host_attachment_count,
         .pAttachments = attachments.data(),
         .blendConstants = std::array{1.0f, 1.0f, 1.0f, 1.0f},
     };
@@ -552,6 +894,23 @@ GraphicsPipeline::GraphicsPipeline(
         .pDynamicState = &dynamic_info,
         .layout = *pipeline_layout,
     };
+    constexpr u32 ivy_ps = u32(Shader::SwStage::Fragment);
+    constexpr u32 ivy_vs = u32(Shader::SwStage::Vertex);
+    if (ivy_fragment_module && infos[ivy_vs] && infos[ivy_vs]->pgm_hash == IvyMaterialProbe::Vertex &&
+        !key.foliage_mask && key.prim_type == AmdGpu::PrimitiveType::TriangleList &&
+        key.mrt_mask == 1 && key.num_samples == 1 && key.depth_samples == 1 &&
+        key.logic_op == AmdGpu::ColorControl::LogicOp::Copy && shader_stages.size() == 2 &&
+        sdata.multisampling.rasterizationSamples == vk::SampleCountFlagBits::e1 &&
+        !sdata.multisampling.sampleShadingEnable && !sdata.multisampling.alphaToCoverageEnable &&
+        pipeline_rendering_ci.depthAttachmentFormat == vk::Format::eD32SfloatS8Uint &&
+        host_attachment_count == 1 && color_formats[0] == vk::Format::eR16G16B16A16Sfloat) {
+        const auto active = IvyMaterialProbe::Modules().Find(key.stage_hashes[ivy_ps], ivy_fragment_module);
+        if (active) {
+            ivy_sample_variant = IvySampleWitness::CreateVariant(instance, pipeline_info, set_layouts,
+                                                                 push_constants, *active, *infos[ivy_ps],
+                                                                 *infos[ivy_vs]);
+        }
+    }
     if (const char* flag = std::getenv("BB_SPECULAR_CAPTURE");
         flag && flag[0] == '1' && flag[1] == '\0' &&
         infos[u32(Shader::SwStage::Fragment)] &&
@@ -719,6 +1078,49 @@ GraphicsPipeline::GraphicsPipeline(
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
+}
+
+void GraphicsPipeline::PushFoliageClass(vk::CommandBuffer command_buffer, bool tagged) const {
+    ASSERT(key.foliage_mask);
+    const u32 value = tagged ? 1 : 0;
+    command_buffer.pushConstants(GetLayout(), AllGraphicsStageBits,
+                                 Shader::FoliageMaskOutput::PushOffset, sizeof(value), &value);
+}
+
+ReflectionDiscard::Verdict GraphicsPipeline::GetStockFragmentVerdict(
+    const PipelineCache& owner, ReflectionDiscard::StockRole role, vk::Pipeline ready) const {
+    return stock_fragment_owner == &owner && stock_fragment_role == role &&
+        ready && ready == HandleIfReady() && owner.StockFragmentUsable(role, stock_fragment_verdict)
+        ? stock_fragment_verdict : ReflectionDiscard::Verdict::Unknown;
+}
+
+void GraphicsPipeline::WaitForStockFragmentCreation() const {
+    constexpr u32 vs = u32(Shader::SwStage::Vertex), ps = u32(Shader::SwStage::Fragment);
+    if (ReflectionDiscard::StockFragmentForStages(key.stage_hashes[vs], key.stage_hashes[ps])) {
+        WaitReady();
+    }
+}
+
+bool GraphicsPipeline::GetReflectionDiscardProof(const PipelineCache* owner, u64 expected_stage,
+                                                ReflectionDiscard::Pipeline& proof) const {
+    if (!reflection_discard || reflection_discard->fragment.id.cache != owner ||
+        reflection_discard->fragment.id.stage != expected_stage) {
+        return false;
+    }
+    const auto handle = HandleIfReady();
+    if (!handle || !ReflectionDiscard::Revalidate(reflection_discard->fragment.id)) return false;
+    proof = *reflection_discard;
+    proof.handle = handle;
+    return true;
+}
+
+void GraphicsPipeline::WaitForReflectionDiscardCreation(const PipelineCache* owner,
+                                                        vk::ShaderModule module) const {
+    if (reflection_discard && reflection_discard->fragment.id.cache == owner &&
+        (reflection_discard->vertex == module ||
+         reflection_discard->fragment.id.handle == std::bit_cast<u64>(module))) {
+        WaitReady();
+    }
 }
 
 GraphicsPipeline::~GraphicsPipeline() {

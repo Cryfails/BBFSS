@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r129a_glass-registry): the glass view, a test view that paints the pixels the glass registry's draws wrote
+// (renderer_vulkan/vk_glass_view.cpp records the passes, glass_registry.h has the rules). Four builds, one per pass,
+// the same snapshot / compare idea as blood_sheen.comp:
+//   GLASS_SNAPSHOT  right before a hit draw: a 32-bit print of each pixel's colour (target 0) and depth into `before_img`
+//                   (the first hit draw of a frame whose tag is not known clear also clears the tag)
+//   GLASS_MARK      right after a G-buffer hit draw: where the print changed, tag = (depth bits & ~7) | kind
+//   GLASS_PAINT     right after a forward hit draw (target 0 is the RGBA16F scene colour): where the print changed, the
+//                   pixel is painted in the kind's colour at once
+//   GLASS_SHOW      over the lit scene after a G-buffer pass's lighting: a tagged pixel whose depth is still the tag's
+//                   (no later draw in front of it) is painted; every tag is cleared
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#include "glass_view_layout.h"
+
+#define GLASS_BUILDS 0
+#if defined(GLASS_SNAPSHOT)
+#undef GLASS_BUILDS
+#define GLASS_BUILDS 1
+#endif
+#if defined(GLASS_MARK)
+#if GLASS_BUILDS != 0
+#error "glass_view.comp: define exactly one of GLASS_SNAPSHOT, GLASS_MARK, GLASS_PAINT, GLASS_SHOW"
+#endif
+#undef GLASS_BUILDS
+#define GLASS_BUILDS 1
+#endif
+#if defined(GLASS_PAINT)
+#if GLASS_BUILDS != 0
+#error "glass_view.comp: define exactly one of GLASS_SNAPSHOT, GLASS_MARK, GLASS_PAINT, GLASS_SHOW"
+#endif
+#undef GLASS_BUILDS
+#define GLASS_BUILDS 1
+#endif
+#if defined(GLASS_SHOW)
+#if GLASS_BUILDS != 0
+#error "glass_view.comp: define exactly one of GLASS_SNAPSHOT, GLASS_MARK, GLASS_PAINT, GLASS_SHOW"
+#endif
+#undef GLASS_BUILDS
+#define GLASS_BUILDS 1
+#endif
+#if GLASS_BUILDS != 1
+#error "glass_view.comp: define exactly one of GLASS_SNAPSHOT, GLASS_MARK, GLASS_PAINT, GLASS_SHOW"
+#endif
+
+layout(local_size_x = GLASS_VIEW_GROUP, local_size_y = GLASS_VIEW_GROUP, local_size_z = 1) in;
+
+// GlassView::Push (vk_glass_view.h), word for word (8 words).
+layout(push_constant) uniform Push {
+    vec2 size;   // pixels
+    uint kind;   // MARK, PAINT: GLASS_VIEW_KIND_*
+    uint flags;  // GLASS_VIEW_FLAG_*
+    vec4 colour; // PAINT: the kind's colour (rgb)
+};
+
+#if defined(GLASS_SNAPSHOT)
+layout(binding = 0) uniform texture2D colour_tex;                 // target 0 of the hit draw
+layout(binding = 1) uniform texture2D depth_tex;                  // the pass's depth
+layout(binding = 2, r32ui) uniform writeonly uimage2D before_img; // the prints before the draw
+layout(binding = 3, r32ui) uniform writeonly uimage2D tag_img;    // cleared with GLASS_VIEW_FLAG_CLEAR
+#elif defined(GLASS_MARK)
+layout(binding = 0) uniform texture2D colour_tex;
+layout(binding = 1) uniform texture2D depth_tex;
+layout(binding = 2, r32ui) uniform readonly uimage2D before_img;
+layout(binding = 3, r32ui) uniform writeonly uimage2D tag_img;
+#elif defined(GLASS_PAINT)
+layout(binding = 0) uniform texture2D depth_tex;
+layout(binding = 1, r32ui) uniform readonly uimage2D before_img;
+layout(binding = 2, rgba16f) uniform image2D scene_img; // target 0: the lit scene colour
+#else
+layout(binding = 0, r32ui) uniform uimage2D tag_img;
+layout(binding = 1) uniform texture2D depth_tex;
+layout(binding = 2, rgba16f) uniform image2D scene_img;
+#endif
+
+#if !defined(GLASS_SHOW)
+// A pixel's colour and depth in 32 bits: a pixel a draw wrote prints differently unless two different values collide.
+uint ColourHash(vec4 c) {
+    const uvec4 a = floatBitsToUint(c);
+    uint h = a.x * 0x9E3779B1u;
+    h = (h ^ (h >> 15u) ^ a.y) * 0x85EBCA77u;
+    h = (h ^ (h >> 13u) ^ a.z) * 0xC2B2AE3Du;
+    h = (h ^ (h >> 16u) ^ a.w) * 0x27D4EB2Fu;
+    return h ^ (h >> 15u);
+}
+uint Print(uint depth_bits, vec4 c) {
+    return depth_bits ^ (ColourHash(c) * 0x9E3779B1u);
+}
+#endif
+
+#if defined(GLASS_SHOW)
+// GlassRegistryRules::ViewColour, the same numbers (glass_view_layout.h).
+vec3 KindColour(uint k) {
+    if (k == GLASS_VIEW_KIND_WINDOW) {
+        return vec3(GLASS_VIEW_WINDOW_R, GLASS_VIEW_WINDOW_G, GLASS_VIEW_WINDOW_B);
+    }
+    if (k == GLASS_VIEW_KIND_MIRROR) {
+        return vec3(GLASS_VIEW_MIRROR_R, GLASS_VIEW_MIRROR_G, GLASS_VIEW_MIRROR_B);
+    }
+    if (k == GLASS_VIEW_KIND_BOTTLE) {
+        return vec3(GLASS_VIEW_BOTTLE_R, GLASS_VIEW_BOTTLE_G, GLASS_VIEW_BOTTLE_B);
+    }
+    return vec3(GLASS_VIEW_YELLOW_R, GLASS_VIEW_YELLOW_G, GLASS_VIEW_YELLOW_B);
+}
+#endif
+
+vec3 Painted(vec3 c, vec3 tint) {
+    const float luma = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), GLASS_VIEW_FLOOR);
+    return mix(c, tint * luma, GLASS_VIEW_MIX);
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(size.x) || p.y >= int(size.y)) {
+        return;
+    }
+#if defined(GLASS_SNAPSHOT)
+    const uint depth_bits = floatBitsToUint(texelFetch(depth_tex, p, 0).x);
+    imageStore(before_img, p, uvec4(Print(depth_bits, texelFetch(colour_tex, p, 0))));
+    if ((flags & GLASS_VIEW_FLAG_CLEAR) != 0u) {
+        imageStore(tag_img, p, uvec4(0u));
+    }
+#elif defined(GLASS_MARK)
+    const uint depth_bits = floatBitsToUint(texelFetch(depth_tex, p, 0).x);
+    if (Print(depth_bits, texelFetch(colour_tex, p, 0)) != imageLoad(before_img, p).x) {
+        imageStore(tag_img, p, uvec4((depth_bits & ~7u) | kind));
+    }
+#elif defined(GLASS_PAINT)
+    const uint depth_bits = floatBitsToUint(texelFetch(depth_tex, p, 0).x);
+    const vec4 c = imageLoad(scene_img, p);
+    if (Print(depth_bits, c) != imageLoad(before_img, p).x) {
+        imageStore(scene_img, p, vec4(Painted(c.rgb, colour.rgb), c.a));
+    }
+#else
+    const uint tag = imageLoad(tag_img, p).x;
+    if (tag != 0u) {
+        const uint depth_bits = floatBitsToUint(texelFetch(depth_tex, p, 0).x);
+        if ((tag & 7u) != 0u && (depth_bits & ~7u) == (tag & ~7u)) {
+            const vec4 c = imageLoad(scene_img, p);
+            imageStore(scene_img, p, vec4(Painted(c.rgb, KindColour(tag & 7u)), c.a));
+        }
+        imageStore(tag_img, p, uvec4(0u));
+    }
+#endif
+}

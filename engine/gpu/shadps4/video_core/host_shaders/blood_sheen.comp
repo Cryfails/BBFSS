@@ -89,6 +89,10 @@ layout(binding = 6, std430) buffer Counters {
 #else
 layout(binding = 0, r32ui) uniform readonly uimage2D tag_img;
 layout(binding = 1, rgba16f) uniform image2D scene_img; // the lit scene
+// r129b_sheen-no-glow: the counters (offset 0, the whole buffer): SHOW's dry-scene reference words, BLOOD_SHEEN_REF_BASE on.
+layout(binding = 2, std430) buffer Counters {
+    uint counts[];
+};
 #endif
 
 #if defined(BLOOD_SNAPSHOT) || defined(BLOOD_MARK) || defined(BLOOD_EDIT)
@@ -132,6 +136,19 @@ void EndCounts() {
 bool DarkRed(vec3 c) {
     const float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
     return c.r >= red_min && c.r >= ratio * c.g && c.r >= ratio * c.b && lum <= lum_max;
+}
+// CB0 holds a world normal in RGB and an unrelated field in alpha.
+bool ReadUnitNormal(ivec2 p, out vec3 unit, out float alpha) {
+    const vec4 encoded = imageLoad(normal_img, p);
+    const vec3 normal = encoded.xyz * 2.0 - 1.0;
+    const float len = length(normal);
+    alpha = encoded.a;
+    if (len > 0.5) {
+        unit = normal / len;
+        return true;
+    }
+    unit = vec3(0.0);
+    return false;
 }
 // r100f_sheen-smooth: the normal is levelled per pixel; nothing is shared between pixels or groups.
 // r100h_sheen-liquid: how much of the pixel's surroundings is dark red (the pool). RingHits counts the taps
@@ -193,8 +210,14 @@ void main() {
     // r100h_sheen-liquid: the normal flag is read first (the fill of the pool's gaps needs the normal target).
     // r100f_sheen-smooth: no barrier, no shared memory, no group mean.
     const bool do_normal = (flags & BLOOD_SHEEN_FLAG_NORMAL) != 0u;
+    // r130a_sheen-colour: x gloss share, y level share (0xFFFFFFFF = 1, 1). EDIT never used `unused`; SHOW keeps its own meaning.
+    // A half of 0xFFFF is set to exactly 1.0 (unpackUnorm's divide need not be exact on a GPU): the default stays bit-exact.
+    const vec2 scales = mix(unpackUnorm2x16(unused), vec2(1.0), equal(uvec2(unused & 0xFFFFu, unused >> 16), uvec2(0xFFFFu)));
     bool picked = false;
     bool kept = false;
+    bool normal_ready = false;
+    vec3 unit;
+    float normal_alpha;
     // wet: the pixel's share of the film (1 for a dark red pixel, the fill weight for a gap of the pool);
     // filled: a gap, with pool_share the share of its 24 taps that are dark red.
     float wet = 1.0;
@@ -215,7 +238,16 @@ void main() {
         picked = surface && (keyed ? kept : rule);
         if (picked && rule) {
             if (DarkRed(texelFetch(albedo_tex, p, 0).rgb)) {
-                atomicAdd(group_counts[BLOOD_SHEEN_WORD_RULE], 1u);
+                if ((flags & BLOOD_SHEEN_FLAG_AUTO_GROUND) != 0u) {
+                    // The automatic ground selector also matches vertical dark-red material.
+                    // Refuse it here, before wet-film stores and without trying gap fill.
+                    picked = do_normal && ReadUnitNormal(p, unit, normal_alpha) &&
+                             unit.y > BLOOD_SHEEN_NORMAL_UP_LO;
+                    normal_ready = picked;
+                }
+                if (picked) {
+                    atomicAdd(group_counts[BLOOD_SHEEN_WORD_RULE], 1u);
+                }
             } else {
                 // r100h_sheen-liquid: a gap of the pool (a stone, a crack the mask leaves out). 8 taps first:
                 // almost all of the frame stops here. Then its normal faces up (a wall or a side is left
@@ -258,25 +290,31 @@ void main() {
             if (m.r >= BLOOD_SHEEN_WET_GLOSS) {
                 atomicAdd(group_counts[BLOOD_SHEEN_WORD_GLOSSY], 1u);
             }
-            m.r = mix(m.r, BLOOD_SHEEN_WET_GLOSS, ws); // r100h (r100j: rim weight): the film's value, the ground's may go down
+            m.r = mix(m.r, BLOOD_SHEEN_WET_GLOSS, ws * scales.x); // r100h (r100j: rim weight; r130a: gloss share): the film's value
             imageStore(material_img, p, m);
             vec4 s = imageLoad(specular_img, p);
             atomicAdd(group_counts[BLOOD_SHEEN_WORD_ROOT_SUM], uint(s.r * 255.0 + 0.5));
             // r100i_sheen-blood-tint: the root is tinted by the blood (deep red). Red is never lowered; green and
             // blue go down to the tinted target by the wet weight (a grey cobble's own green and blue specular
             // would put the white back).
-            const vec3 target = vec3(root) * vec3(BLOOD_SHEEN_TINT_R, BLOOD_SHEEN_TINT_G, BLOOD_SHEEN_TINT_B);
-            s.r = max(s.r, mix(s.r, target.r, ws));
-            s.gb = mix(s.gb, target.gb, ws);
+            // r130a_sheen-colour: TINT 2 (clear film): grey, may go down (the film replaces the ground); TINT 0: untinted target.
+            if ((flags & BLOOD_SHEEN_FLAG_TINT_CLEAR) != 0u) {
+                s.rgb = mix(s.rgb, vec3(BLOOD_SHEEN_CLEAR_ROOT), ws);
+            } else {
+                const vec3 tint = (flags & BLOOD_SHEEN_FLAG_TINT_OFF) != 0u
+                    ? vec3(1.0) : vec3(BLOOD_SHEEN_TINT_R, BLOOD_SHEEN_TINT_G, BLOOD_SHEEN_TINT_B);
+                const vec3 target = vec3(root) * tint;
+                s.r = max(s.r, mix(s.r, target.r, ws));
+                s.gb = mix(s.gb, target.gb, ws);
+            }
             imageStore(specular_img, p, s); // .a (the lighting record) as it was
             if (do_normal) {
                 // A liquid film lies level: toward world up, weighted by how much the pixel faces up
                 // already (a continuous function of this pixel's own normal: no block can show).
-                const vec4 normal = imageLoad(normal_img, p);
-                const vec3 n = normal.xyz * 2.0 - 1.0;
-                const float len = length(n);
-                if (len > 0.5) {
-                    const vec3 unit = n / len;
+                if (!normal_ready) {
+                    normal_ready = ReadUnitNormal(p, unit, normal_alpha);
+                }
+                if (normal_ready) {
                     // r100g_sheen-sheets: all the way inside the pool, EDGE at its rim (a draw key without
                     // the albedo rule has no rim to find: cover 1).
                     // r100h_sheen-liquid: the cover from the 24-tap share (a gap already holds its share and its
@@ -284,12 +322,15 @@ void main() {
                     const float share = filled ? pool_share
                         : ((flags & BLOOD_SHEEN_FLAG_RULE_ALBEDO) != 0u ? PoolShare(p) : 1.0);
                     const float cover = smoothstep(BLOOD_SHEEN_COVER_LO, BLOOD_SHEEN_COVER_HI, share);
-                    const float up_gate = filled ? 1.0
+                    // r129b_sheen-no-glow: a rim (gap-fill) pixel levels by its specular weight (wet x rim share on top of w:
+                    // w x wet x rim_k = ws), not by the fill weight alone, so the rim stones keep their relief; the test knob
+                    // BLOOD_SHEEN_FLAG_RIM_FULL gives the old 1.0 (r100h-r100k).
+                    const float up_gate = filled ? ((flags & BLOOD_SHEEN_FLAG_RIM_FULL) != 0u ? 1.0 : wet * rim_k)
                         : smoothstep(BLOOD_SHEEN_NORMAL_UP_LO, BLOOD_SHEEN_NORMAL_UP_HI, unit.y);
                     const float level = BLOOD_SHEEN_NORMAL_SMOOTH * w * mix(BLOOD_SHEEN_NORMAL_EDGE, 1.0, cover) *
-                                        up_gate;
+                                        up_gate * scales.y; // r130a_sheen-colour: the level share (x 1.0 is exact)
                     const vec3 flat_n = normalize(mix(unit, vec3(0.0, 1.0, 0.0), level));
-                    imageStore(normal_img, p, vec4(flat_n * 0.5 + 0.5, normal.a)); // .a as it was
+                    imageStore(normal_img, p, vec4(flat_n * 0.5 + 0.5, normal_alpha)); // .a as it was
                 }
             }
             atomicAdd(group_counts[BLOOD_SHEEN_WORD_WET], 1u);
@@ -307,17 +348,44 @@ void main() {
             // r100k_sheen-no-hot-spot: the luminance ceiling of the picked pixels (0: none) is in the push word
             // `ratio` (the albedo rule's ratio is for EDIT only); with it the pass also runs at darken 0.
             const float peak = ratio;
+            // r129b_sheen-no-glow: `peak` is now the ceiling's multiple of the dry scene's reference. The reference: one dry
+            // (untagged) pixel a group adds its max channel's log2 code to this show's slot (this pass writes only wet
+            // pixels, so a dry one is in no race); the ceiling below reads the OTHER slot, the last show's.
+            const uint ref_slot = (flags & BLOOD_SHEEN_FLAG_SLOT) != 0u ? 1u : 0u;
+            if (peak > 0.0 && gl_LocalInvocationIndex == 0u && tag != BLOOD_SHEEN_TAG_WET) {
+                const vec3 dry = imageLoad(scene_img, p).rgb;
+                if (!any(isnan(dry)) && !any(isinf(dry))) {
+                    const float top_dry = max(max(dry.r, dry.g), max(dry.b, BLOOD_SHEEN_REF_MIN));
+                    const float code = clamp((log2(top_dry) + BLOOD_SHEEN_REF_BIAS) * BLOOD_SHEEN_REF_SCALE, 0.0,
+                                             BLOOD_SHEEN_REF_MAX_CODE);
+                    atomicAdd(counts[BLOOD_SHEEN_REF_BASE + ref_slot * BLOOD_SHEEN_REF_SLOT_WORDS], uint(code));
+                    atomicAdd(counts[BLOOD_SHEEN_REF_BASE + ref_slot * BLOOD_SHEEN_REF_SLOT_WORDS + 1u], 1u);
+                }
+            }
             if (tag == BLOOD_SHEEN_TAG_WET && (darken > 0.0 || peak > 0.0)) {
                 const vec4 c = imageLoad(scene_img, p);
                 const float luma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
                 const float dim = clamp(darken, 0.0, 1.0) *
                                   (1.0 - smoothstep(BLOOD_SHEEN_DARKEN_LUMA_LO, BLOOD_SHEEN_DARKEN_LUMA_HI, luma));
-                const vec3 mult = mix(vec3(1.0), vec3(BLOOD_SHEEN_DARKEN_RED, BLOOD_SHEEN_DARKEN_OTHER, BLOOD_SHEEN_DARKEN_OTHER), dim);
+                // r130a_sheen-colour: TINT 2: the dimming acts by the pixel's redness (a light-coloured highlight keeps its colour)
+                const float red_share = clamp((c.r - max(c.g, c.b)) / max(c.r, 1e-6), 0.0, 1.0);
+                const float dim_k = (flags & BLOOD_SHEEN_FLAG_TINT_CLEAR) != 0u ? dim * red_share : dim;
+                const vec3 mult = mix(vec3(1.0),
+                                      vec3(BLOOD_SHEEN_DARKEN_RED, BLOOD_SHEEN_DARKEN_OTHER, BLOOD_SHEEN_DARKEN_OTHER), dim_k);
                 vec3 lit = c.rgb * mult;
                 if (peak > 0.0) {
-                    const float lit_luma = dot(lit, vec3(0.2126, 0.7152, 0.0722));
-                    if (lit_luma > BLOOD_SHEEN_PEAK_KNEE * peak) {
-                        lit *= PeakRoll(lit_luma, peak) / lit_luma;
+                    // r129b_sheen-no-glow: the ceiling on the MAX channel (red counts in full, not at 0.21): `peak` times the
+                    // dry scene's reference of the last show (BLOOD_SHEEN_PEAK_FALLBACK before the first).
+                    const uint other = 1u - ref_slot;
+                    const uint samples = counts[BLOOD_SHEEN_REF_BASE + other * BLOOD_SHEEN_REF_SLOT_WORDS + 1u];
+                    const float ceiling = samples != 0u
+                        ? peak * exp2(float(counts[BLOOD_SHEEN_REF_BASE + other * BLOOD_SHEEN_REF_SLOT_WORDS]) /
+                                      float(samples) / BLOOD_SHEEN_REF_SCALE - BLOOD_SHEEN_REF_BIAS)
+                        : BLOOD_SHEEN_PEAK_FALLBACK;
+                    const float top = max(lit.r, max(lit.g, lit.b));
+                    if (top > BLOOD_SHEEN_PEAK_KNEE * ceiling) {
+                        lit *= PeakRoll(top, ceiling) / top;
+                        atomicAdd(counts[BLOOD_SHEEN_REF_BASE + ref_slot * BLOOD_SHEEN_REF_SLOT_WORDS + 2u], 1u);
                     }
                 }
                 imageStore(scene_img, p, vec4(lit, c.a));

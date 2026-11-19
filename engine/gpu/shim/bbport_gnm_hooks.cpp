@@ -2,6 +2,7 @@
 #include "bbport_gnm_hooks.h"
 #include "bbport_native_calls.h"
 #include "engine/gx_records.h"
+#include "engine/guest_precull_visit_probe.h"
 
 #include <algorithm>
 #include <initializer_list>
@@ -436,7 +437,11 @@ bool TokensWanted() {
     return !(env && env[0] == '0');
 }
 
-void NativeDraw(u64 cb, BbNativeCalls::DrawRecord r) {
+void NativeDraw(u64 cb, BbNativeCalls::DrawRecord r
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+                , u64 return_pc = 0
+#endif
+) {
     const std::uint32_t index = native_index[r.kind];
     if (census) {
         __atomic_fetch_add(CounterAt(index), 1, __ATOMIC_RELAXED);
@@ -483,6 +488,9 @@ void NativeDraw(u64 cb, BbNativeCalls::DrawRecord r) {
     }
     const u64 after = reinterpret_cast<u64>(out + n);
     *reinterpret_cast<u64*>(cb + 0x10) = after;
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+    if (!trace) BbEngine::GuestPrecull::Issued(reinterpret_cast<u64>(out), cb, r, return_pc);
+#endif
     if (observe) {
         Mark(index, before, after, cb);
     }
@@ -508,7 +516,11 @@ BB_GNM_ABI void NativeDrawIndexOffset(u64 cb, std::uint32_t index_offset, std::u
     r.kind = BbNativeCalls::DrawIndexOffset;
     r.index_offset = index_offset;
     r.index_count = index_count;
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+    NativeDraw(cb, r, reinterpret_cast<u64>(__builtin_return_address(0)));
+#else
     NativeDraw(cb, r);
+#endif
 }
 
 u64 NativeEntry(std::uint32_t kind) {

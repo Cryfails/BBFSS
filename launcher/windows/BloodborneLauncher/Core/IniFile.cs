@@ -63,6 +63,17 @@ namespace BloodborneLauncher.Core
             ("graphics_lamp_flicker_on_game_strength", "0.00"),
             // r97e: the heat haze's strength, off by default (BbSettings::HeatHazeStrengthDefault).
             ("graphics_heat_haze_strength", "0.00"),
+            // r128b: the water caustics' strengths, off by default (BbSettings::WaterCausticsStrengthDefault).
+            ("graphics_water_caustics_lamps_strength", "0.00"),
+            ("graphics_water_caustics_sun_strength", "0.00"),
+            // r131b: the water motion, the blood sheen, the foliage shadows and the blood sheen colour, the engine's defaults
+            // (BbSettings::WaterMotionStrengthDefault, BloodSheenDefault, RtFoliageDefault, BloodSheenTintDefault).
+            ("graphics_water_motion_strength", "0.00"),
+            ("graphics_rt_foliage_shadows", "0"),
+            ("graphics_blood_sheen", "0.00"),
+            ("graphics_blood_sheen_tint", "1"),
+            // r131a: the foliage translucency, the engine's default (BbSettings::FoliageTranslucencyDefault).
+            ("graphics_foliage_translucency", "0"),
             ("frame_gen_even_pacing", "0"),
             ("dlss_preset", "k"),
             ("fps_position", "0"),

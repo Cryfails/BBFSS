@@ -59,7 +59,8 @@ const CL::Knobs& Load() {
         std::getenv("BB_VOLUMETRIC_CLOUDS_CONTRAST"), // bbport (r119e_clouds-real-sky)
         std::getenv("BB_VOLUMETRIC_CLOUDS_TINT"), std::getenv("BB_VOLUMETRIC_CLOUDS_SMEAR"), // bbport (r119g)
         std::getenv("BB_VOLUMETRIC_CLOUDS_PAINTED"), std::getenv("BB_VOLUMETRIC_CLOUDS_HORIZON"),
-        std::getenv("BB_VOLUMETRIC_CLOUDS_GLOWMAX")); // bbport (r119i_clouds-behind-painted-sky)
+        std::getenv("BB_VOLUMETRIC_CLOUDS_GLOWMAX"), // bbport (r119i_clouds-behind-painted-sky)
+        std::getenv("BB_VOLUMETRIC_CLOUDS_SMOOTH")); // bbport (r119j_clouds-banding)
     return knobs;
 }
 
@@ -187,6 +188,17 @@ u32 LiveMark() {
 #endif
 }
 
+/// bbport (r119j_clouds-banding): BB_VOLUMETRIC_CLOUDS_SMOOTH now (a live knob with the test tools' header, asked again at every
+/// use), else the start's value.
+u32 LiveSoften([[maybe_unused]] u32 at_start) {
+#if BB_CLOUD_LAYER_LIVE
+    static BbLiveKnobs::Knob<u32> soften{"BB_VOLUMETRIC_CLOUDS_SMOOTH", CL::ParseSoften};
+    return soften.Get();
+#else
+    return at_start;
+#endif
+}
+
 constexpr const char* LiveText = BB_CLOUD_LAYER_LIVE ? "live knobs on" : "read at the start";
 
 double Seconds() {
@@ -271,6 +283,10 @@ CloudLayer::CloudLayer(const Instance& instance_, Scheduler& scheduler_,
                      "BB_VOLUMETRIC_CLOUDS_PAINTED, _HORIZON, _GLOWMAX (%s)\n",
                      double(knobs.painted), double(CL::RingNear), double(CL::RingFar), double(knobs.horizon),
                      double(knobs.glow), double(knobs.speed), double(knobs.tint), LiveText);
+    // bbport (r119j_clouds-banding): under 300 characters
+    BbReport::Printf("Volumetric clouds (r119j, BB_VOLUMETRIC_CLOUDS=1): banding fix bits %u of 15 (1 hash jitter, 2 coverage edge a step wide, "
+                     "4 graded painted rings, 8 soft colour knee; 0 = the r119i march); BB_VOLUMETRIC_CLOUDS_SMOOTH (%s)\n",
+                     unsigned(knobs.soften), LiveText);
     if (ReportFrames() != 0) { // bbport (r119f_clouds-open-sky)
         BbReport::Printf("Volumetric clouds (r119f, BB_VOLUMETRIC_CLOUDS_REPORT): the log lines come every %u frames\n",
                          ReportFrames());
@@ -359,6 +375,18 @@ void CloudLayer::ReadLive() {
     live.painted = LivePainted(knobs.painted);
     live.horizon = LiveHorizon(knobs.horizon);
     live.glow = LiveGlow(knobs.glow);
+    // bbport (r119j_clouds-banding): the banding fixes' bits, said once per change
+    live.soften = LiveSoften(knobs.soften);
+    if (told_soften < 0) {
+        told_soften = int(live.soften);
+    } else if (int(live.soften) != told_soften) {
+        told_soften = int(live.soften);
+        std::printf("Volumetric clouds (r119j): live knob BB_VOLUMETRIC_CLOUDS_SMOOTH: %u (jitter %s, coverage edge %s, painted rings %s, "
+                    "colour knee %s)\n",
+                    unsigned(live.soften), (live.soften & CL_SMOOTH_JITTER) != 0u ? "on" : "off",
+                    (live.soften & CL_SMOOTH_EDGE) != 0u ? "on" : "off", (live.soften & CL_SMOOTH_PAINT) != 0u ? "on" : "off",
+                    (live.soften & CL_SMOOTH_GLOW) != 0u ? "on" : "off");
+    }
     if (told_paint[0] < 0.0f) {
         told_paint = {live.painted, live.horizon, live.glow};
     } else if (live.painted != told_paint[0] || live.horizon != told_paint[1] || live.glow != told_paint[2]) {
@@ -611,6 +639,10 @@ void CloudLayer::Report() {
                      "(of the marched sky pixels, those whose opacity the painted sky took %.0f%% or more of), drift %.1f m/s\n",
                      double(live.painted), double(live.horizon), double(live.glow), s.painted,
                      double(CL_PAINTED_SHARE) * 100.0, double(CL::LayerSpeed(ClockState().Velocity(ClockKnobs()), live)));
+    // bbport (r119j_clouds-banding): under 300 characters
+    BbReport::Printf("Volumetric clouds (r119j): banding fix bits %u of 15 (1 jitter, 2 coverage edge, 4 painted rings, 8 colour knee), "
+                     "on in %u of %u drawn frames\n",
+                     unsigned(live.soften), stats.smoothed, stats.drawn);
     {
         // bbport (r119h_clouds-freeze-sheet): where the drift comes from (under 300 characters): the wind's cloud speed held to
         // 2.5-8 m/s, times the SPEED knob (its floor 0.25), plus the morph, which the knob does not scale
@@ -718,9 +750,10 @@ void CloudLayer::Apply(VideoCore::ImageId color_id, VideoCore::ImageId depth_id,
     push.width = width;
     push.height = height;
     push.frame = frame_index++;
-    push.flags = knobs.show ? u32(CL_FLAG_SHOW) : 0u;
+    push.flags = (knobs.show ? u32(CL_FLAG_SHOW) : 0u) | CL::SoftenFlags(live.soften); // bbport (r119j_clouds-banding)
     stats.camera_y = camera.inv_view[7];
     ++stats.drawn;
+    if (live.soften != 0u) ++stats.smoothed; // bbport (r119j_clouds-banding)
     drew_this_frame = true;
     if (!told_size) {
         told_size = true;

@@ -4,13 +4,15 @@
 // drawn, so those stay as the game draws them, and before the upscaler, the game's own colour
 // processing and the HUD, which treat the strokes as they treat a texture. Colours are not
 // changed. Off by default: graphics_drawn_look in lantern.ini and the menu's Picture tab. While
-// it is off, or its strength is 0, the rasterizer calls nothing here but OnFrameEnd: no
-// pipeline, no image, no pass.
+// it is off, or its strength and its ink lines are both 0, the rasterizer calls nothing here but
+// OnFrameEnd: no pipeline, no image, no pass.
 //
-// Built so far (stages 1 and 2 of the design): the switch, the passes' place in the frame, the
-// strokes themselves (host_shaders/paint_strokes.comp), and a test view
-// (graphics_drawn_look_debug) that paints every stroke in a flat colour of its own. Not built:
-// ink lines, painted shadow edges.
+// Built so far (stages 1 and 2 of the design, and r55_drawn-look-lines): the switch, the passes'
+// place in the frame, the strokes themselves (host_shaders/paint_strokes.comp), ink lines along
+// the silhouettes of shapes (host_shaders/paint_ink.comp; with the strength at 0 they are drawn
+// alone), and test views (BB_DRAWN_LOOK_VIEW, never saved) that paint every stroke in a flat
+// colour of its own or show the ink lines alone on a grey page. Not built: ink on inner edges,
+// heavier ink on characters, painted shadow edges.
 //
 // The passes, all compute, recorded in Paint:
 //   paint_prep.comp     the scene colour and the view depth into the copy (the stroke pass
@@ -23,6 +25,8 @@
 //   paint_strokes.comp  the strokes into the scene colour
 //   paint_lock.comp     the painted scene's means (a quarter of the size, and their smaller
 //                       levels), then every place scaled back to the mean colour it had
+//   paint_ink.comp      the ink lines into the scene colour, after the strokes and the lock or
+//                       alone; not on a frame painted right before the upscaler
 
 #pragma once
 
@@ -55,7 +59,8 @@ public:
               ObjectMotion& object_motion);
     ~DrawnLook();
 
-    /// The switch is on and the strength is above 0 (the rasterizer asks once a frame).
+    /// The switch is on and the strength or the ink lines are above 0 (DrawnLookParams::Wanted;
+    /// the rasterizer asks once a frame).
     [[nodiscard]] static bool Wanted();
     /// The scene's hooks below are never reached (no upscaler: BB_UPSCALER=none, or a GPU it
     /// cannot run on): the menu says so instead of offering a switch that does nothing.
@@ -97,9 +102,11 @@ public:
     void OnFrameEnd(bool wanted);
 
 private:
-    /// How a frame went: where its strokes were painted, or why they were not.
+    /// How a frame went: where it was painted, or why it was not. LinesOnlyLate
+    /// (r55_drawn-look-lines): ink lines alone (strength 0), and the frame's place was right
+    /// before the upscaler, where no ink is drawn (DrawnLookParams::PassesFor): nothing recorded.
     enum Result : u32 { AtBlended, AtComposite, AtBeforeUpscaler, Preview, NoCamera, NoRoom,
-                        NotReached, ResultCount };
+                        NotReached, LinesOnlyLate, ResultCount };
     /// An image with all its levels down to one texel.
     struct OwnImage {
         VideoCore::UniqueImage image;
@@ -149,7 +156,7 @@ private:
     CameraMotion& camera_motion;
     ObjectMotion& object_motion;
 
-    Pass prep, stats, mips, key_sums, key_last, strokes, lock_first, lock_down, lock;
+    Pass prep, stats, mips, key_sums, key_last, strokes, lock_first, lock_down, lock, ink;
     vk::UniqueSampler sampler; ///< linear between texels and between levels, clamped
     OwnImage prep_copy; ///< the scene before the strokes, view depth (paint_prep.comp)
     OwnImage marks;     ///< half the size: what tells plain surfaces from detail (paint_stats.comp)
@@ -159,9 +166,10 @@ private:
     std::array<ViewEntry, 6> view_cache{};
     u64 view_uses = 0;
     VideoCore::ImageId gbuffer_depth, gbuffer_normal;
-    /// BB_DRAWN_LOOK_VIEW: a test view that decides instead of the ini's
-    /// graphics_drawn_look_debug while the variable is set; -1 without it.
+    /// BB_DRAWN_LOOK_VIEW: the test view (DrawnLookParams::View), read once; -1 without it.
     int env_view = -1;
+    /// BB_DRAWN_LOOK_LINE (r55_drawn-look-lines): a factor on the ink lines' width, read once.
+    float env_line = 1.0f;
     bool tried = false;
     bool failed = false;
     bool was_wanted = false;
@@ -190,6 +198,10 @@ private:
     /// For the line every 600 frames the look was wanted on.
     std::array<u32, ResultCount> results{};
     u32 frames = 0;
+    u32 ink_frames = 0; ///< (r55_drawn-look-lines) frames the ink lines were recorded on
+    /// (r55_drawn-look-lines) This frame set BbSettings' drawn_look_ink_drawn (OnFrameEnd puts
+    /// it back to 0).
+    bool ink_published = false;
     /// (r45b_drawn-look-fixes) The camera the last frame was painted with, for the frame after
     /// it (DrawnLookParams::Make, `previous`). `last_camera_set`: this frame stored one;
     /// `last_camera_valid`: the frame before did. `previous_frames`: for the line every 600
@@ -205,8 +217,8 @@ private:
     std::array<u64, 8> small_seen{};
     u32 small_seen_count = 0;
     /// What the last painted frame ran with: a line is printed when the size or the test view
-    /// changes, and the first few times the inputs (normals, object motion) do: those may come
-    /// and go with the place a frame is painted at.
+    /// changes, and the first few times the inputs (normals, object motion) or the passes
+    /// (strokes, ink) do: those may come and go with the place a frame is painted at.
     u32 last_width = 0, last_height = 0, last_view = ~0u, last_inputs = ~0u;
     u32 input_lines = 0;
 };

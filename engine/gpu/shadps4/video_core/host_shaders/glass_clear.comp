@@ -1,0 +1,135 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r131c_cabinet-glass-clear): the glass put back over the lit scene. The cabinet's pane draw was redirected into side
+// images (renderer_vulkan/vk_glass_clear.cpp: its own normal, albedo and depth; the game's G-buffer never saw it). Here, once
+// after the G-buffer pass's opaque lighting, a pixel the pane covers and nothing nearer hides gets a thin film of the pane's
+// own albedo, lit by the light already in the scene, and a Fresnel sheen. Only the pane's albedo and normal are read, never
+// its material or specular targets (the game's bright white crackle sits there, most likely).
+//   out = scene * (1 - a) + film_lit * a + F * scene one tap away along the reflected normal's screen direction
+// One build. Most pixels read one 4-byte depth and return.
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+#include "glass_clear_layout.h"
+
+layout(local_size_x = GLASS_CLEAR_GROUP, local_size_y = GLASS_CLEAR_GROUP, local_size_z = 1) in;
+
+// GlassClear::Push (vk_glass_clear.h), word for word (24 words, 96 bytes).
+layout(push_constant) uniform Push {
+    vec4 proj;        // projection x and y scale, z and w as ssgi.comp reads them (PassProjection)
+    vec4 view[3];     // world to view, three rows (PassMatrices().view)
+    vec2 size;        // pixels
+    vec2 jitter;      // render pixels
+    float film;       // a: how much of the pane's film shows (BB_GLASS_CLEAR_FILM)
+    float f0;         // Fresnel F0 of the registry entry
+    float hole_metres; // the scene this far behind the pane is a hole (nothing drawn behind it)
+    uint flags;       // GLASS_CLEAR_FLAG_*
+};
+
+layout(binding = 0, rgba16f) uniform image2D scene_img;   // the lit scene colour, read and written in place
+layout(binding = 1) uniform texture2D scene_depth_tex;    // the scene depth (the pane is not in it)
+layout(binding = 2) uniform texture2D side_depth_tex;     // the pane's own depth (far where it did not draw)
+layout(binding = 3) uniform texture2D side_albedo_tex;    // target 2 of the pane's draw
+layout(binding = 4) uniform texture2D side_normal_tex;    // target 0 of the pane's draw
+layout(binding = 5, std430) buffer Counters {
+    uint words[GLASS_CLEAR_WORDS];                         // visible pane pixels, of them holes (cumulative)
+};
+
+shared uint group_visible;
+shared uint group_hole;
+
+bool IsFar(float d) {
+    return (flags & GLASS_CLEAR_FLAG_REVERSE) != 0u ? d <= 0.0 : d >= 1.0;
+}
+
+float viewZ(float depth) {
+    return proj.w / min(depth - proj.z, -1e-8);
+}
+
+vec3 viewPos(vec2 pixel, float z) {
+    const vec2 ndc = (pixel - jitter) / size * 2.0 - 1.0;
+    return vec3(ndc.x * z / proj.x, ndc.y * z / proj.y, z);
+}
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// 0: nothing here; 1: a pane pixel; 2: a pane pixel with nothing drawn behind it (a hole)
+uint Shade(ivec2 p) {
+    const float side_d = texelFetch(side_depth_tex, p, 0).x;
+    if (IsFar(side_d)) {
+        return 0u;
+    }
+    const float scene_d = texelFetch(scene_depth_tex, p, 0).x;
+    const bool reverse_z = (flags & GLASS_CLEAR_FLAG_REVERSE) != 0u;
+    if (reverse_z ? side_d <= scene_d : side_d >= scene_d) {
+        return 0u; // something nearer than the pane (the hunter) hides it
+    }
+    const float side_z = viewZ(side_d);
+    const vec3 c = viewPos(vec2(p) + 0.5, side_z);
+    const bool hole = IsFar(scene_d) || side_z - viewZ(scene_d) > hole_metres;
+    const vec3 eye = -normalize(c);
+    // the pane's normal, as ssgi.comp decodes the G-buffer's: * 2 - 1, to view space, facing the camera
+    vec3 n = eye;
+    vec3 wn = texelFetch(side_normal_tex, p, 0).xyz * 2.0 - 1.0;
+    if (dot(wn, wn) > 0.25) {
+        wn = normalize(wn);
+        const vec3 vn = normalize(vec3(dot(view[0].xyz, wn), dot(view[1].xyz, wn), dot(view[2].xyz, wn)));
+        n = dot(vn, c) > 0.0 ? -vn : vn;
+    }
+    const float fresnel = f0 + (1.0 - f0) * pow(1.0 - clamp(dot(n, eye), 0.0, 1.0), 5.0);
+    // one tap along the reflected normal's screen direction, only at a pixel the pane did not draw (nobody writes it in this
+    // pass, so the read is the same every run); else the pixel's own colour
+    ivec2 tap = p;
+    const vec3 r = reflect(-eye, n);
+    const vec3 q = c + r * 0.5;
+    if (q.z < -0.01) {
+        const vec2 qp = (vec2(q.x * proj.x, q.y * proj.y) / q.z * 0.5 + 0.5) * size + jitter;
+        const vec2 d = qp - (vec2(p) + 0.5);
+        if (dot(d, d) > 1e-6) {
+            const float reach = GLASS_CLEAR_SHEEN_PIXELS * size.y / 1080.0;
+            const ivec2 t = clamp(p + ivec2(round(normalize(d) * reach)), ivec2(0), ivec2(size) - 1);
+            if (IsFar(texelFetch(side_depth_tex, t, 0).x)) {
+                tap = t;
+            }
+        }
+    }
+    const vec4 scene = imageLoad(scene_img, p);
+    const vec3 tapped = tap == p ? scene.rgb : imageLoad(scene_img, tap).rgb;
+    vec3 albedo = texelFetch(side_albedo_tex, p, 0).rgb;
+    albedo *= min(1.0, GLASS_CLEAR_FILM_LUMA / max(Luma(albedo), 1e-4));
+    const vec3 lit = albedo * Luma(scene.rgb) * GLASS_CLEAR_LIT_GAIN;
+    const float a = hole ? GLASS_CLEAR_HOLE_ALPHA : film;
+    imageStore(scene_img, p, vec4(scene.rgb * (1.0 - a) + lit * a + tapped * fresnel, scene.a));
+    return hole ? 2u : 1u;
+}
+
+void main() {
+    if (gl_LocalInvocationIndex == 0u) {
+        group_visible = 0u;
+        group_hole = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x < int(size.x) && p.y < int(size.y)) {
+        const uint seen = Shade(p);
+        if (seen != 0u) {
+            atomicAdd(group_visible, 1u);
+            if (seen == 2u) {
+                atomicAdd(group_hole, 1u);
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (group_visible != 0u) {
+            atomicAdd(words[GLASS_CLEAR_W_VISIBLE], group_visible);
+        }
+        if (group_hole != 0u) {
+            atomicAdd(words[GLASS_CLEAR_W_HOLE], group_hole);
+        }
+    }
+}

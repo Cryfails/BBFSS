@@ -159,6 +159,7 @@ private:
     std::array<u32, 64> image_var{}, image_type{}, sampled_type{};
     std::array<u32, 16> sampler_var{};
     u32 t_sampler{}, uniform_block{}, uniform_elem_ptr{};
+    u32 var_foliage_mask{};
     u32 var_motion_addr{}, var_motion_cur_out{}, var_motion_prev_out{}, var_motion_frag{},
         var_motion_cur_in{}, var_motion_prev_in{};
     bool uses_quad{}, uses_shuffle{}, uses_lane{}, uses_discard{}, uses_sample_shading{},

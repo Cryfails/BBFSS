@@ -544,6 +544,15 @@ BB_TEST_CAMERA_FORMAT inline void Say(std::vector<std::string>& lines, const cha
 }
 
 // ---- the aim-and-place controller --------------------------------------------------------------------------------------------
+/// Startup-only receipt for the exact sewer R120 hold sequence.
+[[nodiscard]] inline bool SewerEpochEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_SEWER_R120_EPOCH");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 class Session {
 public:
     enum class Phase : std::uint8_t { Idle, Start, Seen, Probe, Aim, Ready, Failed };
@@ -595,6 +604,15 @@ public:
         return phase_ != Phase::Idle && phase_ != Phase::Failed;
     }
 
+    struct WalkEvidence {
+        unsigned posted = 0, marked_ok = 0;
+        std::array<std::uint32_t, 2> marked_sequence{};
+    };
+
+    [[nodiscard]] WalkEvidence ReadWalkEvidence() const {
+        return {walks_, marked_walks_, marked_sequence_};
+    }
+
     void Begin(const Goal& g, std::uint64_t frame, const char* text, std::vector<std::string>& lines) {
         goal_ = g;
         phase_ = Phase::Start;
@@ -604,6 +622,10 @@ public:
         cap_down_ = 70.0f;
         cmd_on_ = false;
         tries_ = walks_ = drifts_ = 0;
+        if (SewerEpochEnabled()) {
+            marked_walks_ = 0;
+            marked_sequence_ = {};
+        }
         waiting_ = false;
         have_last_ = false;
         last_limit_ = false;
@@ -1062,6 +1084,12 @@ private:
                     Fail(o, "the hunter could not be moved (see the 'hang goto (r112o)' lines)");
                     return;
                 }
+                if (SewerEpochEnabled()) {
+                    if (marked_walks_ < marked_sequence_.size()) {
+                        marked_sequence_[marked_walks_] = seq_;
+                    }
+                    ++marked_walks_;
+                }
             } else if (in.frame - post_frame_ > kWalkWait) {
                 Fail(o, "the walk was not served in 1800 frames (a loading screen, no hunter, or the engine hook is missing)");
                 return;
@@ -1293,6 +1321,8 @@ private:
     float ratio_y_ = 0.0f, ratio_p_ = 0.0f; ///< learned: view degrees per field degree (signed); 0: not learned
     float f0y_ = 0.0f, f0p_ = 0.0f, m0h_ = 0.0f, m0p_ = 0.0f;
     unsigned tries_ = 0, walks_ = 0, drifts_ = 0, cap_said_ = 0;
+    unsigned marked_walks_ = 0;
+    std::array<std::uint32_t, 2> marked_sequence_{};
     bool waiting_ = false, last_limit_ = false, ready_said_ = false, said_wait_ = false, said_raise_ = false, have_last_ = false;
     bool aim_only_ = false, mode_decided_ = false, hunter_y0_ok_ = false; ///< r120b: turn only (no hunter move); mode chosen; fall guard armed
     bool stepping_ = false; ///< r120c: aim:hang is backing away from its target (the plan's place is not where the camera is)

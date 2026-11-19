@@ -27,8 +27,12 @@
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_breadcrumbs.h"
+#include "video_core/renderer_vulkan/vk_native_write_suffix.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+#include "video_core/renderer_vulkan/vk_post_resident_geometry.h"
+#endif
 
 namespace tracy {
 class VkCtxScope;
@@ -68,6 +72,16 @@ struct RenderState {
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
 
+#ifdef BB_TEST_SHARED_POST_GRAPH
+struct PostPresentSubmitObservation {
+    Scheduler* scheduler{};
+    u64 tick{};
+    NativeWriteSuffix::QueueSubmitInput input{};
+    std::span<const vk::CommandBuffer> ordered{}, segments{};
+    NativeWriteSuffix::PostKey key{};
+};
+#endif
+
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
@@ -79,6 +93,22 @@ struct SubmitInfo {
     /// bbport: queue operations that go out right before the submission, in queue order (sparse
     /// binds): with BB_ASYNC_SUBMIT the submission itself goes out later, on a recording thread.
     std::vector<std::function<void()>> before_submit;
+
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    NativeWriteSuffix::PostKey post_present_key{};
+    // One original submit, after the actual Vulkan call. Copy needed spans inside the
+    // callback. This runs under submit_mutex, so it must not re-enter or wait on submission.
+    Common::UniqueFunction<void, const PostPresentSubmitObservation&> observe_post_present_submit;
+
+    void NotifyPostPresentSubmit(Scheduler* scheduler, u64 tick,
+                                 const NativeWriteSuffix::QueueSubmitInput& input,
+                                 std::span<const vk::CommandBuffer> ordered,
+                                 std::span<const vk::CommandBuffer> segments) {
+        if (auto observer = std::exchange(observe_post_present_submit, {})) {
+            observer({scheduler, tick, input, ordered, segments, std::exchange(post_present_key, {})});
+        }
+    }
+#endif
 
     void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
         wait_semas[num_wait_semas] = semaphore;
@@ -590,10 +620,25 @@ struct SubmissionBatch {
     static constexpr u32 MaxSegments = 64;
     std::array<vk::CommandBuffer, MaxSegments> segments{}; ///< null until begun
     std::array<u32, MaxSegments> handed{}, recorded{};
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    std::array<std::shared_ptr<PostResidentGeometry::Ticket>,
+               PostResidentGeometry::MaxCandidates> resident{};
+    u64 resident_tick{};
+    u32 resident_count{};
+    bool resident_raw{};
+#endif
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    u64 native_suffix_tick{};
+#endif
     void Reset() {
         segments.fill({});
         handed.fill(0);
         recorded.fill(0);
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        resident_count = 0;
+        resident_tick = 0;
+        resident_raw = false;
+#endif
     }
 };
 
@@ -635,9 +680,10 @@ public:
     }
 
     /// Returns false (and leaves `func` untouched) when the chunk has no room.
-    template <typename Func>
+    template <NativeWriteSuffix::Handling handling = NativeWriteSuffix::Handling::Unknown,
+              typename Func>
     bool Push(Func&& func) {
-        using Command = TypedCommand<std::decay_t<Func>>;
+        using Command = TypedCommand<std::decay_t<Func>, handling>;
         static_assert(sizeof(Command) <= Capacity, "recorded command is too large");
         const size_t offset = (used + alignof(Command) - 1) & ~(alignof(Command) - 1);
         if (offset + sizeof(Command) > Capacity) {
@@ -684,6 +730,10 @@ public:
             command->~CommandBase();
             command = next;
         }
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        RefuseResidentDraw();
+        ++resident_incarnation;
+#endif
         first = last = nullptr;
         used = 0;
         spill_cursor = nullptr;
@@ -698,6 +748,39 @@ public:
     [[nodiscard]] size_t Size() const noexcept {
         return used + spill_used;
     }
+
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    u64 ResidentIncarnation() const noexcept { return resident_incarnation; }
+
+    template <NativeWriteSuffix::Handling handling = NativeWriteSuffix::Handling::Unknown,
+              typename Func>
+    bool PushResidentDraw(const std::shared_ptr<PostResidentGeometry::Ticket>& ticket, Func&& func) {
+        if (!Push<handling>(std::forward<Func>(func))) {
+            return false;
+        }
+        RefuseResidentDraw();
+        resident_ticket = ticket;
+        resident_draw = last;
+        return true;
+    }
+
+    std::shared_ptr<PostResidentGeometry::Ticket> TakeAdjacentResidentDraw() {
+        if (resident_draw != last) {
+            RefuseResidentDraw();
+            return {};
+        }
+        resident_draw = nullptr;
+        return std::exchange(resident_ticket, {});
+    }
+
+    void RefuseResidentDraw() {
+        if (resident_ticket) {
+            resident_ticket->Refuse(PostResidentGeometry::State::NoAdjacentEnd);
+            resident_ticket.reset();
+        }
+        resident_draw = nullptr;
+    }
+#endif
 
     u32 segment = 0; ///< the command buffer segment the chunk is recorded into (Scheduler)
     SubmissionBatch* batch = nullptr; ///< the submission it belongs to (Scheduler)
@@ -721,12 +804,18 @@ private:
         virtual void Execute(vk::CommandBuffer cmdbuf) = 0;
         CommandBase* next{};
     };
-    template <typename Func>
+    template <typename Func, NativeWriteSuffix::Handling handling>
     struct TypedCommand final : CommandBase {
         explicit TypedCommand(Func&& func_) : func{std::move(func_)} {}
         explicit TypedCommand(const Func& func_) : func{func_} {}
         void Execute(vk::CommandBuffer cmdbuf) override {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+            NativeWriteSuffix::Run<handling>(cmdbuf, func, [&] {
+                return NativeWriteSuffix::EncodeOnWorker(cmdbuf);
+            });
+#else
             func(cmdbuf);
+#endif
         }
         Func func;
     };
@@ -738,6 +827,11 @@ private:
     size_t spill_remaining = 0, spill_used = 0;
     CommandBase* first{};
     CommandBase* last{};
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    std::shared_ptr<PostResidentGeometry::Ticket> resident_ticket;
+    CommandBase* resident_draw{};
+    u64 resident_incarnation{1};
+#endif
 };
 
 class Scheduler {
@@ -779,6 +873,16 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    // A readback splits an already-open STORE pass. Its identical state resumes with LOAD.
+    [[nodiscard]] bool SuspendRenderingForReadback(const RenderState& state) {
+        if (!IsRenderingWith(state)) {
+            return false;
+        }
+        EndRendering();
+        resume_rendering = true;
+        return true;
+    }
+
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
         this->on_submit = std::move(on_submit);
@@ -805,6 +909,12 @@ public:
     }
 
     void SpliceSink(RecordSink& sink) {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        if (!sink.full.empty() || (sink.chunk && !sink.chunk->Empty())) {
+            NativeWriteSuffix::Recorder::Get().Unordered(this,
+                                                        NativeWriteSuffix::Gap::UnclassifiedSink);
+        }
+#endif
         if (!CurrentChunk().Empty()) {
             RetireChunk();
         }
@@ -821,6 +931,11 @@ public:
     }
 
     void SetForkOpen(bool open) noexcept {
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        if (open && record_chunk) {
+            record_chunk->RefuseResidentDraw();
+        }
+#endif
         fork_open = open;
     }
 
@@ -834,15 +949,48 @@ public:
     /// records directly (Record() included, so callers may mix both) until the next
     /// KickRecording() or submission.
     [[gnu::noinline]] vk::CommandBuffer CommandBuffer() {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        return BorrowCommandBuffer(false, __builtin_return_address(0));
+    }
+
+private:
+    vk::CommandBuffer BorrowCommandBuffer(bool post_root, void* caller) {
+#endif
         ++r21_serial; // bbport (r21_draw-sort): commands recorded on it are not seen
         ProducerScope producer{*this, "CommandBuffer"};
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        if (batch) {
+            batch->resident_raw = true;
+        }
+#endif
         if (!workers.empty() && !direct_mode) {
             EnterDirectMode();
             direct_recordings.fetch_add(1, std::memory_order_relaxed);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            TraceDirectRecording(caller);
+#else
             TraceDirectRecording(__builtin_return_address(0));
+#endif
         }
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (!post_root) {
+            post_raw_tick = batch ? batch->native_suffix_tick : 0;
+#endif
+        if (NativeWriteSuffix::Recorder::Get().Armed()) {
+            EncodeNativeWriteSuffix(current_cmdbuf)
+                .Note(NativeWriteSuffix::Kind::RawCommandBuffer);
+        }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        }
+#endif
+        native_suffix_raw_escaped = true;
+#endif
         return current_cmdbuf;
     }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+public:
+#endif
 
     /// BB_RECORDER_TRACE=1: prints the most frequent CommandBuffer() callers every 2000 calls.
     static void TraceDirectRecording(void* caller);
@@ -887,32 +1035,179 @@ public:
     /// everything it uses (capture by value): it may run later on the recording thread.
     template <typename Func>
     void Record(Func&& func) {
+        RecordImpl<NativeWriteSuffix::Handling::Unknown>(std::forward<Func>(func));
+    }
+
+#ifdef BB_TEST_NATIVE_WRITE_SUFFIX
+    // Arm on the command producer before handing over any of the selected markers.
+    NativeWriteSuffix::CaptureId ArmNativeWriteSuffix(NativeWriteSuffix::Consumer consumer) {
+        using namespace NativeWriteSuffix;
+        auto& recorder = Recorder::Get();
+        const auto capture =
+            recorder.Arm(this, consumer, batch->native_suffix_tick, native_suffix_raw_escaped,
+                         is_rendering || resume_rendering);
+        if (capture && (host_copies_done.load(std::memory_order_acquire) != host_copies_issued ||
+                        deferred_signals_done->load(std::memory_order_acquire) !=
+                            deferred_signals_issued.load(std::memory_order_relaxed))) {
+            recorder.Unordered(this, Gap::OrderedHost);
+        }
+        return capture;
+    }
+
+    bool ReadNativeWriteSuffix(NativeWriteSuffix::CaptureId capture,
+                               NativeWriteSuffix::Report& report) {
+        return NativeWriteSuffix::Recorder::Get().Read(this, capture, work_semaphore.KnownGpuTick(),
+                                                       report);
+    }
+
+    void DisarmNativeWriteSuffix(NativeWriteSuffix::CaptureId capture) {
+        NativeWriteSuffix::Recorder::Get().Disarm(this, capture);
+    }
+#endif
+
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    // Use only for a closure whose emitter accounts for every operation and every branch.
+    // Pass the encoder into actual emissions. The encoder and raw handle must not escape.
+    template <typename Func>
+    void RecordNativeWriteSuffix(Func&& func) {
+        RecordImpl<NativeWriteSuffix::Handling::Described>(std::forward<Func>(func));
+    }
+#endif
+
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    class PostNativeBorrow {
+    public:
+        PostNativeBorrow(const PostNativeBorrow&) = delete;
+        PostNativeBorrow& operator=(const PostNativeBorrow&) = delete;
+        ~PostNativeBorrow();
+        vk::CommandBuffer Buffer() const { return buffer; }
+        NativeWriteSuffix::PostBorrowOrigin Origin() const { return origin; }
+        void Note();
+        void Close(bool all_raw_uses_classified);
+        bool NoteOverwriteBarrier(vk::CommandBuffer issued, const vk::ImageMemoryBarrier2& barrier,
+                                  const NativeWriteSuffix::PostMergeAllocation& backing);
+        bool NoteOverwriteRoot(vk::CommandBuffer issued,
+                               const NativeWriteSuffix::PostMergeRootProof& proof);
+        void CloseAfterOverwrite(NativeWriteSuffix::PostOverwriteTail tail);
+
+    private:
+        friend class Scheduler;
+        PostNativeBorrow(Scheduler& scheduler, NativeWriteSuffix::PostToken token,
+                         vk::CommandBuffer buffer);
+        bool StillCurrent(bool allow_inline_recorded = false) const;
+        void CloseImpl(bool fully_classified, NativeWriteSuffix::PostOverwriteTail tail);
+        Scheduler& scheduler;
+        NativeWriteSuffix::PostToken token;
+        vk::CommandBuffer buffer;
+        std::thread::id producer;
+        NativeWriteSuffix::PostBorrowOrigin origin;
+        std::array<NativeWriteSuffix::PostMergeBarrierObservation,
+                   NativeWriteSuffix::MaxPostMergeBarriers> merge_barriers{};
+        size_t merge_barrier_count{};
+        bool overwrite_attempted{}, overwrite_unclassified{};
+    };
+
+    NativeWriteSuffix::CaptureId ArmPostNativeOrder(NativeWriteSuffix::PostKey key);
+    NativeWriteSuffix::PostToken ReservePostNativeOperation(NativeWriteSuffix::CaptureId capture,
+                                                          NativeWriteSuffix::PostRole role,
+                                                          u64 operation);
+    [[gnu::noinline]] PostNativeBorrow BorrowPostNativeRoot(NativeWriteSuffix::PostToken token);
+    bool ReadPostNativeOperation(NativeWriteSuffix::PostToken token,
+                                 NativeWriteSuffix::PostReceipt& receipt);
+    // After the existing fence is known, accept the actual retained owner proof for this merge.
+    bool ConfirmPostProxyLifetime(NativeWriteSuffix::PostToken merge,
+                                  const NativeWriteSuffix::PostProxyLifetimeProof& proof);
+    void DisarmPostNativeOrder(NativeWriteSuffix::CaptureId capture);
+
+    template <typename Func>
+    void RecordPostNative(NativeWriteSuffix::PostToken token, Func&& func) {
+        RecordNativeWriteSuffix([token, encode = std::forward<Func>(func)](
+                                    vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) mutable {
+            RunPostOperation(token, encoder, [&] { encode(cmd, encoder); });
+        });
+    }
+
+    template <typename Func>
+    void RecordPostNative(const Breadcrumbs::Crumb& crumb, NativeWriteSuffix::PostToken token,
+                          Func&& func) {
+        RecordNativePostCrumb(crumb, [token, encode = std::forward<Func>(func)](
+                                vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) mutable {
+            RunPostOperation(token, encoder, [&] { encode(cmd, encoder); });
+        });
+    }
+#endif
+
+private:
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    friend class NativeWriteSuffix::PostOrderFixture;
+
+    template <typename Func>
+    static void RunPostOperation(NativeWriteSuffix::PostToken token,
+                                 NativeWriteSuffix::Encoder& encoder, Func&& func) {
+        if (token.role != NativeWriteSuffix::PostRole::Merge) {
+            encoder.expected_post = token;
+        }
+        func();
+        if (!encoder.post_attested) {
+            encoder.Note(NativeWriteSuffix::Kind::UnknownRecord,
+                         encoder.expected_post && token.capture == encoder.id ? token.operation : 0);
+        }
+    }
+
+    template <typename Func>
+    void RecordNativePostCrumb(const Breadcrumbs::Crumb& crumb, Func&& func) {
+        if (!Breadcrumbs::Enabled()) {
+            RecordNativeWriteSuffix(std::forward<Func>(func));
+            return;
+        }
+        const u32 id = Breadcrumbs::Note(crumb_stream, crumb);
+        RecordNativeWriteSuffix([encode = std::forward<Func>(func), stream = crumb_stream, id](
+                                   vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) mutable {
+            Breadcrumbs::Mark(cmd, stream, id, false);
+            encode(cmd, encoder);
+            Breadcrumbs::Mark(cmd, stream, id, true);
+        });
+    }
+#endif
+
+    template <NativeWriteSuffix::Handling handling, typename Func>
+    void RecordImpl(Func&& func) {
         ++r21_serial; // bbport (r21_draw-sort): R21Serial()
         if (RecordSink* sink = thread_sink) [[unlikely]] {
-            if (!sink->chunk->Push(std::forward<Func>(func))) {
+            if (!sink->chunk->Push<handling>(std::forward<Func>(func))) {
                 RetireSinkChunk(*sink);
-                const bool pushed = sink->chunk->Push(std::forward<Func>(func));
+                const bool pushed = sink->chunk->Push<handling>(std::forward<Func>(func));
                 ASSERT(pushed);
             }
             return;
         }
         ProducerScope producer{*this, "Record"};
-        if (workers.empty() || direct_mode) {
+        const auto execute_inline = [&] {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+            NativeWriteSuffix::Run<handling>(current_cmdbuf, func, [&] {
+                return EncodeNativeWriteSuffix(current_cmdbuf);
+            });
+#else
             func(current_cmdbuf);
+#endif
+        };
+        if (workers.empty() || direct_mode) {
+            execute_inline();
             return;
         }
         if (BbToggle::Disabled(BbToggle::ThreadedRecording)) {
             EnterDirectMode();
-            func(current_cmdbuf);
+            execute_inline();
             return;
         }
-        if (!CurrentChunk().Push(std::forward<Func>(func))) {
+        if (!CurrentChunk().Push<handling>(std::forward<Func>(func))) {
             RetireChunk();
-            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
+            const bool pushed = CurrentChunk().Push<handling>(std::forward<Func>(func));
             ASSERT(pushed);
         }
     }
 
+public:
     /// bbport: Record() for a draw, dispatch or pass that runs shaders, between GPU breadcrumbs
     /// (vk_breadcrumbs.h): on a GPU hang they say which one never finished.
     template <typename Func>
@@ -929,6 +1224,68 @@ public:
             Breadcrumbs::Mark(cmdbuf, stream, id, true);
         });
     }
+
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    // The original draw callable is invoked exactly once on every route. Its Issue is inactive
+    // when the draw cannot be joined to an ordinary EndRendering in the same deferred chunk.
+    template <typename Func>
+    void RecordPostResidentDraw(const Breadcrumbs::Crumb& crumb,
+                                const std::shared_ptr<PostResidentGeometry::Ticket>& ticket,
+                                Func&& func) {
+        RecordPostResidentDrawImpl<NativeWriteSuffix::Handling::Unknown>(
+            ticket, std::forward<Func>(func),
+            [&](auto&& command) { RecordCrumb(crumb, std::move(command)); });
+    }
+
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    template <typename Func>
+    void RecordPostResidentDraw(const Breadcrumbs::Crumb& crumb,
+                                const std::shared_ptr<PostResidentGeometry::Ticket>& ticket,
+                                NativeWriteSuffix::PostToken post, Func&& func) {
+        using namespace PostResidentGeometry;
+        RecordPostResidentDrawImpl<NativeWriteSuffix::Handling::Described>(
+            ticket, [post, draw = std::forward<Func>(func)](
+                        vk::CommandBuffer cmd, Issue& issue, NativeWriteSuffix::Encoder& encoder) mutable {
+                RunPostOperation(post, encoder, [&] { draw(cmd, issue, encoder); });
+            }, [&](auto&& command) { RecordNativePostCrumb(crumb, std::move(command)); });
+    }
+#endif
+
+private:
+    template <NativeWriteSuffix::Handling handling, typename Func, typename Fallback>
+    void RecordPostResidentDrawImpl(const std::shared_ptr<PostResidentGeometry::Ticket>& ticket,
+                                    Func&& func, Fallback&& record_fallback) {
+        using namespace PostResidentGeometry;
+        if (ticket && ticket->Get() == State::Planned) {
+            ProducerScope producer{*this, "RecordPostResidentDraw"};
+            if (is_rendering && !thread_sink && !fork_open && IsRecordingDeferred() &&
+                !Breadcrumbs::Enabled() && batch && !batch->resident_raw &&
+                PrepareResidentDraw(*ticket)) {
+                auto& chunk = CurrentChunk();
+                ticket->incarnation = chunk.ResidentIncarnation();
+                auto command = [ticket, draw = std::forward<Func>(func)](
+                                   vk::CommandBuffer cmd, auto&... encoder) mutable {
+                    Issue issue{ticket->Get() == State::Recorded ? ticket.get() : nullptr, cmd};
+                    draw(cmd, issue, encoder...);
+                };
+                if (chunk.PushResidentDraw<handling>(ticket, std::move(command))) {
+                    ++r21_serial;
+                    ticket->Set(State::Recorded);
+                    return;
+                }
+                ticket->Refuse(State::NoAdjacentEnd);
+                record_fallback(std::move(command));
+                return;
+            }
+            ticket->Refuse(State::Unordered);
+        }
+        record_fallback([draw = std::forward<Func>(func)](vk::CommandBuffer cmd, auto&... encoder) mutable {
+            Issue inactive{nullptr, cmd};
+            draw(cmd, inactive, encoder...);
+        });
+    }
+public:
+#endif
 
     /// bbport: waits until the submission signalling `tick` is in the queue. Another thread's
     /// submission waiting for the tick on the same queue must not go first (BB_ASYNC_SUBMIT
@@ -1055,6 +1412,9 @@ public:
                                u32 label_size = 0) {
         // A direct segment queues it too: signals queued before it must not be overtaken.
         if (!IsRecordingDeferred() && !direct_segment) {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+            NativeWriteSuffix::Recorder::Get().Unordered(this, NativeWriteSuffix::Gap::OrderedHost);
+#endif
             WaitHostCopies();
             signal();
             return;
@@ -1329,7 +1689,20 @@ private:
     /// 0x263b8e7: 3 of 4 soak runs instead of none).
     template <typename Func>
     void RecordOrdered(Func&& func) {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        NativeWriteSuffix::Recorder::Get().Unordered(this, NativeWriteSuffix::Gap::OrderedHost);
+#endif
+        RecordOrderedImpl(std::forward<Func>(func));
+    }
+
+    template <typename Func>
+    void RecordOrderedImpl(Func&& func) {
         ProducerScope producer{*this, "RecordOrdered"};
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        if (!thread_sink && record_chunk) {
+            record_chunk->RefuseResidentDraw();
+        }
+#endif
         if (OrderedInline()) {
             func();
             return;
@@ -1340,14 +1713,27 @@ private:
             return;
         }
         auto command = [func = std::forward<Func>(func)](vk::CommandBuffer) mutable { func(); };
-        if (!OrderedChunk().Push(std::move(command))) {
+        if (!OrderedChunk().Push<NativeWriteSuffix::Handling::NoNativeWrites>(std::move(command))) {
             auto full = AcquireChunk();
             ordered_chunk.swap(full);
             ordered_full.push_back(std::move(full));
-            const bool pushed = OrderedChunk().Push(std::move(command));
+            const bool pushed =
+                OrderedChunk().Push<NativeWriteSuffix::Handling::NoNativeWrites>(std::move(command));
             ASSERT(pushed);
         }
     }
+
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    void RecordRenderEnd();
+    NativeWriteSuffix::Encoder EncodeNativeWriteSuffix(vk::CommandBuffer cmdbuf);
+    bool native_suffix_raw_escaped = false;
+#endif
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    u64 post_borrow_epoch{}, post_raw_tick{};
+    NativeWriteSuffix::CaptureId open_post_borrow{};
+    bool NotePostNativeRoot(NativeWriteSuffix::PostToken token, vk::CommandBuffer buffer,
+                            const NativeWriteSuffix::PostMergeRootEvidence* overwrite = nullptr);
+#endif
 
     [[nodiscard]] bool RecordingIdle() const; ///< with recorder_mutex held
 
@@ -1385,6 +1771,16 @@ private:
         bool carry = false;         ///< bbport (r35_pending-ops): may run in a later frame
     };
     std::queue<PendingOp> pending_ops;
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    bool PrepareResidentDraw(PostResidentGeometry::Ticket& ticket);
+    bool TryPostResidentEnd();
+    void EncodePostResident(RecordChunk& chunk, PostResidentGeometry::Ticket& ticket,
+                            vk::CommandBuffer cmd);
+    void SubmitPostResident(SubmissionBatch& submitted, vk::Result result, u64 signal,
+                            std::span<const vk::CommandBuffer> commands);
+    std::queue<PendingOp> resident_pending_ops;
+    std::mutex resident_pending_ops_mutex;
+#endif
     std::recursive_mutex pending_ops_mutex;
     u32 pending_polls = 0; // bbport
     // bbport (r35_pending-ops): frees the GPU is past, carried to a later frame because the budget

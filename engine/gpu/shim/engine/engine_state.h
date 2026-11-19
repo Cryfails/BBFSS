@@ -24,6 +24,14 @@ bool player_origin(int* origin);
 bool world_player_block(std::uint32_t* block);
 // bbport (r111_footprints): the hunter's position (x, y, z; y up) as the game's physics keeps it.
 bool world_player_position(float pos[3]);
+
+// t166 test tool: one local-player sample. The raw field's meaning is unverified.
+struct WorldPlayerRegionSample {
+    std::uint32_t block;
+    std::uint32_t region_raw;
+    float position[3];
+};
+bool world_player_region_sample(WorldPlayerRegionSample& out);
 bool event_flag_get(std::uint32_t id, bool* value);
 bool event_flag_set(std::uint32_t id, bool value);
 

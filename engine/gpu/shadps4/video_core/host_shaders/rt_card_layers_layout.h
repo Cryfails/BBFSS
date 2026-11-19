@@ -265,4 +265,12 @@
 #define CARD_LAMP_BOOK_FULL 217
 #define CARD_LAMP_BUFFER_WORDS 218
 
+// bbport (r131a_foliage-translucency): the colour layers (RGBA8, CARD_COLOUR_SIZE square, one level, CARD_LAYER_COUNT layers: the level 2 size of the
+// alpha layers; rt_card_alpha_fill.comp COLOUR=1) and the lamp pass's FOLIAGE counters (point_shadow_ray.comp): words CARD_LAMP_FOLIAGE_FIRST on of the
+// counters buffer, which is CARD_LAMP_FOLIAGE_WORDS words longer only with FOLIAGE builds: 0 lamp rays, 1 rays that passed a leaf, 2 leaves passed,
+// 3 rays that ended at the floor, 4 leaves passed without colour (a mask texture), then three spare.
+#define CARD_COLOUR_SIZE 64
+#define CARD_LAMP_FOLIAGE_FIRST 218
+#define CARD_LAMP_FOLIAGE_WORDS 8
+
 #endif

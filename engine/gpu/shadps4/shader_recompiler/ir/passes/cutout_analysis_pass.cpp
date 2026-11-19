@@ -71,6 +71,7 @@
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/program.h"
 #include "video_core/renderer_vulkan/rt_card_uv.h" // bbport (r54_leaf-stage2): ReadCardAlpha
+#include "bbport_settings.h" // bbport (r131b_lrt-settings): the foliage setting
 
 namespace Shader::Optimization {
 namespace {
@@ -2072,12 +2073,24 @@ bool CutoutLogOn() {
 u32 CardAlphaLevel() {
     static const u32 level = [] {
         const char* env = std::getenv("BB_RT_CARD_ALPHA");
-        if (Vulkan::CardAlphaMisread(env)) {
+        // bbport (r131b_lrt-settings): a variable that is set and not empty decides; else the setting graphics_rt_foliage_shadows
+        // (the start copy: the three readers cannot disagree after a menu change). First call is after BbSettings::Load.
+        const int setting = BbSettings::Get().startup_rt_foliage_shadows;
+        if (Vulkan::EnvGiven(env) && Vulkan::CardAlphaMisread(env)) {
             std::printf("Ray tracing card UVs (r54): BB_RT_CARD_ALPHA=%.16s is not 0, 1 or 2: "
                         "off\n",
                         env);
         }
-        return Vulkan::ReadCardAlpha(env);
+        {
+            const auto given = [](const char* name) {
+                return Vulkan::EnvGiven(std::getenv(name)) ? "set: it decides" : "not set";
+            };
+            std::printf("Ray traced foliage shadows (r131b): setting graphics_rt_foliage_shadows=%d (%s); BB_RT_CARD_ALPHA %s, "
+                        "BB_RT_CARD_LAMPS %s, BB_RT_CARD_SUN %s\n",
+                        setting, setting >= 2 ? "lamps and sun" : setting == 1 ? "lamps" : "off", given("BB_RT_CARD_ALPHA"),
+                        given("BB_RT_CARD_LAMPS"), given("BB_RT_CARD_SUN"));
+        }
+        return Vulkan::CardAlphaOf(env, setting);
     }();
     return level;
 }

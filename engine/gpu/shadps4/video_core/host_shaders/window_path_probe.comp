@@ -1,0 +1,100 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "window_path_probe_layout.h"
+
+layout(local_size_x = 8) in;
+struct Ray { vec4 o_min, d_max; };
+struct Segment { Ray solid, pane; uvec4 masks; };
+struct Selection { uvec4 info; uvec4 low, high; };
+struct Hit { uint status, looked, id, primitive; uint custom, front; float t; uint reserved; };
+struct Result { Hit pane, actual, skipped; };
+layout(binding = 0) uniform accelerationStructureEXT scene;
+layout(std430, binding = 1) readonly buffer Inputs {
+    Segment segments[WP_SEGMENTS];
+    Selection selected[WP_SELECTED];
+    uvec2 records[WP_RECORDS]; // triangle count, mask:8 + custom index:24
+} input_data;
+layout(std430, binding = 2) writeonly buffer Outputs { Result result[]; } output_data;
+layout(push_constant) uniform Push { uint segments, records, selected; } push;
+
+bool Selected(uint id, uint primitive) {
+    for (uint i = 0u; i < push.selected; ++i) {
+        const Selection s = input_data.selected[i];
+        if (s.info.x == id) {
+            const uint w = primitive >> 5;
+            if (w >= WP_TRI_WORDS) {
+                return false;
+            }
+            const uint word = w < 4u ? s.low[w] : s.high[w - 4u];
+            return (word & (1u << (primitive & 31u))) != 0u;
+        }
+    }
+    return false;
+}
+
+Hit Trace(Ray ray, uint mask, uint mode) {
+    Hit hit = Hit(WP_COMPLETE, 0, WP_NONE, WP_NONE, WP_NONE, 0, -1, 0);
+    if (mask == 0u || !(ray.o_min.w >= 0.0 && ray.d_max.w > ray.o_min.w)) {
+        hit.status = WP_BAD_INPUT;
+        return hit;
+    }
+    rayQueryEXT query;
+    // The supported consumers use solid triangle visibility. Expose every candidate, then
+    // confirm all relevant triangles (actual), or all except the witnessed subset (skipped).
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, mask, ray.o_min.xyz, ray.o_min.w,
+                          ray.d_max.xyz, ray.d_max.w);
+    while (rayQueryProceedEXT(query)) {
+        if (hit.looked == WP_CANDIDATES) {
+            hit.status = WP_OVERFLOW;
+            break;
+        }
+        ++hit.looked;
+        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+            hit.status = WP_BAD_TYPE;
+            break;
+        }
+        const uint id = uint(rayQueryGetIntersectionInstanceIdEXT(query, false));
+        const uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, false));
+        const uint custom = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, false));
+        if (id >= push.records ||
+            rayQueryGetIntersectionGeometryIndexEXT(query, false) != 0 ||
+            primitive >= input_data.records[id].x ||
+            custom != (input_data.records[id].y & 0xffffffu) ||
+            ((input_data.records[id].y >> 24u) & mask) == 0u) {
+            hit.status = WP_UNKNOWN;
+            break;
+        }
+        const float t = rayQueryGetIntersectionTEXT(query, false);
+        if (!(t >= ray.o_min.w && t <= ray.d_max.w)) {
+            hit.status = WP_BAD_INPUT;
+            break;
+        }
+        const bool pane = Selected(id, primitive);
+        if (WP_ACCEPT(mode, pane)) {
+            rayQueryConfirmIntersectionEXT(query);
+        }
+    }
+    if (hit.status != WP_COMPLETE) {
+        rayQueryTerminateEXT(query);
+    } else if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT) {
+        hit.id = uint(rayQueryGetIntersectionInstanceIdEXT(query, true));
+        hit.primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+        hit.custom = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
+        hit.front = uint(rayQueryGetIntersectionFrontFaceEXT(query, true));
+        hit.t = rayQueryGetIntersectionTEXT(query, true);
+    }
+    return hit;
+}
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= push.segments || push.segments > WP_SEGMENTS || push.records > WP_RECORDS ||
+        push.selected > WP_SELECTED) {
+        return;
+    }
+    const Segment s = input_data.segments[i];
+    output_data.result[i] = Result(Trace(s.pane, s.masks.y, WP_PANE),
+        Trace(s.solid, s.masks.x, WP_ACTUAL), Trace(s.solid, s.masks.x, WP_SKIP));
+}

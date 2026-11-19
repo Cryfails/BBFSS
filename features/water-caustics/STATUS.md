@@ -1,5 +1,15 @@
 # Water caustics: moving light nets from sun, moon and lamps
 
+## Development snapshot, 2026-11-19
+
+LRT T05. Feature work is paused.
+
+- Verified scope. Native sewer bed reads, wet light and dry/off controls passed. The reduced moving WARP sample path also passed.
+- Open scope. The alternate scene reproduced the centre controls. Its diagnostic copied the wrong layer for diagonals. The private correction still needs a live check. Displayed motion and cost remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 45%. Rated by the weakest part: caustics look right only on rippling liquid, and the latest fix is unjudged.
 
 ## What works
@@ -45,3 +55,6 @@ None are on a fork branch yet; the notes plan visual/glass-water.
 - Graveyard with water or blood pools at night: lamp caustics.
 - Church puddles: puddle plane; must do nothing when no water plane exists (it logs "no water plane").
 - Dream house or a dry open place: do-nothing check.
+
+
+</details>

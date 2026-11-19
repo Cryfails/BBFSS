@@ -1,0 +1,228 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (r55_drawn-look-lines): the drawn look's ink lines. Recorded by
+// renderer_vulkan/vk_drawn_look.cpp after the strokes and the colour lock, or alone when the
+// strokes' strength is 0 (lines only); not on a frame painted right before the upscaler, where
+// fog and particles are already in the scene. It rewrites the scene colour's rgb in place and
+// keeps the alpha. The sky is not written.
+//
+// A pixel gets ink where its surface stands in front of what lies behind it: taps along 4 axes,
+// both ways, out to a pixel past the line's width, read the depth, and a tap counts when it is
+// farther than the pixel's own plane, carried on to the tap, says it should be (by GAP of the
+// pixel's depth). Only the depth decides, never the colour: a texture's cracks and joints get no
+// line, and a cobble lip of 2 cm at 3 m is under GAP. The line lies on the near side, on the
+// front surface's own pixels. Something that lies in front of what is behind it on both sides of
+// an axis within those taps (narrower than about twice the line: a railing, a branch) gets half
+// the weight along that axis. A line pixel's rgb is multiplied by mix(1, f, weight), with
+// f = min(INK_OWN x its brightness, INK_KEY x the frame's key) / its brightness: one factor for
+// the three channels, so its hue stays, and a scene twice as bright gets the same lines. What
+// glows (the rule of paint_strokes.comp's keepOwn) gets no ink.
+//
+// The line's width is LINE_PX_ENV pixels of a 1080-line scene near the camera, narrowing with
+// distance; how dark it is far away (`opacity`) is taken from that width in 1080-line pixels, so
+// where lines show does not depend on the render size or on BB_DRAWN_LOOK_LINE. In this scene's
+// pixels the width is times size.y / 1080 and LINE_SCALE; a line narrower than one pixel is
+// drawn one pixel wide with its weight times its width.
+//
+// The block's words are the other passes' (paint_common.glsl); DrawnLookParams::MakeInk
+// (drawn_look_params.h) gives three of its floats the meanings below.
+//
+// Test view 3 (BB_DRAWN_LOOK_VIEW=3, INK_WORLD 1): a page of the key's grey with the lines
+// dark, key * (1 - weight), on every pixel that is not sky.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "paint_common.glsl"
+
+#define INK_WORLD strength    // graphics_drawn_look_ink_world, 0..1 (1 in test view 3)
+#define INK_CHARS brush       // graphics_drawn_look_outlines: carried, not read yet
+#define LINE_SCALE characters // BB_DRAWN_LOOK_LINE, 0.5..2 (1 without it)
+
+// paint_prep.comp's copy and its smaller levels (rgb the scene before the strokes); its last
+// level, one texel, holds the frame's key (paint_key.comp). Linear between texels and levels.
+layout(binding = 0) uniform sampler2D prep_tex;
+layout(binding = 1) uniform texture2D depth_tex; // depth 0..1 (D3D projection), 1: sky
+layout(binding = 2, rgba16f) uniform image2D scene_img;
+
+// A tap counts from the first share of the pixel's depth beyond its plane, fully from the
+// second.
+const vec2 GAP = vec2(0.02, 0.06);
+// The plane's prediction may move the depth by at most this share of the pixel's depth per
+// pixel of a 1080-line scene: an edge-on plane would predict any depth at all.
+const float SLOPE_CAP = 0.04;
+// A jump of the second share of the depth or more (a pillar against the far courtyard) inks
+// fully; a step of the first or less (a ledge) inks half.
+const vec2 BIG_JUMP = vec2(0.05, 0.30);
+// A line's width in pixels of a 1080-line scene near the camera; from LINE_NEAR_M on it narrows
+// with the square root of the distance, to half of it at four times that distance.
+const float LINE_PX_ENV = 1.5;
+const float LINE_NEAR_M = 4.0;
+// Between these distances (metres) the lines fade out.
+const vec2 ENV_FADE_M = vec2(40.0, 120.0);
+// A fully inked pixel: its own brightness times INK_OWN, or the key times INK_KEY where that is
+// darker.
+const float INK_OWN = 0.30;
+const float INK_KEY = 0.05;
+// What glows, as paint_strokes.comp: this many stops over the key and over its place.
+const vec2 GLOW_STOPS = vec2(4.0, 1.0);
+// Beyond on the other side of an axis: from the first share (as a tap's count) the weight along
+// the axis goes down, to THIN_WEIGHT from the second.
+const vec2 THIN = vec2(0.3, 0.7);
+const float THIN_WEIGHT = 0.5;
+const uint VIEW_INK = 3u;
+
+float depthAt(ivec2 p) {
+    return texelFetch(depth_tex, p, 0).r;
+}
+
+// The view position seen at pixel p (sky as very far).
+vec3 viewAt(ivec2 p) {
+    const float d = depthAt(p);
+    return viewPos(vec2(p) + 0.5, d >= 1.0 ? 1e6 : viewZ(d));
+}
+
+bool inside(ivec2 p) {
+    return all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, ivec2(size)));
+}
+
+// The surface's step from the pixel to its neighbour along `step`: of the two neighbours the
+// one nearer in depth (as depthNormal in paint_strokes.comp), so it does not lean across an
+// edge; at the image's border the one inside.
+vec3 tangent(ivec2 pixel, vec3 c, ivec2 step) {
+    const ivec2 a = pixel - step, b = pixel + step;
+    const bool a_in = inside(a), b_in = inside(b);
+    const vec3 pa = a_in ? viewAt(a) : c;
+    const vec3 pb = b_in ? viewAt(b) : c;
+    if (!a_in) {
+        return pb - c;
+    }
+    if (!b_in) {
+        return c - pa;
+    }
+    return abs(pb.z - c.z) < abs(c.z - pa.z) ? pb - c : c - pa;
+}
+
+// The surface's normal from the depth around the pixel, view axes (its sign does not matter).
+vec3 viewNormal(ivec2 pixel, vec3 c) {
+    const vec3 n = cross(tangent(pixel, c, ivec2(0, 1)), tangent(pixel, c, ivec2(1, 0)));
+    return dot(n, n) > 1e-12 ? normalize(n) : -normalize(c);
+}
+
+// How much the depth at pixel q lies beyond the plane (normal n, n . P = level) of the pixel
+// at depth z, as a share 0..1 (GAP); `jump`: its depth over the pixel's, less 1. The sky is
+// four times the pixel's depth. `apart`: the tap's distance in pixels.
+float beyond(ivec2 q, vec3 n, float level, float z, float apart, float s, out float jump) {
+    const float dq = depthAt(q);
+    const float zq = dq >= 1.0 ? 4.0 * z : viewZ(dq);
+    const float along = dot(n, viewPos(vec2(q) + 0.5, 1.0));
+    const float zplane = abs(along) > 1e-4 ? level / along : z;
+    const float limit = SLOPE_CAP * (apart / s) * z;
+    const float zhat = z + clamp(zplane - z, -limit, limit);
+    jump = (zq - z) / z;
+    return smoothstep(GAP.x, GAP.y, (zq - zhat) / z);
+}
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const float depth = depthAt(pixel);
+    if (depth >= 1.0) {
+        return;
+    }
+    const bool page = ((flags >> 8u) & 7u) == VIEW_INK;
+    const float s = size.y / 1080.0;
+    const float z = viewZ(depth);
+    const vec3 c = viewPos(vec2(pixel) + 0.5, z);
+    const float d = length(c);
+    // The width in pixels of a 1080-line scene at line scale 1; under one such pixel the line
+    // fades (none at 0.6): from about 9 m on at the near width.
+    const float narrowed = LINE_PX_ENV * clamp(sqrt(LINE_NEAR_M / d), 0.5, 1.0);
+    const float opacity = smoothstep(0.6, 1.0, narrowed);
+    // The width in this scene's pixels: the same share of the picture at every render size. A
+    // line under one pixel is drawn one pixel wide (`drawn`) at the share `thinner` of its
+    // weight: it does not jump from pixel to pixel with the jitter, and the ink along an edge
+    // goes with the width.
+    const float width = narrowed * s * LINE_SCALE;
+    const float drawn = max(width, 1.0);
+    const float thinner = min(width, 1.0);
+    const float fade = 1.0 - smoothstep(ENV_FADE_M.x, ENV_FADE_M.y, d);
+    float line = 0.0;
+    if (opacity > 0.0 && fade > 0.0 && INK_WORLD > 0.0) {
+        const vec3 n = viewNormal(pixel, c);
+        const float level = dot(n, c);
+        // Taps at whole pixels out to a pixel past the line; one pixel of the line a tap's way
+        // across the edge is the share clamp(drawn + 1 - distance, 0, 1) of that pixel. A tap
+        // past the line (share 0) only tells whether the other side lies beyond too.
+        const int reach = int(min(ceil(drawn + 1.0), 7.0));
+        const vec2 dirs[4] = vec2[4](vec2(1.0, 0.0), vec2(0.0, 1.0), vec2(0.70710678, 0.70710678),
+                                     vec2(0.70710678, -0.70710678));
+        for (int i = 0; i < 4; ++i) {
+            // la, lb: the line from the taps on each side; fa, fb: how far beyond each side lies
+            // anywhere within reach.
+            float la = 0.0, lb = 0.0, fa = 0.0, fb = 0.0;
+            ivec2 last = ivec2(0);
+            for (int r = 1; r <= reach; ++r) {
+                const ivec2 o = ivec2(floor(dirs[i] * float(r) + 0.5));
+                if (o == last) {
+                    continue;
+                }
+                last = o;
+                const float apart = length(vec2(o));
+                const float cover = clamp(drawn + 1.0 - apart, 0.0, 1.0);
+                const ivec2 qa = clamp(pixel + o, ivec2(0), ivec2(size) - 1);
+                const ivec2 qb = clamp(pixel - o, ivec2(0), ivec2(size) - 1);
+                float jump_a = 0.0, jump_b = 0.0;
+                const float sa = qa != pixel ? beyond(qa, n, level, z, apart, s, jump_a) : 0.0;
+                const float sb = qb != pixel ? beyond(qb, n, level, z, apart, s, jump_b) : 0.0;
+                fa = max(fa, sa);
+                fb = max(fb, sb);
+                const float ka = mix(0.5, 1.0, smoothstep(BIG_JUMP.x, BIG_JUMP.y, jump_a));
+                const float kb = mix(0.5, 1.0, smoothstep(BIG_JUMP.x, BIG_JUMP.y, jump_b));
+                la = max(la, sa * cover * ka);
+                lb = max(lb, sb * cover * kb);
+            }
+            line = max(line, la * mix(1.0, THIN_WEIGHT, smoothstep(THIN.x, THIN.y, fb)));
+            line = max(line, lb * mix(1.0, THIN_WEIGHT, smoothstep(THIN.x, THIN.y, fa)));
+        }
+    }
+    float weight = line * thinner * opacity * INK_WORLD * fade;
+    if (weight <= 0.0 && !page) {
+        return;
+    }
+    const vec4 scene = imageLoad(scene_img, pixel);
+    // A scene colour that is no number stays what it is (the ink page draws over it).
+    if (!page && any(isnan(scene.rgb))) {
+        return;
+    }
+    const float own = dot(max(scene.rgb, 0.0), LUMA);
+    const float key = textureLod(prep_tex, vec2(0.5), 99.0).r;
+    const float black = blackLevel(key);
+    // What glows: brighter than the key and than its place, around the pixel over a few pixels
+    // and over a large place (about 1/270 and 1/17 of the picture's height), as keepOwn.
+    const vec2 uv = (vec2(pixel) + 0.5) / size;
+    const float lines = log2(size.y);
+    const float near = dot(textureLod(prep_tex, uv, lines - 8.1).rgb, LUMA);
+    const float place = dot(textureLod(prep_tex, uv, lines - 4.1).rgb, LUMA);
+    const float top = max(own, near);
+    const float glow = min(log2((top + black) / (key + black)) - GLOW_STOPS.x,
+                           log2((top + black) / (place + black)) - GLOW_STOPS.y);
+    weight *= 1.0 - smoothstep(0.0, 1.0, glow);
+    vec3 result;
+    if (page) {
+        result = vec3(key) * (1.0 - weight);
+    } else {
+        if (weight <= 0.0) {
+            return;
+        }
+        // One factor for all three channels (a channel under 0 included): the hue stays.
+        const float factor = min(INK_OWN * own, INK_KEY * key) / max(own, black);
+        result = scene.rgb * mix(1.0, factor, weight);
+    }
+    if (!any(isnan(result))) {
+        imageStore(scene_img, pixel, vec4(result, scene.a));
+    }
+}

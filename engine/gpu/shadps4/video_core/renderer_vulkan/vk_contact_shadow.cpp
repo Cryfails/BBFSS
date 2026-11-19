@@ -10,8 +10,10 @@
 #include "engine/graphics.h"
 #include "common/assert.h"
 #include "video_core/host_shaders/contact_shadow_comp.h"
+#include "video_core/renderer_vulkan/vk_bend_sss.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_cloud_shadow.h" // bbport (r105_cloud-shadows)
+#include "video_core/renderer_vulkan/vk_sun_term_view.h" // bbport (t129c_sun-term-view)
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -27,10 +29,12 @@ struct Push {
     u32 buf_off;
     u32 frame_index;
     std::array<float, 2> size;
-    float length_m;
-    float thickness_m;
+    std::array<float, 4> light_coordinate;
+    std::array<s32, 2> wave_offset;
+    float surface_thickness;
+    float bilinear_threshold;
     float strength;
-    float flip;
+    float shadow_contrast;
     u32 debug;
     u32 contact_on;
     u32 pcss_on;
@@ -40,8 +44,9 @@ struct Push {
     float bias_m;
     u32 filter_on;
     float cascade_blend;
+    float bend_distance_scale; // 0: no uniforms bound, so no distance fade
 };
-static_assert(sizeof(Push) == 68);
+static_assert(sizeof(Push) == 96);
 
 constexpr auto Compute = vk::PipelineStageFlagBits2::eComputeShader;
 
@@ -64,7 +69,9 @@ bool ContactShadow::Ready() {
     using enum vk::DescriptorType;
     const bool made =
         EffectPass::StorageFormat(instance, vk::Format::eR8G8B8A8Unorm) &&
-        EffectPass::CreateSampler(instance, sampler, vk::Filter::eNearest) &&
+        EffectPass::CreateSampler(instance, sampler, vk::Filter::eNearest,
+                                  vk::SamplerAddressMode::eClampToBorder,
+                                  vk::BorderColor::eFloatOpaqueWhite) &&
         EffectPass::Create(instance, set_layout, layout, pipeline,
                            {eStorageBuffer, eCombinedImageSampler, eStorageImage,
                             eCombinedImageSampler, eStorageBuffer},
@@ -179,11 +186,34 @@ void ContactShadow::Flush(bool native_blur) {
         runtime.FlushBarriers();
     }
 
+    // Bend's wavefront layout is only needed for the contact shadows; the shadow-map filter on
+    // its own runs one thread per pixel, in rows of 64.
+    BendSss::DispatchList dispatches;
+    bool bend = use_contact;
+    if (bend) {
+        if (pending_inputs.has_constants_cpu) {
+            dispatches = BendSss::BuildDirectionalDispatchList(
+                pending_inputs.constants_cpu.data(), int(width), int(height), flip);
+        }
+        if (dispatches.dispatch_count == 0) {
+            bend = false;
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::printf("Contact shadows: sun projection unavailable; skipped\n");
+            }
+            if (!use_filter) {
+                rt_shadow.RecordBuilds();
+                return;
+            }
+        }
+    }
     static bool printed = false;
     if (!printed) {
         printed = true;
-        std::printf("Contact shadows: %ux%u, length %.2f m, thickness %.2f m, strength %.2f\n",
-                    width, height, length_m, thickness_m, strength);
+        std::printf("Contact shadows: Bend Studio compute, %ux%u, 60 samples, %d dispatches, "
+                    "strength %.2f\n",
+                    width, height, dispatches.dispatch_count, strength);
         std::printf("Directional shadows: %s after native blur, cascade blend %.0f%%\n",
                     use_filter ? (use_pcss ? "atlas-safe PCSS" : "atlas-safe PCF") : "native filter",
                     100.0f * BbEngine::Graphics::DirectionalShadowBlend());
@@ -192,12 +222,14 @@ void ContactShadow::Flush(bool native_blur) {
         .buf_off = pending_inputs.constants_offset_word,
         .frame_index = pending_inputs.frame_index,
         .size = {float(width), float(height)},
-        .length_m = length_m,
-        .thickness_m = thickness_m,
+        .light_coordinate = dispatches.light_coordinate,
+        .wave_offset = {},
+        .surface_thickness = surface_thickness,
+        .bilinear_threshold = bilinear_threshold,
         .strength = strength,
-        .flip = flip,
+        .shadow_contrast = shadow_contrast,
         .debug = debug,
-        .contact_on = use_contact ? 1u : 0u,
+        .contact_on = bend ? 1u : 0u,
         .pcss_on = use_pcss ? 1u : 0u,
         .light_tan = light_tan,
         .max_penumbra_m = max_penumbra_m,
@@ -205,6 +237,7 @@ void ContactShadow::Flush(bool native_blur) {
         .bias_m = bias_m,
         .filter_on = use_filter ? 1u : 0u,
         .cascade_blend = BbEngine::Graphics::DirectionalShadowBlend(),
+        .bend_distance_scale = pending_inputs.uniforms ? bend_distance_scale : 0.0f,
     };
     const auto in = pending_inputs;
     const bool filter_on = use_filter;
@@ -221,6 +254,10 @@ void ContactShadow::Flush(bool native_blur) {
                           .frame_index = in.frame_index,
                           .width = width,
                           .height = height});
+        // bbport (t129c_sun-term-view, TOOL): BB_RT_SUN_TERM_VIEW on only: the sun's visibility copied out before the clouds change it
+        if (auto* term_view = SunTermView::Active(); term_view && sun_replaced) {
+            term_view->Capture(target_view, width, height);
+        }
         // bbport (r105_cloud-shadows): the clouds into the alpha the ray traced sun (or the
         // VSM) just wrote, before the game's directional light reads it (null when off)
         if (auto* clouds = CloudShadow::Active(); clouds && sun_replaced) {
@@ -231,7 +268,7 @@ void ContactShadow::Flush(bool native_blur) {
     EffectPass::Mark(4, "contact shadows and PCSS");
     scheduler.RecordCrumb(
         {.name = "Contact shadows"},
-        [push, width, height, target_view, depth_view, sampler = *sampler, in, filter_on,
+        [push, dispatches, bend, width, height, target_view, depth_view, sampler = *sampler, in, filter_on,
          constants = pending_inputs.constants, constants_offset = pending_inputs.constants_offset,
          constants_range = pending_inputs.constants_range, pipeline = *pipeline,
          layout = *layout](vk::CommandBuffer cmdbuf) {
@@ -247,8 +284,9 @@ void ContactShadow::Flush(bool native_blur) {
             const vk::DescriptorImageInfo depth_info{sampler, depth_view,
                                                      vk::ImageLayout::eGeneral};
             const vk::DescriptorImageInfo target_info{{}, target_view, vk::ImageLayout::eGeneral};
+            // The uniforms also carry the sun-shadow distance fade the Bend shadows use.
             const vk::DescriptorBufferInfo ubo_info =
-                filter_on ? vk::DescriptorBufferInfo{in.uniforms, in.uniforms_offset,
+                in.uniforms ? vk::DescriptorBufferInfo{in.uniforms, in.uniforms_offset,
                                                    in.uniforms_range}
                         : buffer_info;
             const vk::DescriptorImageInfo map_info =
@@ -273,9 +311,19 @@ void ContactShadow::Flush(bool native_blur) {
             }};
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
             cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
-            cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push),
-                                 &push);
-            cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+            if (!bend) {
+                cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push),
+                                     &push);
+                cmdbuf.dispatch((width + 63) / 64, height, 1);
+            }
+            for (int i = 0; bend && i < dispatches.dispatch_count; ++i) {
+                Push dispatch_push = push;
+                dispatch_push.wave_offset = dispatches.dispatches[i].wave_offset;
+                cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0,
+                                     sizeof(Push), &dispatch_push);
+                const auto& count = dispatches.dispatches[i].wave_count;
+                cmdbuf.dispatch(count[0], count[1], count[2]);
+            }
             const vk::MemoryBarrier2 after{
                 .srcStageMask = Compute,
                 .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,

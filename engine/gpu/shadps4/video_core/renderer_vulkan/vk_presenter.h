@@ -23,6 +23,8 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/renderer_vulkan/vk_workflow_present.h"
+#include "video_core/renderer_vulkan/vk_bottle_motion_t198.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Frontend {
@@ -34,6 +36,12 @@ struct Liverpool;
 }
 
 namespace Vulkan {
+
+namespace SewerPresent { struct Capture; }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+namespace BottleCutPresent { struct Capture; }
+namespace BottleCaustic::CutSource { u32 Run(); }
+#endif
 
 struct Frame {
     u32 width;
@@ -58,6 +66,22 @@ struct Frame {
     bool generated_ok{false};
     /// bbport: DLSS Frame Generation (vk_streamline.h): this game frame's index and inputs.
     DlssFrameInfo dlss{};
+    BottleMotion::Mark motion{};
+    u64 motion_swap_epoch{};
+    std::shared_ptr<SewerPresent::Capture> sewer_prepared, sewer_present_readback;
+    u64 sewer_prepared_generation{};
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    u64 post_present_backing{};
+#endif
+    vk::Format sewer_final_format{};
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    std::shared_ptr<BottleCutPresent::Capture> bottle_prepared, bottle_present_readback;
+    u64 bottle_incarnation{};
+    vk::Format bottle_final_format{};
+#endif
+    bool workflow_display_override = false;
+    u32 workflow_input_width = 0;
+    u32 workflow_input_height = 0;
 };
 
 enum SchedulerType {
@@ -102,7 +126,16 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        const bool bottle_change = BottleCaustic::CutSource::Run() && swapchain.GetHDR() != enable;
+#endif
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (swapchain.GetHDR() != enable) InvalidatePostPresentSwap();
+#endif
         swapchain.SetHDR(enable);
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+        if (bottle_change) bottle_swap_generation.fetch_add(1, std::memory_order_acq_rel);
+#endif
         pp_settings.hdr = enable ? 1 : 0;
     }
 
@@ -186,6 +219,36 @@ private:
     /// bbport: while a generated frame is presented, the real frame whose gain map it uses
     /// (PresentGenerated, PresentHdr; present thread).
     const Frame* hdr_gain_source = nullptr;
+    WorkflowPresent workflow_present;
+    bool MotionMarker(vk::CommandBuffer cb,vk::Image target,const BottleMotion::Mark& mark);
+    void ReportMotionAttempts();
+    VkBuffer motion_buffer{};
+    VmaAllocation motion_allocation{};
+    std::atomic<u64> motion_swap_epoch{0};
+    std::atomic<u64> sewer_swap_generation{1};
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    void InvalidatePostPresentSwap();
+#endif
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    std::atomic<u64> post_present_next_backing{0};
+#endif
+    u64 sewer_next_frame_generation = 0; // draw owner
+    u64 sewer_present_serial = 0; // submit_mutex, actual Vk present attempts
+#ifdef BB_TEST_BOTTLE_CUT_SOURCE
+    std::atomic<u64> bottle_swap_generation{1};
+    u64 bottle_next_incarnation{}; // draw owner
+    u64 bottle_present_serial{}; // submit_mutex, actual Vk present attempts
+#endif
+    struct MotionAttempt {
+        BottleMotion::Mark mark;
+        u64 ready_tick,submit_ns,result_ns,swap_epoch;
+        vk::SwapchainKHR swap;
+        vk::Image swap_image;
+        u32 swap_index;
+        bool success;
+    };
+    std::array<MotionAttempt,BottleMotion::MaxOn+BottleMotion::MaxOff> motion_attempts{};
+    u32 motion_attempts_count{};
     int hdr_logged_mode = -1;   ///< bbport: LogHdrState (present thread)
     int hdr_native_state = -1;  ///< native mode: the last frame had a gain map (1) or not (0)
     int hdr_logged_native = -1; ///< ... as last logged

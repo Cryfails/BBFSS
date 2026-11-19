@@ -10,6 +10,8 @@
 #include <vector>
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r41_lamp-shadows)
+#include "video_core/renderer_vulkan/foliage_translucency.h" // bbport (r131a_foliage-translucency)
+#include "video_core/renderer_vulkan/lamp_jitter.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/image.h"
 
@@ -24,6 +26,8 @@ class RtShadow;
 class Runtime;
 class SceneTargets;
 class Scheduler;
+
+namespace WindowPathProbe { struct SceneObservation; }
 
 class PointShadow {
 public:
@@ -59,6 +63,14 @@ public:
         }
         return std::array<vk::ImageView, 2>{*lamp[0].view, *lamp[1].view};
     }
+    struct LampTargetOwner {
+        u32 slot;
+        u64 generation;
+        vk::Format format;
+        vk::Extent2D extent;
+    };
+    /// Identify the live allocation behind an already bound lamp attachment.
+    [[nodiscard]] std::optional<LampTargetOwner> LookupLampTarget(vk::ImageView view) const noexcept;
     /// A batch is collected whose lamps are drawn apart: a draw that only adds to the light
     /// targets need not end it.
     [[nodiscard]] bool Apart() const noexcept {
@@ -78,6 +90,8 @@ public:
     }
 
     void Flush(bool animate_noise);
+    /// Current clearance at a point emitter, independent of any shadow batch.
+    [[nodiscard]] static float EmitterClearance();
     [[nodiscard]] bool Pending() const noexcept {
         return !tiles.empty();
     }
@@ -104,6 +118,9 @@ public:
 
     void OnFrameEnd();
 
+    void TagColourProbeDisplay(VAddr address) const;
+    static void NoteColourProbeCapture(VAddr address, int index, bool upscaled);
+
     void Drop();
     /// At the end of a frame: a batch of lamps drawn apart that no draw ended loses its light.
     void DropUnended() {
@@ -122,6 +139,7 @@ private:
         VideoCore::UniqueImage image;
         vk::UniqueImageView view;
         u32 width = 0, height = 0;
+        u64 generation = 0;
     };
     bool EnsureImage(OwnImage& own, u32 width, u32 height, vk::Format format, const char* name,
                      vk::ImageUsageFlags more_usage = {});
@@ -210,6 +228,17 @@ private:
     std::vector<Tile> tiles;
     std::vector<u32> data;
     std::unique_ptr<VideoCore::Buffer> light_data;
+    struct PaneLightInventory;
+    std::unique_ptr<PaneLightInventory> pane_inventory;
+    u32 pane_inventory_reported = 0;
+    void EndPaneLightInventory();
+
+    struct ColourProbe;
+    std::unique_ptr<ColourProbe> colour_probe;
+    struct ActualBlocker;
+    std::unique_ptr<ActualBlocker> actual_blocker;
+    std::unique_ptr<WindowPathProbe::SceneObservation> blocker_scene_watch;
+    void ReleaseBlockerScene();
     u32 frame_index = 0;
     u32 batches = 0;
     u32 frame_tiles = 0;
@@ -223,6 +252,8 @@ private:
     u32 history_index = 0;
     bool history_written = false;
     bool history_fresh = false;
+    LampJitterFrame lamp_jitter;
+    LampJitterHistory history_jitter, pending_jitter;
     // bbport (r52_follow-soft): the follow state beside the history (point_shadow_ray.comp
     // follow_prev, follow_cur), one R32F a pixel, taken in turn with it (history_index); made
     // with the history, laid out and zeroed on first use.
@@ -260,6 +291,21 @@ private:
     // that read their colour history, and passes with the COLOUR builds that stayed grey.
     bool colour_mode = false;
     OwnImage colour_image;
+    // bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT=1 (RtShadow::GlassLightWanted) with colour_mode: the four tracing COLOUR builds are
+    // made in their GLASS form (point_shadow_ray.comp GLASS), and every repair pass pushes the flag word and glass_words (the 64 tint
+    // words, GlassLight::Words) after its 16 tuning words. Off: false, nothing pushed, nothing selected.
+    bool glass_mode = false;
+    // bbport (r131a_foliage-translucency): the light through leaves for the lamps (FoliageTranslucency::LampThrough, with colour_mode): the CARDS builds
+    // are made in their FOLIAGE form (point_shadow_ray.comp CARDS COLOUR FOLIAGE; set 1 has the colour layers as binding 5 and the counters buffer holds
+    // CARD_LAMP_FOLIAGE_WORDS words more), and the CARDS passes shadow in colour (LampTuneColour). Off: false, nothing different is made or bound.
+    bool foliage_mode = false;
+    FoliageTranslucency::LampSpec foliage_spec{};
+    u32 card_words = CARD_LAMP_BUFFER_WORDS;
+    std::array<u32, 8> foliage_last{};
+    std::array<u32, 64> glass_words{};
+    // bbport (r130g_glass-light-forward): the words of the half resolution counters buffer: 16, and with glass_mode the glass
+    // counter's GlassLight::RaySlots after them (set in Ready, before HalfReady makes the buffers)
+    u32 half_words = 16;
     bool colour_laid_out = false;
     u32 colour_wrote_frame = ~0u;
     u32 line_colour = 0, line_colour_read = 0, line_colour_grey = 0;

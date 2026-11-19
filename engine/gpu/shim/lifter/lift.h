@@ -221,6 +221,7 @@ struct Input {
     bool dual_source{};
     bool clip_emulation_input{};
     bool fragment_motion{};
+    bool foliage_mask{};
     bool depth_first{};
 
     std::array<u32, 3> workgroup_size{};

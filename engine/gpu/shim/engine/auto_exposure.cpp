@@ -5,6 +5,7 @@
 #include "loading.h"
 #include "bbport_platform.h"
 #include "bbport_settings.h"
+#include "bbport_test_exposure_lock.h" // bbport (t125, TOOL)
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -157,7 +158,7 @@ std::int64_t __attribute__((sysv_abi)) BeforeEnable(std::uint64_t, const std::ui
     return 0;
 }
 
-std::int64_t __attribute__((sysv_abi)) BeforeTone(std::uint64_t, const std::uint64_t* saved) {
+std::int64_t __attribute__((sysv_abi)) BeforeToneImpl(std::uint64_t, const std::uint64_t* saved) {
     // YEBIS also calls this setter internally, including while metering. Only
     // the game's post-application call supplies an authored exposure baseline.
     if (saved[6] != g_image + kToneCall + 5) return 0;
@@ -242,6 +243,20 @@ std::int64_t __attribute__((sysv_abi)) BeforeTone(std::uint64_t, const std::uint
     g_post_owned = true;
     Publish(result.status, std::log2(result.exposure / baseline));
     return 0;
+}
+// bbport (t125_exposure-lock, TOOL): BB_TEST_EXPOSURE_LOCK=1 holds the exposure the tone setter gets.
+std::int64_t __attribute__((sysv_abi)) BeforeTone(std::uint64_t a, const std::uint64_t* saved) {
+    const std::int64_t result = BeforeToneImpl(a, saved);
+    if (saved[6] != g_image + kToneCall + 5) return result;
+    float value = 0;
+    std::memcpy(&value, SavedXmm(saved, 0), sizeof value);
+    const float held = BbTestExposureLock::HoldTone(value);
+    if (held != value) {
+        std::memcpy(const_cast<std::uint8_t*>(SavedXmm(saved, 0)), &held, sizeof held);
+        std::scoped_lock lock(g_mutex);
+        if (g_post_owned) Write(g_image + kPost + 0x98, held);
+    }
+    return result;
 }
 }
 

@@ -10,6 +10,7 @@
 
 #include "video_core/host_shaders/ambient_particles_frag.h"
 #include "video_core/host_shaders/ambient_particles_vert.h"
+#include "engine/engine_state.h" // bbport (r98e_moths-at-lamps): the hunter (BbEngine::world_player_position)
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -77,6 +78,21 @@ AmbientParticles::AmbientParticles(const Instance& instance_, Scheduler& schedul
                 double(still_knobs.still), double(still_knobs.dark), double(AmbientMotes::OpenTau),
                 double(AmbientMotes::CalmDrift[0]), double(AmbientMotes::CalmDrift[2]),
                 double(AP_DARK_LO), double(AP_DARK_HI));
+    // bbport (r98e_moths-at-lamps)
+    if (moth_level > 0) {
+        std::printf("Ambient particles (r98e, BB_PARTICLES_MOTHS=%d): %d to %d moths round each of the %u "
+                    "nearest lit lamps (warm or white, luminance %.2f or more, reach %.1f to %.1f m, "
+                    "within %.0f m of the camera, none within %.1f m of the hunter's chest), loops of "
+                    "%.2f to %.2f m, leaning downwind in the open (at most %.2f m), calmer in shelter; "
+                    "seen in full to %.0f m, gone at %.0f m; %u instances more in a frame that shows "
+                    "one; needs the lamps (BB_PARTICLES_LAMPS above 0, an engine effect running)%s\n",
+                    moth_level, moth_level >= 2 ? 3 : 2, moth_level >= 2 ? 6 : 4, u32(AP_MOTH_LAMPS), double(AmbientMotes::MothMinLuma),
+                    double(AmbientMotes::MothReachMin), double(AmbientMotes::MothReachMax),
+                    double(AP_MOTH_FAR1), double(AmbientMotes::MothHunterNear),
+                    double(AP_MOTH_ORBIT_MIN), double(AP_MOTH_ORBIT_MAX), double(AP_MOTH_LEAN_MAX),
+                    double(AP_MOTH_FAR0), double(AP_MOTH_FAR1), u32(AP_MOTH_INSTANCES),
+                    lamp_gain > 0.0f ? "" : " (BB_PARTICLES_LAMPS is 0: no moths)");
+    }
 }
 
 AmbientParticles::~AmbientParticles() {
@@ -253,9 +269,25 @@ void AmbientParticles::Draw(const TemporalUpscaler::UpscaledFrame& frame,
     }
     // bbport (r98d_particles-still-indoors): the indoor shade, for the dust's colour (0 in the open).
     lamp_block.wind[3] = shade;
+    // bbport (r98e_moths-at-lamps): moths round the lit lamps of the block (BB_PARTICLES_MOTHS above 0); none
+    // round a light the hunter carries; calm = 1 - the air share (0 in the open). Their instances follow
+    // the flames' in the draw, only in a frame that shows one.
+    u32 moth_instances = 0;
+    if (moth_level > 0 && lamp_block.info[2] > 0.0f && camera.valid) {
+        std::array<float, 3> hunter{};
+        const bool hunter_known = BbEngine::world_player_position(hunter.data()) &&
+                                  std::isfinite(hunter[0]) && std::isfinite(hunter[1]) &&
+                                  std::isfinite(hunter[2]);
+        const std::array<float, 3> eye{camera.inv_view[3], camera.inv_view[7], camera.inv_view[11]};
+        const AmbientMotes::MothStats got =
+            moths.Apply(lamp_block, eye, hunter_known, hunter, moth_level, 1.0f - air, seconds);
+        moth_window.Add(got);
+        moth_instances = got.shown > 0 ? u32(AP_MOTH_INSTANCES) : 0u;
+    }
     // The lattice's instances, then the flames' ember slots while the lamps are on.
     const u32 lamp_instances =
-        AmbientMotes::Instances + (lamp_block.info[2] > 0.0f ? AmbientMotes::FlameInstances : 0u);
+        AmbientMotes::Instances + (lamp_block.info[2] > 0.0f ? AmbientMotes::FlameInstances : 0u) +
+        moth_instances; // r98e: the moths' instances after the flames'
     const bool srgb = frame.scene_format == vk::Format::eR8G8B8A8Srgb;
     const bool usable = pipeline && frame.view && frame.depth && frame.scene && camera.valid &&
                         Rgba8(frame.scene_format) &&
@@ -401,6 +433,13 @@ void AmbientParticles::Draw(const TemporalUpscaler::UpscaledFrame& frame,
         char still_line[320];
         still_stats.Text(still_line, sizeof(still_line), elapsed);
         std::printf("%s\n", still_line);
+        // bbport (r98e_moths-at-lamps): the moths of the same 10 s.
+        if (moth_level > 0) {
+            char moth_line[360];
+            moth_window.Text(moth_line, sizeof(moth_line), elapsed);
+            std::printf("%s\n", moth_line);
+            moth_window = {};
+        }
         still_stats = {};
         lamp_window = {};
         window = now;

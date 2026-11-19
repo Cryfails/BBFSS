@@ -11,6 +11,7 @@
 #include <map>
 #include <mutex>
 #include <array>
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <unordered_map>
@@ -20,6 +21,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/post_geometry_witness.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
@@ -37,6 +39,8 @@ struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
 } // namespace Vulkan
+
+namespace Vulkan::ReflectionOrdinal3 { struct Writer; }
 
 namespace VideoCore {
 
@@ -151,6 +155,31 @@ public:
         NoteUse(address, size);
     }
 
+    struct WallStreamProbe {
+        static constexpr u32 Bytes = 416;
+        enum class Route : u8 { None, MapCommit, ReserveInline, ReserveRecorder, ReservePool };
+        enum : u8 { Completed = 1, Preflight = 2 };
+        std::array<u8, Bytes> owned{};
+        std::atomic<u8> receipt{};
+        BufferCache* owner{};
+        vk::Buffer handle{};
+        VAddr guest{};
+        u64 generation{}, offset{}, tick{}, cache_generation{};
+        u32 packet{};
+        Route route = Route::None;
+
+        bool Match(vk::Buffer bound, u64 at, u64 range, u32 adjust, VAddr source, u64 epoch) const {
+            return route != Route::None && bound == handle && at == offset && range == Bytes &&
+                   !adjust && source == guest && epoch == generation;
+        }
+        bool CompletedBeforePreflight() {
+            return (receipt.fetch_or(Preflight, std::memory_order_acq_rel) & Completed) != 0;
+        }
+    };
+    WallStreamProbe* WatchWallStream(VAddr guest, u32 size, u64 generation, u32 packet);
+    static void UnwatchWallStream();
+    static const char* WallStreamRoute(WallStreamProbe::Route route);
+
     /// Finds a buffer for the specified region.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
@@ -174,6 +203,7 @@ public:
 
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
+    [[nodiscard]] bool IsOrdinal3CpuModified(VAddr addr, size_t size);
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
@@ -404,7 +434,17 @@ private:
 
     /// bbport: batched small copies on the copy threads (BbCopy::QueueCopy).
     static void RunGuestCopy(const BbCopy::Item& item);
-    void SmallGuestCopy(const BbCopy::Item& item);
+    static void RunWallStreamCopy(const BbCopy::Item& item);
+    static void CompleteWallStreamCopy(WallStreamProbe& observation, const u8* bytes);
+    void SmallGuestCopy(const BbCopy::Item& item, WallStreamProbe* observation = nullptr,
+                        Vulkan::ReflectionOrdinal3::Writer* object3 = nullptr,
+                        PostGeometry::Capture::Copy* geometry = nullptr);
+    [[nodiscard]] PostGeometry::Reservation GeometryReservation(VAddr guest, u32 bytes, u64 offset,
+                                                                 u64 tick) const;
+    static void RunPostGeometryCopy(const BbCopy::Item& item);
+    static void RunOrdinal3Copy(const BbCopy::Item& item);
+    WallStreamProbe wall_stream_probe{};
+    static thread_local WallStreamProbe* watched_wall_stream;
 
     const Buffer* UploadCopies(const Buffer* arena, std::span<vk::BufferCopy> copies,
                                size_t total_size_bytes);

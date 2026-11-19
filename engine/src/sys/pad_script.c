@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
 
 typedef struct {
     uint32_t ms, buttons;
@@ -20,6 +24,74 @@ static struct {
 } injected = {0, {-1, -1, -1, -1}, -1};
 
 static int replay_state;
+/* Both snapshots and parser transitions run within the pad read lock. */
+static PadScriptReceipt receipt;
+static uint64_t last_command_generation, observed_command_generation;
+
+uint64_t pad_script_observed_command(void) {
+    return observed_command_generation;
+}
+
+PadScriptReceipt pad_script_receipt(void) {
+    PadScriptReceipt current = receipt;
+    current.replay_state = replay_state;
+    return current;
+}
+
+/* An ignored legacy token identifies a diagnostic publication without changing pad inputs.
+ * Require a complete canonical body from the same stream and genuine parse semantics. */
+static void receipt_parse(FILE *file, const char *nonce, const char *tag, unsigned words, int saw_finish) {
+    char body[80], prefix[48];
+    int read_ok = !ferror(file);
+#ifdef _WIN32
+    /* Inspect the same open publication without text CTRL-Z translation. */
+    if (read_ok) read_ok = _setmode(_fileno(file), _O_BINARY) != -1;
+#endif
+    read_ok = read_ok && fseek(file, 0, SEEK_SET) == 0;
+    const size_t size = read_ok ? fread(body, 1, sizeof(body), file) : 0;
+    const int complete = read_ok && !ferror(file) && feof(file);
+    ++receipt.native_generation;
+    receipt.command_generation = observed_command_generation = 0;
+    receipt.buttons = injected.buttons;
+    memcpy(receipt.axes, injected.stick, sizeof(receipt.axes));
+    receipt.touch_side = injected.touch_side;
+    receipt.healthy_file = complete;
+    receipt.kind = PAD_RECEIPT_FOREIGN;
+    if (!complete) return;
+    if (!size && !words) {
+        receipt.kind = PAD_RECEIPT_EMPTY;
+        return;
+    }
+    if (injected.buttons || injected.touch_side != -1 || injected.stick[0] != -1 ||
+        injected.stick[1] != -1 || injected.stick[3] != -1) return;
+
+    const int rx = injected.stick[2];
+    const int len = rx == -1 ? snprintf(prefix, sizeof(prefix), "receipt=%s/", nonce)
+                             : snprintf(prefix, sizeof(prefix), "rx=%d receipt=%s/", rx, nonce);
+    if (len < 0 || (size_t)len >= sizeof(prefix) || (saw_finish && rx != -1)) return;
+    const size_t tag_end = (size_t)len + 16;
+    if (size != tag_end + (saw_finish ? 7 : 0) || memcmp(body, prefix, (size_t)len) ||
+        words != (rx == -1 && !saw_finish ? 1u : 2u) ||
+        (saw_finish && memcmp(body + tag_end, " finish", 7))) return;
+    const size_t tag_start = rx == -1 ? 0 : (size_t)len - (8 + 16 + 1);
+    if (strlen(tag) != tag_end - tag_start ||
+        memcmp(body + tag_start, tag, tag_end - tag_start)) return;
+    uint64_t generation = 0;
+    for (size_t i = (size_t)len; i < tag_end; ++i) {
+        unsigned nibble;
+        if (body[i] >= '0' && body[i] <= '9') nibble = (unsigned)(body[i] - '0');
+        else if (body[i] >= 'a' && body[i] <= 'f') nibble = (unsigned)(body[i] - 'a' + 10);
+        else return;
+        generation = (generation << 4) | nibble;
+    }
+    observed_command_generation = generation;
+    if (generation > last_command_generation) {
+        last_command_generation = generation;
+        receipt.command_generation = generation;
+        if (saw_finish) receipt.kind = PAD_RECEIPT_FINISH;
+        else receipt.kind = rx == -1 ? PAD_RECEIPT_CLEAR : PAD_RECEIPT_RX;
+    }
+}
 static uint64_t replay_started;
 static PadSample *replay;
 static size_t replay_count, replay_next;
@@ -43,11 +115,15 @@ static void read_pad_file(void) {
     static long long seen_time, seen_stamp;
     env_once("BB_PAD_FILE", &path, &path_read);
     if (!path || !*path) return;
+    const char *nonce = pad_guest_receipt_nonce();
     uint64_t now = pad_now_us();
     if (now - last_look < 20000) return;
     last_look = now;
     struct stat info;
-    if (stat(path, &info)) return;
+    if (stat(path, &info)) {
+        if (nonce) receipt.healthy_file = 0;
+        return;
+    }
 #ifdef _WIN32
     long long stamp = (long long)info.st_size;
 #else
@@ -57,7 +133,10 @@ static void read_pad_file(void) {
     seen_time = (long long)info.st_mtime;
     seen_stamp = stamp;
     FILE *file = fopen(path, "r");
-    if (!file) return;
+    if (!file) {
+        if (nonce) receipt.healthy_file = 0;
+        return;
+    }
     static const struct { const char *name; uint32_t button; } words[] = {
         {"cross", PAD_CROSS}, {"circle", PAD_CIRCLE}, {"square", PAD_SQUARE}, {"triangle", PAD_TRIANGLE},
         {"l1", PAD_L1}, {"r1", PAD_R1}, {"l2", PAD_L2}, {"r2", PAD_R2}, {"l3", PAD_L3}, {"r3", PAD_R3},
@@ -68,8 +147,15 @@ static void read_pad_file(void) {
     injected.buttons = 0;
     injected.touch_side = -1;
     for (int i = 0; i < 4; ++i) injected.stick[i] = -1;
-    char word[64];
+    char word[64], tag[64] = "";
+    unsigned words_seen = 0;
+    int saw_finish = 0;
     while (fscanf(file, "%63s", word) == 1) {
+        if (nonce) {
+            if (words_seen < 3) ++words_seen;
+            if (!strncmp(word, "receipt=", 8)) memcpy(tag, word, strlen(word) + 1);
+            if (!strcmp(word, "finish")) saw_finish = 1;
+        }
         if (!strcmp(word, "replay") && replay_state != REPLAY_RUNNING) {
             replay_state = REPLAY_RUNNING;
             replay_started = 0;
@@ -86,6 +172,7 @@ static void read_pad_file(void) {
                 injected.stick[i] = value < 0 ? 0 : value > 255 ? 255 : value;
             }
     }
+    if (nonce) receipt_parse(file, nonce, tag, words_seen, saw_finish);
     fclose(file);
     printf("Runtime: pad file: buttons 0x%x sticks %d %d %d %d\n", injected.buttons, injected.stick[0],
            injected.stick[1], injected.stick[2], injected.stick[3]);

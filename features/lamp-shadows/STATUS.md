@@ -1,5 +1,15 @@
 # Ray traced lamp shadows: status
 
+## Development snapshot, 2026-11-19
+
+LRT T02. Feature work is paused.
+
+- Verified scope. Selectable sharpness and centered-window default passed. Default clearance stopped the sampled wall leak.
+- Open scope. Contact, moving edge stability and distance-softening acceptance remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 60% (rated by the weakest part: moving shadow edges are still a little blocky, and the newest softness, layer and colour parts have never been judged by eye at 4K).
 
 ## What works
@@ -70,3 +80,6 @@ Apply order is the order in scripts.txt. [fork] = already committed on fork bran
 - dark-alley: street lamps (sharp setting is the do-nothing case for layers).
 - sewer-water: one lamp colour, must do nothing for colour and layers.
 - Use 4K DLSS Performance, half-size lamp shadows, high quality ambient occlusion (graphics_ao_quality=1) and the hero light off for lamp tests. Moving-shadow faults only show in a normal 4K run.
+
+
+</details>

@@ -242,6 +242,14 @@ struct PsColorBuffer {
     bool operator==(const PsColorBuffer& other) const = default;
 };
 
+// Host-only fragment color output. The guest push ABI still ends at byte 128.
+struct FoliageMaskOutput {
+    static constexpr u32 Location = 6;
+    static constexpr u32 PushMember = 13;
+    static constexpr u32 PushOffset = 128;
+    static constexpr u32 PushSize = PushOffset + sizeof(u32);
+};
+
 struct HwFragmentRuntimeInfo {
     struct PsInput {
         u8 param_index;
@@ -274,6 +282,7 @@ struct HwFragmentRuntimeInfo {
     bool motion_vectors{false};
     /// bbport: drawn with DEPTH_BEFORE_SHADER (Profile::early_fragment_tests).
     bool depth_first{false};
+    bool foliage_mask{false};
 
     bool operator==(const HwFragmentRuntimeInfo& other) const noexcept {
         return std::ranges::equal(color_buffers, other.color_buffers) &&
@@ -284,6 +293,7 @@ struct HwFragmentRuntimeInfo {
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
                motion_vectors == other.motion_vectors && depth_first == other.depth_first &&
+               foliage_mask == other.foliage_mask &&
                std::ranges::equal(inputs.begin(), inputs.begin() + num_inputs, other.inputs.begin(),
                                   other.inputs.begin() + num_inputs);
     }

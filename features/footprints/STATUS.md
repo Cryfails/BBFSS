@@ -1,5 +1,15 @@
 # Footprints: wet and bloody prints behind the hunter
 
+## Development snapshot, 2026-11-19
+
+FTP 35%. Feature work is paused.
+
+- Verified scope. Wet footprints appeared in the 4K sewer trial.
+- Open scope. Intermittent pickup and abrupt transitions remain. The smoothing draft is separate.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 55%. Rated by the weakest part: wet and blood prints look alike, start and end abruptly, and mud is not done.
 
 ## What works
@@ -45,3 +55,6 @@ None are on a fork branch yet; the notes plan visual/footprints.
 - Church puddles (church-puddles): wet prints on lit slabs.
 - Dream house: must do nothing visible.
 - The camera must look back at the trail (it lies about 3 m behind the hunter, at the bottom edge of the picture).
+
+
+</details>

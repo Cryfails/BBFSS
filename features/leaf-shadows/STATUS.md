@@ -1,5 +1,15 @@
 # Cut-out (leaf) lamp shadows: status
 
+## Development snapshot, 2026-11-19
+
+LRT T03. Feature work is paused.
+
+- Verified scope. Lamp-lit foliage silhouettes passed.
+- Open scope. Sun/moon, cut-out props and colour backlighting still need live geometry and actor authority.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 70% (rated by the weakest part: it is still off by default, its cost is not measured, and only foliage by lamps has been judged; hooks, grilles and chains are not shown yet).
 
 ## What works
@@ -63,3 +73,6 @@ Order is the order in scripts.txt. [fork] = already committed on fork branch vis
 - sewer-water: do-nothing place (lamp housing only).
 - dark-alley: street lamp plants (the lamp is weak there; not framed yet).
 - Look for darker leaf-shaped shadows on surfaces behind foliage with the knob on, with the torch standing still, then walking.
+
+
+</details>

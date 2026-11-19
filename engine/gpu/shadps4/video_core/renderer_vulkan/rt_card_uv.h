@@ -62,6 +62,24 @@ inline constexpr std::uint32_t CardAlphaLayers = 2;
 [[nodiscard]] constexpr bool CardAlphaMisread(const char* text) noexcept {
     return text && !((text[0] == '0' || text[0] == '1' || text[0] == '2') && text[1] == '\0');
 }
+// bbport (r131b_lrt-settings): the setting graphics_rt_foliage_shadows (0 off, 1 lamps, 2 lamps and sun) next to the variables. A variable
+// that is set and not empty decides for its own part (also "0" and text: off); else the setting. Pure, so tests/test_rt_card_uv.cpp builds it.
+[[nodiscard]] constexpr bool EnvGiven(const char* text) noexcept {
+    return text != nullptr && text[0] != '\0';
+}
+/// BB_RT_CARD_ALPHA or, with none, the setting: 1 or 2 give the layers (2), 0 off.
+[[nodiscard]] constexpr std::uint32_t CardAlphaOf(const char* env, int setting) noexcept {
+    return EnvGiven(env) ? ReadCardAlpha(env) : setting >= 1 ? CardAlphaLayers : CardAlphaOff;
+}
+/// BB_RT_CARD_LAMPS (exactly "1" is on) or, with none, the setting 1 or 2.
+[[nodiscard]] constexpr bool CardLampsOf(const char* env, int setting) noexcept {
+    return EnvGiven(env) ? (env[0] == '1' && env[1] == '\0') : setting >= 1;
+}
+static_assert(EnvGiven("0") && EnvGiven("x") && !EnvGiven("") && !EnvGiven(nullptr));
+static_assert(CardAlphaOf("0", 2) == CardAlphaOff && CardAlphaOf(nullptr, 1) == CardAlphaLayers && CardAlphaOf("", 2) == CardAlphaLayers &&
+              CardAlphaOf("x", 2) == CardAlphaOff && CardAlphaOf(nullptr, 0) == CardAlphaOff && CardAlphaOf("1", 0) == CardAlphaUv);
+static_assert(!CardLampsOf("0", 2) && CardLampsOf(nullptr, 1) && CardLampsOf("", 2) && !CardLampsOf("", 0) && CardLampsOf("1", 0) &&
+              !CardLampsOf("x", 2) && !CardLampsOf(nullptr, 0));
 
 // ---- Sizes (RtShadow's buffers)
 

@@ -4,6 +4,10 @@
 #endif
 #include "sys.h"
 #include "runtime.h"
+#include "../../gpu/shim/bbport_workflow_probe.h"
+#ifdef _WIN32
+struct WorkflowFile;
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -25,6 +29,33 @@ typedef struct stat HostStat;
 #define host_fstat fstat
 #define host_seek lseek
 #endif
+
+// The Windows launcher merges stdout and stderr onto one synchronous append handle.
+// Write the entire record, including both line boundaries, in one operation.
+int workflow_log_record(const char* line, size_t bytes) {
+    if (bytes < 2 || bytes > WORKFLOW_LOG_RECORD_BYTES || line[0] != '\n' || line[bytes - 1] != '\n') return 0;
+#ifdef _WIN32
+    const int fd = _fileno(stdout);
+    if (fd < 0) return 0;
+    const intptr_t handle = _get_osfhandle(fd);
+    if (handle == -1 || handle == -2) return 0;
+    DWORD written = 0;
+    return WriteFile((HANDLE)handle, line, (DWORD)bytes, &written, NULL) && written == bytes;
+#else
+    return fwrite(line, 1, bytes, stdout) == bytes;
+#endif
+}
+
+// One admission counter for bounded file and exact-draw geometry payload.
+static size_t workflow_payload_bytes;
+int workflow_payload_reserve(size_t bytes) {
+    size_t previous = __atomic_load_n(&workflow_payload_bytes, __ATOMIC_RELAXED);
+    do {
+        if (bytes > WORKFLOW_PAYLOAD_BYTES - previous) return 0;
+    } while (!__atomic_compare_exchange_n(&workflow_payload_bytes, &previous, previous + bytes,
+                                          1, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+    return 1;
+}
 
 #define KERNEL_ERROR(e) ((int32_t)(UINT32_C(0x80020000) | (uint32_t)(e)))
 
@@ -64,12 +95,33 @@ typedef struct {
     size_t count;
 } Listing;
 
+#ifdef _WIN32
+typedef struct {
+    HANDLE immutable;
+    uint64_t serial;
+    size_t size, covered;
+    unsigned char *snapshot, *coverage;
+    const char *session, *directory;
+    char layer;
+    int invalid, reported;
+} Round2File;
+
+static HostMutex round2_file_lock = HOST_MUTEX_INIT;
+static uint64_t round2_file_serial;
+static int round2_file_enabled;
+enum { ROUND2_FILE_LIMIT = 1 << 20, ROUND2_OPEN_LIMIT = 8 };
+#endif
+
 typedef struct {
     int host, references, loader;
     Listing *listing;
     size_t position;
     uint64_t opened_ns;
     char guest[512];
+#ifdef _WIN32
+    Round2File *round2;
+    struct WorkflowFile *workflow;
+#endif
 } File;
 
 typedef struct {
@@ -132,6 +184,146 @@ static void fold_path(char *path) {
         else if (*path >= 'A' && *path <= 'Z') *path = (char)(*path - 'A' + 'a');
     }
 }
+
+#ifdef _WIN32
+static void round2_file_event(const Round2File *p, const char *status, const char *reason) {
+    printf("Round2 file: {\"schema\":\"round2-file-v1\",\"session\":\"%s\",\"pid\":%lu,\"serial\":%llu,"
+           "\"time_ns\":%llu,\"layer\":\"%c\",\"status\":\"%s\",\"reason\":\"%s\","
+           "\"size\":%zu,\"delivered_coverage\":%zu}\n", p->session, (unsigned long)GetCurrentProcessId(),
+           (unsigned long long)p->serial, (unsigned long long)host_monotonic_ns(),
+           p->layer, status, reason, p->size, p->covered);
+}
+
+static void round2_file_fail(Round2File *p, const char *reason) {
+    if (p->invalid) return;
+    p->invalid = 1;
+    round2_file_event(p, "invalid", reason);
+}
+
+static void round2_file_free(Round2File *p) {
+    if (!p) return;
+    if (!p->reported) round2_file_fail(p, "incomplete_guest_coverage");
+    if (p->immutable != INVALID_HANDLE_VALUE) CloseHandle(p->immutable);
+    free(p->snapshot);
+    free(p->coverage);
+    free(p);
+}
+
+static int round2_file_id(HANDLE handle, FILE_ID_INFO *id) {
+    static const FILE_ID_128 zero = {0};
+    return handle != INVALID_HANDLE_VALUE && GetFileInformationByHandleEx(handle, FileIdInfo, id, sizeof(*id)) &&
+           memcmp(&id->FileId, &zero, sizeof(zero));
+}
+
+static int round2_same_id(const FILE_ID_INFO *a, const FILE_ID_INFO *b) {
+    return a->VolumeSerialNumber == b->VolumeSerialNumber && !memcmp(&a->FileId, &b->FileId, sizeof(a->FileId));
+}
+
+static Round2File *round2_file_open(const char *guest, int host) {
+    static const char target[] = "dvdroot_ps4/map/m24_01_00_00/m24_01_00_00_009700.flver.dcx";
+    const char *key = !strncmp(guest, "/app0/", 6) ? guest + 6 : !strncmp(guest, "/hostapp/", 9) ? guest + 9 : NULL;
+    if (!key || strlen(key) != sizeof(target) - 1) return NULL;
+    char folded[sizeof(target)];
+    memcpy(folded, key, sizeof(folded));
+    fold_path(folded);
+    if (strcmp(folded, target)) return NULL;
+    const char *session = getenv("BB_ROUND2_SESSION");
+    const char *directory = getenv("BB_ROUND2_CAPTURE_DIR");
+    const char *asset_a = getenv("BB_ROUND2_ASSET_A"), *asset_b = getenv("BB_ROUND2_ASSET_B");
+    if (!session || !*session || strlen(session) > 32 ||
+        session[strspn(session, "abcdefghijklmnopqrstuvwxyz0123456789-")] || !directory || !*directory ||
+        !asset_a || !*asset_a || !asset_b || !*asset_b) return NULL;
+
+    Round2File seed = {.immutable = INVALID_HANDLE_VALUE, .session = session, .directory = directory,
+                       .layer = '?', .serial = __atomic_add_fetch(&round2_file_serial, 1, __ATOMIC_RELAXED)};
+    if (seed.serial > ROUND2_OPEN_LIMIT) {
+        if (seed.serial == ROUND2_OPEN_LIMIT + 1) round2_file_fail(&seed, "open_limit");
+        return NULL;
+    }
+    HANDLE candidates[2] = {
+        CreateFileA(asset_a, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL),
+        CreateFileA(asset_b, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL),
+    };
+    FILE_ID_INFO actual, a, b;
+    if (round2_file_id((HANDLE)_get_osfhandle(host), &actual) && round2_file_id(candidates[0], &a) &&
+        round2_file_id(candidates[1], &b) && !round2_same_id(&a, &b)) {
+        const int match_a = round2_same_id(&actual, &a), match_b = round2_same_id(&actual, &b);
+        if (match_a || match_b) {
+            const int index = match_a ? 0 : 1;
+            seed.layer = match_a ? 'a' : 'b';
+            seed.immutable = candidates[index];
+            candidates[index] = INVALID_HANDLE_VALUE;
+        }
+    }
+    for (int i = 0; i < 2; ++i) if (candidates[i] != INVALID_HANDLE_VALUE) CloseHandle(candidates[i]);
+    if (seed.immutable == INVALID_HANDLE_VALUE) {
+        round2_file_fail(&seed, "opened_handle_not_unique_candidate");
+        return NULL;
+    }
+    Round2File *p = malloc(sizeof(*p));
+    if (!p) {
+        CloseHandle(seed.immutable);
+        round2_file_fail(&seed, "probe_allocation");
+        return NULL;
+    }
+    *p = seed;
+    HostStat info;
+    if (host_fstat(host, &info) || !S_ISREG(info.st_mode) || info.st_size <= 0 || info.st_size > ROUND2_FILE_LIMIT) {
+        round2_file_fail(p, "snapshot_size");
+        round2_file_free(p);
+        return NULL;
+    }
+    p->size = (size_t)info.st_size;
+    p->snapshot = malloc(p->size);
+    p->coverage = calloc((p->size + 7) / 8, 1);
+    if (!p->snapshot || !p->coverage || pread(host, p->snapshot, p->size, 0) != (int64_t)p->size) {
+        round2_file_fail(p, "same_descriptor_snapshot");
+        round2_file_free(p);
+        return NULL;
+    }
+    return p;
+}
+
+static void round2_file_read(Round2File *p, int64_t offset, const void *delivered, int64_t bytes) {
+    if (p->invalid) return;
+    if (offset < 0 || (uint64_t)offset > p->size || bytes < 0 || (uint64_t)bytes > p->size - (size_t)offset) {
+        round2_file_fail(p, "unprovable_delivered_range");
+        return;
+    }
+    if (bytes && memcmp(p->snapshot + offset, delivered, (size_t)bytes)) {
+        round2_file_fail(p, "delivered_byte_mismatch");
+        return;
+    }
+    if (p->reported) return;
+    for (size_t i = (size_t)offset, end = i + (size_t)bytes; i < end; ++i) {
+        const unsigned char bit = (unsigned char)(1u << (i % 8));
+        if (!(p->coverage[i / 8] & bit)) {
+            p->coverage[i / 8] |= bit;
+            ++p->covered;
+        }
+    }
+    if (p->covered != p->size) return;
+    char path[PATH_SIZE];
+    int n = snprintf(path, sizeof(path), "%s/%s-file-%llu.dcx", p->directory, p->session,
+                     (unsigned long long)p->serial);
+    FILE *out = n > 0 && (size_t)n < sizeof(path) ? fopen(path, "wbx") : NULL;
+    if (!out) {
+        round2_file_fail(p, "snapshot_output_open");
+        return;
+    }
+    const size_t wrote = fwrite(p->snapshot, 1, p->size, out);
+    if (fclose(out) || wrote != p->size) {
+        round2_file_fail(p, "snapshot_output_write");
+        return;
+    }
+    p->reported = 1;
+    round2_file_event(p, "ok", "complete_byte_comparison");
+}
+#endif
+
+#ifdef _WIN32
+#include "workflow_file_probe.h"
+#endif
 
 static int compare_mod_files(const void *a, const void *b) {
     return strcmp(((const ModFile *)a)->key, ((const ModFile *)b)->key);
@@ -212,6 +404,11 @@ static void load_file_list(const char *variable, const char *what, int hostapp) 
 }
 
 void sys_file_configure(const char *app0, const char *user) {
+#ifdef _WIN32
+    const char *lineage = getenv("BB_ROUND2_LINEAGE");
+    round2_file_enabled = lineage && !strcmp(lineage, "1");
+    workflow_files_configure();
+#endif
     sys_file_stream_configure(app0);
     load_mod_files();
     snprintf(user_dir, sizeof(user_dir), "%s", user);
@@ -259,9 +456,12 @@ static int climbs_up(const char *path) {
     return 0;
 }
 
-static int translate_mounted(const char *full, char *out, size_t size) {
+static int translate_mounted(const char *full, char *out, size_t size, const char **route) {
     const char *mod = find_mod_file(full);
-    if (mod) return (size_t)snprintf(out, size, "%s", mod) >= size ? ENAMETOOLONG : 0;
+    if (mod) {
+        if (route) *route = "mod-table";
+        return (size_t)snprintf(out, size, "%s", mod) >= size ? ENAMETOOLONG : 0;
+    }
     const Mount *best = NULL;
     int result = ENOENT;
     host_read_lock(&mounts_lock);
@@ -271,7 +471,10 @@ static int translate_mounted(const char *full, char *out, size_t size) {
             (!best || mount->length > best->length))
             best = mount;
     }
-    if (best) result = (size_t)snprintf(out, size, "%s%s", best->host, full + best->length) >= size ? ENAMETOOLONG : 0;
+    if (best) {
+        if (route) *route = !strcmp(best->guest, "/app0") || !strcmp(best->guest, "/hostapp") ? "base-mount" : "override-mount";
+        result = (size_t)snprintf(out, size, "%s%s", best->host, full + best->length) >= size ? ENAMETOOLONG : 0;
+    }
     host_read_unlock(&mounts_lock);
     return result;
 }
@@ -310,7 +513,7 @@ static int brazilian_path(const char *full, char localized[PATH_SIZE]) {
     return 0;
 }
 
-int sys_file_translate(const char *guest, char *out, size_t size) {
+static int translate_file(const char *guest, char *out, size_t size, const char **route) {
     if (!guest || !*guest) return ENOENT;
     char full[PATH_SIZE];
     if ((size_t)snprintf(full, sizeof(full), "%s%s", guest[0] == '/' ? "" : "/app0/", guest) >= sizeof(full))
@@ -320,11 +523,17 @@ int sys_file_translate(const char *guest, char *out, size_t size) {
     char localized[PATH_SIZE], host[PATH_SIZE];
     HostStat st;
     if (language && !strcmp(language, "17") && brazilian_path(full, localized) &&
-        !translate_mounted(localized, host, sizeof(host)) && !host_stat(host, &st) && S_ISREG(st.st_mode))
+        !translate_mounted(localized, host, sizeof(host), NULL) && !host_stat(host, &st) && S_ISREG(st.st_mode)) {
+        if (route) *route = "localized";
         return (size_t)snprintf(out, size, "%s", host) >= size ? ENAMETOOLONG : 0;
-    int result = translate_mounted(full, out, size);
+    }
+    int result = translate_mounted(full, out, size, route);
     if (result == ENOENT) fprintf(stderr, "Runtime: no mount for guest path %s\n", guest);
     return result;
+}
+
+int sys_file_translate(const char *guest, char *out, size_t size) {
+    return translate_file(guest, out, size, NULL);
 }
 
 static int under_mount(const char *path, const char *mount) {
@@ -443,6 +652,10 @@ static void unpin(File *file) {
     int left = --file->references;
     host_unlock(&files_lock);
     if (left) return;
+#ifdef _WIN32
+    round2_file_free(file->round2);
+    workflow_file_free(file->workflow);
+#endif
     if (file->host >= 0) close(file->host);
     free_listing(file->listing);
     free(file);
@@ -476,7 +689,12 @@ static void trace_mod_open(const char *guest, const char *path) {
 static int64_t do_open(const char *guest, int flags, int mode) {
     if (is_game_path(guest) && (flags & GUEST_READ_ONLY_FLAGS)) return -EROFS;
     char path[PATH_SIZE];
+#ifdef _WIN32
+    const char *workflow_route = NULL;
+    int e = translate_file(guest, path, sizeof(path), workflow_files_enabled ? &workflow_route : NULL);
+#else
     int e = sys_file_translate(guest, path, sizeof(path));
+#endif
     if (e) return -e;
     HostStat info;
     Listing *listing = NULL;
@@ -524,6 +742,15 @@ static int64_t do_open(const char *guest, int flags, int mode) {
     file->opened_ns = started;
     file->loader = loader && !listing;
     snprintf(file->guest, sizeof(file->guest), "%s", guest);
+#ifdef _WIN32
+    if (round2_file_enabled && game_read && host >= 0 && !listing)
+        file->round2 = round2_file_open(guest, host);
+    if (workflow_files_enabled && game_read && host >= 0 && !listing) {
+        const int saved = errno;
+        file->workflow = workflow_file_open(guest, host, workflow_route);
+        errno = saved;
+    }
+#endif
     int fd = -1;
     host_lock(&files_lock);
     for (int i = lowest_free; i < FILE_LIMIT && fd < 0; ++i) if (!files[i]) fd = i;
@@ -533,6 +760,10 @@ static int64_t do_open(const char *guest, int flags, int mode) {
     }
     host_unlock(&files_lock);
     if (fd < 0) {
+#ifdef _WIN32
+        round2_file_free(file->round2);
+        workflow_file_free(file->workflow);
+#endif
         if (host >= 0) close(host);
         free_listing(listing);
         free(file);
@@ -610,9 +841,34 @@ static int64_t read_file(int fd, void *buffer, uint64_t size, int64_t offset, in
     runtime_memory_note_write((uintptr_t)buffer, size);
     touch_pages(buffer, size);
     const uint64_t started = sys_file_stream_read_begin(file->loader);
+#ifdef _WIN32
+    int64_t delivered_at = offset;
+    int64_t before_seek = -1;
+    if (file->round2 || file->workflow) {
+        host_lock(&round2_file_lock);
+        before_seek = host_seek(file->host, 0, SEEK_CUR);
+        if (!positional) delivered_at = before_seek;
+    }
+#endif
     int64_t got = positional ? pread(file->host, buffer, size, offset) : read(file->host, buffer, size);
     if (got < 0 && size && (!positional || offset >= 0) && runtime_memory_guest_writable((uintptr_t)buffer, size))
         got = read_through_bounce(file->host, buffer, size, offset);
+#ifdef _WIN32
+    if (file->round2 || file->workflow) {
+        const int saved = errno;
+        const int64_t after_seek = host_seek(file->host, 0, SEEK_CUR);
+        if (before_seek < 0 || (got >= 0 && (positional ? after_seek != before_seek :
+            after_seek < before_seek || after_seek - before_seek != got))) {
+            if (file->round2) round2_file_fail(file->round2, "descriptor_position_conflict");
+            if (file->workflow) workflow_file_delivered(file->workflow, -1, buffer, 1);
+        } else {
+            if (file->round2) round2_file_read(file->round2, delivered_at, buffer, got);
+            if (file->workflow) workflow_file_delivered(file->workflow, delivered_at, buffer, got);
+        }
+        host_unlock(&round2_file_lock);
+        errno = saved;
+    }
+#endif
     if (file->loader) sys_file_trace('R', fd, positional ? offset : -1, (int64_t)size, got, NULL);
     sys_file_stream_read_end(file->loader, started, got);
     if (got < 0) {
@@ -682,8 +938,14 @@ static int64_t do_lseek(int fd, int64_t offset, int whence) {
             result = offset;
         }
     } else {
+#ifdef _WIN32
+        if (file->round2 || file->workflow) host_lock(&round2_file_lock);
+#endif
         result = host_seek(file->host, offset, whence);
         if (result < 0) result = -errno;
+#ifdef _WIN32
+        if (file->round2 || file->workflow) host_unlock(&round2_file_lock);
+#endif
         if (file->loader) sys_file_trace('S', fd, offset, whence, result, NULL);
     }
     unpin(file);

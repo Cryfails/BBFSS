@@ -19,6 +19,8 @@
 
 #include <array>
 #include <chrono>
+#include <memory>
+#include <string>
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/lamp_fog_lights.h" // bbport (r107b_caustics-visible)
@@ -36,14 +38,22 @@ namespace Vulkan {
 class CameraMotion;
 class Instance;
 class PointShadow;
+class Rasterizer;
 class Runtime;
 class SceneTargets;
 class Scheduler;
+namespace SewerMotion { struct Series; }
 
 class Caustics {
 public:
     /// BB_CAUSTICS gives a strength above 0 or "show" (read once; the first call says the knobs).
     [[nodiscard]] static bool Wanted();
+    /// bbport (r128b_lrt-caustics-water): Wanted reads the strengths in force at each call (the
+    /// variable where set and not empty, else the lantern.ini setting), so the rasterizer makes the
+    /// object at the first frame one is above 0. Refresh takes the two strengths again (once a
+    /// frame); StrengthLine says them (first frame, after a change, at most once every 600).
+    static void StrengthLine();
+    void Refresh();
     Caustics(const Instance& instance, Scheduler& scheduler, VideoCore::TextureCache& texture_cache,
              Runtime& runtime, SceneTargets& scene_targets, CameraMotion& camera_motion,
              PointShadow& point_shadow, bool upscaler_on);
@@ -74,9 +84,139 @@ public:
     /// The first blended draw after the opaque scene: the caustics into `color` (the scene colour,
     /// RGBA16F), from `depth` (the scene's). `wind`: m/s in the world (zero without BB_WIND).
     void Apply(VideoCore::ImageId color, VideoCore::ImageId depth, std::array<float, 2> jitter,
-               const std::array<float, 3>& wind);
+               const std::array<float, 3>& wind, Rasterizer* sewer_witness = nullptr);
+
+    bool SewerReducedArmed(bool ground);
+    void RefuseReducedBedDraw(bool product, const char* reason);
+    void SewerReducedDraw(bool ground, bool product, u64 scene,
+                          VideoCore::ImageId depth, vk::ImageView depth_view,
+                          VideoCore::ImageId cb2, vk::ImageView cb2_view, std::array<float, 2> jitter);
+    bool SewerReducedBeforeCopy(VideoCore::ImageId source, const VideoCore::Image& src,
+                                VideoCore::ImageId destination, const VideoCore::Image& dst,
+                                u64 bytes, std::array<float, 2> jitter);
+    void SewerReducedFallbackCopy(VideoCore::ImageId source);
+    void SewerReducedAfterCopy(VideoCore::ImageId source, VideoCore::ImageId destination,
+                               const VideoCore::Image& dst, vk::ImageView sampled, vk::ImageView written);
+
+    [[nodiscard]] bool NativeBedWanted() const noexcept {
+        return native_bed_enabled && made && knobs.world > 0.0f && LampsWanted() && world_map.buffer;
+    }
+    void ResetNativeBedPass();
+
+    // t200 reuses the accepted t180 pre-ground request. No trace is active on ordinary frames.
+    void StartNativeBedTrace(u64 frame, u64 scene, u32 pass, VideoCore::ImageId depth);
+    [[nodiscard]] bool TracingNativeBed(VideoCore::ImageId depth) const noexcept {
+        return bed_trace.active && bed_trace.depth == depth;
+    }
+    bool NativeBedTraceGate(bool accepted, const char* path, const char* predicate) const;
+    [[nodiscard]] bool TraceNativeBedWanted(const char* path) const;
+    bool ClaimNativeBedDrawTrace(bool ground) noexcept;
+    [[nodiscard]] bool TracingJoinedBed(VideoCore::ImageId depth) const noexcept {
+        return bed_trace.joined_enabled && TracingNativeBed(depth);
+    }
+    bool ClaimJoinedBedCopy(VideoCore::ImageId depth) noexcept {
+        if (!TracingJoinedBed(depth) || bed_trace.joined_copy) return false;
+        bed_trace.joined_copy = true;
+        return true;
+    }
+    std::string JoinedBedStamp() const;
+    std::string JoinedBedState() const;
+    void NoteNativeBedGround(VideoCore::ImageId depth, VideoCore::ImageId albedo,
+                             vk::Extent2D extent, std::array<float, 2> jitter);
+    [[nodiscard]] bool WantsNativeBedCopy(VideoCore::ImageId source) const;
+    void NoteNativeBedCopy(VideoCore::ImageId source_id, const VideoCore::Image& source,
+                           VideoCore::ImageId dest_id, const VideoCore::Image& dest, u64 bytes,
+                           u64 previous_write, std::array<float, 2> jitter);
+    [[nodiscard]] bool AwaitsNativeBedWater() const noexcept {
+        return native_bed.stage == NativeBedStage::Ground || native_bed.stage == NativeBedStage::Copy;
+    }
+    void NoteNativeBedWater(VideoCore::ImageId depth, vk::Extent2D extent,
+                            std::array<float, 2> jitter);
 
 private:
+    struct SewerReducedReceipt;
+    bool sewer_reduced_master{}, sewer_reduced_claimed{};
+    std::shared_ptr<SewerReducedReceipt> sewer_reduced;
+    std::unique_ptr<SewerMotion::Series> sewer_motion;
+    void RefreshSewerMotion();
+    void SewerReducedRefused(const char* reason);
+    bool SewerReducedConsume(VideoCore::ImageId color, vk::ImageView color_view, vk::Image color_image,
+                             VideoCore::ImageId depth, vk::ImageView depth_view, vk::Image depth_image,
+                             VideoCore::ImageId cb2, vk::ImageView cb2_view, vk::Image cb2_image,
+                             const ::BbCaustics::Push& push, vk::ImageView bed_view, bool observe_bed);
+    enum class NativeBedStage { Empty, Ground, Copy, Water, Closed, CopyPending };
+    struct NativeBedImage {
+        VideoCore::ImageId id{};
+        u64 uid = 0;
+        vk::Image handle{};
+        const VideoCore::Image::BackingImage* backing = nullptr;
+        VAddr begin = 0, end = 0;
+
+        static NativeBedImage Of(VideoCore::ImageId id, const VideoCore::Image& image);
+        bool operator==(const NativeBedImage&) const = default;
+    };
+    struct NativeBedPass {
+        NativeBedStage stage = NativeBedStage::Empty;
+        bool reduced = false;
+        u64 serial = 0, frame = 0, loading = 0, generation = 0;
+        NativeBedImage depth, albedo, copy;
+        u64 copy_write = 0, copied_source_write = 0, water_write = 0, copy_bytes = 0;
+        vk::Extent2D extent{}, copy_extent{};
+        u64 scene = 0;
+        vk::Image depth_proxy{}, albedo_proxy{};
+        vk::ImageView ground_view{}, ground_albedo_view{};
+        std::array<float, 4> proj{};
+        std::array<float, 12> view{}, inv_view{};
+        std::array<float, 2> jitter{};
+
+        void Ground();
+        void Copied();
+        void Water();
+    };
+    NativeBedPass native_bed;
+    const char* reduced_bed_refusal = nullptr;
+    void CloseReducedBed(const char* reason);
+    void TrackReducedBedCopy(VideoCore::ImageId source, const VideoCore::Image& src,
+                             VideoCore::ImageId destination, const VideoCore::Image& dst,
+                             u64 bytes, std::array<float, 2> jitter);
+    u64 native_bed_pass_serial = 0;
+    bool native_bed_enabled = false;
+    struct BedTrace {
+        bool active = false, used = false, draw_ground = false, draw_water = false;
+        u64 frame = 0, scene = 0;
+        u32 pass = 0, rows = 0;
+        VideoCore::ImageId depth{};
+        const char* first_path = nullptr;
+        const char* first_failure = nullptr;
+        bool first_reset = false, joined_enabled = false, joined_copy = false;
+    };
+    mutable BedTrace bed_trace;
+    void NativeBedTraceEvent(const char* event, const char* path, const char* detail) const;
+    void NativeBedTraceClose(const char* path, const char* detail) const;
+    void FinishNativeBedTrace(bool joined, VideoCore::ImageId depth, NativeBedStage returned);
+    [[nodiscard]] bool CurrentNativeBed(const NativeBedPass& pass, const char* trace = nullptr) const;
+    [[nodiscard]] bool NativeBedCamera(const NativeBedPass& pass, std::array<float, 2> jitter,
+                                       const char* trace = nullptr) const;
+    [[nodiscard]] bool NativeBedImageFits(const VideoCore::Image* image, vk::Extent2D extent,
+                                          const char* trace = nullptr) const;
+    NativeBedPass TakeNativeBed();
+    struct JoinedBedBind;
+    vk::ImageView BindNativeBed(const NativeBedPass& pass, VideoCore::ImageId color_id,
+                                const VideoCore::Image& color, VideoCore::ImageId depth_id,
+                                const VideoCore::Image& depth, const VideoCore::Image* albedo,
+                                vk::ImageView depth_view, vk::ImageView albedo_view,
+                                vk::Extent2D extent, std::array<float, 2> jitter, float plane, JoinedBedBind* joined);
+    struct ReducedBedTargets;
+    vk::ImageView BindReducedBed(const NativeBedPass& pass, VideoCore::ImageId color_id,
+                                 const VideoCore::Image& color, VideoCore::ImageId depth_id,
+                                 const VideoCore::Image& depth, const VideoCore::Image* albedo,
+                                 const ReducedBedTargets& targets, vk::Extent2D extent,
+                                 std::array<float, 2> jitter, float plane);
+    vk::ImageView BindBedCopy(const NativeBedPass& pass, VideoCore::ImageId color_id,
+                             const VideoCore::Image& color, VideoCore::ImageId depth_id,
+                             const VideoCore::Image& depth, const VideoCore::Image& albedo,
+                             const ReducedBedTargets* targets, JoinedBedBind* joined);
+
     struct ViewEntry {
         vk::Image image{};
         u64 uid = 0;
@@ -86,6 +226,10 @@ private:
     };
     vk::ImageView CachedView(const VideoCore::Image& image, vk::ImageAspectFlags aspect);
     void Report();
+    class WetnessProbe;
+    std::unique_ptr<WetnessProbe> wetness_probe;
+    class BedObserver;
+    std::unique_ptr<BedObserver> bed_observer;
 
     const Instance& instance;
     Scheduler& scheduler;
@@ -97,6 +241,24 @@ private:
 
     ::BbCaustics::Knobs knobs;
     ::BbCaustics::Drift drift;
+    // bbport (r130b_water-moves): the moving water: its state, the strength in force (0: nothing runs) and where it came from
+    ::BbCaustics::Motion::State motion;
+    ::BbCaustics::Motion::Ambient ambient;
+    std::array<bool, ::BbCaustics::Slots> slot_ambient_warp{};
+    float motion_strength = 0.0f;
+    bool motion_env = false;
+    // bbport (r130e_sewer-water-moves): the copy of the water's colours (RGBA16F, the scene's size; made at the first warp, remade
+    // on a size change), whether the copy's contents were cleared, the world map's maker, the bed light's lines
+    struct WarpImage {
+        VideoCore::UniqueImage image;
+        vk::UniqueImageView view;
+        u32 width = 0, height = 0;
+        bool cleared = false;
+    } warp;
+    bool world_env_set = false; ///< r130e: BB_CAUSTICS_WORLD is set and not empty (it decides the bed light, also 0)
+    bool world_tried = false;   ///< r130e: the world map was tried (once)
+    bool EnsureWarpImage(u32 width, u32 height);
+    bool MakeWorldMap();
     vk::UniqueDescriptorSetLayout set_layout;
     vk::UniquePipelineLayout layout;
     vk::UniquePipeline pipeline;
@@ -115,7 +277,7 @@ private:
     std::array<::BbCaustics::Lamp, ::BbCaustics::MaxLamps> last_lamps{};
     u32 last_lamp_count = 0;
     bool made = false;
-    std::array<ViewEntry, 6> view_cache{};
+    std::array<ViewEntry, 7> view_cache{};
     u64 view_uses = 0;
     std::chrono::steady_clock::time_point last_time = std::chrono::steady_clock::now();
 
@@ -172,11 +334,23 @@ private:
         u64 puddle_ground = 0, puddle_wet = 0; ///< r107e: the guard's last counts
         u32 world_draws = 0;   ///< r107f: dispatches that used the world map
         u32 world_changes = 0; ///< r107f: new plane generations (the map starts again)
+        u32 motion_dispatches = 0, steps = 0, landings = 0; ///< r130b: dispatches with the motion, the hunter's steps and landings
+        u64 ring_px = 0;                                    ///< r130b: the water pixels the rings reached, summed
+        bool hunter_read = false;                           ///< r130b: the last frame's position read worked
+        u32 warp_dispatches = 0, motion_only = 0, warp_reads = 0; ///< r130e: warp dispatches, those alone, those whose counts were read
+        u64 warp_px = 0, warp_kept = 0;                           ///< r130e: the water pixels warped and those kept, summed over the reads
+        u64 warp_rows = 0, warp_height = 0;                       ///< r130e: the band's rows and the frames' rows, summed
         std::array<u64, ::BbCaustics::SlotWords> pixels{}; ///< the shader's counts, read back late
         u32 read = 0;      ///< dispatches whose counts were read
     } stats;
     bool reported = false;
     bool told_first = false;
+    bool told_motion = false; ///< r130b: the first moving dispatch was said
+    u32 motion_changes = 0;   ///< r130b: Refresh found another strength
+    bool told_warp = false, told_bed = false, warp_failed = false; ///< r130e: the first warp, the bed light and a failed copy were said
+    std::chrono::steady_clock::time_point warp_retry_at{}; // r132b: copy-image retry deadline
+    u32 strength_changes = 0; ///< r128b: Refresh found another strength (setting moved)
+    u32 idle_passes = 0;      ///< r128b: Apply calls skipped with both strengths 0
 };
 
 } // namespace Vulkan

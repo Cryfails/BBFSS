@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#include "interior_roof_layout.h"
+
+layout(local_size_x = ROOF_RAYS) in;
+layout(binding = 0) uniform accelerationStructureEXT scene;
+layout(std430, binding = 1) readonly buffer Records { uint flags[]; } records;
+struct Ray {
+    uint status, candidates;
+    uint hit_id, hit_primitive, hit_front;
+    float hit_t;
+    uint raw_id, raw_primitive, raw_front;
+    float raw_t;
+    uint rejected[5];
+    uint reserved;
+};
+layout(std430, binding = 2) writeonly buffer Results { Ray rays[]; } results;
+layout(push_constant) uniform Push {
+    vec4 row0, row1, row2, origin;
+    uint count;
+} push;
+
+void main() {
+    const uint index = gl_LocalInvocationIndex;
+    const vec2 diagonal = vec2(0.7071067811865475);
+    const vec2 azimuth[8] = vec2[8](vec2(1, 0), diagonal, vec2(0, 1),
+        vec2(-diagonal.x, diagonal.y), vec2(-1, 0), -diagonal, vec2(0, -1),
+        vec2(diagonal.x, -diagonal.y));
+    vec3 direction = vec3(0, 1, 0);
+    if (index != 0) {
+        const vec2 xz = 0.5 * azimuth[index - 1];
+        direction = vec3(xz.x, 0.8660254037844386, xz.y);
+    }
+    const vec3 origin_view = vec3(dot(push.row0, push.origin), dot(push.row1, push.origin),
+                                  dot(push.row2, push.origin));
+    const vec3 direction_view = vec3(dot(push.row0.xyz, direction), dot(push.row1.xyz, direction),
+                                     dot(push.row2.xyz, direction));
+    Ray ray = Ray(ROOF_DONE, 0u, ROOF_NONE, ROOF_NONE, 0u, -1.0, ROOF_NONE, ROOF_NONE, 0u, -1.0,
+                  uint[5](0, 0, 0, 0, 0), 0u);
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, 0xffu, origin_view, ROOF_TMIN,
+                          direction_view, ROOF_TMAX);
+    while (rayQueryProceedEXT(query)) {
+        if (ray.candidates == ROOF_CANDIDATES) {
+            ray.status = ROOF_OVERFLOW;
+            break;
+        }
+        ++ray.candidates;
+        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+            ray.status = ROOF_TYPE;
+            break;
+        }
+        const uint id = uint(rayQueryGetIntersectionInstanceIdEXT(query, false));
+        if (id >= push.count || id >= records.flags.length()) {
+            ray.status = ROOF_UNKNOWN;
+            break;
+        }
+        const uint flags = records.flags[id];
+        const float t = rayQueryGetIntersectionTEXT(query, false);
+        if ((flags & 0xffu) == 0u || !(t >= ROOF_TMIN && t <= ROOF_TMAX)) {
+            ray.status = ROOF_MISMATCH;
+            break;
+        }
+        if (ray.raw_id == ROOF_NONE || t < ray.raw_t) {
+            ray.raw_id = id;
+            ray.raw_t = t;
+            ray.raw_primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, false));
+            ray.raw_front = uint(rayQueryGetIntersectionFrontFaceEXT(query, false));
+        }
+        const uint exclusions = flags >> ROOF_EXCLUDE_SHIFT;
+        if (exclusions == 0u) {
+            rayQueryConfirmIntersectionEXT(query);
+        } else {
+            for (uint bit = 0; bit < 5; ++bit) {
+                ray.rejected[bit] += (exclusions >> bit) & 1u;
+            }
+        }
+    }
+    if (ray.status != ROOF_DONE) {
+        rayQueryTerminateEXT(query);
+    } else if (rayQueryGetIntersectionTypeEXT(query, true) ==
+               gl_RayQueryCommittedIntersectionTriangleEXT) {
+        ray.hit_id = uint(rayQueryGetIntersectionInstanceIdEXT(query, true));
+        if (ray.hit_id >= push.count || ray.hit_id >= records.flags.length() ||
+            (records.flags[ray.hit_id] >> ROOF_EXCLUDE_SHIFT) != 0u) {
+            ray.hit_id = ROOF_NONE;
+            ray.status = ROOF_MISMATCH;
+        } else {
+            ray.hit_t = rayQueryGetIntersectionTEXT(query, true);
+            ray.hit_primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+            ray.hit_front = uint(rayQueryGetIntersectionFrontFaceEXT(query, true));
+        }
+    }
+    results.rays[index] = ray;
+}

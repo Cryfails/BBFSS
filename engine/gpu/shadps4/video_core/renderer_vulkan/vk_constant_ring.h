@@ -31,6 +31,11 @@ public:
     [[nodiscard]] vk::Buffer Handle() const noexcept {
         return buffer.Handle();
     }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    [[nodiscard]] VmaAllocation Allocation() const noexcept {
+        return buffer.buffer.allocation;
+    }
+#endif
 
     /// Stage A: `size` bytes at `alignment`; returns the ring offset, or nullopt when the ring is
     /// still in use by the GPU (the caller leaves the binding to stage B).

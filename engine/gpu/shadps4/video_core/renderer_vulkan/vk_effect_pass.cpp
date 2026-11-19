@@ -79,15 +79,17 @@ bool Create(const Instance& instance, vk::UniqueDescriptorSetLayout& set_layout,
     return true;
 }
 
-bool CreateSampler(const Instance& instance, vk::UniqueSampler& sampler, vk::Filter filter) {
+bool CreateSampler(const Instance& instance, vk::UniqueSampler& sampler, vk::Filter filter,
+                   vk::SamplerAddressMode address, vk::BorderColor border) {
     auto made = instance.GetDevice().createSamplerUnique({
         .magFilter = filter,
         .minFilter = filter,
         .mipmapMode = vk::SamplerMipmapMode::eNearest,
-        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
-        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        .addressModeU = address,
+        .addressModeV = address,
+        .addressModeW = address,
         .maxLod = 0.0f,
+        .borderColor = border,
     });
     if (made.result != vk::Result::eSuccess) {
         std::printf("Effects: off - no sampler (%s)\n", vk::to_string(made.result).c_str());

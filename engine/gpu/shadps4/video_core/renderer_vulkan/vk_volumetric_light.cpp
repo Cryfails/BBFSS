@@ -1115,7 +1115,7 @@ bool VolumetricLight::DualReady() {
 // bbport (r115_sun-fog-indoors): once a march with the volumetric sunlight on: the mode when it
 // changes (the rule once when it is 2), and while it is 2 every 600 marches how many were area gate
 // marches and of them how many had the dual gate, no ray traced gate (light sets and the near rule)
-// or the ray traced gate with r85's rule (fog noise or gate probe on, or the dual gate not made).
+// or the ray traced gate with r85's rule (gate probe on, or the dual gate not made).
 void VolumetricLight::SayAreaMode(u32 mode, bool area, bool gated, bool dual) {
     if (mode != area_mode_seen) {
         if (mode == 2) {
@@ -1140,7 +1140,7 @@ void VolumetricLight::SayAreaMode(u32 mode, bool area, bool gated, bool dual) {
     if (++r115_marches % 600 == 0) {
         std::printf("Volumetric lighting (r115): area gate 2 on %llu of 600 marches: %llu with the "
                     "dual ray traced gate, %llu without ray tracing, %llu with the ray traced gate "
-                    "as r85 (fog noise or gate probe on)\n",
+                    "as r85 (gate probe on or the dual gate not made)\n",
                     static_cast<unsigned long long>(r115_area),
                     static_cast<unsigned long long>(r115_dual),
                     static_cast<unsigned long long>(r115_plain),
@@ -1670,7 +1670,12 @@ void VolumetricLight::Integrate(VideoCore::ImageId shadow_target,
     // keeps r82's name for the bytes pushed: NoiseParams, WindParams while drifting, else Params
     // (each starts with Params). Never noise and drift both: SetFogNoise took back SetWind's
     // request, and a march without a camera has neither.
-    const bool noise = FogNoiseMarch(viewing, gated, area && !viewing);
+    // bbport (r94c_fog-noise-dual-gate): BB_VOLUMETRIC_AREA_GATE=2 on an area gate march with the
+    // ray traced gate: the DUAL builds (DualReady), decided before the noise so that the noise can
+    // take the DUAL pair; not while the gate's probe or view runs (their DIAG build has no wider
+    // answer)
+    const bool dual = area && !viewing && gated && area_mode == 2 && !diag && DualReady();
+    const bool noise = FogNoiseMarch(viewing, gated, area && !viewing, dual);
     const PushBlock wind_push =
         noise ? PushBlock::Of(NoiseParams{params, FogNoiseTail()})
               : PushBlock::Of(WindParams{params, wind_fog.view_to_world, wind_fog.off1,
@@ -1678,11 +1683,7 @@ void VolumetricLight::Integrate(VideoCore::ImageId shadow_target,
     const u32 push_size = noise   ? u32(sizeof(NoiseParams))
                           : drift ? u32(sizeof(WindParams))
                                   : u32(sizeof(Params));
-    // bbport (r115_sun-fog-indoors): BB_VOLUMETRIC_AREA_GATE=2 on an area gate march with the ray
-    // traced gate: the DUAL builds (DualReady), not while the gate's probe or view runs (their DIAG
-    // build has no wider answer) or the fog noise does (no DUAL build of it): r85's rule there
-    const bool dual = area && !viewing && gated && area_mode == 2 && !diag && !noise && DualReady();
-    gate_dual_on = dual;
+    gate_dual_on = dual; // bbport (r115_sun-fog-indoors): `dual` is decided above (r94c)
     if (live_strength > 0.0f) {
         SayAreaMode(area_mode, area && !viewing, gated, dual);
     }
@@ -1752,10 +1753,10 @@ void VolumetricLight::Integrate(VideoCore::ImageId shadow_target,
          // AREA+GATE builds (the GATE builds' bindings, which `gated` writes below); never on a
          // march the gate view draws (`viewing` in these initializers is Integrate's)
          // bbport (r94_fog-noise): with the fog noise the NOISE build of that pass (its bindings)
-         pipeline = *(noise              ? NoisePass(gated, area && !viewing, repairing)
+         pipeline = *(noise              ? NoisePass(gated, area && !viewing, repairing, dual)
                       : area && !viewing ? AreaPass(gated, repairing, dual)
                                          : pass).pipeline,
-         layout = *(noise              ? NoisePass(gated, area && !viewing, repairing)
+         layout = *(noise              ? NoisePass(gated, area && !viewing, repairing, dual)
                     : area && !viewing ? AreaPass(gated, repairing, dual)
                                        : pass).layout](
             vk::CommandBuffer cmd) {

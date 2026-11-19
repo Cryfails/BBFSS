@@ -72,7 +72,7 @@ const vec2 GLOW_STOPS = vec2(4.0, 1.0);
 
 float lum_floor;  // the frame's black (blackLevel)
 float tone_floor; // the same as a tone (toneOf)
-// In the test view (graphics_drawn_look_debug 1, 2 or 4) every dab has a flat colour of its
+// In the test view (BB_DRAWN_LOOK_VIEW 1, 2 or 4) every dab has a flat colour of its
 // own, grey by as much as the surface moves by itself (movesItself).
 bool test_view = false;
 float test_grey = 0.0;

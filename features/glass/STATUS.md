@@ -1,5 +1,15 @@
 # Glass: window panes, bottles and glints in the ray traced scene
 
+## Development snapshot, 2026-11-19
+
+LRT T04. Feature work is paused.
+
+- Verified scope. Dream House cabinet transmission reached two receivers. Bottle HDR and moving colour passed at the tested pose.
+- Open scope. Latest Cabinet 4K and warm cache boot passed. The host refused its grouped file comparison before the effect test. Switch-off and displayed world reflections remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 15%. Rated by the weakest part: nothing glass-related is visible to a player yet.
 
 ## What works
@@ -51,3 +61,6 @@ None of these are on a fork branch yet; the notes plan branch visual/glass-water
 - Dark alley: must do nothing (zero panes, "0 passes").
 - Graveyard with the torch out: the hang case for r121b (run it about 40 times).
 - Lamp test spot has a 12 triangle pane draw, so it is not a zero-pane place.
+
+
+</details>

@@ -135,11 +135,14 @@ struct LampBlock {
     std::array<std::array<float, 4>, AP_MAX_LAMPS> place{};  ///< world xyz (m), reach (m)
     std::array<std::array<float, 4>, AP_MAX_LAMPS> colour{}; ///< rgb as drawn (at most 4), weight
     std::array<std::array<float, 4>, AP_MAX_FLAMES> flame{}; ///< seed, share x weight, 0, 0
+    std::array<std::array<float, 4>, AP_MAX_LAMPS> moth{};   ///< x moths, y seed, z loop scale,
+                                                             ///< w calm (r98e_moths-at-lamps)
 };
 static_assert(sizeof(LampBlock) == AP_LAMP_BLOCK_BYTES &&
-              AP_LAMP_BLOCK_BYTES == 32 + 32 * AP_MAX_LAMPS + 16 * AP_MAX_FLAMES);
+              AP_LAMP_BLOCK_BYTES == 32 + 32 * AP_MAX_LAMPS + 16 * AP_MAX_FLAMES + 16 * AP_MAX_LAMPS);
 static_assert(offsetof(LampBlock, place) == 32 && offsetof(LampBlock, colour) == 32 + 16 * AP_MAX_LAMPS &&
-              offsetof(LampBlock, flame) == 32 + 32 * AP_MAX_LAMPS);
+              offsetof(LampBlock, flame) == 32 + 32 * AP_MAX_LAMPS &&
+              offsetof(LampBlock, moth) == 32 + 32 * AP_MAX_LAMPS + 16 * AP_MAX_FLAMES);
 
 class LampSet {
 public:
@@ -364,6 +367,8 @@ private:
     static void Fill(LampBlock& block, std::size_t slot, const Entry& e) {
         block.place[slot] = {e.world[0], e.world[1], e.world[2], e.reach};
         block.colour[slot] = {e.colour[0], e.colour[1], e.colour[2], e.weight};
+        // bbport (r98e_moths-at-lamps): the lamp's seed (its own number while kept), for its moths
+        block.moth[slot] = {0.0f, SeedOf(e.serial), 0.0f, 0.0f};
     }
 
     LampFog::FrameLights gathered;

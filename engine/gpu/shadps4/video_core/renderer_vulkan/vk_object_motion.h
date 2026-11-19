@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <thread>
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
@@ -74,6 +75,41 @@ public:
 
     /// Rendering of a motion pipeline: the motion attachment (render-target size).
     void Attach(RenderState& state, u32 width, u32 height);
+
+    struct AttachmentOwner {
+        const ObjectMotion* owner = nullptr;
+        const void* target = nullptr;
+        VmaAllocation allocation{};
+        vk::Image image{};
+        vk::ImageView view{};
+        vk::Extent2D extent{};
+        vk::ImageCreateInfo creation{};
+        vk::ImageLayout layout{};
+        u64 owner_frame = 0, used_frame = 0;
+        bool written = false;
+
+        bool operator==(const AttachmentOwner&) const = default;
+    };
+    /// t132d: the actual render-size target; no allocation, layout transition or use stamp.
+    [[nodiscard]] std::optional<AttachmentOwner> FindAttachmentOwner(u32 width, u32 height) const noexcept {
+        const auto* target = Find(width, height);
+        if (!target) {
+            return std::nullopt;
+        }
+        return AttachmentOwner{
+            .owner = this,
+            .target = target,
+            .allocation = target->image.allocation,
+            .image = target->image.image,
+            .view = target->view.get(),
+            .extent = {target->width, target->height},
+            .creation = target->image.image_ci,
+            .layout = target->layout,
+            .owner_frame = frame,
+            .used_frame = target->used_frame,
+            .written = target->written,
+        };
+    }
 
     /// Start of a frame (display pass).
     void OnFrameStart();

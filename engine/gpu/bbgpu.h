@@ -51,6 +51,37 @@ void bbgpu_spark_probe_pad(uint32_t buttons);
 /* bbport (r110_weapon-sparks): the pad buttons the game was just given (scePadReadState);
  * BB_WEAPON_SPARKS takes the transform button's presses from them, otherwise it returns at once. */
 void bbgpu_weapon_sparks_pad(uint32_t buttons);
+/* Private T05 diagnostic. The native pad owner serializes stops against successful returns. */
+typedef struct {
+    uint64_t request, loading, generation, command, scene;
+    uint32_t frame;
+} BbSewerPadKey;
+
+typedef enum {
+    BB_SEWER_PAD_FEEDBACK, BB_SEWER_PAD_ARM, BB_SEWER_PAD_STOP, BB_SEWER_PAD_CANCEL
+} BbSewerPadAction;
+
+typedef enum {
+    BB_SEWER_PAD_WAITING, BB_SEWER_PAD_ARMED, BB_SEWER_PAD_CUT, BB_SEWER_PAD_REFUSED
+} BbSewerPadPhase;
+
+typedef enum {
+    BB_SEWER_PAD_NONE, BB_SEWER_PAD_PROJECTION, BB_SEWER_PAD_CANCELLED,
+    BB_SEWER_PAD_EARLY_RX, BB_SEWER_PAD_HOST_LEASE, BB_SEWER_PAD_RENDER_LEASE,
+    BB_SEWER_PAD_ABSOLUTE, BB_SEWER_PAD_OWNER, BB_SEWER_PAD_INPUT,
+    BB_SEWER_PAD_BUDGET, BB_SEWER_PAD_PUBLICATION
+} BbSewerPadCause;
+
+typedef struct {
+    BbSewerPadPhase phase;
+    BbSewerPadCause stop_cause, fault;
+    uint64_t stop_serial, after_read, first_read;
+    uint64_t stop_loading, stop_generation, stop_scene, heartbeat;
+    uint32_t stop_frame, owner;
+    int first_inherited;
+} BbSewerPadStatus;
+
+BbSewerPadStatus bbgpu_sewer_pad_latch(BbSewerPadAction action, const BbSewerPadKey *key);
 #ifdef __cplusplus
 }
 #endif

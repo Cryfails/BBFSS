@@ -17,10 +17,12 @@
 #include "video_core/renderer_vulkan/vk_volumetric_light.h"
 
 #include "video_core/host_shaders/volumetric_light_integrate_area_noise_comp.h"
+#include "video_core/host_shaders/volumetric_light_integrate_gate_area_dual_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_integrate_gate_area_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_integrate_gate_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_integrate_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_area_noise_comp.h"
+#include "video_core/host_shaders/volumetric_light_repair_gate_area_dual_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_gate_area_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_gate_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_noise_comp.h"
@@ -70,11 +72,15 @@ const VolumetricFogNoise::Knobs& FogNoiseKnobs() {
 }
 
 // noise_passes's index of a build: bit 0 the ray traced gate, bit 1 the area gate, bit 2 repair.
-constexpr std::size_t NoiseIndex(bool gated, bool area, bool repairing) {
-    return (gated ? 1u : 0u) | (area ? 2u : 0u) | (repairing ? 4u : 0u);
+// bbport (r94c_fog-noise-dual-gate): bit 3 the dual gate (a gated area march), so 16 builds
+constexpr std::size_t NoiseIndex(bool gated, bool area, bool repairing, bool dual = false) {
+    return (gated ? 1u : 0u) | (area ? 2u : 0u) | (repairing ? 4u : 0u) | (dual ? 8u : 0u);
 }
 
-const char* NoisePairName(bool gated, bool area) {
+const char* NoisePairName(bool gated, bool area, bool dual) {
+    if (dual) { // bbport (r94c_fog-noise-dual-gate)
+        return "ray traced gate, area gate and dual gate";
+    }
     return gated ? (area ? "ray traced gate and area gate" : "ray traced gate")
                  : (area ? "area gate" : "plain");
 }
@@ -117,18 +123,34 @@ void VolumetricLight::SetFogNoise(bool wind_on, double wind_time,
 // builds take the bindings of the builds they stand for (plain and area: the pass's own; gated
 // and gated area: then the gate and each column's first open slice) and PushBytes of push
 // constants. A failure is said once; that pair's marches then stay even.
-bool VolumetricLight::NoisePasses(bool gated, bool area) {
-    const std::size_t pair = NoiseIndex(gated, area, false);
+bool VolumetricLight::NoisePasses(bool gated, bool area, bool dual) {
+    const std::size_t pair = NoiseIndex(gated, area, false, dual);
     if (fog_noise.tried[pair]) {
         return !fog_noise.failed[pair];
     }
     fog_noise.tried[pair] = true;
     using enum vk::DescriptorType;
     constexpr u32 bytes = VolumetricFogNoise::PushBytes;
-    Pass& march = noise_passes[NoiseIndex(gated, area, false)];
-    Pass& repair_march = noise_passes[NoiseIndex(gated, area, true)];
+    Pass& march = noise_passes[NoiseIndex(gated, area, false, dual)];
+    Pass& repair_march = noise_passes[NoiseIndex(gated, area, true, dual)];
     bool made = false;
-    if (gated) {
+    if (dual) {
+        // bbport (r94c_fog-noise-dual-gate): the GATE+AREA march with the dual gate's wider answer
+        // after the gate's bindings, as DualReady's builds have them
+        made =
+            CreatePass(march,
+                       {eStorageBuffer, eStorageBuffer, eCombinedImageSampler,
+                        eCombinedImageSampler, eStorageImage, eStorageImage,
+                        eCombinedImageSampler, eCombinedImageSampler, eCombinedImageSampler},
+                       VOLUMETRIC_LIGHT_INTEGRATE_GATE_AREA_DUAL_NOISE_COMP, bytes,
+                       "Volumetric integrate (gate, area gate, dual, fog noise)") &&
+            CreatePass(repair_march,
+                       {eStorageBuffer, eStorageBuffer, eCombinedImageSampler,
+                        eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage,
+                        eCombinedImageSampler, eCombinedImageSampler, eCombinedImageSampler},
+                       VOLUMETRIC_LIGHT_REPAIR_GATE_AREA_DUAL_NOISE_COMP, bytes,
+                       "Volumetric repair (gate, area gate, dual, fog noise)");
+    } else if (gated) {
         made =
             CreatePass(march,
                        {eStorageBuffer, eStorageBuffer, eCombinedImageSampler,
@@ -172,13 +194,13 @@ bool VolumetricLight::NoisePasses(bool gated, bool area) {
                      : "Volumetric lighting (r94): the fog noise builds for %s marches could "
                        "not be made; those marches stay even and do not drift with the "
                        "wind\n",
-                NoisePairName(gated, area));
+                NoisePairName(gated, area, dual));
     return made;
 }
 
-const VolumetricLight::Pass& VolumetricLight::NoisePass(bool gated, bool area,
-                                                        bool repairing) const {
-    return noise_passes[NoiseIndex(gated, area, repairing)];
+const VolumetricLight::Pass& VolumetricLight::NoisePass(bool gated, bool area, bool repairing,
+                                                        bool dual) const {
+    return noise_passes[NoiseIndex(gated, area, repairing, dual)];
 }
 
 VolumetricFogNoise::Tail VolumetricLight::FogNoiseTail() const {
@@ -190,17 +212,18 @@ VolumetricFogNoise::Tail VolumetricLight::FogNoiseTail() const {
 // alone; its pair's NOISE builds made). Every 600 marches with the noise a line counts them, those
 // with the ray traced gate, the area gate and the wind, the marches since the last line that
 // stayed even or had no camera, and the largest octave's offset (it moves only with the wind).
-bool VolumetricLight::FogNoiseMarch(bool viewing, bool gated, bool area) {
+bool VolumetricLight::FogNoiseMarch(bool viewing, bool gated, bool area, bool dual) {
     if (!std::exchange(fog_noise.on, false)) {
         return false;
     }
-    if (viewing || !NoisePasses(gated, area)) {
+    if (viewing || !NoisePasses(gated, area, dual)) {
         ++fog_noise.even;
         return false;
     }
     ++fog_noise.marches;
     fog_noise.gated += gated ? 1 : 0;
     fog_noise.area += area ? 1 : 0;
+    fog_noise.dual += dual ? 1 : 0; // bbport (r94c_fog-noise-dual-gate)
     fog_noise.drifted += fog_noise.drifting ? 1 : 0;
     if (fog_noise.marches % 600 == 0) {
         const std::array<float, 3> cells = fog_noise.drift.Cells(0);
@@ -215,6 +238,11 @@ bool VolumetricLight::FogNoiseMarch(bool viewing, bool gated, bool area) {
                     static_cast<unsigned long long>(fog_noise.even),
                     static_cast<unsigned long long>(fog_noise.no_camera), double(cells[0]),
                     double(cells[1]), double(cells[2]));
+        // bbport (r94c_fog-noise-dual-gate): of those marches, how many had r115's dual gate
+        std::printf("Volumetric lighting (r94c): %llu of those 600 marches with the noise had the "
+                    "dual gate (BB_VOLUMETRIC_AREA_GATE=2)\n",
+                    static_cast<unsigned long long>(fog_noise.dual));
+        fog_noise.dual = 0;
         // bbport (r94b_fog-noise-visible): with the banks look, how far they moved since the last
         // line: the largest octave's offset across the ground (x, z; the wind has no up part),
         // each axis wrapped the short way, in cells of the scale (its ratio is 1), so metres

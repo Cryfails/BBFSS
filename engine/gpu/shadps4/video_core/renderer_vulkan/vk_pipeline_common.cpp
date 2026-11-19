@@ -14,6 +14,7 @@
 
 #include "bbport_settings.h"
 #include "bbport_interior_exposure.h" // bbport (r99_interior-exposure)
+#include "bbport_test_exposure_lock.h" // bbport (t125, TOOL)
 #include "shader_recompiler/native/froyok_composite.h"
 #include "shader_recompiler/native/gt7_tonemap.h"
 #include "shader_recompiler/native/tone_curve.h"
@@ -23,6 +24,10 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+#include "video_core/renderer_vulkan/vk_bottle_set0_b182.h"
+#endif
 
 namespace Vulkan {
 
@@ -151,10 +156,27 @@ Shader::Native::ToneCurvePush ToneCurveParams() {
 }
 } // namespace
 
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+static void NoteBottleSet0(Scheduler& scheduler, BottleDisplay182::DescriptorTicket& selected,
+                           vk::CommandBuffer cmd, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout,
+                           BottleDisplay182::DescriptorSlots slots, BottleDisplay182::BindRoute route,
+                           vk::DescriptorSet set = {}) {
+    const auto* worker = NativeWriteSuffix::worker_segment;
+    selected.NoteBind(BottleDisplay182::NoteOrigin(scheduler, selected, cmd,
+                         worker ? worker->scheduler : nullptr, worker ? worker->buffer : vk::CommandBuffer{},
+                         worker ? worker->tick : 0, worker ? worker->segment : 0),
+                      bind_point, layout, slots, route, set);
+}
+#endif
+
 void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,
                              std::span<const vk::DescriptorImageInfo> image_infos,
                              std::span<const vk::DescriptorBufferInfo> buffer_infos,
-                             float froyok_blend) const {
+                             float froyok_blend
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+                             , const std::shared_ptr<BottleDisplay182::DescriptorTicket>& bottle
+#endif
+                             ) const {
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
@@ -169,7 +191,7 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
             // bbport (r99_interior-exposure): times the interior lift, exactly 1 unless
             // BB_INTERIOR_EXPOSURE is on (gpu/shim/bbport_interior_exposure.h)
             .exposure = settings.graphics_gt7_exposure.load(std::memory_order_relaxed) *
-                        BbInteriorExposure::Scale(),
+                        BbTestExposureLock::HoldScale(BbInteriorExposure::Scale()),
             .unused = {},
         };
         scheduler.Record([layout, stage_flags, tone_map](vk::CommandBuffer cmdbuf) {
@@ -198,6 +220,18 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
 
     if (uses_push_descriptors) {
         if (!scheduler.IsRecordingDeferred()) {
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+            if (bottle) {
+                // Same inline call and operands as the ordinary branch. Only the owned receipt
+                // persists. The synchronous Vulkan write span is never retained by the ticket.
+                scheduler.Record([&, ticket = bottle](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
+                    NoteBottleSet0(scheduler, *ticket, cmdbuf, bind_point, layout,
+                                   BottleDisplay182::InspectSet0(set_writes), BottleDisplay182::BindRoute::InlinePush);
+                });
+                return;
+            }
+#endif
             scheduler.Record([&](vk::CommandBuffer cmdbuf) {
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, set_writes);
             });
@@ -240,6 +274,16 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                     write.pBufferInfo = buffers.data() + (write.pBufferInfo - buffer_infos.data());
                 }
             }
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+            if (bottle) {
+                scheduler.Record([producer = &scheduler, bind_point, layout, writes, ticket = bottle](vk::CommandBuffer cmdbuf) {
+                    cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+                    NoteBottleSet0(*producer, *ticket, cmdbuf, bind_point, layout,
+                                   BottleDisplay182::InspectSet0(writes), BottleDisplay182::BindRoute::BulkPush);
+                });
+                return;
+            }
+#endif
             scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
                 cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
             });
@@ -268,6 +312,16 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
                     scheduler.RecordData(std::span{write.pTexelBufferView, write.descriptorCount}).data();
             }
         }
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+        if (bottle) {
+            scheduler.Record([producer = &scheduler, bind_point, layout, writes, ticket = bottle](vk::CommandBuffer cmdbuf) {
+                cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
+                NoteBottleSet0(*producer, *ticket, cmdbuf, bind_point, layout,
+                               BottleDisplay182::InspectSet0(writes), BottleDisplay182::BindRoute::RebasedPush);
+            });
+            return;
+        }
+#endif
         scheduler.Record([bind_point, layout, writes](vk::CommandBuffer cmdbuf) {
             cmdbuf.pushDescriptorSetKHR(bind_point, layout, 0, writes);
         });
@@ -280,6 +334,18 @@ void Pipeline::BindResources(DescriptorWrites& set_writes, const Shader::PushDat
         set_write.dstSet = desc_set;
     }
     instance.GetDevice().updateDescriptorSets(set_writes, {});
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    if (bottle) {
+        const auto updated = BottleDisplay182::InspectSet0(set_writes, desc_set);
+        scheduler.Record([producer = &scheduler, bind_point, layout, desc_set, updated,
+                          ticket = bottle](vk::CommandBuffer cmdbuf) {
+            cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
+            NoteBottleSet0(*producer, *ticket, cmdbuf, bind_point, layout, updated,
+                           BottleDisplay182::BindRoute::UpdatedSet, desc_set);
+        });
+        return;
+    }
+#endif
     scheduler.Record([bind_point, layout, desc_set](vk::CommandBuffer cmdbuf) {
         cmdbuf.bindDescriptorSets(bind_point, layout, 0, desc_set, {});
     });

@@ -774,6 +774,8 @@ static bool DepthBlockCopy(Rasterizer& rasterizer, VideoCore::ImageId src_id, VA
     textures.UpdateImage(src_id);
     auto& src_image = textures.GetImage(src_id);
     auto& dst_image = textures.GetImage(dst_id);
+    const bool sewer_witness = rasterizer.HasSewerReceiverWitness();
+    const u64 previous_dst_write = sewer_witness ? dst_image.write_seq : 0;
     auto* const scene = runtime.scene_targets;
     if (!BbToggle::Experiment(2048) && scene && scene->Reduced() &&
         scene->CanCopyDepthProxyToColor(src_image, dst_image)) {
@@ -782,7 +784,14 @@ static bool DepthBlockCopy(Rasterizer& rasterizer, VideoCore::ImageId src_id, VA
                 return std::string{"render-target copy HLE: depth block from proxy (shader)"};
             });
         }
-        if (scene->CopyDepthProxyToColor(src_image, dst_image)) {
+        SceneTargets::SewerCopyViews sewer_views{};
+        const bool sewer_reduced = rasterizer.SewerReducedBeforeCopy(src_id, src_image, dst_id, dst_image, bytes);
+        if (scene->CopyDepthProxyToColor(src_image, dst_image, sewer_reduced ? &sewer_views : nullptr)) {
+            rasterizer.SewerReducedAfterCopy(src_id, dst_id, dst_image, sewer_views[0], sewer_views[1]);
+            if (sewer_witness) {
+                rasterizer.NoteSewerDepthBlockCopy(src_id, src_image, dst_id, dst_image, bytes,
+                                                  previous_dst_write, false);
+            }
             static bool proxy_logged = false;
             if (!proxy_logged) {
                 proxy_logged = true;
@@ -794,13 +803,27 @@ static bool DepthBlockCopy(Rasterizer& rasterizer, VideoCore::ImageId src_id, VA
             return true;
         }
     }
+    rasterizer.SewerReducedFallbackCopy(src_id);
     report(32, "copied as an image", &destination);
     if (auto* profiler = GpuProfiler::Get()) {
         profiler->Mark(0xC0B3ull, [] {
             return std::string{"render-target copy HLE: depth block to R32F image copy"};
         });
     }
+    const auto joined_bed = sewer_witness ?
+        rasterizer.SewerJoinedCopyBefore(src_id, src_image, dst_id, dst_image) : std::string{};
+    const bool native_bed = rasterizer.WantsNativeBedCopy(src_id);
+    const u64 native_bed_previous_write = native_bed ? dst_image.write_seq : 0;
     runtime.CopyColorAndDepth(&src_image, &dst_image);
+    if (native_bed) {
+        rasterizer.NoteNativeBedCopy(src_id, src_image, dst_id, dst_image, bytes,
+                                     native_bed_previous_write);
+    }
+    if (sewer_witness) {
+        rasterizer.SewerJoinedCopyAfter(joined_bed, src_id, src_image, dst_id, dst_image, bytes, native_bed);
+        rasterizer.NoteSewerDepthBlockCopy(src_id, src_image, dst_id, dst_image, bytes,
+                                          previous_dst_write, !(scene && scene->Reduced()));
+    }
     return true;
 }
 

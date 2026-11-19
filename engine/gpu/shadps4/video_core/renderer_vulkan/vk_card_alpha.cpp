@@ -12,6 +12,8 @@
 #include "shader_recompiler/ir/passes/cutout_analysis.h"
 #include "video_core/amdgpu/resource.h"
 #include "video_core/host_shaders/rt_card_alpha_fill_comp.h"
+#include "video_core/host_shaders/rt_card_alpha_fill_colour_comp.h" // bbport (r131a_foliage-translucency)
+#include "video_core/renderer_vulkan/foliage_translucency.h"       // bbport (r131a_foliage-translucency)
 #include "video_core/host_shaders/rt_card_view_comp.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
@@ -37,6 +39,9 @@ constexpr auto MemoryAll = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits
 constexpr u32 LineFrames = 600;
 constexpr vk::ImageSubresourceRange LayersRange{vk::ImageAspectFlagBits::eColor, 0, CardLayerMips,
                                                 0, CardLayerCount};
+// bbport (r131a_foliage-translucency): the colour layers' size and range
+constexpr vk::DeviceSize ColourBytes = vk::DeviceSize(CARD_COLOUR_SIZE) * CARD_COLOUR_SIZE * 4 * CardLayerCount;
+constexpr vk::ImageSubresourceRange ColourRange{vk::ImageAspectFlagBits::eColor, 0, 1, 0, CardLayerCount};
 
 std::atomic<u64> cutout_loaded{0};
 std::atomic<u64> cutout_refused{0};
@@ -119,6 +124,10 @@ CardAlpha::~CardAlpha() {
     }
     level_views = {};
     layers_view.reset();
+    colour_view.reset(); // bbport (r131a_foliage-translucency)
+    if (colour_image) {
+        vmaDestroyImage(instance.GetAllocator(), colour_image, colour_allocation);
+    }
     if (layers_image) {
         vmaDestroyImage(instance.GetAllocator(), layers_image, layers_allocation);
     }
@@ -155,6 +164,47 @@ void CardAlpha::FreeBuffer(Buffer& buffer) {
         vmaDestroyBuffer(instance.GetAllocator(), buffer.buffer, buffer.allocation);
     }
     buffer = {};
+}
+
+// bbport (r131a_foliage-translucency): the colour layers (see the member), cleared to 0 (a = 0: no colour) before the first fill. False: not made
+// (no room, or the format cannot be stored): the fill is the plain one and the readers get no colour view.
+bool CardAlpha::MakeColour() {
+    const auto device = instance.GetDevice();
+    if (!EffectPass::StorageFormat(instance, vk::Format::eR8G8B8A8Unorm) || !EffectPass::HasRoom(instance, ColourBytes)) {
+        return false;
+    }
+    const VkImageCreateInfo image_ci{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {CARD_COLOUR_SIZE, CARD_COLOUR_SIZE, 1},
+        .mipLevels = 1,
+        .arrayLayers = CardLayerCount,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage raw{};
+    if (vmaCreateImage(instance.GetAllocator(), &image_ci, &alloc_ci, &raw, &colour_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    colour_image = raw;
+    SetObjectName(device, colour_image, "Card colour layers");
+    colour_view = Check<"create card colour view">(device.createImageViewUnique({
+        .image = colour_image,
+        .viewType = vk::ImageViewType::e2DArray,
+        .format = vk::Format::eR8G8B8A8Unorm,
+        .subresourceRange = ColourRange,
+    }));
+    scheduler.Record([image = colour_image](vk::CommandBuffer cmd) {
+        EffectPass::InitGeneral(cmd, image, ColourRange);
+        const vk::ClearColorValue zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+        cmd.clearColorImage(image, vk::ImageLayout::eGeneral, zero, ColourRange);
+        EffectPass::MemoryBarrier(cmd, Transfer, vk::AccessFlagBits2::eTransferWrite, AllCommands, MemoryAll);
+    });
+    return true;
 }
 
 // The layers (CardLayersBytes), their views, the layer info and the fill pass: all once, at
@@ -222,9 +272,14 @@ bool CardAlpha::Make() {
         return false;
     }
     using enum vk::DescriptorType;
-    if (!EffectPass::Create(instance, fill_set, fill_layout, fill_pipeline,
-                            {eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage},
-                            CARD_FILL_PUSH_BYTES, RT_CARD_ALPHA_FILL_COMP, "card alpha fill")) {
+    // bbport (r131a_foliage-translucency): with the light through leaves on, the colour layers and the COLOUR build of the fill (a fifth image)
+    colour_on = FoliageTranslucency::LightThrough() && MakeColour();
+    if (colour_on ? !EffectPass::Create(instance, fill_set, fill_layout, fill_pipeline,
+                                        {eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage, eStorageImage},
+                                        CARD_FILL_PUSH_BYTES, RT_CARD_ALPHA_FILL_COLOUR_COMP, "card alpha fill (colour)")
+                  : !EffectPass::Create(instance, fill_set, fill_layout, fill_pipeline,
+                                        {eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage},
+                                        CARD_FILL_PUSH_BYTES, RT_CARD_ALPHA_FILL_COMP, "card alpha fill")) {
         return false;
     }
     // Every layer starts at 0 (a reader never reads a layer before its fill: the layer info's
@@ -373,11 +428,12 @@ CardAlpha::FillResult CardAlpha::Fill(u32 layer) {
     const vk::DescriptorImageInfo dst0{{}, *level_views[0], vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo dst1{{}, *level_views[1], vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo dst2{{}, *level_views[2], vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo dst3{{}, colour_on ? *colour_view : vk::ImageView{}, vk::ImageLayout::eGeneral}; // bbport (r131a_foliage-translucency)
     constexpr u32 groups = (CardLayerSize + CARD_FILL_GROUP - 1) / CARD_FILL_GROUP;
     EffectPass::Mark(62, "card alpha fill");
     scheduler.RecordCrumb(
         {.name = "Card alpha fill"},
-        [push, src, dst0, dst1, dst2, pipeline = *fill_pipeline,
+        [push, src, dst0, dst1, dst2, dst3, with_colour = colour_on, pipeline = *fill_pipeline,
          layout = *fill_layout](vk::CommandBuffer cmd) {
             // The layer may be read by rays recorded before (its old texture, or the same one
             // before a refill): they finish first.
@@ -394,9 +450,13 @@ CardAlpha::FillResult CardAlpha::Fill(u32 layer) {
                                        .pImageInfo = &dst1},
                 vk::WriteDescriptorSet{.dstBinding = 3, .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
-                                       .pImageInfo = &dst2}};
+                                       .pImageInfo = &dst2},
+                vk::WriteDescriptorSet{.dstBinding = 4, .descriptorCount = 1, // bbport (r131a_foliage-translucency): the colour layers
+                                       .descriptorType = vk::DescriptorType::eStorageImage,
+                                       .pImageInfo = &dst3}};
             cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
-            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0,
+                                     vk::ArrayProxy<const vk::WriteDescriptorSet>(with_colour ? 5u : 4u, writes.data()));
             cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), push.data());
             cmd.dispatch(groups, groups, 1);
             EffectPass::MemoryBarrier(cmd, Compute, ShaderWrite, AllCommands,

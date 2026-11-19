@@ -88,6 +88,8 @@ static_assert(std::size(kPadIcons) == BbSettings::PadIconsCount);
 const Choice kSunShadows[] = {{0, 127010}, {1, 127011}, {2, 127012}};
 const Choice kLampShadows[] = {{0, 127010}, {1, 127013}, {2, 127014}};
 const Choice kBlurQuality[] = {{0, 127010}, {1, 127013}};
+const Choice kBloomQuality[] = {{BbSettings::BloomQualityOriginal, 127010}, {BbSettings::BloomQualityFroyok, 120010}};
+static_assert(std::size(kBloomQuality) == BbSettings::BloomQualityCount);
 const Choice kLookChoices[] = {{0, 128010}, {1, 128011}, {2, 128012}, {3, 128013}, {4, 128014}, {5, 128016}, {6, 128015}};
 static_assert(std::size(kLookChoices) == BbLooks::PresetCount + 2);
 
@@ -103,7 +105,8 @@ Setting g_graphics[] = {Toggle(117001, 0, true),           Toggle(117000, 1, tru
                         Pick(117004, BbSettings::OutputDefault, kOutputs), Slider(117008, 10, 0, 0.1f, true),
                         Toggle(117009, 1, true), Toggle(117050, 0, true)};
 Setting g_effects[] = {Toggle(117005, 0, true), Toggle(117002, 0, true), Toggle(117003, 0, true),
-                       Toggle(120001, 1, true), Slider(120000, 10, 0, 0.1f, true)};
+                       Toggle(120001, 1, true), Slider(120000, 10, 0, 0.1f, true),
+                       Pick(120002, BbSettings::BloomQualityOriginal, kBloomQuality)};
 Setting g_colour[] = {Toggle(125004, 0),
                       Slider(125000, 5, 0.5f, 0.1f, true), Slider(125001, 5, 0.95f, 0.01f, true),
                       Slider(125002, 5, 0, 0.2f, true),    Slider(125003, 5, -20, 4, true)};
@@ -349,6 +352,7 @@ bool BindSettings() {
     effect(g_effects[2], ca);
     g_effects[3].flag = &s.graphics_vignette;
     g_effects[4].amount = &s.graphics_bloom;
+    g_effects[5].number = &s.graphics_bloom_quality; // applies at the next start (startup_bloom_quality)
     g_colour[0].flag = &s.graphics_controls;
     g_colour[1].amount = &s.graphics_brightness;
     g_colour[2].amount = &s.graphics_contrast;

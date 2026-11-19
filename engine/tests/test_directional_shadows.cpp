@@ -11,6 +11,7 @@
 #include <limits>
 #include <vector>
 #include "video_core/host_shaders/contact_shadow_comp.h"
+#include "../gpu/shadps4/video_core/renderer_vulkan/vk_bend_sss.h"
 
 namespace {
 #define CHECK(call) do { if ((call) != VK_SUCCESS) { std::fprintf(stderr, "%s failed\n", #call); std::exit(1); } } while (false)
@@ -18,15 +19,18 @@ unsigned W = 17, H = 9;
 constexpr unsigned Atlas = 64, CbBase = 4, UbBase = 8;
 struct Push {
     unsigned offsets = (CbBase * 4) | ((UbBase * 4) << 8), frame = 0;
-    float width = W, height = H, length = 0.6f, thickness = 0.35f, strength = 0.75f, flip = 1;
+    float width = W, height = H;
+    std::array<float, 4> light_coordinate{};
+    std::array<int, 2> wave_offset{};
+    float surface = 0.005f, bilinear = 0.02f, strength = 0.75f, contrast = 2;
     unsigned debug = 0, contact = 0, pcss = 0;
     float light = 0.02f, maximum = 0.3f, minimum = 0.0f, bias = 0.04f;
     unsigned filter = 1;
     float blend = 0;
-    unsigned optimizations = 0;
+    float bend_scale = 0; // 0: Bend shadows not distance-faded
 };
-static_assert(sizeof(Push) == 72);
-constexpr unsigned PushBytes = 68;
+static_assert(sizeof(Push) == 96);
+constexpr unsigned PushBytes = 96;
 struct Buffer { VkBuffer buffer{}; VkDeviceMemory memory{}; void* data{}; };
 struct Image { VkImage image{}; VkDeviceMemory memory{}; VkImageView view{}; };
 
@@ -41,7 +45,6 @@ struct Test {
     VkDescriptorSetLayout set_layout{};
     VkPipelineLayout layout{};
     VkPipeline pipeline{};
-    VkPipeline optimized_pipeline{};
     VkSampler sampler{};
     VkQueryPool timing{};
     float timestamp_period = 0;
@@ -155,19 +158,14 @@ struct Test {
         VkComputePipelineCreateInfo pc{.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
             .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = module, .pName = "main"}, .layout = layout};
-        for (unsigned optimized = 0; optimized < 2; ++optimized) {
-            VkSpecializationMapEntry entry{0, 0, sizeof optimized};
-            VkSpecializationInfo specialization{1, &entry, sizeof optimized, &optimized};
-            pc.stage.pSpecializationInfo = &specialization;
-            CHECK(vkCreateComputePipelines(device, {}, 1, &pc, nullptr,
-                optimized ? &optimized_pipeline : &pipeline));
-        }
+        CHECK(vkCreateComputePipelines(device, {}, 1, &pc, nullptr, &pipeline));
         vkDestroyShaderModule(device, module, nullptr);
         VkSamplerCreateInfo sm{.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
             .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST,
-            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+            .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE};
         CHECK(vkCreateSampler(device, &sm, nullptr, &sampler));
         if (timestamp_bits) {
             VkQueryPoolCreateInfo query{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
@@ -200,7 +198,6 @@ struct Test {
         vkDestroySampler(device, sampler, nullptr);
         if (timing) vkDestroyQueryPool(device, timing, nullptr);
         vkDestroyPipeline(device, pipeline, nullptr);
-        vkDestroyPipeline(device, optimized_pipeline, nullptr);
         vkDestroyPipelineLayout(device, layout, nullptr);
         vkDestroyDescriptorSetLayout(device, set_layout, nullptr);
         vkDestroyCommandPool(device, pool, nullptr);
@@ -236,13 +233,22 @@ int main(int argc, char** argv) {
     std::fill_n(static_cast<unsigned*>(pixels.data), W * H, 0x601e140au);
     bool initialized = false;
     bool patterned_depth = false;
+    std::vector<float> custom_depth; // when set, the depth buffer (W * H) instead of view_z
+
     double gpu_ms = 0;
     const auto dispatch = [&](Push push, float view_z, bool tilted = false) {
         for (unsigned y = 0; y < H; ++y)
             for (unsigned x = 0; x < W; ++x)
                 static_cast<float*>(scene.data)[y * W + x] =
+                    !custom_depth.empty() ? custom_depth[y * W + x] :
                     patterned_depth && (x + y) % 4 == 0 ? 1.0f :
                     view_z + (tilted ? 0.02f * (2 * (float(x) + 0.5f) / W - 1) : 0);
+        Vulkan::BendSss::DispatchList bend;
+        if (push.contact) {
+            bend = Vulkan::BendSss::BuildDirectionalDispatchList(constants, W, H);
+            assert(bend.dispatch_count > 0);
+            push.light_coordinate = bend.light_coordinate;
+        }
         CHECK(vkResetCommandBuffer(t.cmd, 0));
         VkCommandBufferBeginInfo begin{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         CHECK(vkBeginCommandBuffer(t.cmd, &begin));
@@ -271,15 +277,25 @@ int main(int argc, char** argv) {
                 .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &m},
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 4, .descriptorCount = 1,
                 .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &ubi}}};
-        vkCmdBindPipeline(t.cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-            push.optimizations ? t.optimized_pipeline : t.pipeline);
+        vkCmdBindPipeline(t.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, t.pipeline);
         t.descriptors(t.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, t.layout, 0, 5, writes.data());
-        vkCmdPushConstants(t.cmd, t.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &push);
         if (t.timing) vkCmdWriteTimestamp(t.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, t.timing, 0);
         const unsigned repeats = benchmark ? 16 : 1;
         for (unsigned repeat = 0; repeat < repeats; ++repeat) {
             if (repeat) t.Barrier(output.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
-            vkCmdDispatch(t.cmd, (W + 7) / 8, (H + 7) / 8, 1);
+            if (!push.contact) {
+                // Shadow-map filter only: one thread per pixel, in rows of 64.
+                vkCmdPushConstants(t.cmd, t.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &push);
+                vkCmdDispatch(t.cmd, (W + 63) / 64, H, 1);
+            }
+            for (int i = 0; push.contact && i < bend.dispatch_count; ++i) {
+                Push dispatch_push = push;
+                dispatch_push.wave_offset = bend.dispatches[i].wave_offset;
+                vkCmdPushConstants(t.cmd, t.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes,
+                                   &dispatch_push);
+                const auto& count = bend.dispatches[i].wave_count;
+                vkCmdDispatch(t.cmd, count[0], count[1], count[2]);
+            }
         }
         if (t.timing) vkCmdWriteTimestamp(t.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, t.timing, 1);
         t.Barrier(output.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -310,14 +326,7 @@ int main(int argc, char** argv) {
         return alpha / (W * H);
     };
     const auto run = [&](Push push, float view_z, bool tilted = false) {
-        push.optimizations = 0;
-        const float alpha = dispatch(push, view_z, tilted);
-        const auto* data = static_cast<unsigned*>(result.data);
-        std::vector<unsigned> baseline(data, data + W * H);
-        push.optimizations = 1;
-        dispatch(push, view_z, tilted);
-        assert(std::equal(baseline.begin(), baseline.end(), static_cast<unsigned*>(result.data)));
-        return alpha;
+        return dispatch(push, view_z, tilted);
     };
     auto* depths = static_cast<float*>(atlas.data);
     Push p;
@@ -332,18 +341,15 @@ int main(int argc, char** argv) {
             p.light = 0.5f;
             uniforms[72] = scenario < 2 ? 100 : 0;
             run(p, 0.475f, true);
-            std::array<std::vector<double>, 2> samples;
+            std::vector<double> samples;
             for (unsigned trial = 0; trial < 24; ++trial) {
-                for (unsigned order = 0; order < 2; ++order) {
-                    p.optimizations = (order + trial) % 2;
-                    dispatch(p, 0.475f, true);
-                    if (trial >= 4) samples[p.optimizations].push_back(gpu_ms);
-                }
+                dispatch(p, 0.475f, true);
+                if (trial >= 4) samples.push_back(gpu_ms);
             }
-            for (auto& s : samples) std::sort(s.begin(), s.end());
-            std::printf("1280x720 %s + contact (%s), median GPU ms: original %.4f, optimized %.4f\n",
+            std::sort(samples.begin(), samples.end());
+            std::printf("1280x720 Bend + %s (%s), median GPU ms: %.4f\n",
                 pcss ? "PCSS" : "PCF", scenario < 2 ? "visible" : "fully faded",
-                samples[0][samples[0].size()/2], samples[1][samples[1].size()/2]);
+                samples[samples.size()/2]);
         }
         return 0;
     }
@@ -448,7 +454,106 @@ int main(int argc, char** argv) {
     uniforms[72] = 0;
     assert(run(p, 0.4f) > 0.999f);
     p.contact = 1;
-    run(p, 0.4f);
+    first[0] = 0; first[1] = 0.1f;
+    first[4] = 0.1f; first[5] = 0; first[6] = 0.1f;
+    first[8] = 0.5f; first[10] = 0;
+    const float flat_contact = run(p, 0.4f);
+    assert(flat_contact > 1.0f - p.strength);
+    patterned_depth = true;
+    // Sky holes (depth 1) keep the native alpha and must not break the pass; they darken the
+    // average only because their native alpha is 96/255 (they cast nothing).
+    assert(run(p, 0.4f) < flat_contact - 0.01f);
+    patterned_depth = false;
+
+    // Bend contact occlusion with a real forward-Z perspective camera (the identity fixture
+    // above projects every sun to W = 0, which no game projection does and which Bend's sign and
+    // light-depth formulas don't cover). A plane facing the sun, plus a thin caster placed where
+    // the receiver's Bend ray passes, with the sun in front of the camera (W > 0) and behind it
+    // (W < 0), both from the left.
+    {
+        std::array<float, 32> saved;
+        std::copy_n(constants, saved.size(), saved.begin());
+        const float n = 0.1f, f = 100.0f, a = f / (f - n), b = -n * f / (f - n);
+        // inverse(P) for P = {1,0,0,0 | 0,1,0,0 | 0,0,a,b | 0,0,1,0}: clip -> view.
+        const float inv[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1 / b, -a / b};
+        std::copy_n(inv, 16, constants);
+        // The receiver: the plane -0.3 x - z = -5 (normal (-0.3, 0, -1), towards the camera and
+        // the left), so z = 5 / (1 + 0.3 ndc_x).
+        const auto plane_depth = [&](unsigned x) {
+            const float ndc = (float(x) + 0.5f) / W * 2 - 1;
+            return a + b / (5.0f / (1 + 0.3f * ndc));
+        };
+        const auto column = [&](unsigned x) {
+            return float(static_cast<unsigned*>(result.data)[(H / 2) * W + x] >> 24) / 255;
+        };
+        // Native result fully lit and the shadow-map filter off: only Bend can darken pixels.
+        std::fill_n(static_cast<unsigned*>(pixels.data), W * H, 0xff1e140au);
+        p.filter = 0;
+        const unsigned receiver = 12;
+        for (const float sz : {0.1f, -0.1f}) {
+            const float len = std::sqrt(1 + sz * sz);
+            const float s[3] = {-1 / len, 0, sz / len}; // towards the sun, view space
+            // Orthographic sun view -> light rows; stored as clip -> light (rows * inverse(P)).
+            const float rows[4][4] = {{0, 1, 0, 0.25f},
+                                      {s[2], 0, -s[0], 0.25f},
+                                      {-0.01f * s[0], -0.01f * s[1], -0.01f * s[2], 0.5f},
+                                      {0, 0, 0, 1}};
+            const unsigned slot[4] = {0, 4, 8, 12}; // u, v, light depth, w
+            for (unsigned r = 0; r < 4; ++r)
+                for (unsigned c = 0; c < 4; ++c) {
+                    float sum = 0;
+                    for (unsigned i = 0; i < 4; ++i) sum += rows[r][i] * inv[i * 4 + c];
+                    first[slot[r] + c] = sum;
+                }
+            const auto bend = Vulkan::BendSss::BuildDirectionalDispatchList(constants, W, H);
+            const auto& light = bend.light_coordinate;
+            // In front: the sun projects left of the screen, rays march towards it. Behind: its
+            // antipode projects right of the screen, rays march away from it. Both go left.
+            assert(bend.dispatch_count > 0);
+            assert(sz > 0 ? light[3] == 1 && light[0] < 0 : light[3] == -1 && light[0] > W);
+            const float direction = -light[3];
+            const float distance = std::abs(float(receiver) + 0.5f - light[0]);
+            const float d0 = plane_depth(receiver);
+
+            custom_depth.assign(W * H, 0);
+            for (unsigned y = 0; y < H; ++y)
+                for (unsigned x = 0; x < W; ++x) custom_depth[y * W + x] = plane_depth(x);
+            const float lit = run(p, 0.4f);
+            // Bend's ray keeps (depth - light z) / pixel distance constant. Its shadowing window
+            // is (1 - depth) / min(distance + direction, 1 / thickness) in front of the ray; put
+            // the caster 80% into it, 1-3 pixels along the march (the hard samples).
+            const float window =
+                (1 - d0) / std::min(distance + direction, 1 / p.surface);
+            for (unsigned k = 1; k <= 3; ++k) {
+                const float ray = light[2] + (d0 - light[2]) * (distance + direction * k) / distance;
+                for (unsigned y = 0; y < H; ++y)
+                    custom_depth[y * W + receiver - k] = ray - 0.8f * window;
+            }
+            const float cast = run(p, 0.4f);
+            std::printf("Bend caster, sun %s: light %.1f %.1f %.4f %.0f, flat %.4f, caster %.4f;"
+                        " columns:", sz > 0 ? "in front" : "behind", light[0], light[1], light[2],
+                        light[3], lit, cast);
+            for (unsigned x = 0; x < W; ++x) std::printf(" %.2f", column(x));
+            std::printf("\n");
+            assert(lit > 0.99f);
+            // Darkest possible is 1 - strength (0.25).
+            assert(column(receiver) < 0.6f);
+            for (unsigned x = 0; x + 6 <= receiver; ++x) assert(column(x) > 0.99f);
+            // Distance fade: fade end 0 removes the shadow; far inside it, unchanged.
+            p.bend_scale = 1.5f;
+            uniforms[72] = 0;
+            assert(run(p, 0.4f) > 0.999f);
+            uniforms[72] = 100;
+            assert(std::abs(run(p, 0.4f) - cast) < 0.001f);
+            uniforms[72] = 0;
+            p.bend_scale = 0;
+        }
+        custom_depth.clear();
+        p.filter = 1;
+        std::fill_n(static_cast<unsigned*>(pixels.data), W * H, 0x601e140au);
+        std::copy_n(saved.begin(), saved.size(), constants);
+    }
+
     first[3] = 2;
     assert(std::abs(run(p, 0.4f) - 96.0f / 255) < 0.001f);
     first[3] = 0.25f;
@@ -473,5 +578,6 @@ int main(int argc, char** argv) {
     }
     std::puts("Directional shadows: PASS (four atlas tiles, PCF/PCSS edges, lit/shadow, "
               "cascade blending, sloped receivers, fractional comparisons, stock/sky fallback, fade, "
-              "RGB preservation, odd sizes, buffer offsets, contact hardening, thin caster, frame stability)");
+              "RGB preservation, odd sizes, buffer offsets, Bend contact occlusion, thin caster, "
+              "frame stability)");
 }

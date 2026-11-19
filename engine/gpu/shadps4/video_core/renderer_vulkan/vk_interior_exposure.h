@@ -13,6 +13,16 @@ class Scheduler;
 /// lift (gpu/shim/bbport_interior_exposure.h has the rule and the knobs).
 namespace InteriorExposure {
 
+struct RoofEvidence {
+    bool valid = false;
+    u64 read_ms = 0, lift_ms = 0, observed_ms = 0;
+    float far_raw = 0, far_eased = 0, open_raw = 0, open_eased = 0;
+    float meter = 0, target = 0, indoor = 0, wanted = 0, applied = 0;
+};
+// t132e read-only telemetry. Times use the same steady clock as the query samples.
+[[nodiscard]] bool RoofEvidenceWanted();
+[[nodiscard]] RoofEvidence ReadRoofEvidence();
+
 /// Called by TemporalUpscaler::Run with the frame's camera (its projection turns depth into view
 /// depth for the open share), HDR scene colour (`color`: rgba16f, GENERAL, storage) and depth
 /// (`depth`: GENERAL, sampled) of w x h render pixels, before the upscaler reads them. Reads the

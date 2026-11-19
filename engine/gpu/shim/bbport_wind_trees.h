@@ -367,6 +367,11 @@ struct Stats {
     std::uint64_t limbs = 0;         ///< bbport (r89k): draws taken as limb pieces (counted in taken too)
     std::uint64_t too_small = 0;     ///< bbport (r89o): tree-shaped or limb-piece draws refused as too small a model (SizeOk)
     std::uint64_t limb_cutout = 0;   ///< bbport (r89p): limb piece by shape, refused because its pixel shader discards (not an opaque draw)
+    std::uint64_t limb_cut = 0;      ///< bbport (r89q): cut-out limb pieces taken (counted in taken and limbs too)
+    std::uint64_t limb_cut_small = 0; ///< bbport (r89q): cut-out limb pieces refused under CutoutMin
+    std::uint64_t lr_model = 0;      ///< bbport (r89r): limb-shaped draws refused under the model size rule (LimbWorldOn() false)
+    std::uint64_t lr_indoors = 0;    ///< bbport (r89r): limb-shaped draws refused as indoors
+    std::uint64_t lr_old = 0;        ///< bbport (r89r): limb draws taken that r89q's model size rules would have refused
     std::uint64_t limb_new = 0, limb_refused = 0; ///< ranges judged limb pieces; refused by the limb rule too
 };
 
@@ -402,6 +407,122 @@ inline void SizeLineText(const Stats& s, char* out, std::size_t size) {
                   "tree (a model under %.1f units tall, a limb piece under %.1f: chains, grilles, hooks and props stay still)",
                   static_cast<double>(ModelMin()), static_cast<unsigned long long>(s.too_small), static_cast<double>(ModelMin()),
                   static_cast<double>(ModelMin() + LimbExtra));
+}
+
+/// bbport (r89q_twigs-limb-discard): BB_WIND_TWIGS_LIMB_CUTOUT (read once, default 1; needs the limb rule): a limb piece whose pixel
+/// shader discards (an alpha-tested bark or twig card: the visible wood of the bare trees) is taken like an opaque one. 0 gives r89p back.
+[[nodiscard]] inline bool CutoutOn() {
+    static const bool on = LimbOn() && W::ParseNumber(std::getenv("BB_WIND_TWIGS_LIMB_CUTOUT"), 1.0f) >= 0.5f;
+    return on;
+}
+
+/// bbport (r89q): the model height (Shape::height units) a cut-out limb piece needs, on top of the size rule: a cut-out is also what iron
+/// fences, grilles and cage bars are made of. Default 6.0 (the bare trees' limb pieces of the log are 6.94 to 7.25, a chain-like one 2.48);
+/// BB_WIND_TWIGS_CUTOUT_MIN_MODEL, read once; 0 = no extra rule.
+inline constexpr float CutoutMinDefault = 6.0f;
+
+[[nodiscard]] inline float CutoutMin() {
+    static const float v = std::clamp(W::ParseNumber(std::getenv("BB_WIND_TWIGS_CUTOUT_MIN_MODEL"), CutoutMinDefault), 0.0f, 30.0f);
+    return v;
+}
+
+[[nodiscard]] inline bool CutoutSizeOk(float model_height) {
+    const float m = CutoutMin();
+    return !(m > 0.0f) || model_height >= m;
+}
+
+inline void CutoutOnceText(char* out, std::size_t size) {
+    std::snprintf(out, size,
+                  "Wind twigs trees (r89q, BB_WIND_TWIGS_LIMB_CUTOUT=%d, BB_WIND_TWIGS_CUTOUT_MIN_MODEL=%.1f): a limb piece whose pixel "
+                  "shader discards (alpha-tested bark and twig cards) is taken like an opaque one when its model is at least that many "
+                  "units tall, the camera is outdoors and its world box says tree",
+                  CutoutOn() ? 1 : 0, static_cast<double>(CutoutMin()));
+}
+
+inline void CutoutLineText(const Stats& s, char* out, std::size_t size) {
+    std::snprintf(out, size,
+                  "Wind twigs trees (r89q): in the last 600 frames %llu cut-out limb draws taken (counted in taken and limbs too), "
+                  "%llu refused as a cut-out under BB_WIND_TWIGS_CUTOUT_MIN_MODEL (%.1f)",
+                  static_cast<unsigned long long>(s.limb_cut), static_cast<unsigned long long>(s.limb_cut_small),
+                  static_cast<double>(CutoutMin()));
+}
+
+/// bbport (r89r_twigs-limb-units): BB_WIND_TWIGS_LIMB_WORLD (read once, default 1; needs the limb rule): a limb piece (opaque or cut-out)
+/// is sized by its WORLD box (BbWindTwigs::LimbMinHeight metres tall, still), not by Shape::height, which is the extent along an arbitrary
+/// axis in model units (a bare tree's bark and twig cards read 0.01 to 0.11). 0 gives r89q's model size rules back.
+[[nodiscard]] inline bool LimbWorldOn() {
+    static const bool on = LimbOn() && W::ParseNumber(std::getenv("BB_WIND_TWIGS_LIMB_WORLD"), 1.0f) >= 0.5f;
+    return on;
+}
+
+/// bbport (r89r): whether r89q's model size rules (SizeOk for a limb, and CutoutSizeOk for a cut-out) would refuse a limb draw.
+[[nodiscard]] inline bool LimbOldRuleRefuses(float model_height, bool cut_out) {
+    return !SizeOk(model_height, true) || (cut_out && !CutoutSizeOk(model_height));
+}
+
+/// bbport (r89r): the frame of the early report line (the regular one comes every ReportFrames frames).
+inline constexpr std::uint64_t UnitsEarlyFrame = 150;
+
+/// bbport (r89r): the limb entries of the twig book by the verdict of their world box (Add is called for each, at the report).
+struct LimbCensus {
+    unsigned entries = 0, waiting = 0, tree = 0, short_h = 0, moved = 0, tall = 0, other = 0, judged = 0;
+    float h_min = 0.0f, h_max = 0.0f;
+
+    void Add(bool is_waiting, bool is_tree, const char* why, float height) {
+        ++entries;
+        if (is_waiting) {
+            ++waiting;
+            return;
+        }
+        if (is_tree) {
+            ++tree;
+        } else if (why != nullptr && std::strcmp(why, "short") == 0) {
+            ++short_h;
+        } else if (why != nullptr && std::strcmp(why, "moved") == 0) {
+            ++moved;
+        } else if (why != nullptr && std::strcmp(why, "tall") == 0) {
+            ++tall;
+        } else {
+            ++other;
+        }
+        if (height > 0.0f && std::isfinite(height)) {
+            h_min = judged == 0 ? height : std::min(h_min, height);
+            h_max = judged == 0 ? height : std::max(h_max, height);
+            ++judged;
+        }
+    }
+};
+
+/// bbport (r89r): the once line (no 'limb piece', 'mesh:' or 'candidate' in it: the slot runner's evidence filter drops those).
+inline void UnitsOnceText(char* out, std::size_t size) {
+    std::snprintf(out, size,
+                  "Wind twigs trees (r89r, BB_WIND_TWIGS_LIMB_WORLD=%d, BB_WIND_TWIGS_LIMB_MIN_H=%.1f): a limb-shaped draw (opaque or cut-out) is "
+                  "sized by its world box (at least that many metres tall, still, camera outdoors), not by its model height (model units "
+                  "are not metres); a line every 600 frames (and at frame %llu) counts why each is refused",
+                  LimbWorldOn() ? 1 : 0, static_cast<double>(BbWindTwigs::LimbMinHeight()),
+                  static_cast<unsigned long long>(UnitsEarlyFrame));
+}
+
+/// bbport (r89r): the counts line. `s` holds the counters since the last report (the 600-frame line resets them).
+inline void UnitsLineText(const Stats& s, const LimbCensus& c, char* out, std::size_t size) {
+    const auto n = [](std::uint64_t v) { return static_cast<unsigned long long>(v); };
+    std::snprintf(out, size,
+                  "Wind twigs trees (r89r): limb draws taken %llu (cut-out %llu; %llu the old model rule would have refused), refused: %llu "
+                  "by model size, %llu by cut-out model size, %llu indoors, %llu because the pixel shader discards; limb entries in the twig "
+                  "book %u: %u judged trees, %u waiting, refused by world box %u short (under %.1f m), %u moved, %u tall, %u other; "
+                  "judged world heights %.1f to %.1f m",
+                  n(s.limbs), n(s.limb_cut), n(s.lr_old), n(s.lr_model), n(s.limb_cut_small), n(s.lr_indoors), n(s.limb_cutout), c.entries,
+                  c.tree, c.waiting, c.short_h, static_cast<double>(BbWindTwigs::LimbMinHeight()), c.moved, c.tall, c.other,
+                  static_cast<double>(c.h_min), static_cast<double>(c.h_max));
+}
+
+/// bbport (r89q): the line of a cut-out limb piece taken (the first few, each once).
+inline void CutLimbText(const Mesh& m, std::uint64_t first_vertex, char* out, std::size_t size) {
+    std::snprintf(out, size,
+                  "Wind twigs trees (r89q) cut-out limb part taken: first vertex at %llx, %u vertices, model height %.2f, "
+                  "trunk radius %.3f, crown radius %.3f, up axis %d, boxy %.3f",
+                  static_cast<unsigned long long>(first_vertex), m.verts, static_cast<double>(m.shape.height),
+                  static_cast<double>(m.shape.trunk), static_cast<double>(m.shape.crown), m.shape.up, static_cast<double>(m.boxy));
 }
 
 /// bbport (r89p_twigs-really-move): the gate and limb line, every ReportFrames frames with the trees route on.

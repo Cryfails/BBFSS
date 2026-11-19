@@ -402,6 +402,7 @@ Input MakeInput(const Shader::Info& info, const Shader::RuntimeInfo& rt,
         in.dual_source = fs.dual_source_blending;
         in.clip_emulation_input = fs.clip_distance_emulation;
         in.fragment_motion = fs.motion_vectors;
+        in.foliage_mask = fs.foliage_mask;
         in.depth_first = fs.depth_first;
     }
     if (info.hw_stage == HwStage::Compute) {

@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <memory>
+
 #include <boost/container/static_vector.hpp>
 #include <xxhash.h>
 
@@ -11,11 +14,16 @@
 #include "video_core/amdgpu/regs_depth.h"
 #include "video_core/amdgpu/regs_primitive.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#include "video_core/renderer_vulkan/vk_bottle_display_evidence_b182.h"
 
 namespace VideoCore {
 class BufferCache;
 class TextureCache;
 } // namespace VideoCore
+
+namespace WorkflowCapture {
+enum class Route : u8;
+}
 
 namespace Vulkan {
 
@@ -25,6 +33,15 @@ static constexpr u32 MaxVertexBufferCount = 32;
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+class PipelineCache;
+namespace ReflectionDiscard {
+enum class StockRole : u8;
+enum class Verdict : u8;
+struct Pipeline;
+}
+namespace IvySampleWitness {
+struct Variant;
+}
 
 template <typename T>
 using VertexInputs = boost::container::static_vector<T, MaxVertexBufferCount>;
@@ -48,6 +65,7 @@ struct GraphicsPipelineKey {
         AmdGpu::DepthBuffer::ZFormat z_format : 2;
         AmdGpu::DepthBuffer::StencilFormat stencil_format : 1;
         u32 depth_clamp_enable : 1;
+        u32 foliage_mask : 1;
     };
     struct {
         AmdGpu::PrimitiveType prim_type : 5;
@@ -63,6 +81,18 @@ struct GraphicsPipelineKey {
 
     bool operator==(const GraphicsPipelineKey& key) const noexcept {
         return std::memcmp(this, &key, sizeof(key)) == 0;
+    }
+
+    // These describe host attachments. mrt_mask and num_color_attachments retain their
+    // original meaning for guest target lookup and pass classification.
+    u32 HostColorAttachmentCount() const {
+        constexpr u32 count = Shader::FoliageMaskOutput::Location + 1;
+        return foliage_mask && num_color_attachments < count ? count : num_color_attachments;
+    }
+
+    vk::ColorComponentFlags HostWriteMask(u32 location) const {
+        return foliage_mask && location == Shader::FoliageMaskOutput::Location
+                   ? vk::ColorComponentFlagBits::eR : write_masks[location];
     }
 
     void Serialize(Serialization::Archive& ar) const;
@@ -91,16 +121,44 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, WorkflowCapture::Route capture_proof = {},
+                     const PipelineCache* module_owner = nullptr);
     ~GraphicsPipeline();
 
     const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
         return fetch_shader;
     }
 
+    // Ordered draw hook calls this after BindResources for every masked draw, including zero.
+    void PushFoliageClass(vk::CommandBuffer command_buffer, bool tagged) const;
+
+    const GraphicsPipeline* FoliageVariant() const {
+        return foliage_variant.load(std::memory_order_acquire);
+    }
+    void SetFoliageVariant(const GraphicsPipeline* variant) const {
+        foliage_variant.store(variant, std::memory_order_release);
+    }
+
+    u64 IvyFragmentModule() const { return ivy_fragment_module; }
+    std::shared_ptr<const IvySampleWitness::Variant> IvySampleVariant() const {
+        return ivy_sample_variant;
+    }
+
     const GraphicsPipelineKey& GetGraphicsKey() const {
         return key;
     }
+    WorkflowCapture::Route WorkflowCaptureProof() const { return capture_proof; }
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    const BottleDisplay182::Program* BottleDisplayProgram() const { return bottle_display_program.get(); }
+#endif
+
+    ReflectionDiscard::Verdict GetStockFragmentVerdict(const PipelineCache& owner,
+        ReflectionDiscard::StockRole role, vk::Pipeline ready) const;
+    void WaitForStockFragmentCreation() const;
+
+    bool GetReflectionDiscardProof(const PipelineCache* owner, u64 expected_stage,
+                                   ReflectionDiscard::Pipeline& proof) const;
+    void WaitForReflectionDiscardCreation(const PipelineCache* owner, vk::ShaderModule module) const;
 
     /// Gets the attributes and bindings for vertex inputs.
     /// bbport: `sharps`, when given, are the V#s of the fetch shader's attributes as the GPU
@@ -113,10 +171,21 @@ public:
                          u32 step_rate_1, std::span<const AmdGpu::Buffer> sharps = {}) const;
 
 private:
+    mutable std::atomic<const GraphicsPipeline*> foliage_variant{};
     void BuildDescSetLayout(bool preloading);
 
 private:
     GraphicsPipelineKey key;
+    WorkflowCapture::Route capture_proof;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    std::unique_ptr<const BottleDisplay182::Program> bottle_display_program;
+#endif
+    ReflectionDiscard::Verdict stock_fragment_verdict{};
+    ReflectionDiscard::StockRole stock_fragment_role{};
+    u64 ivy_fragment_module{};
+    std::shared_ptr<const IvySampleWitness::Variant> ivy_sample_variant;
+    const PipelineCache* stock_fragment_owner{};
+    std::unique_ptr<const ReflectionDiscard::Pipeline> reflection_discard;
     vk::UniqueDescriptorSetLayout motion_address_layout;
     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
 };

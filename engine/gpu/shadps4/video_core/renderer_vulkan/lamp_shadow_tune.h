@@ -471,6 +471,7 @@ inline float LampWeight(const LampShadowTune& tune, bool inverse_square, float c
 /// nothing of it: the grey ratio.
 using LampRgb = std::array<float, 3>;
 inline LampRgb LampColourScale(const LampRgb& rc, float ratio, const LampRgb& light) {
+    ratio = std::clamp(ratio, 0.0f, 1.0f); // bbport (r131d_lamp-colour-blob): match shader colourScale
     constexpr LampRgb Luma{0.299f, 0.587f, 0.114f};
     float whole = 0.0f, got = 0.0f;
     for (int c = 0; c < 3; ++c) {

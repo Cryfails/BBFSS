@@ -4,6 +4,7 @@
 #include "engine_state.h"
 #include "gx_draws.h"
 #include "gx_objects.h"
+#include "guest_precull_visit_probe.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -418,6 +419,32 @@ std::int64_t __attribute__((sysv_abi)) OnDraw(std::uint64_t, const std::uint64_t
     current.set = current.record != 0;
     return 0;
 }
+
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+template <u32 Site>
+std::int64_t __attribute__((sysv_abi)) OnDrawAt(std::uint64_t id, const std::uint64_t* saved) {
+    if constexpr (Site == 1 || Site == 3) GuestPrecull::OnGxProducer(Site / 2, saved);
+    return OnDraw(id, saved);
+}
+
+void InstallPassive(std::uint8_t* image, std::size_t size) {
+    if (!GuestPrecull::Requested()) return;
+    std::array<Hook, 2> hooks{};
+    const auto gate = reinterpret_cast<u64>(&GuestPrecull::armed);
+    const bool prepared =
+        PrepareGatedEntryObserver(hooks[0], image, size, kDraws[1], kPushes,
+                                  GuestPrecull::ObserveGxProducer, 1, gate) &&
+        PrepareGatedEntryObserver(hooks[1], image, size, kDraws[3], kPushesWide,
+                                  GuestPrecull::ObserveGxProducer, 2, gate);
+    if (!prepared || !GuestPrecull::Install(image, size)) {
+        for (auto& hook : hooks) Discard(hook);
+        if (!prepared) host_log("G108 probe refusal: original indexed GX entry byte pins");
+        return;
+    }
+    Commit(hooks);
+    host_log("G108 passive GX entry hooks ready with production GX records off");
+}
+#endif
 }
 
 bool On() {
@@ -438,6 +465,9 @@ bool Used() {
 
 void Stamp(std::uint64_t record_address, std::uint32_t count) {
     Current& current = g_current;
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+    if (GuestPrecull::installed.load(std::memory_order_relaxed)) GuestPrecull::ClearStamp();
+#endif
     Slot& slot = SlotFor(record_address);
     if (!current.set || current.count != count) {
         if (slot.address.load(std::memory_order_relaxed) == record_address) slot.address.store(0, std::memory_order_relaxed);
@@ -452,6 +482,25 @@ void Stamp(std::uint64_t record_address, std::uint32_t count) {
         std::atomic_thread_fence(std::memory_order_release);
         Capture(payload.state, current.pending, current.context, GxDraws::BoundState());
         payload.state.record = current.record;
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+        if (GuestPrecull::armed.load(std::memory_order_relaxed) && GuestPrecull::Shortlisted(count)) {
+            const auto& render = payload.state.render;
+            GuestPrecull::AttachStamp({
+                .cmd = record_address,
+                .pending = current.pending,
+                .context = current.context,
+                .record = current.record,
+                .sequence = sequence,
+                .index_base = render.index_base,
+                .index_key = payload.state.index_key,
+                .objects_epoch = GxObjects::Epoch(),
+                .count = count,
+                .index_format = render.index_format,
+                .topology = Peek<u32>(current.pending + kTopology),
+                .index_known = render.index_known != 0,
+            });
+        }
+#endif
         payload.sequence.store(sequence, std::memory_order_release);
     }
     slot.sequence.store(sequence, std::memory_order_relaxed);
@@ -568,23 +617,41 @@ void NoteTarget(int target, std::uint64_t ours, std::uint64_t old) {
 
 bool Install(std::uint8_t* image, std::size_t size) {
     const char* on = std::getenv("LANTERN_GX_RECORDS");
-    if (!on || (on[0] != '1' && on[0] != '2' && on[0] != '3')) return false;
+    if (!on || (on[0] != '1' && on[0] != '2' && on[0] != '3')) {
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+        InstallPassive(image, size);
+#endif
+        return false;
+    }
     const bool compare = on[0] == '2';
     const char* native = std::getenv("LANTERN_GX_NATIVE");
     const bool use = on[0] == '3' || (!compare && native && native[0] == '1');
     if (!GxObjects::On()) {
         host_log("GX records off: they need the object table");
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+        InstallPassive(image, size);
+#endif
         return false;
     }
     std::array<Hook, 4> hooks;
     bool ready = true;
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+    const Callback on_draw[] = {OnDrawAt<0>, OnDrawAt<1>, OnDrawAt<2>, OnDrawAt<3>};
+#endif
     for (int i = 0; i < 4 && ready; ++i) {
         const std::span<const std::uint8_t> entry = i == 3 ? std::span<const std::uint8_t>(kPushesWide) : std::span<const std::uint8_t>(kPushes);
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+        ready = Prepare(hooks[i], image, size, kDraws[i], entry, on_draw[i]);
+#else
         ready = Prepare(hooks[i], image, size, kDraws[i], entry, OnDraw);
+#endif
     }
     if (!ready) {
         for (Hook& hook : hooks) Discard(hook);
         host_log("GX records off: GX's draw calls differ from 1.09, or the trace holds them");
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+        InstallPassive(image, size);
+#endif
         return false;
     }
     g_image = reinterpret_cast<u64>(image);
@@ -612,6 +679,9 @@ bool Install(std::uint8_t* image, std::size_t size) {
     g_used.store(use, std::memory_order_relaxed);
     g_on.store(true, std::memory_order_relaxed);
     Commit(std::span<Hook>(hooks));
+#if defined(_WIN32) && defined(BB_TEST_GUEST_PRECULL_VISITS)
+    GuestPrecull::Install(image, size);
+#endif
     host_log(compare ? "GX records: on, each pipeline, binding and render state compared with the old path's (LANTERN_GX_RECORDS=2)"
              : use   ? "GX records: on, pipelines, bindings and render state from the record (LANTERN_GX_RECORDS=3)"
                      : "GX records: on (LANTERN_GX_RECORDS=0 turns them off)");

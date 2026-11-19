@@ -28,6 +28,8 @@
 #include "../face_shot.h"
 #include "bbport_settings.h"
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -63,9 +65,47 @@ std::int64_t __attribute__((sysv_abi)) OnStep(std::uint64_t, const std::uint64_t
     return 0;
 }
 
+// t166 test tool. OnFrame runs this on the game thread after the load state is updated.
+void InteriorRegionProbeTick() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_INTERIOR_REGION_PROBE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    if (!enabled) return;
+
+    using Clock = std::chrono::steady_clock;
+    constexpr auto kInterval = std::chrono::milliseconds(500);
+    constexpr unsigned kMaxSamples = 240;
+    static Clock::time_point first{}, next{};
+    static unsigned samples = 0;
+    if (samples >= kMaxSamples) return;
+    const auto now = Clock::now();
+    if (now < next) return;
+    if (samples == 0) first = now;
+    next = now + kInterval;
+    const unsigned seq = ++samples;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - first).count();
+    const auto load_generation = static_cast<unsigned long long>(Loading::Generation());
+
+    WorldPlayerRegionSample sample{};
+    const char* unavailable = Loading::ScreenUp() ? "loading" :
+                              Loading::CinematicPlaying() ? "cinematic" : nullptr;
+    if (!unavailable && !world_player_region_sample(sample)) unavailable = "no-play-snapshot";
+    if (unavailable) {
+        std::printf("Interior region t166 seq=%u elapsed_ms=%lld load_gen=%llu state=%s\n",
+                    seq, static_cast<long long>(ms), load_generation, unavailable);
+        return;
+    }
+    std::printf("Interior region t166 seq=%u elapsed_ms=%lld load_gen=%llu state=sample "
+                "map=%08x region_raw=%08x pos=%.4f/%.4f/%.4f\n",
+                seq, static_cast<long long>(ms), load_generation, static_cast<unsigned>(sample.block),
+                static_cast<unsigned>(sample.region_raw), sample.position[0], sample.position[1], sample.position[2]);
+}
+
 std::int64_t __attribute__((sysv_abi)) OnFrame(std::uint64_t, const std::uint64_t* saved) {
     FrameRate::Tick();
     Loading::Tick(saved[5]);
+    InteriorRegionProbeTick();
     Sss::Tick();
     ChangeAppearance::Tick();
     BbFaceShot::Tick(ChangeAppearance::PreviewShown() && Seamless());

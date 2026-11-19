@@ -41,6 +41,10 @@ public:
         previous_jitter = jitter;
         jitter = value;
     }
+    /// bbport (r128a_lrt-moving-shadows): this frame's jitter (render pixels, x right, y down), as SetJitter took it.
+    [[nodiscard]] std::array<float, 2> Jitter() const noexcept {
+        return jitter;
+    }
 
     [[nodiscard]] bool Enabled() const noexcept {
         return debug_overlay || for_upscaler;

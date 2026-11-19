@@ -1,5 +1,15 @@
 # Camera mode: status
 
+## Development snapshot, 2026-11-19
+
+CAM 30%. Feature work is paused.
+
+- Verified scope. Camera controls and path components passed scoped slot tests.
+- Open scope. A normal 4K clip using the actual camera mode is still pending.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 45% (rated by the weakest part: the keys are rejected by the owner and must be redesigned, and the path, freeze and orbit keys were never pressed by hand).
 
 ## What works
@@ -45,3 +55,6 @@ Revert order: r102b, then r102 3-4, then r102 1-2.
 - lamp-test-spot: clean shot in a lamp scene, and orbit clips for the other features.
 - dark-alley: view of a street lamp for fog shaft and flicker clips.
 - Look for: no HUD piece left, no stale item icon grid, the camera returns control after F4, no game input leaking while camera mode is active.
+
+
+</details>

@@ -184,9 +184,9 @@ Clock::time_point g_shown_until{};
 
 std::atomic<unsigned> g_turns{0}, g_flicks{0}, g_free_changes{0};
 
-// Camera mode's orbit. The keys change g_orbit under g_orbit_lock (the window's thread); the
+// Camera mode. F4 and the pad's chord change g_orbit under g_orbit_lock (the window's thread); the
 // follow camera's update (the game's thread) reads it while g_orbit_live is set and alone owns
-// g_run. g_orbit_live stays set until a stop has eased out, g_orbit_drive only while the orbit is
+// g_run. g_orbit_live stays set until a stop has eased out, g_orbit_drive only while camera mode is
 // wanted. A loading screen or a cutscene (a new Loading::Generation) ends it: the camera update
 // checks first thing, and OrbitFrame (the frame pacer's update) checks too, in case no camera
 // update runs. Neither assumes the two share a thread: the radius factor is set only under
@@ -194,12 +194,10 @@ std::atomic<unsigned> g_turns{0}, g_flicks{0}, g_free_changes{0};
 struct OrbitCommand {
     bool want = false;
     unsigned serial = 0; // one more at each start; 0 is never a start
-    float speed = CameraOrbit::kSpeedStart;
-    int height = 0; // steps from the pitch at the start
-    CameraOrbit::HeightRange heights{-CameraOrbit::kHeightStepsMost, CameraOrbit::kHeightStepsMost};
+    float speed = 0.0f;  // degrees a second of its own turn (BB_CAMERA_ORBIT); the hand's is added
     float radius = 1.0f;
     std::uint64_t generation = 0;
-    bool path = false; // bbport (r102_camera-mode-3-4): a camera path plays (F6), not the orbit
+    bool path = false; // bbport (r102_camera-mode-3-4): a camera path plays (P in camera mode), not the hand's look
 };
 constexpr unsigned kOrbitAwayUpdates = 30;
 // A start needs a camera update with the follow camera's free path at most this long ago.
@@ -216,11 +214,20 @@ CameraOrbit::Run g_run;
 unsigned g_run_serial = 0, g_run_away = 0;
 bool g_run_tail = false; // after an early end g_run.radius alone eases back to 1
 std::uint64_t g_run_generation = 0;
-float g_run_base = 0, g_run_turned = 0;
+float g_run_turned = 0;
 Clock::time_point g_run_last{}, g_run_began{};
 
-// bbport (r102_camera-mode-3-4): camera paths. g_path_keys are the keys F5 added (window thread
-// only); F6 copies them into g_path_play under g_orbit_lock; the camera update copies g_path_play
+// bbport (r124_camera-mode-keys): the hand's look. Look() (the window's thread) sets the three axes;
+// the camera update reads them. g_cam_pitch is the pitch the hand has asked for (radians, inside the
+// game's limits) and g_run_playing tells a play's start from its end; the game's thread alone owns
+// both. g_zoom_said: the "needs PC Camera Controls" line goes out once a run.
+std::atomic<float> g_look_x{0.0f}, g_look_y{0.0f}, g_look_zoom{0.0f};
+float g_cam_pitch = 0.0f;
+bool g_run_playing = false;
+std::atomic<bool> g_zoom_said{false};
+
+// bbport (r102_camera-mode-3-4): camera paths. g_path_keys are the keys K added (window thread
+// only); P copies them into g_path_play under g_orbit_lock; the camera update copies g_path_play
 // into g_run_path when a play starts, with the camera's pose of that moment as its first pose,
 // and alone owns g_run_path, g_run_timing and g_run_seconds. g_seen_* are the follow camera's
 // last pose (lantern_free_camera_turn) and the distance factor last set (SetDistanceLocked).
@@ -229,7 +236,7 @@ bool g_path_loaded = false; // window thread: the path file was read
 CameraPath::Timing g_run_timing;
 float g_run_seconds = 0;
 std::atomic<float> g_seen_pitch{0.0f}, g_seen_yaw{0.0f}, g_seen_radius{1.0f};
-float g_path_seconds = CameraPath::kSecondsDefault; // under g_orbit_lock: BB_CAMERA_PATH_S, given by F6
+float g_path_seconds = CameraPath::kSecondsDefault; // under g_orbit_lock: BB_CAMERA_PATH_S, given by P
 static_assert(CameraPath::kRadiusLeast == CameraOrbit::kRadiusLeast && CameraPath::kRadiusMost == CameraOrbit::kRadiusMost &&
               CameraPath::kRadiansPerDegree == CameraOrbit::kRadiansPerDegree);
 
@@ -254,12 +261,23 @@ bool SetDistance(float factor, std::uint64_t generation) {
     return SetDistanceLocked(factor, generation);
 }
 
-// g_orbit_lock held, any thread: the keys and the pad are done with the orbit. False if it was
+// bbport (r124_camera-mode-keys): g_orbit_lock held, any thread: camera mode is left. The game gets
+// its pad back, the hand's look stops, and the overlay ends what camera mode switched on (the HUD
+// hidden by H, a freeze). The overlay's call takes no lock.
+void DriveOff() {
+    g_orbit_drive = false;
+    g_look_x = 0.0f;
+    g_look_y = 0.0f;
+    g_look_zoom = 0.0f;
+    BbOverlay::CameraModeEnded();
+}
+
+// g_orbit_lock held, any thread: the keys and the pad are done with camera mode. False if it was
 // over already.
 bool RetireLocked() {
     if (!g_orbit_live.load(std::memory_order_relaxed)) return false;
     g_orbit.want = false;
-    g_orbit_drive = false;
+    DriveOff();
     g_orbit_live = false;
     return true;
 }
@@ -274,6 +292,7 @@ void OrbitEnd(unsigned serial, const char* why, bool keep_radius) {
     g_run = {};
     g_run_serial = 0;
     g_run_away = 0;
+    g_run_playing = false; // bbport (r124_camera-mode-keys)
     g_run_tail = keep_radius && !CameraOrbit::RadiusHome(radius);
     if (g_run_tail) {
         g_run.radius = radius;
@@ -287,8 +306,8 @@ void OrbitEnd(unsigned serial, const char* why, bool keep_radius) {
     if (serial && serial != g_orbit.serial) return; // started again meanwhile
     if (!RetireLocked()) return;                     // OrbitFrame saw the loading screen first
     if (why && !*why) return; // bbport (r102_camera-mode-3-4): a camera path printed its own line
-    if (why) std::printf("Camera: %s off (%s)\n", g_orbit.path ? "path" : "orbit", why); // bbport (r102_camera-mode-3-4)
-    else std::printf("Camera: orbit stopped, %.0f degrees in %.1f s\n", turned, seconds);
+    if (why) std::printf("Camera: camera mode off (%s)\n", why); // bbport (r124_camera-mode-keys)
+    else std::printf("Camera: camera mode ended, %.0f degrees turned in %.1f s\n", turned, seconds);
 }
 
 // The game's thread, each camera update while g_run_tail is set.
@@ -318,9 +337,9 @@ void PathBegin(float pitch, float yaw, float seconds_per_key) {
     g_run_seconds = 0;
 }
 
-// bbport (r102_camera-mode-3-4): a play's part of the follow camera's update. A stop (F6 again, F4,
-// the menu) ends it at once, the camera staying where it is and the distance easing back; so does
-// the end of the path.
+// bbport (r102_camera-mode-3-4): a play's part of the follow camera's update. Leaving camera mode (F4,
+// Esc, the menu) ends it at once, the camera staying where it is and the distance easing back. P
+// again, or the end of the path, ends the play only: camera mode goes on from the pose it left.
 bool PathTurn(const OrbitCommand& c, std::uint8_t* camera, std::uint8_t* had_input, float pitch, float lowest,
               float highest, Clock::time_point now) {
     if (!c.want) {
@@ -341,12 +360,14 @@ bool PathTurn(const OrbitCommand& c, std::uint8_t* camera, std::uint8_t* had_inp
     SetDistance(k.radius, c.generation);
     if (g_run_seconds >= g_run_timing.total) {
         std::printf("Camera: path done, %zu keys in %.1f s\n", g_run_path.size() - 1, double(g_run_seconds));
-        OrbitEnd(c.serial, "", true);
+        // bbport (r124_camera-mode-keys): camera mode goes on; the next update takes the last pose over.
+        std::scoped_lock lock(g_orbit_lock);
+        if (g_orbit.serial == c.serial) g_orbit.path = false;
     }
     return true;
 }
 
-// The orbit's part of the follow camera's update. False when the orbit ended here, so the
+// Camera mode's part of the follow camera's update. False when camera mode ended here, so the
 // stick and the mouse turn the camera in this update again.
 bool OrbitTurn(std::uint8_t* camera, std::uint8_t* had_input, float stick_pitch, float stick_yaw) {
     OrbitCommand c;
@@ -370,18 +391,10 @@ bool OrbitTurn(std::uint8_t* camera, std::uint8_t* had_input, float stick_pitch,
         g_run_generation = c.generation;
         g_run_tail = false;
         g_run.pitch = {pitch, 0.0f};
-        g_run_base = pitch;
+        g_cam_pitch = pitch; // bbport (r124_camera-mode-keys): the hand's look starts from the pitch the camera has
+        g_run_playing = false;
         g_run_turned = 0;
         g_run_last = g_run_began = now;
-        // The height steps stay inside the game's pitch limits as they are at the start.
-        const CameraOrbit::HeightRange heights = CameraOrbit::HeightRangeFrom(pitch, lowest, highest);
-        std::scoped_lock lock(g_orbit_lock);
-        if (g_orbit.serial == c.serial) {
-            g_orbit.heights = heights;
-            g_orbit.height = std::clamp(g_orbit.height, heights.least, heights.most);
-        }
-        c.height = std::clamp(c.height, heights.least, heights.most);
-        if (c.path) PathBegin(pitch, yaw, g_path_seconds); // bbport (r102_camera-mode-3-4)
     }
     g_run_away = 0;
     if (!std::isfinite(pitch) || !std::isfinite(yaw)) {
@@ -392,19 +405,66 @@ bool OrbitTurn(std::uint8_t* camera, std::uint8_t* had_input, float stick_pitch,
         OrbitEnd(c.serial, "the stick or the mouse turned the camera", true);
         return false;
     }
+    // bbport (r124_camera-mode-keys): a play starts or ends inside camera mode (P; a play also ends
+    // by itself, PathTurn). It starts from the camera's pose; when it ends the hand's look goes on
+    // from the last pose and distance.
+    if (c.path != g_run_playing) {
+        g_run_playing = c.path;
+        g_run_last = now;
+        g_run.rate = {};
+        std::scoped_lock lock(g_orbit_lock);
+        if (c.path) {
+            PathBegin(pitch, yaw, g_path_seconds);
+        } else {
+            g_run.pitch = {pitch, 0.0f};
+            g_cam_pitch = pitch;
+            c.radius = g_run.radius.value;
+            if (g_orbit.serial == c.serial) g_orbit.radius = c.radius;
+        }
+    }
     if (c.path) return PathTurn(c, camera, had_input, pitch, lowest, highest, now); // bbport (r102_camera-mode-3-4)
     const float dt = std::chrono::duration<float>(now - g_run_last).count();
     g_run_last = now;
-    const CameraOrbit::Targets t{c.want, c.speed,
-                                 g_run_base + float(c.height) * CameraOrbit::kHeightStep * CameraOrbit::kRadiansPerDegree,
-                                 c.radius};
-    const CameraOrbit::Pose p = CameraOrbit::Step(g_run, t, dt, pitch, yaw, lowest, highest);
-    g_run_turned += std::fabs(g_run.rate.value) * std::clamp(dt, 0.0f, CameraOrbit::kLongestStep);
-    // bbport (r102b_camera-clean-hud): the orbit's periodic line, every 300 camera updates while one turns
-    // (F4 or BB_CAMERA_ORBIT; the game's thread, so no orbit, no cost).
+    // bbport (r124_camera-mode-keys): the hand's look, while camera mode is wanted. The mouse's counts
+    // of this update turn the yaw at once and move the pitch the hand asks for (MouseTurn, so the
+    // sensitivity and the inversion are the mouse camera's); the arrow keys and the right stick give
+    // a turning speed and a pitch speed; the triggers move the distance. The springs ease the rest.
+    float look_x = 0.0f, mouse_yaw = 0.0f;
+    if (c.want) {
+        look_x = g_look_x.load(std::memory_order_relaxed);
+        const float look_y = g_look_y.load(std::memory_order_relaxed);
+        const float zoom = g_look_zoom.load(std::memory_order_relaxed);
+        float mouse_down = 0.0f;
+        const MouseTurn::Settings mouse{g_degrees_per_count.load(std::memory_order_relaxed),
+                                        g_invert_x.load(std::memory_order_relaxed),
+                                        g_invert_y.load(std::memory_order_relaxed)};
+        MouseTurn::Turn(g_update_x, g_update_y, mouse, mouse_down, mouse_yaw, -CameraOrbit::kPi, CameraOrbit::kPi);
+        g_cam_pitch = CameraOrbit::LookPitch(g_cam_pitch, look_y, mouse_down, dt, lowest, highest);
+        if (zoom != 0.0f) {
+            if (!BbEngine::Camera::Active()) {
+                if (!g_zoom_said.exchange(true))
+                    std::printf("Camera: the distance stays x1.0: it needs PC Camera Controls (camera_controls=1) at start\n");
+            } else {
+                std::scoped_lock lock(g_orbit_lock);
+                if (g_orbit.serial == c.serial && g_orbit.want) {
+                    g_orbit.radius = CameraOrbit::ZoomRadius(g_orbit.radius, zoom, dt);
+                    c.radius = g_orbit.radius;
+                }
+            }
+        }
+    }
+    const CameraOrbit::Targets t{c.want, CameraOrbit::LookSpeed(c.speed, look_x), g_cam_pitch, c.radius};
+    // A turn of its own (BB_CAMERA_ORBIT) keeps the orbit's slow spring; the hand's look has a quick one.
+    CameraOrbit::Pose p = CameraOrbit::Step(g_run, t, dt, pitch, yaw, lowest, highest,
+                                            c.speed != 0.0f ? CameraOrbit::kRateTime : CameraOrbit::kLookRateTime,
+                                            CameraOrbit::kLookPitchTime);
+    p.yaw = CameraOrbit::Wrap(p.yaw + mouse_yaw);
+    g_run_turned += std::fabs(g_run.rate.value) * std::clamp(dt, 0.0f, CameraOrbit::kLongestStep) + std::fabs(mouse_yaw);
+    // bbport (r102b_camera-clean-hud): camera mode's periodic line, every 300 camera updates while it is
+    // on (the game's thread, so no camera mode, no cost).
     static unsigned turning_updates = 0;
     if (++turning_updates % 300 == 0) {
-        std::printf("Camera: orbit turning, %.0f degrees in %.1f s so far\n",
+        std::printf("Camera: camera mode, %.0f degrees turned in %.1f s so far\n",
                     double(g_run_turned / CameraOrbit::kRadiansPerDegree),
                     double(std::chrono::duration<float>(now - g_run_began).count()));
     }
@@ -432,11 +492,11 @@ std::int64_t __attribute__((sysv_abi)) OnCameraUpdate(std::uint64_t, const std::
         g_update_y = g_count_y;
         g_count_x = g_count_y = 0;
     }
-    // A loading screen or a cutscene ends the orbit before this update does anything else.
+    // A loading screen or a cutscene ends camera mode before this update does anything else.
     if (g_orbit_live.load(std::memory_order_relaxed) &&
         g_orbit_generation.load(std::memory_order_relaxed) != BbEngine::Loading::Generation())
         OrbitEnd(0, "a loading screen or a cutscene", false);
-    // The orbit holds the game's auto-rotation like the mouse does, so it alone turns the camera.
+    // Camera mode holds the game's auto-rotation like the mouse does, so it alone turns the camera.
     const bool mouse_holds = g_hold.load(std::memory_order_relaxed), orbit_live = g_orbit_live.load(std::memory_order_relaxed);
     HoldAutoRotation(mouse_holds || orbit_live || BbTestCamera::HoldWanted()); // bbport (r120_test-camera-lookat, TOOL): the held camera is not turned back
     if (!orbit_live) g_run_away = 0;
@@ -552,7 +612,7 @@ void Publish(int sensitivity, bool invert_x, bool invert_y, bool hold_auto_rotat
 
 void OrbitToggle(const char* key) {
     if (!g_installed) {
-        std::printf("Camera: orbit unavailable (%s): the follow camera's hook is off (PC controls off, or not the "
+        std::printf("Camera: camera mode unavailable (%s): the follow camera's hook is off (PC controls off, or not the "
                     "1.09 game)\n", key);
         return;
     }
@@ -560,8 +620,8 @@ void OrbitToggle(const char* key) {
     OrbitCommand& c = g_orbit;
     if (OrbitOn(c)) {
         c.want = false;
-        g_orbit_drive = false;
-        std::printf("Camera: %s off (%s)\n", c.path ? "path" : "orbit", key); // bbport (r102_camera-mode-3-4)
+        DriveOff();
+        std::printf("Camera: camera mode off (%s)\n", key); // bbport (r124_camera-mode-keys)
         return;
     }
     // Only while no loading screen is up and the follow camera's free path ran in the last 0.25 s;
@@ -570,50 +630,55 @@ void OrbitToggle(const char* key) {
     const Clock::rep seen = g_follow_seen.load(std::memory_order_relaxed);
     const bool follow = seen && Clock::now() - Clock::time_point(Clock::duration(seen)) <= kFollowFresh;
     if (BbEngine::Loading::ScreenUp() || !follow) {
-        std::printf("Camera: orbit unavailable (%s): the follow camera is not running (%s)\n", key,
+        std::printf("Camera: camera mode unavailable (%s): the follow camera is not running (%s)\n", key,
                     BbEngine::Loading::ScreenUp() ? "a loading screen is up"
                                                   : "no camera update with its free path in the last 0.25 s");
         return;
     }
-    // Every start begins at 12 degrees a second, height 0 and radius x1.0.
+    // Every start holds the camera still (no turn of its own), at radius x1.0, with no hand input.
     c.want = true;
     c.serial = c.serial + 1 ? c.serial + 1 : 1;
-    c.speed = CameraOrbit::kSpeedStart;
-    c.height = 0;
-    c.heights = {-CameraOrbit::kHeightStepsMost, CameraOrbit::kHeightStepsMost};
+    c.speed = 0.0f;
     c.radius = 1.0f;
     c.path = false; // bbport (r102_camera-mode-3-4)
     c.generation = BbEngine::Loading::Generation();
     g_orbit_generation = c.generation;
+    g_look_x = 0.0f;
+    g_look_y = 0.0f;
+    g_look_zoom = 0.0f;
     g_orbit_drive = true;
     g_orbit_live = true;
-    std::printf("Camera: orbit on (%s): %+.0f degrees a second, radius x%.1f\n", key, c.speed, c.radius);
+    std::printf("Camera: camera mode on (%s): the mouse or the arrow keys turn the view, Esc leaves\n", key);
 }
 
 void OrbitStop(const char* why) {
     std::scoped_lock lock(g_orbit_lock);
     if (!OrbitOn(g_orbit)) return;
     g_orbit.want = false;
-    g_orbit_drive = false;
-    std::printf("Camera: %s off (%s)\n", g_orbit.path ? "path" : "orbit", why); // bbport (r102_camera-mode-3-4)
+    DriveOff();
+    std::printf("Camera: camera mode off (%s)\n", why); // bbport (r124_camera-mode-keys)
 }
 
-void OrbitAdjust(int speed, int height, int radius, const char* keys) {
+// bbport (r124_camera-mode-keys): the hand's input, the window's thread. Held until set again; the
+// camera update reads it while camera mode is wanted and DriveOff clears it.
+void Look(float x, float y, float zoom) {
+    g_look_x.store(CameraOrbit::LookAxis(x, 0.0f), std::memory_order_relaxed);
+    g_look_y.store(CameraOrbit::LookAxis(y, 0.0f), std::memory_order_relaxed);
+    g_look_zoom.store(CameraOrbit::LookAxis(zoom, 0.0f), std::memory_order_relaxed);
+}
+
+// bbport (r124_camera-mode-keys): one wheel notch or + / - key.
+void Zoom(int step, const char* how) {
     std::scoped_lock lock(g_orbit_lock);
     OrbitCommand& c = g_orbit;
-    if (!OrbitOn(c) || c.path) return; // bbport (r102_camera-mode-3-4): not while a path plays
-    c.speed = CameraOrbit::NextSpeed(c.speed, speed);
-    const int was = c.height;
-    c.height = std::clamp(CameraOrbit::NextHeight(c.height, height), c.heights.least, c.heights.most);
-    const bool held = height && c.height == was;
-    if (radius && !BbEngine::Camera::Active()) {
-        std::printf("Camera: orbit radius stays x1.0: it needs PC Camera Controls (camera_controls=1) at start\n");
-    } else {
-        c.radius = CameraOrbit::NextRadius(c.radius, radius);
+    if (!OrbitOn(c) || c.path || !step) return; // not while a path plays: it sets the distance
+    if (!BbEngine::Camera::Active()) {
+        if (!g_zoom_said.exchange(true))
+            std::printf("Camera: the distance stays x1.0: it needs PC Camera Controls (camera_controls=1) at start\n");
+        return;
     }
-    std::printf("Camera: orbit %+.0f degrees a second, height %+d (%+.0f degrees%s), radius x%.1f (%s)\n", c.speed,
-                c.height, float(c.height) * CameraOrbit::kHeightStep,
-                held ? ", no further: the game's pitch limit or 8 steps" : "", c.radius, keys);
+    c.radius = CameraOrbit::NextRadius(c.radius, step < 0 ? -1 : 1);
+    std::printf("Camera: distance x%.1f (%s)\n", double(c.radius), how);
 }
 
 bool OrbitDriving() {
@@ -621,11 +686,11 @@ bool OrbitDriving() {
            g_orbit_generation.load(std::memory_order_relaxed) == BbEngine::Loading::Generation();
 }
 
-// bbport (r102b_camera-clean-hud): BB_CAMERA_ORBIT=<degrees a second> starts the orbit by itself once a run,
-// as F4 does, when the follow camera has run for 2 s (no gap over 0.25 s, no loading screen up) with
-// the settings menu closed; at that speed (CameraOrbit::AutoSpeedFrom). Everything after the start is
-// F4's orbit (the keys change it; F4, the menu, a loading screen or lock-on end it; it does not start
-// again). For clips and test runs without a key. Unset (or 0, or not a number), or the follow
+// bbport (r102b_camera-clean-hud): BB_CAMERA_ORBIT=<degrees a second> enters camera mode by itself once a
+// run, as F4 does, when the follow camera has run for 2 s (no gap over 0.25 s, no loading screen up)
+// with the settings menu closed; its own turn is at that speed (CameraOrbit::AutoSpeedFrom). Everything
+// after the start is camera mode (its keys work; F4, Esc, the menu, a loading screen or lock-on end
+// it; it does not start again). For clips and test runs without a key. Unset (or 0, or not a number), or the follow
 // camera's hook not installed: after the first frame OrbitFrame's one more cost is the test of a
 // plain bool. The frame pacer's thread only.
 namespace {
@@ -647,7 +712,7 @@ void OrbitAuto() {
     static bool said = false;
     if (!said) {
         said = true;
-        std::printf("Camera: BB_CAMERA_ORBIT=%+.1f: the orbit starts by itself once a run, when the follow "
+        std::printf("Camera: BB_CAMERA_ORBIT=%+.1f: camera mode starts by itself once a run, when the follow "
                     "camera has run for 2 s with the settings menu closed\n",
                     double(speed));
     }
@@ -662,21 +727,19 @@ void OrbitAuto() {
     g_auto_orbit_pending = false;
     std::scoped_lock lock(g_orbit_lock);
     OrbitCommand& c = g_orbit;
-    if (OrbitOn(c)) return; // F4 or F6 came first
-    // As OrbitToggle's start, at the knob's speed.
+    if (OrbitOn(c)) return; // F4 came first
+    // As OrbitToggle's start, with a turn of its own at the knob's speed.
     c.want = true;
     c.serial = c.serial + 1 ? c.serial + 1 : 1;
     c.speed = speed;
-    c.height = 0;
-    c.heights = {-CameraOrbit::kHeightStepsMost, CameraOrbit::kHeightStepsMost};
     c.radius = 1.0f;
     c.path = false;
     c.generation = BbEngine::Loading::Generation();
     g_orbit_generation = c.generation;
     g_orbit_drive = true;
     g_orbit_live = true;
-    std::printf("Camera: orbit on (BB_CAMERA_ORBIT): %+.1f degrees a second, radius x%.1f\n", double(c.speed),
-                double(c.radius));
+    std::printf("Camera: camera mode on (BB_CAMERA_ORBIT): turning %+.1f degrees a second, radius x%.1f\n",
+                double(c.speed), double(c.radius));
 }
 }
 
@@ -686,7 +749,7 @@ void OrbitFrame() {
     const std::uint64_t generation = BbEngine::Loading::Generation();
     std::scoped_lock lock(g_orbit_lock);
     if (g_orbit_live.load(std::memory_order_relaxed) && g_orbit.generation != generation && RetireLocked())
-        std::printf("Camera: %s off (a loading screen or a cutscene)\n", g_orbit.path ? "path" : "orbit"); // bbport (r102)
+        std::printf("Camera: camera mode off (a loading screen or a cutscene)\n"); // bbport (r124_camera-mode-keys)
     if (g_distance_moved.load(std::memory_order_relaxed) && g_distance_generation != generation)
         SetDistanceLocked(1.0f, generation);
 }
@@ -694,7 +757,7 @@ void OrbitFrame() {
 // bbport (r102_camera-mode-3-4): camera paths, the window's thread.
 namespace {
 // The path file: camera_path.txt in the engine's user folder (BB_GPU_USER_DIR), else in the working
-// folder. Read at the first F5 or F6 of a run, written again at every F5 and Shift+F5.
+// folder. Read at the first K or P of a run, written again at every K and Backspace.
 std::string PathFile() {
     const char* dir = std::getenv("BB_GPU_USER_DIR");
     return dir && *dir ? std::string(dir) + "/camera_path.txt" : std::string("camera_path.txt");
@@ -725,7 +788,7 @@ void SavePath() {
         std::printf("Camera: the path file could not be written\n");
         return;
     }
-    std::fputs("# camera mode path (F5 adds a key, Shift+F5 clears, F6 plays): yaw and pitch in degrees, "
+    std::fputs("# camera mode path (K adds a key, Backspace clears, P plays): yaw and pitch in degrees, "
                "then the distance factor\n", f);
     char line[96];
     for (const CameraPath::Key& k : g_path_keys) {
@@ -755,7 +818,7 @@ void PathKey(const char* key) {
     }
     LoadPath();
     if (g_path_keys.size() >= CameraPath::kKeysMost) {
-        std::printf("Camera: path key refused (%s): %zu keys already (Shift+F5 clears)\n", key, g_path_keys.size());
+        std::printf("Camera: path key refused (%s): %zu keys already (Backspace clears)\n", key, g_path_keys.size());
         return;
     }
     const CameraPath::Key k{g_seen_yaw.load(std::memory_order_relaxed), g_seen_pitch.load(std::memory_order_relaxed),
@@ -785,18 +848,17 @@ void PathToggle(const char* key) {
     LoadPath();
     std::scoped_lock lock(g_orbit_lock);
     OrbitCommand& c = g_orbit;
-    if (OrbitOn(c)) {
-        if (!c.path) {
-            std::printf("Camera: path not started (%s): the orbit is on (F4 stops it)\n", key);
-            return;
-        }
-        c.want = false;
-        g_orbit_drive = false;
+    if (!OrbitOn(c)) { // bbport (r124_camera-mode-keys): a path plays inside camera mode
+        std::printf("Camera: path not started (%s): camera mode is off (F4 turns it on)\n", key);
+        return;
+    }
+    if (c.path) {
+        c.path = false; // the camera update ends the play; camera mode goes on from the pose
         std::printf("Camera: path off (%s)\n", key);
         return;
     }
     if (g_path_keys.empty()) {
-        std::printf("Camera: path has no keys (%s): F5 adds the camera's pose as one\n", key);
+        std::printf("Camera: path has no keys (%s): K adds the camera's pose as one\n", key);
         return;
     }
     if (const char* why = FollowMissing()) {
@@ -805,13 +867,7 @@ void PathToggle(const char* key) {
     }
     g_path_play = g_path_keys;
     g_path_seconds = PathSeconds();
-    c.path = true;
-    c.want = true;
-    c.serial = c.serial + 1 ? c.serial + 1 : 1;
-    c.generation = BbEngine::Loading::Generation();
-    g_orbit_generation = c.generation;
-    g_orbit_drive = true;
-    g_orbit_live = true;
+    c.path = true; // the camera update starts the play from the camera's pose
     const CameraPath::Timing t = CameraPath::TimingFor(g_path_play.size() + 1, PathSeconds());
     std::printf("Camera: path on (%s): %zu keys, %.1f s a key, about %.1f s\n", key, g_path_play.size(),
                 double(PathSeconds()), double(t.total));
@@ -861,13 +917,13 @@ extern "C" __attribute__((sysv_abi)) void lantern_free_camera_turn(std::uint8_t*
         float seen;
         std::memcpy(&seen, camera + kYaw, 4);
         BbEngine::OnlineFixes::SetCameraYaw(seen);
-        // bbport (r102_camera-mode-3-4): the pose F5 adds to a camera path.
+        // bbport (r102_camera-mode-3-4): the pose K adds to a camera path.
         float seen_pitch;
         std::memcpy(&seen_pitch, camera + kPitch, 4);
         g_seen_yaw.store(seen, std::memory_order_relaxed);
         g_seen_pitch.store(seen_pitch, std::memory_order_relaxed);
     }
-    // Camera mode's orbit owns the camera while it runs; off, this is the one check it costs.
+    // Camera mode owns the camera while it runs; off, this is the one check it costs.
     if (g_orbit_live.load(std::memory_order_relaxed) && OrbitTurn(camera, had_input, stick_pitch, stick_yaw)) return;
     // bbport (r120_test-camera-lookat, TOOL): BB_TEST_CAMERA holds the camera's fields (after the orbit, which owns the camera
     // while it runs; before the mouse's turn); off, this is one relaxed load of a false flag

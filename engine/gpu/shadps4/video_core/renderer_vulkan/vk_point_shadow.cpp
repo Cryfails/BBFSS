@@ -10,6 +10,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
 
 #include "bbport_live_knobs.h" // bbport (r87_live-flip-knobs): TOOL
 #include "bbport_settings.h"
@@ -23,9 +25,18 @@
 #include "video_core/host_shaders/point_shadow_ray_centred_cards_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_cards_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_centred_cards_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_cards_colour_foliage_comp.h" // bbport (r131a_foliage-translucency)
+#include "video_core/host_shaders/point_shadow_ray_centred_cards_colour_foliage_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_cards_colour_foliage_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_centred_cards_colour_foliage_comp.h"
+#include "video_core/renderer_vulkan/foliage_translucency.h"
 // bbport (r60_lamp-centred-window): the builds of BB_LAMP_SHADOW_WINDOW=2
 #include "video_core/host_shaders/point_shadow_ray_centred_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_centred_comp.h"
+#include "video_core/host_shaders/lamp_actual_blocker_layout.h"
+#include "video_core/host_shaders/point_shadow_ray_half_centred_t191_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_resolve_t191_comp.h"
+#include "video_core/renderer_vulkan/vk_window_path_scene.h"
 // bbport (r61_lamp-window-cost): the resolves' own builds of BB_LAMP_SHADOW_WINDOW=2
 #include "video_core/host_shaders/point_shadow_ray_half_resolve_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_resolve_comp.h"
@@ -36,6 +47,19 @@
 #include "video_core/host_shaders/point_shadow_ray_half_colour_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_half_resolve_colour_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_resolve_colour_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_colour_t131e_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_centred_colour_t131e_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_resolve_colour_t131e_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_colour_t131e_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_centred_colour_t131e_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_resolve_colour_t131e_comp.h"
+// bbport (r130c_glass-lamp-light): the GLASS forms of the tracing COLOUR builds (BB_GLASS_LIGHT=1)
+#include "video_core/host_shaders/point_shadow_ray_centred_colour_glass_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_colour_glass_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_centred_colour_glass_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_half_colour_glass_comp.h"
+#include "video_core/renderer_vulkan/glass_light.h"
+#include "video_core/renderer_vulkan/glass_light_forward.h" // bbport (r130g_glass-light-forward)
 #include "video_core/renderer_vulkan/lamp_moving_edge.h" // bbport (r101_lamp-moving-edge)
 #include "video_core/renderer_vulkan/lamp_shadow_layers.h" // bbport (r114_lamp-shadow-layers)
 #include "video_core/renderer_vulkan/lamp_young_pixels.h" // bbport (r103_lamp-young-pixels)
@@ -45,6 +69,7 @@
 #include "video_core/renderer_vulkan/vk_effect_pass.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h" // bbport (r61_lamp-window-cost)
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_lamp_pane_probe.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -54,6 +79,20 @@
 
 namespace Vulkan {
 namespace {
+float LampClearanceNow() {
+    static BbLiveKnobs::Knob<float> clearance{
+        "BB_LAMP_SHADOW_CLEARANCE", [](const char* text) -> float {
+            const float fallback = LampShadowTune{}.clearance_m;
+            if (text == nullptr || text[0] == 0) {
+                return fallback;
+            }
+            char* end = nullptr;
+            const float value = std::strtof(text, &end);
+            return end != text && std::isfinite(value) ? std::clamp(value, 0.05f, 2.0f) : fallback;
+        }};
+    return clearance.Get();
+}
+
 struct Push {
     u32 first_light;
     u32 frame_index;
@@ -274,7 +313,8 @@ CardExtras CardExtrasFromEnv() {
 bool MakeCardBuild(vk::Device device, vk::DescriptorSetLayout cards,
                    vk::UniqueDescriptorSetLayout& set_layout, vk::UniquePipelineLayout& layout,
                    vk::UniquePipeline& pipeline, std::initializer_list<vk::DescriptorType> types,
-                   std::span<const u32> code, float texel_scale, u32 colour_images = 0) {
+                   std::span<const u32> code, float texel_scale, u32 colour_images = 0,
+                   const FoliageTranslucency::LampSpec* foliage = nullptr) { // bbport (r131a_foliage-translucency): FOLIAGE builds only
     std::vector<vk::DescriptorSetLayoutBinding> bindings;
     bindings.reserve(types.size());
     for (const vk::DescriptorType type : types) {
@@ -322,8 +362,23 @@ bool MakeCardBuild(vk::Device device, vk::DescriptorSetLayout cards,
                                         std::bit_cast<u32>(extras.lit_dist_m), std::bit_cast<u32>(extras.strict_m),
                                         extras.split, extras.split_phase, std::bit_cast<u32>(extras.housing_m), extras.blocks}; // (r62o_cutout-visible-foliage: 15 CARD_BLOCKS) // (r62n_cutout-skinned-blocker: 14 CARD_HOUSING) (r62l_cutout-steady-proof: 11 CARD_STRICT, 12 CARD_SPLIT, 13 CARD_SPLIT_PHASE) (r62i: constant 6 CARD_PROOF; r62j_cutout-rule-and-place: 7 CARD_GATHER, 8 CARD_WRAP_CLAMPED; r62k_cutout-lit-fence: 9 CARD_LIT_SHARE, 10 CARD_LIT_DIST)
     const std::array<vk::SpecializationMapEntry, 16> spec_entries{{{0, 0, 4}, {1, 4, 4}, {2, 8, 4}, {3, 12, 4}, {4, 16, 4}, {5, 20, 4}, {6, 24, 4}, {7, 28, 4}, {8, 32, 4}, {9, 36, 4}, {10, 40, 4}, {11, 44, 4}, {12, 48, 4}, {13, 52, 4}, {14, 56, 4}, {15, 60, 4}}};
-    const vk::SpecializationInfo spec{u32(spec_entries.size()), spec_entries.data(), sizeof(spec_words),
-                                      spec_words.data()};
+    // bbport (r131a_foliage-translucency): the FOLIAGE builds' constants 16 to 19: T, the hue mix, the floor, whether the lamps keep their own hue
+    std::array<u32, 20> spec_words_f{};
+    std::copy(spec_words.begin(), spec_words.end(), spec_words_f.begin());
+    std::array<vk::SpecializationMapEntry, 20> spec_entries_f{};
+    std::copy(spec_entries.begin(), spec_entries.end(), spec_entries_f.begin());
+    if (foliage != nullptr) {
+        spec_words_f[16] = std::bit_cast<u32>(foliage->pass);
+        spec_words_f[17] = std::bit_cast<u32>(foliage->tint);
+        spec_words_f[18] = std::bit_cast<u32>(foliage->floor);
+        spec_words_f[19] = foliage->hue;
+        for (u32 i = 16; i < 20; ++i) {
+            spec_entries_f[i] = vk::SpecializationMapEntry{i, i * 4u, 4};
+        }
+    }
+    const vk::SpecializationInfo spec{foliage != nullptr ? 20u : u32(spec_entries.size()), spec_entries_f.data(),
+                                      foliage != nullptr ? sizeof(spec_words_f) : sizeof(spec_words),
+                                      foliage != nullptr ? spec_words_f.data() : spec_words.data()};
     auto built = device.createComputePipelineUnique(
         {}, vk::ComputePipelineCreateInfo{
                 .flags = vk::PipelineCreateFlagBits::eDispatchBase,
@@ -346,6 +401,16 @@ bool MakeCardBuild(vk::Device device, vk::DescriptorSetLayout cards,
 // bbport (r92_lamp-shadow-colour): a lamp build's SPIR-V, or its COLOUR form's (BB_LAMP_SHADOW_COLOUR=1)
 std::span<const u32> ColourCode(bool colour, std::span<const u32> plain, std::span<const u32> coloured) {
     return colour ? coloured : plain;
+}
+
+// bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT=1: the COLOUR build's GLASS form (same bindings, more code)
+std::span<const u32> GlassCode(bool glass, std::span<const u32> coloured, std::span<const u32> glassed) {
+    return glass ? glassed : coloured;
+}
+
+// bbport (r131a_foliage-translucency): the CARDS build's SPIR-V, or its FOLIAGE form's (the light through leaves)
+std::span<const u32> FoliageCode(bool foliage, std::span<const u32> plain, std::span<const u32> leafy) {
+    return foliage ? leafy : plain;
 }
 
 std::array<float, 16> Invert(const u32* words, bool& ok) {
@@ -410,6 +475,393 @@ std::array<float, 12> Multiply(const std::array<float, 12>& a, const std::array<
 bool Overlaps(const std::array<s32, 4>& a, const std::array<s32, 4>& b) {
     return a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
 }
+}
+
+// t131e shares binding 0 and the normal pipeline layouts. Only the probe variants see the
+// appended, disjoint stats range. The draw scheduler owns the GPU state and the staging ring.
+static constexpr u32 ProbeSampleWords = 32, ProbeBuckets = 64, ProbeFields = 14;
+static constexpr u32 ProbeWords = 2 * ProbeSampleWords + 3 * ProbeBuckets * ProbeFields;
+static constexpr vk::DeviceSize ProbeBytes = ProbeWords * sizeof(u32);
+static constexpr vk::DeviceSize ProbeOffset = DataWords * sizeof(u32);
+static constexpr u32 ProbeSlots = 8, ProbeMaxPasses = 8;
+
+namespace {
+bool ColourProbeWanted() {
+    static const bool wanted = [] {
+        const char* value = std::getenv("BB_LAMP_COLOUR_OUTPUT_PROBE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return wanted;
+}
+
+struct ColourProbeResult {
+    std::array<std::array<u32, ProbeFields>, 3> stages{};
+    std::array<u32, ProbeSampleWords> sample{};
+    u32 passes = 0, skipped = 0;
+};
+
+void LogColourProbe(u32 frame, const ColourProbeResult& result, bool capture) {
+    const char* kind = capture ? "captured" : "periodic";
+    std::printf("Lamp colour output (t131e) %s frame %u: passes=%u skipped=%u\n",
+                kind, frame, result.passes, result.skipped);
+    if (result.passes == 0) {
+        return;
+    }
+    const std::array<const char*, 3> names{"full", "half-first", "half-fill"};
+    for (size_t i = 0; i < names.size(); ++i) {
+        const auto& s = result.stages[i];
+        if (s[0] == 0 && s[7] == 0 && s[8] == 0) {
+            continue;
+        }
+        std::printf("Lamp colour output (t131e) frame %u %s: coverage_samples=%u "
+                    "nf_scale_gt1=%u nf_scale_other=%u finite_scale_range=%u bad_inputs=%u "
+                    "nf_output=%u format_risk=%u max_abs_ratio/rc/scale/out0/out1=%g/%g/%g/%g/%g\n",
+                    frame, names[i], s[0], s[1], s[2], s[3], s[4], s[5], s[6],
+                    double(std::bit_cast<float>(s[9])), double(std::bit_cast<float>(s[10])),
+                    double(std::bit_cast<float>(s[11])), double(std::bit_cast<float>(s[12])),
+                    double(std::bit_cast<float>(s[13])));
+    }
+    const auto& s = result.sample;
+    if (s[0] == 0) {
+        return;
+    }
+    std::printf("Lamp colour output (t131e) sample frame %u %s pixel=%u,%u target=%ux%u flags=0x%02x "
+                "ratio=%08x rc=%08x/%08x/%08x scale=%08x/%08x/%08x\n",
+                frame, names[s[5]], s[1], s[2], s[3], s[4], s[6], s[7],
+                s[8], s[9], s[10], s[11], s[12], s[13]);
+    std::printf("Lamp colour output (t131e) sample frame %u "
+                "s0=%08x/%08x/%08x d0=%08x/%08x/%08x s1=%08x/%08x/%08x d1=%08x/%08x/%08x "
+                "out0=%08x/%08x/%08x out1=%08x/%08x/%08x\n",
+                frame, s[14], s[15], s[16], s[17], s[18], s[19], s[20], s[21], s[22],
+                s[23], s[24], s[25], s[26], s[27], s[28], s[29], s[30], s[31]);
+}
+
+// Keep only recent results and the latest display tag per address. No addresses go in the log.
+// The present-dump hooks may run on a different thread from the draw scheduler.
+struct ColourProbeLink {
+    struct DisplayTag {
+        VAddr address = 0;
+        u32 frame = 0;
+    };
+    struct Recent {
+        u32 frame = ~0u;
+        std::optional<ColourProbeResult> result;
+        bool captured = false;
+    };
+    std::mutex mutex;
+    std::array<DisplayTag, 16> displays{};
+    std::array<Recent, 128> recent{};
+    u32 display_next = 0, capture_lines = 0;
+
+    void Tag(VAddr address, u32 frame) {
+        std::scoped_lock lock{mutex};
+        auto tag = std::ranges::find(displays, address, &DisplayTag::address);
+        if (tag == displays.end()) {
+            tag = displays.begin() + (display_next++ % displays.size());
+        }
+        *tag = {address, frame};
+        recent[frame % recent.size()] = {.frame = frame};
+    }
+
+    void Publish(u32 frame, const ColourProbeResult& result) {
+        std::scoped_lock lock{mutex};
+        auto& entry = recent[frame % recent.size()];
+        if (entry.frame == frame) {
+            entry.result = result;
+            if (entry.captured) {
+                LogColourProbe(frame, result, true);
+                return;
+            }
+        }
+        if (result.passes != 0 && frame % 120 == 0) {
+            LogColourProbe(frame, result, false);
+        }
+    }
+
+    void Capture(VAddr address, int index, bool upscaled) {
+        std::scoped_lock lock{mutex};
+        if (capture_lines >= 32) {
+            return;
+        }
+        ++capture_lines;
+        const char* source = upscaled ? "upscaled" : "native";
+        const auto tag = std::ranges::find(displays, address, &DisplayTag::address);
+        if (tag == displays.end() || tag->address == 0) {
+            std::printf("Lamp colour output (t131e) capture %s %d: no display frame tag\n", source, index);
+            return;
+        }
+        auto& entry = recent[tag->frame % recent.size()];
+        if (entry.frame != tag->frame) {
+            std::printf("Lamp colour output (t131e) capture %s %d frame %u: result expired\n", source, index, tag->frame);
+            return;
+        }
+        std::printf("Lamp colour output (t131e) capture %s %d frame %u\n", source, index, tag->frame);
+        if (!std::exchange(entry.captured, true) && entry.result) {
+            LogColourProbe(tag->frame, *entry.result, true);
+        }
+    }
+};
+
+ColourProbeLink& ProbeLink() {
+    static ColourProbeLink link;
+    return link;
+}
+
+vk::UniquePipeline ProbePipeline(vk::Device device, vk::PipelineLayout layout, std::span<const u32> code) {
+    const auto [result, module] =
+        device.createShaderModuleUnique({.codeSize = code.size_bytes(), .pCode = code.data()});
+    if (result != vk::Result::eSuccess) {
+        return {};
+    }
+    auto pipeline = device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .flags = vk::PipelineCreateFlagBits::eDispatchBase,
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute, .module = *module, .pName = "main"},
+                .layout = layout,
+            });
+    return pipeline.result == vk::Result::eSuccess ? std::move(pipeline.value) : vk::UniquePipeline{};
+}
+} // namespace
+
+// t151: test-only inventory of the post-flicker point-grid inputs. The same
+// light repeats across tiles. Use the exact position, falloff, RGB and guest
+// auxiliary words as the identity. Tile identity and renderer history are excluded.
+static bool PaneLightInventoryEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_LAMP_PANE_LIGHT_INVENTORY");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+struct PointShadow::PaneLightInventory {
+    static constexpr u32 MaxUnique = 512, Slots = 2 * MaxUnique, MaxScanned = 65536;
+    using Key = std::array<u32, 12>;
+    std::array<Key, MaxUnique> records;
+    struct {
+        std::array<float, 12> view{}, inverse{};
+        std::array<u16, Slots> slots{};
+        u64 seen = 0, uid = 0;
+        u32 rt_passes = 0, image = 0, count = 0, duplicates = 0;
+        u32 invalid = 0, inactive = 0, overflow = 0, scanned = 0;
+        bool camera_mismatch = false;
+    } frame;
+
+    void Add(const Inputs& inputs, const CameraMotion::Matrices& camera,
+             VideoCore::ImageId depth, u64 uid) {
+        auto& f = frame;
+        if (!camera.valid || !depth || !uid ||
+            (f.seen && (f.image != depth.index || f.uid != uid || f.view != camera.view ||
+                        f.inverse != camera.inv_view))) {
+            f.camera_mismatch = true;
+        }
+        if (!f.seen) {
+            f.image = depth.index;
+            f.uid = uid;
+            f.view = camera.view;
+            f.inverse = camera.inv_view;
+        }
+        f.seen += inputs.count;
+        const u32 take = std::min(inputs.count, MaxScanned - f.scanned);
+        f.scanned += take;
+        for (u32 i = 0; i < take; ++i) {
+            Key key;
+            std::copy_n(inputs.lights + i * LightWords, key.size(), key.begin());
+            const auto finite = [](u32 word) { return std::isfinite(std::bit_cast<float>(word)); };
+            if (!std::all_of(key.begin(), key.begin() + 7, finite)) {
+                ++f.invalid;
+                continue;
+            }
+            if (!(std::bit_cast<float>(key[3]) > 0.0f) ||
+                ((key[4] | key[5] | key[6]) & 0x7fffffffu) == 0) {
+                ++f.inactive;
+                continue;
+            }
+            u32 hash = 2166136261u;
+            for (u32 word : key) {
+                hash = (hash ^ word) * 16777619u;
+            }
+            u32 slot = (hash ^ (hash >> 16)) % Slots;
+            while (f.slots[slot] && records[f.slots[slot] - 1] != key) {
+                slot = (slot + 1) % Slots;
+            }
+            if (f.slots[slot]) {
+                ++f.duplicates;
+            } else if (f.count == MaxUnique) {
+                ++f.overflow;
+            } else {
+                records[f.count++] = key;
+                f.slots[slot] = u16(f.count);
+            }
+        }
+    }
+
+    void Report(const LampPaneProbe& pane, u32 point_frame, u64 rt_frame,
+                const RtShadow::GlassSceneView& scene) const {
+        const auto& id = pane.capture;
+        const auto& f = frame;
+        const auto ull = [](u64 value) { return static_cast<unsigned long long>(value); };
+        const char* refusal = nullptr;
+        const auto finite = [](float value) { return std::isfinite(value); };
+        if (id.rt != rt_frame || !scene.this_frame || !f.rt_passes) {
+            refusal = "no_current_rt_lamp_pass";
+        } else if (!f.seen) {
+            refusal = "no_point_grid_inputs";
+        } else if (f.camera_mismatch || f.image != id.image || f.uid != id.uid ||
+                   f.view != scene.view || f.view != pane.camera.view ||
+                   f.inverse != pane.camera.inverse ||
+                   !std::all_of(f.view.begin(), f.view.end(), finite) ||
+                   !std::all_of(f.inverse.begin(), f.inverse.end(), finite)) {
+            refusal = "input_rt_pane_depth_or_view_mismatch";
+        }
+        std::printf("Lamp inventory (t151): {\"request\":%u,\"scene\":%llu,\"rt\":%llu,"
+                    "\"draw\":%u,\"build\":%u,\"key\":\"%016llx\",\"point_frame\":%u,"
+                    "\"depth_image\":%u,\"depth_uid\":%llu,\"status\":\"%s\"}\n",
+                    id.request, ull(id.scene), ull(id.rt), id.draw, id.build, ull(pane.key),
+                    point_frame, id.image, ull(id.uid), refusal ? refusal : "joined");
+        std::printf("Lamp inventory (t151): {\"request\":%u,\"source\":\"OnLightDraw/post-flicker\","
+                    "\"dedup\":\"exact_words_0_to_11\",\"seen\":%llu,\"rt_passes\":%u,\"unique\":%u,"
+                    "\"duplicate\":%u,\"inactive\":%u,\"invalid\":%u,\"overflow\":%u,"
+                    "\"unscanned\":%llu,\"cap\":%u,\"scan_cap\":%u}\n",
+                    id.request, ull(f.seen), f.rt_passes, f.count, f.duplicates, f.inactive,
+                    f.invalid, f.overflow, ull(f.seen - f.scanned), MaxUnique, MaxScanned);
+        if (refusal) {
+            return;
+        }
+        for (u32 row = 0; row < 3; ++row) {
+            const float* v = scene.view.data() + row * 4;
+            std::printf("Lamp inventory (t151): {\"request\":%u,\"view_row\":%u,"
+                        "\"value\":[%.9g,%.9g,%.9g,%.9g]}\n",
+                        id.request, row, v[0], v[1], v[2], v[3]);
+        }
+        for (u32 i = 0; i < f.count; ++i) {
+            const auto& r = records[i];
+            const auto value = [&](u32 at) { return double(std::bit_cast<float>(r[at])); };
+            const double x = value(0), y = value(1), z = value(2);
+            const auto world = [&](u32 row) {
+                const float* m = f.inverse.data() + row * 4;
+                return m[0] * x + m[1] * y + m[2] * z + m[3];
+            };
+            std::printf("Lamp inventory (t151): {\"request\":%u,\"lamp\":%u,"
+                        "\"type\":\"point_grid\",\"world\":[%.12g,%.12g,%.12g],"
+                        "\"view\":[%.9g,%.9g,%.9g],\"reach\":%.12g,\"rgb\":[%.9g,%.9g,%.9g],"
+                        "\"aux\":[\"%08x\",\"%08x\",\"%08x\",\"%08x\",\"%08x\"]}\n",
+                        id.request, i, world(0), world(1), world(2), x, y, z,
+                        1.0 / std::sqrt(value(3)), value(4), value(5), value(6),
+                        r[7], r[8], r[9], r[10], r[11]);
+        }
+    }
+};
+
+void PointShadow::EndPaneLightInventory() {
+    const auto* pane = rt_shadow.ActiveLampPane();
+    if (!pane || pane->request.id == pane_inventory_reported) {
+        pane_inventory.reset();
+        return;
+    }
+    if (pane->Captured()) {
+        const auto rt_frame = rt_shadow.WindowDiagnosticFrame();
+        const auto scene = rt_shadow.GlassScene();
+        if (pane_inventory) {
+            pane_inventory->Report(*pane, frame_index, rt_frame, scene);
+        } else {
+            std::printf("Lamp inventory (t151): {\"request\":%u,\"status\":\"no_point_grid_inputs\"}\n",
+                        pane->request.id);
+        }
+        pane_inventory_reported = pane->request.id;
+        pane_inventory.reset();
+    } else if (pane_inventory) {
+        pane_inventory->frame = {};
+    }
+}
+
+struct PointShadow::ColourProbe {
+    struct Slot {
+        u64 tick = 0;
+        u32 frame = 0, passes = 0, skipped = 0;
+    };
+    std::array<Slot, ProbeSlots> slots{};
+    u32 front = 0, pending = 0, passes = 0, skipped = 0;
+    vk::DeviceSize stride = 0;
+    std::unique_ptr<VideoCore::Buffer> readback;
+    vk::UniquePipeline full, full_resolve, half, half_resolve;
+
+    void EndFrame(Scheduler& scheduler, vk::Buffer lights, u32 frame) {
+        while (pending != 0 && scheduler.IsFree(slots[front].tick)) {
+            const auto& slot = slots[front];
+            const vk::DeviceSize offset = stride * front;
+            std::array<u32, ProbeWords> words;
+            readback->Invalidate(offset, ProbeBytes);
+            std::memcpy(words.data(), readback->mapped_data.data() + offset, ProbeBytes);
+            ColourProbeResult result{.passes = slot.passes, .skipped = slot.skipped};
+            for (u32 i = 0; i < result.stages.size(); ++i) {
+                auto& stage = result.stages[i];
+                for (u32 j = 0; j < ProbeBuckets; ++j) {
+                    const u32 at = 2 * ProbeSampleWords + (i * ProbeBuckets + j) * ProbeFields;
+                    for (u32 k = 0; k < 9; ++k) {
+                        stage[k] += words[at + k];
+                    }
+                    for (u32 k = 9; k < ProbeFields; ++k) {
+                        stage[k] = std::max(stage[k], words[at + k]);
+                    }
+                }
+            }
+            const u32 sample_at = words[ProbeSampleWords] != 0 ? ProbeSampleWords : 0;
+            std::copy_n(words.begin() + sample_at, ProbeSampleWords, result.sample.begin());
+            ProbeLink().Publish(slot.frame, result);
+            front = (front + 1) % ProbeSlots;
+            --pending;
+        }
+
+        if (passes == 0) {
+            ProbeLink().Publish(frame, {.skipped = std::exchange(skipped, 0u)});
+            return;
+        }
+        // A slot was available when this frame's first diagnostic pass recorded its fill.
+        const u32 next = (front + pending) % ProbeSlots;
+        const vk::DeviceSize offset = stride * next;
+        scheduler.EndRendering();
+        scheduler.Record([lights, host = readback->Handle(), offset](vk::CommandBuffer cmd) {
+            constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+            EffectPass::MemoryBarrier(cmd, Compute | Transfer,
+                                      vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+                                      Transfer, vk::AccessFlagBits2::eTransferRead);
+            cmd.copyBuffer(lights, host, vk::BufferCopy{ProbeOffset, offset, ProbeBytes});
+            EffectPass::MemoryBarrier(cmd, Transfer, vk::AccessFlagBits2::eTransferWrite,
+                                      vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead);
+        });
+        slots[next] = {scheduler.CurrentTick(), frame, std::exchange(passes, 0u), std::exchange(skipped, 0u)};
+        ++pending;
+    }
+};
+
+#include "vk_point_shadow_actual_blocker.inl"
+
+void PointShadow::TagColourProbeDisplay(VAddr address) const {
+    if (actual_blocker && actual_blocker->submitted) {
+        const auto& s = actual_blocker->sample;
+        ActualBlockerDisplay().Mark(address, frame_index,
+                                    s.frame == frame_index ? s.header[0] : 0u);
+    }
+    if (colour_probe) {
+        ProbeLink().Tag(address, frame_index);
+    }
+}
+
+void PointShadow::NoteColourProbeCapture(VAddr address, int index, bool upscaled) {
+    if (ActualBlockerWanted()) {
+        ActualBlockerDisplay().Capture(address, index, upscaled);
+    }
+    if (ColourProbeWanted()) {
+        ProbeLink().Capture(address, index, upscaled);
+    }
+}
+
+float PointShadow::EmitterClearance() {
+    // The caustic rays leave the centre of a point light. A shadow pass can trace to a
+    // disc, but its per-pass radius and history do not change clearance for this source.
+    const LampShadowTune point{.radius_m = 0.0f, .clearance_m = LampClearanceNow()};
+    return LampPassClearance(point);
 }
 
 PointShadow::PointShadow(const Instance& instance_, Scheduler& scheduler_,
@@ -496,7 +948,46 @@ bool PointShadow::Ready() {
     // COLOUR: one binding more, the colour image, after the build's last), and the CARDS builds'
     // layouts get that binding too; a build that cannot be made falls back as the plain one would,
     // to the next build in its COLOUR form. Not on a device that cannot store the image's format.
-    colour_mode = tune.colour && EffectPass::StorageFormat(instance, ColourFormat);
+    // bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT=1 (RtShadow::GlassLightWanted) needs the colour image too: the colour builds
+    // are made for it, in their GLASS form (four tracing builds; the resolves do not trace)
+    glass_mode = rt_shadow.GlassLightWanted();
+    // bbport (r131a_foliage-translucency): the light through leaves for the lamps needs the colour image too (the leaf's hue rides in the colour sums)
+    foliage_mode = FoliageTranslucency::LampThrough();
+    colour_mode = (tune.colour || glass_mode || foliage_mode) && EffectPass::StorageFormat(instance, ColourFormat); // bbport (r131a): foliage_mode
+    if (foliage_mode && !colour_mode) {
+        std::printf("Foliage translucency (r131a): lamps: off (this GPU cannot store A2B10G10R10)\n");
+        foliage_mode = false;
+    }
+    if (foliage_mode) {
+        const auto& leaf = FoliageTranslucency::Tuning();
+        foliage_spec = {leaf.pass, leaf.tint, leaf.floor, tune.colour ? 1u : 0u};
+    }
+    if (glass_mode) {
+        const auto& glass_table = GlassRegistryRules::Load();
+        const char* glass_text = std::getenv("BB_GLASS_LIGHT");
+        if (!colour_mode) {
+            std::printf("Glass light (r130c): BB_GLASS_LIGHT=%.16s: off (this GPU cannot store A2B10G10R10)\n",
+                        glass_text ? glass_text : "");
+            rt_shadow.GlassLightOff();
+            glass_mode = false;
+        } else {
+            glass_words = GlassLight::Words(glass_table);
+            const u32 transmitting = GlassLight::CountTransmitting(glass_table);
+            std::printf("Glass light (r130c): BB_GLASS_LIGHT=%.16s: on: lamp light through %u transmitting entries (tint x "
+                        "strength), %u mirror entries stay opaque; colour builds on; lamp hue %s (BB_LAMP_SHADOW_COLOUR); live %s\n",
+                        glass_text ? glass_text : "", transmitting, glass_table.count - transmitting,
+                        tune.colour ? "on" : "off", rt_shadow.GlassLightLive() ? "yes (BB_LIVE_KNOBS_FILE)" : "no");
+            for (u32 i = 0; i < glass_table.count; ++i) {
+                const auto& e = glass_table.entries[i];
+                const auto lin = GlassLight::LinearOf(e.tint);
+                std::printf("Glass light (r130c): entry %u %s %08llx:%08llx tint %06x strength %.2f -> linear %.3f %.3f %.3f%s\n",
+                            i + 1, GlassRegistryRules::KindName(e.kind), static_cast<unsigned long long>(e.vs),
+                            static_cast<unsigned long long>(e.ps), e.tint, double(GlassLight::StrengthOf(e)), double(lin[0]),
+                            double(lin[1]), double(lin[2]), GlassLight::Transmits(e.kind) ? "" : " opaque (mirror)");
+            }
+        }
+    }
+    half_words = HalfSlots + (glass_mode ? GlassLight::RaySlots : 0u); // bbport (r130g_glass-light-forward): the glass counter
     if (tune.colour) {
         std::printf("Ray traced lamps (r92): coloured lamp shadows %s (BB_LAMP_SHADOW_COLOUR=1): each lamp's "
                     "share of a pixel's shadow keeps the lamp's colour, so where a warm and a cool lamp "
@@ -533,7 +1024,8 @@ bool PointShadow::Ready() {
     centred = tune.window && tune.window_centred;
     if (centred && rt_shadow.Capturing() &&
         !make_centred(ray_set_layout, ray_layout, ray_pipeline,
-                      ColourCode(colour_mode, POINT_SHADOW_RAY_CENTRED_COMP, POINT_SHADOW_RAY_CENTRED_COLOUR_COMP), // r92
+                      GlassCode(glass_mode, ColourCode(colour_mode, POINT_SHADOW_RAY_CENTRED_COMP, POINT_SHADOW_RAY_CENTRED_COLOUR_COMP),
+                                 POINT_SHADOW_RAY_CENTRED_COLOUR_GLASS_COMP), // r92, r130c
                       "Ray traced lamps")) {
         std::printf("Ray traced lamps (r60): the centred window's pass could not be made: "
                     "BB_LAMP_SHADOW_WINDOW=1\n");
@@ -547,7 +1039,8 @@ bool PointShadow::Ready() {
                             {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
                              eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
                              eStorageImage, eStorageImage, eStorageImage, eStorageImage},
-                            sizeof(Push), POINT_SHADOW_RAY_COLOUR_COMP, "Ray traced lamps (colour)", true)) {
+                            sizeof(Push), GlassCode(glass_mode, POINT_SHADOW_RAY_COLOUR_COMP, POINT_SHADOW_RAY_COLOUR_GLASS_COMP),
+                            "Ray traced lamps (colour)", true)) { // bbport (r130c_glass-lamp-light): GlassCode
         std::printf("Ray traced lamps: off - the pass could not be made (r92: its COLOUR form)\n");
     }
     // bbport (r52_follow-soft): bindings 9 and 10, the follow state
@@ -678,8 +1171,53 @@ bool PointShadow::Ready() {
                            vk::FormatFeatureFlagBits::eColorAttachmentBlend;
     lamp_format = (instance.GetPhysicalDevice().getFormatProperties(TargetFormat)
                        .optimalTilingFeatures & Drawn) == Drawn;
+    if (ColourProbeWanted()) {
+        if (ray_pipeline && colour_mode && tune.colour && !glass_mode && !foliage_mode) {
+            const auto device = instance.GetDevice();
+            auto probe = std::make_unique<ColourProbe>();
+            probe->full = ProbePipeline(device, *ray_layout,
+                ColourCode(centred, POINT_SHADOW_RAY_COLOUR_T131E_COMP,
+                           POINT_SHADOW_RAY_CENTRED_COLOUR_T131E_COMP));
+            if (resolve_pipeline) {
+                probe->full_resolve = ProbePipeline(device, *resolve_layout, POINT_SHADOW_RAY_RESOLVE_COLOUR_T131E_COMP);
+            }
+            const auto atom = instance.GetPhysicalDevice().getProperties().limits.nonCoherentAtomSize;
+            probe->stride = (ProbeBytes + atom - 1) & ~(atom - 1);
+            if (probe->full) {
+                probe->readback = std::make_unique<VideoCore::Buffer>(
+                    instance, 0, probe->stride * ProbeSlots, VideoCore::MemoryType::HostCached,
+                    "Lamp colour output readback");
+                if (probe->readback->mapped_data.size() >= probe->stride * ProbeSlots) {
+                    colour_probe = std::move(probe);
+                }
+            }
+        }
+        std::printf("Lamp colour output (t131e): %s\n",
+                    colour_probe ? "armed for standard colour view 0"
+                                 : "unavailable (need standard colour ray pipeline and mapped staging)");
+    }
+    if (ActualBlockerWanted()) {
+        const auto* window = std::getenv("BB_WINDOW_PATH_PROBE");
+        if (window && std::strcmp(window, "1") == 0) {
+            std::puts("Lamp blocker (t191) unavailable reason=window-observer-conflict");
+        } else if (ray_pipeline && centred && !colour_mode && !glass_mode && !colour_probe) {
+            auto probe = std::make_unique<ActualBlocker>();
+            const auto atom = instance.GetPhysicalDevice().getProperties().limits.nonCoherentAtomSize;
+            const auto aligned = (BlockerBytes + atom - 1) & ~(atom - 1);
+            probe->readback = std::make_unique<VideoCore::Buffer>(
+                instance, 0, aligned, VideoCore::MemoryType::HostCached, "Lamp blocker readback");
+            if (probe->readback->mapped_data.size() >= aligned) {
+                actual_blocker = std::move(probe);
+            }
+            std::puts(actual_blocker ? "Lamp blocker (t191) ready"
+                                    : "Lamp blocker (t191) unavailable reason=no-mapped-readback");
+        } else {
+            std::puts("Lamp blocker (t191) unavailable reason=standard-grey-centred-path");
+        }
+    }
     light_data = std::make_unique<VideoCore::Buffer>(
-        instance, 0, DataWords * sizeof(u32), VideoCore::MemoryType::DeviceLocal, "Point shadow lights");
+        instance, 0, ProbeOffset + (colour_probe ? ProbeBytes : actual_blocker ? BlockerBytes : 0),
+        VideoCore::MemoryType::DeviceLocal, "Point shadow lights");
     // bbport (r65_lamp-half-at-start): at start, the half-resolution build with the others when a
     // pass would take it now (Flush also needs the ray pass and ray traced lamps wanted), so that
     // the first half-resolution pass does not make it during play. Not at start
@@ -734,8 +1272,9 @@ bool PointShadow::HalfReady() {
     // the window of 1 and does not split; the full-resolution pass keeps 2), said in the log.
     half_centred = ray_pipeline && centred &&
                    make_half_centred(half_set_layout, half_layout, half_pipeline,
-                                     ColourCode(colour_mode, POINT_SHADOW_RAY_HALF_CENTRED_COMP,
-                                                POINT_SHADOW_RAY_HALF_CENTRED_COLOUR_COMP), // bbport (r92)
+                                     GlassCode(glass_mode, ColourCode(colour_mode, POINT_SHADOW_RAY_HALF_CENTRED_COMP,
+                                                POINT_SHADOW_RAY_HALF_CENTRED_COLOUR_COMP),
+                                 POINT_SHADOW_RAY_HALF_CENTRED_COLOUR_GLASS_COMP), // bbport (r92, r130c)
                                      "Ray traced lamps (half resolution)");
     if (ray_pipeline && centred && !half_centred) {
         std::printf("Ray traced lamps (r60): the centred window's half-resolution pass could not be made: "
@@ -759,7 +1298,8 @@ bool PointShadow::HalfReady() {
                            {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage,
                             eStorageImage, eAccelerationStructureKHR, eStorageImage, eStorageImage, eStorageImage,
                             eStorageBuffer, eStorageImage, eStorageImage, eStorageImage},
-                           sizeof(Push), POINT_SHADOW_RAY_HALF_COLOUR_COMP, "Ray traced lamps (half resolution, colour)",
+                           sizeof(Push), GlassCode(glass_mode, POINT_SHADOW_RAY_HALF_COLOUR_COMP, POINT_SHADOW_RAY_HALF_COLOUR_GLASS_COMP),
+                           "Ray traced lamps (half resolution, colour)", // bbport (r130c_glass-lamp-light): GlassCode
                            true);
     const bool made =
         ray_pipeline &&
@@ -776,13 +1316,13 @@ bool PointShadow::HalfReady() {
     }
     if (made) {
         half_counts = std::make_unique<VideoCore::Buffer>(
-            instance, 0, HalfSlots * sizeof(u32), VideoCore::MemoryType::DeviceLocal,
+            instance, 0, half_words * sizeof(u32), VideoCore::MemoryType::DeviceLocal, // bbport (r130g): half_words
             "Ray traced lamp half counters");
         half_readback = std::make_unique<VideoCore::Buffer>(
-            instance, 0, HalfSlots * sizeof(u32), VideoCore::MemoryType::HostCached,
+            instance, 0, half_words * sizeof(u32), VideoCore::MemoryType::HostCached, // bbport (r130g): half_words
             "Ray traced lamp half counters readback");
-        if (half_readback->mapped_data.size() >= HalfSlots * sizeof(u32)) {
-            std::memset(half_readback->mapped_data.data(), 0, HalfSlots * sizeof(u32));
+        if (half_readback->mapped_data.size() >= half_words * sizeof(u32)) { // bbport (r130g): half_words
+            std::memset(half_readback->mapped_data.data(), 0, half_words * sizeof(u32)); // bbport (r130g): half_words
             half_made = true;
         }
     }
@@ -799,10 +1339,38 @@ bool PointShadow::HalfReady() {
     std::printf("Ray traced lamps (r65): the half-resolution build made %s in %.1f ms\n",
                 at_start ? "at start" : "during play",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r65_began).count());
+    if (colour_probe && half_made) {
+        const auto device = instance.GetDevice();
+        colour_probe->half = ProbePipeline(device, *half_layout,
+            ColourCode(half_centred, POINT_SHADOW_RAY_HALF_COLOUR_T131E_COMP,
+                       POINT_SHADOW_RAY_HALF_CENTRED_COLOUR_T131E_COMP));
+        if (half_resolve_pipeline) {
+            colour_probe->half_resolve =
+                ProbePipeline(device, *half_resolve_layout, POINT_SHADOW_RAY_HALF_RESOLVE_COLOUR_T131E_COMP);
+        }
+    }
+    if (actual_blocker && half_made && half_centred) {
+        const auto device = instance.GetDevice();
+        actual_blocker->main =
+            ProbePipeline(device, *half_layout, POINT_SHADOW_RAY_HALF_CENTRED_T191_COMP);
+        if (half_resolve_pipeline) {
+            actual_blocker->resolve =
+                ProbePipeline(device, *half_resolve_layout, POINT_SHADOW_RAY_HALF_RESOLVE_T191_COMP);
+        }
+    }
     return half_made;
 }
 
-PointShadow::~PointShadow() = default;
+PointShadow::~PointShadow() {
+    ReleaseBlockerScene();
+}
+
+void PointShadow::ReleaseBlockerScene() {
+    if (blocker_scene_watch) {
+        rt_shadow.UnwatchWindowScene(blocker_scene_watch.get());
+        blocker_scene_watch.reset();
+    }
+}
 
 // bbport (r63_leaf-stage4): BB_RT_CARD_LAMPS=1 (RtShadow::CardLampsWanted): the CARDS form of the
 // ray pass's build (half: of the half-resolution build), made where that build is made (Ready,
@@ -816,15 +1384,17 @@ void PointShadow::CardLampsReady(bool half) {
     using enum vk::DescriptorType;
     if (!card_set_layout) {
         constexpr auto Stage = vk::ShaderStageFlagBits::eCompute;
-        const std::array<vk::DescriptorSetLayoutBinding, 5> bindings{{{0, eStorageBuffer, 1, Stage},
+        // bbport (r131a_foliage-translucency): with the light through leaves a sixth binding, the colour layers (the plain CARDS builds ignore it)
+        const std::array<vk::DescriptorSetLayoutBinding, 6> bindings{{{0, eStorageBuffer, 1, Stage},
                                                                       {1, eStorageBuffer, 1, Stage},
                                                                       {2, eStorageBuffer, 1, Stage},
                                                                       {3, eCombinedImageSampler, 1, Stage},
-                                                                      {4, eStorageBuffer, 1, Stage}}};
+                                                                      {4, eStorageBuffer, 1, Stage},
+                                                                      {5, eCombinedImageSampler, 1, Stage}}};
         auto set = device.createDescriptorSetLayoutUnique(
-            {.bindingCount = u32(bindings.size()), .pBindings = bindings.data()});
+            {.bindingCount = foliage_mode ? 6u : 5u, .pBindings = bindings.data()});
         const std::array<vk::DescriptorPoolSize, 2> sizes{
-            {{eStorageBuffer, 4 * CardSetsMost}, {eCombinedImageSampler, CardSetsMost}}};
+            {{eStorageBuffer, 4 * CardSetsMost}, {eCombinedImageSampler, (foliage_mode ? 2u : 1u) * CardSetsMost}}};
         auto pool = device.createDescriptorPoolUnique(
             {.maxSets = CardSetsMost, .poolSizeCount = u32(sizes.size()), .pPoolSizes = sizes.data()});
         if (set.result != vk::Result::eSuccess || pool.result != vk::Result::eSuccess) {
@@ -832,14 +1402,15 @@ void PointShadow::CardLampsReady(bool half) {
                         "rays leave the cards out\n");
             return;
         }
+        card_words = CARD_LAMP_BUFFER_WORDS + (foliage_mode ? u32(CARD_LAMP_FOLIAGE_WORDS) : 0u); // bbport (r131a_foliage-translucency)
         card_counts = std::make_unique<VideoCore::Buffer>(
-            instance, 0, CARD_LAMP_BUFFER_WORDS * sizeof(u32), VideoCore::MemoryType::DeviceLocal, // bbport (r62m): the book too
+            instance, 0, card_words * sizeof(u32), VideoCore::MemoryType::DeviceLocal, // bbport (r62m): the book too; (r131a): card_words
             "Ray traced lamp card counters");
         card_readback = std::make_unique<VideoCore::Buffer>(
-            instance, 0, CARD_LAMP_BUFFER_WORDS * sizeof(u32), VideoCore::MemoryType::HostCached,
+            instance, 0, card_words * sizeof(u32), VideoCore::MemoryType::HostCached, // bbport (r131a): card_words
             "Ray traced lamp card counters readback");
-        if (card_readback->mapped_data.size() >= CARD_LAMP_BUFFER_WORDS * sizeof(u32)) {
-            std::memset(card_readback->mapped_data.data(), 0, CARD_LAMP_BUFFER_WORDS * sizeof(u32));
+        if (card_readback->mapped_data.size() >= card_words * sizeof(u32)) { // bbport (r131a): card_words
+            std::memset(card_readback->mapped_data.data(), 0, card_words * sizeof(u32));
         }
         card_set_layout = std::move(set.value);
         card_pool = std::move(pool.value);
@@ -943,8 +1514,9 @@ void PointShadow::CardLampsReady(bool half) {
                               eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
                               eStorageImage, eStorageImage, eStorageBuffer, eStorageImage, eStorageImage,
                               eStorageImage},
-                             POINT_SHADOW_RAY_HALF_CENTRED_CARDS_COMP, card_texel_scale,
-                             colour_mode ? 1u : 0u); // bbport (r92_lamp-shadow-colour)
+                             FoliageCode(foliage_mode, POINT_SHADOW_RAY_HALF_CENTRED_CARDS_COMP,
+                                         POINT_SHADOW_RAY_HALF_CENTRED_CARDS_COLOUR_FOLIAGE_COMP), card_texel_scale,
+                             colour_mode ? 1u : 0u, foliage_mode ? &foliage_spec : nullptr); // bbport (r92, r131a)
     } else if (half) {
         what = "half-resolution";
         made = MakeCardBuild(device, *card_set_layout, card_half_set_layout, card_half_layout,
@@ -952,8 +1524,9 @@ void PointShadow::CardLampsReady(bool half) {
                              {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
                               eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
                               eStorageImage, eStorageImage, eStorageBuffer, eStorageImage, eStorageImage},
-                             POINT_SHADOW_RAY_HALF_CARDS_COMP, card_texel_scale,
-                             colour_mode ? 1u : 0u); // bbport (r92_lamp-shadow-colour)
+                             FoliageCode(foliage_mode, POINT_SHADOW_RAY_HALF_CARDS_COMP,
+                                         POINT_SHADOW_RAY_HALF_CARDS_COLOUR_FOLIAGE_COMP), card_texel_scale,
+                             colour_mode ? 1u : 0u, foliage_mode ? &foliage_spec : nullptr); // bbport (r92, r131a)
     } else if (centred) {
         what = "centred";
         made = MakeCardBuild(device, *card_set_layout, card_ray_set_layout, card_ray_layout,
@@ -961,8 +1534,9 @@ void PointShadow::CardLampsReady(bool half) {
                              {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
                               eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
                               eStorageImage, eStorageImage, eStorageImage, eStorageImage},
-                             POINT_SHADOW_RAY_CENTRED_CARDS_COMP, card_texel_scale,
-                             colour_mode ? 1u : 0u); // bbport (r92_lamp-shadow-colour)
+                             FoliageCode(foliage_mode, POINT_SHADOW_RAY_CENTRED_CARDS_COMP,
+                                         POINT_SHADOW_RAY_CENTRED_CARDS_COLOUR_FOLIAGE_COMP), card_texel_scale,
+                             colour_mode ? 1u : 0u, foliage_mode ? &foliage_spec : nullptr); // bbport (r92, r131a)
     } else {
         what = "full-resolution";
         made = MakeCardBuild(device, *card_set_layout, card_ray_set_layout, card_ray_layout,
@@ -970,8 +1544,9 @@ void PointShadow::CardLampsReady(bool half) {
                              {eStorageBuffer, eCombinedImageSampler, eStorageImage, eStorageImage,
                               eStorageImage, eStorageImage, eAccelerationStructureKHR, eStorageImage,
                               eStorageImage, eStorageImage, eStorageImage},
-                             POINT_SHADOW_RAY_CARDS_COMP, card_texel_scale,
-                             colour_mode ? 1u : 0u); // bbport (r92_lamp-shadow-colour)
+                             FoliageCode(foliage_mode, POINT_SHADOW_RAY_CARDS_COMP,
+                                         POINT_SHADOW_RAY_CARDS_COLOUR_FOLIAGE_COMP), card_texel_scale,
+                             colour_mode ? 1u : 0u, foliage_mode ? &foliage_spec : nullptr); // bbport (r92, r131a)
     }
     std::printf("Ray traced lamps (r63): the %s build with cards %s\n", what,
                 made ? "made" : "could not be made: that pass leaves the cards out");
@@ -1014,7 +1589,7 @@ vk::DescriptorSet PointShadow::CardLampSet(bool half) {
         }
     }
     const auto r = rt_shadow.CardLampReadersNow();
-    if (r.instances == 0 || !r.rows || !r.pool || !r.info || !r.layers || !r.sampler) {
+    if (r.instances == 0 || !r.rows || !r.pool || !r.info || !r.layers || !r.sampler || (foliage_mode && !r.colour)) { // bbport (r131a)
         return {};
     }
     if (card_set && r.rows == card_set_rows && r.pool == card_set_pool && r.info == card_set_info &&
@@ -1058,6 +1633,12 @@ vk::DescriptorSet PointShadow::CardLampSet(bool half) {
          .pBufferInfo = &counts},
     }};
     device.updateDescriptorSets(writes, {});
+    if (foliage_mode) { // bbport (r131a_foliage-translucency): binding 5, the colour layers (read with the alpha layers' sampler)
+        const vk::DescriptorImageInfo colour{r.sampler, r.colour, vk::ImageLayout::eGeneral};
+        const vk::WriteDescriptorSet colour_write{.dstSet = set, .dstBinding = 5, .descriptorCount = 1,
+                                                  .descriptorType = eCombinedImageSampler, .pImageInfo = &colour};
+        device.updateDescriptorSets(colour_write, {});
+    }
     card_set = set;
     card_set_rows = r.rows;
     card_set_pool = r.pool;
@@ -1272,6 +1853,21 @@ void PointShadow::CardLampsLine() {
     }
     card_last = now;
     const auto counts = rt_shadow.TakeCardLampCounts();
+    if (foliage_mode && card_readback && card_readback->mapped_data.size() >= card_words * sizeof(u32)) {
+        // bbport (r131a_foliage-translucency): the lamp rays' leaves (the counted passes' sample, as the counters above): rays, rays that passed a leaf,
+        // leaves passed, rays that ended at the floor, leaves passed without colour. Zeroed by the first counted pass; differences survive the wrap.
+        std::array<u32, 8> f{};
+        card_readback->Invalidate(CARD_LAMP_FOLIAGE_FIRST * sizeof(u32), sizeof(f));
+        std::memcpy(f.data(), card_readback->mapped_data.data() + CARD_LAMP_FOLIAGE_FIRST * sizeof(u32), sizeof(f));
+        std::array<double, 8> fd{};
+        for (u32 i = 0; i < 8; ++i) {
+            fd[i] = double(u32(f[i] - foliage_last[i]));
+        }
+        foliage_last = f;
+        std::printf("Foliage light (r131a): lamp card rays %.0f, passed a leaf %.0f (T=%.2f, %.0f leaves), ended at floor %.0f, grey (no colour) %.0f; "
+                    "rest lamps grey (the two strongest lamps of a pixel take the hue); counted passes only (one in %u, one pixel in 64)\n",
+                    fd[0], fd[1], double(foliage_spec.pass), fd[2], fd[3], fd[4], unsigned(CardCountEvery));
+    }
     const auto share = [](double part, double whole) { return whole > 0.0 ? 100.0 * part / whole : 0.0; };
     const double card_rays = d[CARD_LAMP_CARD_RAYS];
     const auto ull = [](u64 v) { return static_cast<unsigned long long>(v); };
@@ -1434,6 +2030,17 @@ bool PointShadow::BeginApart(u32 width, u32 height) {
     return true;
 }
 
+std::optional<PointShadow::LampTargetOwner> PointShadow::LookupLampTarget(vk::ImageView view) const noexcept {
+    if (!view) return std::nullopt;
+    for (u32 slot = 0; slot < std::size(lamp); ++slot) {
+        const auto& own = lamp[slot];
+        if (own.image && own.view.get() == view) {
+            return LampTargetOwner{slot, own.generation, own.image.image_ci.format, {own.width, own.height}};
+        }
+    }
+    return std::nullopt;
+}
+
 bool PointShadow::EnsureImage(OwnImage& own, u32 width, u32 height, vk::Format format,
                               const char* name, vk::ImageUsageFlags more_usage) {
     if (own.image && own.width == width && own.height == height) {
@@ -1469,10 +2076,25 @@ bool PointShadow::EnsureImage(OwnImage& own, u32 width, u32 height, vk::Format f
     }));
     own.width = width;
     own.height = height;
+    ++own.generation;
     return true;
 }
 
 void PointShadow::OnFrameEnd() {
+    if (PaneLightInventoryEnabled()) {
+        EndPaneLightInventory();
+    }
+    if (colour_probe) {
+        colour_probe->EndFrame(scheduler, light_data->Handle(), frame_index);
+    }
+    if (actual_blocker) {
+        actual_blocker->EndFrame(scheduler, frame_index);
+        if (blocker_scene_watch && !actual_blocker->ended &&
+            std::chrono::steady_clock::now() - actual_blocker->start > std::chrono::seconds(3)) {
+            actual_blocker->Refuse();
+            ReleaseBlockerScene();
+        }
+    }
     // bbport (r42_lamp-soft): this frame's lamps are "the frame before" of the next one when
     // its pass left an averaged history
     track.End(history_written && history_blend && track_frame == frame_index);
@@ -1483,6 +2105,7 @@ void PointShadow::OnFrameEnd() {
         last_view = pending_view;
         last_proj = pending_proj;
         last_valid = pending_valid;
+        history_jitter = pending_jitter;
         history_fresh = true;
         history_blended = history_blend; // bbport (r42_lamp-soft)
     } else {
@@ -1517,6 +2140,20 @@ void PointShadow::OnFrameEnd() {
     // (bbport r37_menu-options), the first time a pass wants the half resolution (bbport
     // r65_lamp-half-at-start: or at start, by Ready; the line still waits for the first pass that
     // asks for it, half_asked, as before).
+    // bbport (r130g_glass-light-forward): with BB_GLASS_LIGHT on the glass counter (half_counts words 16 to 24, written by the half
+    // resolution passes that are counted) goes to RtShadow every frame, 40 bytes: its own lines print it. The copy to the host
+    // lands in one pass of 8, late; the words are cumulative (u32 differences survive the wrap).
+    if (glass_mode && half_made && half_readback && half_readback->mapped_data.size() >= half_words * sizeof(u32)) {
+        half_readback->Invalidate(0, half_words * sizeof(u32));
+        std::array<u32, GlassLight::RayFirst + GlassLight::RaySlots> all{};
+        std::memcpy(all.data(), half_readback->mapped_data.data(), std::min(sizeof(all), half_words * sizeof(u32)));
+        std::array<u32, 10> words{};
+        words[0] = all[0];
+        for (u32 i = 0; i < GlassLight::RaySlots; ++i) {
+            words[1 + i] = all[GlassLight::RayFirst + i];
+        }
+        rt_shadow.GlassRaysSeen(words);
+    }
     if (half_made && half_asked && half_readback && ++half_frames >= 600) {
         std::array<u32, HalfSlots> now{};
         half_readback->Invalidate(0, sizeof(now));
@@ -1734,6 +2371,18 @@ void PointShadow::LogTargetMismatch(const std::array<VideoCore::Image*, 2>& targ
 
 void PointShadow::OnLightDraw(VideoCore::ImageId color0, VideoCore::ImageId color1,
                               const Inputs& inputs) {
+    if (PaneLightInventoryEnabled() && inputs.lights && inputs.count) {
+        const auto* pane = rt_shadow.ActiveLampPane();
+        if (pane && pane->request.id != pane_inventory_reported) {
+            if (!pane_inventory) {
+                pane_inventory = std::make_unique<PaneLightInventory>();
+            }
+            const auto depth = camera_motion.Depth();
+            const auto* image = depth ? texture_cache.TryGetImage(depth, 0) : nullptr;
+            pane_inventory->Add(inputs, camera_motion.PassMatrices(), depth,
+                                image ? image->image_uid : 0);
+        }
+    }
     ending_uncounted = false;
     redirect_draw = false;
     if (failed || !color0 || !color1 || !inputs.constants || !inputs.lights || inputs.count == 0 ||
@@ -1832,8 +2481,11 @@ void PointShadow::OnLightDraw(VideoCore::ImageId color0, VideoCore::ImageId colo
                                   pending_uid[1] == targets[1]->image_uid;
         // (An apart batch's pass always has the history words after the tiles.)
         const bool room = data.size() + words + TileWords * (tiles.size() + 1) +
-                              (apart || merged ? HistoryWords + LampTuneWordCount : 0) <=
-                          DataWords; // bbport (r41_lamp-shadows): and the tuning words
+                              (apart || merged
+                                   ? HistoryWords + LampTuneWordCount +
+                                         (glass_mode ? GlassLight::WordCount : 0u)
+                                   : 0u) <=
+                          DataWords; // Reserve the glass tail whenever Flush serializes it.
         const OwnImage& before = apart ? lamp[0] : snapshot[0];
         const bool same_size = before.width == width && before.height == height;
         if (same_targets && same_size && apart == can_apart && (merged || !one_tile_batches) &&
@@ -2232,6 +2884,7 @@ void PointShadow::TrackLamps(u32 end, bool blend, bool read, bool line) {
     line_spatial = 0; // bbport (r93_lamp-shadow-spatial)
     LampYoungLine(); // bbport (r103_lamp-young-pixels): a short line after the r42 line, only with the knob set
     LampMovingSmoothLine(); // bbport (r60c_moving-shadow-steps): a short line after r103's, only with the knob on
+    LampJitterLine(lamp_jitter); // bbport (r128a_lrt-moving-shadows): a short line after r60c's, only with the knob on
     LampLayersLine(); // bbport (r114_lamp-shadow-layers): a short line after the r42 line, with the knob set
     // bbport (r92_lamp-shadow-colour): BB_LAMP_SHADOW_COLOUR=1: a short line of its own after the r42
     // line, at its times (the slot runs keep 300 characters of a log line; the r42 line is longer
@@ -2250,6 +2903,10 @@ void PointShadow::Flush(bool animate_noise) {
     if (tiles.empty()) {
         return;
     }
+    if (actual_blocker && !actual_blocker->ended) {
+        ++actual_blocker->frame_flushes;
+    }
+    lamp_jitter.Latch(frame_index);
     const auto ids = pending;
     const auto uids = pending_uid;
     auto batch = std::move(tiles);
@@ -2297,8 +2954,45 @@ void PointShadow::Flush(bool animate_noise) {
     const bool batch_merged = merged;
     merged = false;
     // (An apart batch was begun for rays: the setting going off meanwhile does not drop it.)
-    const bool use_rays =
-        ray_pipeline && (batch_apart || RaysWanted()) && rt_shadow.PrepareScene();
+    auto* blocker_watch = static_cast<Blocker::SceneObservation*>(nullptr);
+    if (actual_blocker && ray_pipeline && batch_apart) {
+        if (actual_blocker->Attempt(frame_index)) {
+            if (!blocker_scene_watch) {
+                blocker_scene_watch = std::make_unique<Blocker::SceneObservation>();
+                blocker_scene_watch->lamp_witness = true;
+                blocker_scene_watch->textures = &texture_cache;
+            }
+            if (rt_shadow.TryWatchWindowScene(blocker_scene_watch.get())) {
+                blocker_watch = blocker_scene_watch.get();
+            } else {
+                actual_blocker->failure = "window-observer-conflict";
+                ReleaseBlockerScene();
+            }
+        } else if (actual_blocker->ended) {
+            ReleaseBlockerScene();
+        }
+    }
+    const bool use_rays = ray_pipeline && (batch_apart || RaysWanted()) &&
+        rt_shadow.PrepareScene(blocker_watch);
+    const auto prepared_scene = blocker_watch ? rt_shadow.Scene() : vk::AccelerationStructureKHR{};
+    std::optional<BlockerScope> blocker_scope;
+    if (blocker_watch) {
+        if (use_rays && blocker_watch->scene &&
+            blocker_watch->scene->serial == rt_shadow.WindowSceneSerial() &&
+            rt_shadow.LampSceneMatches(*blocker_watch, depth_id, depth.image_uid)) {
+            blocker_scope.emplace();
+            rt_shadow.UnwatchWindowScene(blocker_watch);
+            blocker_scope->observation = std::move(*blocker_watch);
+            blocker_scene_watch.reset();
+        } else {
+            const auto status = blocker_watch->status;
+            actual_blocker->failure = status == Blocker::SceneStatus::EarlierPreparationUnattested
+                ? "earlier-tlas-preparation-unattested"
+                : status == Blocker::SceneStatus::BytewiseReuseUnattested
+                ? "bytewise-tlas-reuse-unattested"
+                : status == Blocker::SceneStatus::Budget ? "scene-budget" : "no-ready-lamp-scene";
+        }
+    }
     if (!use_rays &&
         (batch_merged ||
          !BbSettings::Get().effects[BbSettings::EffectPointShadows].load(std::memory_order_relaxed))) {
@@ -2310,6 +3004,7 @@ void PointShadow::Flush(bool animate_noise) {
     // every pass): the tuning words go after the tile table, their place into the mode word.
     bool repair = false;
     u32 tune_at = 0;
+    bool glass_pass = false; // bbport (r130c_glass-lamp-light): this pass pushed the glass words with the flag ACTIVE
     // One pass a frame can use the history. While the lamps are drawn apart that is their pass, the
     // one that covers the screen: a small batch before it (a lamp quad that could not go apart)
     // does not take it.
@@ -2395,22 +3090,8 @@ void PointShadow::Flush(bool animate_noise) {
             std::printf("Ray traced lamps (r62f): view %u now (BB_LAMP_SHADOW_VIEW, live)\n", view_now);
         }
     }
-    // bbport (r87_live-flip-knobs): TOOL: BB_LAMP_SHADOW_CLEARANCE asked again at every pass (a live
-    // knob), so one running game can flip the blind sphere at the lamp; the rule of
-    // ReadLampShadowTune (not set or not a number: the default; 0.05-2)
-    {
-        static BbLiveKnobs::Knob<float> clearance{
-            "BB_LAMP_SHADOW_CLEARANCE", [](const char* text) -> float {
-                const float fallback = LampShadowTune{}.clearance_m;
-                if (text == nullptr || text[0] == 0) {
-                    return fallback;
-                }
-                char* end = nullptr;
-                const float value = std::strtof(text, &end);
-                return end != text && std::isfinite(value) ? std::clamp(value, 0.05f, 2.0f) : fallback;
-            }};
-        tune.clearance_m = clearance.Get();
-    }
+    // Refresh the base clearance before selecting this pass's radius.
+    tune.clearance_m = LampClearanceNow();
     tune.radius_m = LampSoftnessRadius(tune, softness);
     if (use_rays && tune.radius_m != told_radius_m) {
         told_radius_m = tune.radius_m;
@@ -2456,6 +3137,24 @@ void PointShadow::Flush(bool animate_noise) {
             data[tune_at] |= LampMovingEdgeBits(); // bbport (r101_lamp-moving-edge): 0 when off
             data[tune_at] |= LampTuneSpatialBit(pass_tune); // bbport (r93_lamp-shadow-spatial): bit 26
             data[tune_at] |= LampLayersBits(pass_tune.radius_m > 0.0f && LampHistoryFrames(pass_tune) > 0.0f); // bbport (r114_lamp-shadow-layers): bits 4-7, 18, 19, 30, 31; 0 when off
+            if (glass_mode) { // bbport (r130c_glass-lamp-light): the 16 tuning words end here; the glass words follow at word 16
+                if (data.size() != std::size_t(tune_at) + 16) {
+                    data.clear();
+                    return;
+                }
+                glass_pass = rt_shadow.GlassLightActive();
+                data.push_back(GlassLight::Flags(glass_pass, tune.colour) | // bbport (r131a_foliage-translucency): bit 8, the light through leaves is on
+                                    (foliage_mode && FoliageTranslucency::LightNow() ? FoliageTranslucency::LampFlagOn : 0u));
+                data.insert(data.end(), glass_words.begin(), glass_words.end());
+                rt_shadow.NoteGlassLightPass(glass_pass);
+            }
+            if (foliage_mode && !glass_mode) { // bbport (r131a_foliage-translucency): word 16, bit 8: the light through leaves is on (the FOLIAGE builds read it)
+                if (data.size() != std::size_t(tune_at) + 16) {
+                    data.clear();
+                    return;
+                }
+                data.push_back(FoliageTranslucency::LightNow() ? FoliageTranslucency::LampFlagOn : 0u);
+            }
         }
         if (int(repair) != std::exchange(repair_state, int(repair))) {
             std::printf("Ray traced lamps (r41): repair %s (experiment 35184372088832 %s)\n",
@@ -2542,6 +3241,8 @@ void PointShadow::Flush(bool animate_noise) {
         const float keep = repair ? LampHistoryFrames(pass_tune) : 0.0f;
         const bool blend = keep > 0.0f;
         const bool kept = blend || lamp_reuse;
+        const bool carries_jitter = lamp_jitter.Live() && blend && lamp_jitter.On() &&
+                                    LampJitterRoom(data.size() + HistoryWords, DataWords);
         u32 flags = blend ? HistoryWrite | HistoryBlend : lamp_reuse ? HistoryWrite : 0u;
         // bbport (r60_lamp-centred-window): the half-resolution pass splits only with its centred
         // build (HalfReady may have made the plain one)
@@ -2553,6 +3254,7 @@ void PointShadow::Flush(bool animate_noise) {
         // bbport (r48_lamp-softness): nor is one written at another lamp radius (the softness
         // changed): as across a camera cut, the pass starts again from this frame's rays.
         if (kept && history_fresh && history_blended == blend &&
+            lamp_jitter.Compatible(carries_jitter, history_jitter) &&
             history_radius_m == pass_tune.radius_m && last_valid && camera.valid && ok) {
             reproject = Multiply(last_view, camera.inv_view);
             // bbport (r42_lamp-soft): an averaged history is not read across a cut (the camera
@@ -2659,6 +3361,9 @@ void PointShadow::Flush(bool animate_noise) {
         auto tail = LampHistoryTail(pass_tune);
         tail[0] = std::bit_cast<u32>(keep);
         data.insert(data.end(), tail.begin(), tail.end());
+        pending_jitter = LampJitterAdd(data, history_at, DataWords, blend, lamp_jitter,
+                                      camera_motion.Jitter(),
+                                      (flags & HistoryRead) != 0 ? &history_jitter : nullptr);
         pending_view = camera.view;
         pending_proj = proj;
         pending_valid = camera.valid && ok;
@@ -2806,7 +3511,7 @@ void PointShadow::Flush(bool animate_noise) {
             data[tune_at] |= card_cap_bits << LampTuneCardCapShift;
         }
         if (counted) {
-            scheduler.Record([clear = std::exchange(card_counts_clear, false),
+            scheduler.Record([clear = std::exchange(card_counts_clear, false), words = card_words, // bbport (r131a_foliage-translucency)
                               counters = card_counts->Handle(),
                               readback = card_readback->Handle()](vk::CommandBuffer cmdbuf) {
                 if (clear) {
@@ -2815,7 +3520,7 @@ void PointShadow::Flush(bool animate_noise) {
                     EffectPass::MemoryBarrier(cmdbuf, Compute, vk::AccessFlagBits2::eShaderWrite,
                                               vk::PipelineStageFlagBits2::eTransfer,
                                               vk::AccessFlagBits2::eTransferRead);
-                    const vk::BufferCopy region{0, 0, CARD_LAMP_BUFFER_WORDS * sizeof(u32)}; // bbport (r62m): the book too
+                    const vk::BufferCopy region{0, 0, words * sizeof(u32)}; // bbport (r62m): the book too; (r131a): the foliage words
                     cmdbuf.copyBuffer(counters, readback, region);
                 }
                 EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eTransfer,
@@ -2840,7 +3545,7 @@ void PointShadow::Flush(bool animate_noise) {
     // The image is bound to every ray traced pass while the COLOUR builds are made (their layouts
     // have the binding).
     const u32 colour_flags = history_at != 0 ? data[history_at] : 0u;
-    const bool colour_pass = use_rays && colour_mode && repair && !card_bind &&
+    const bool colour_pass = use_rays && colour_mode && repair && (card_bind ? foliage_mode : (tune.colour || glass_mode)) && // bbport (r131a)
                              colour_image.width == width && colour_image.height == ColourParts * height &&
                              (colour_flags == 0u || (colour_flags & HistoryBlend) != 0);
     line_colour += colour_pass ? 1 : 0;
@@ -2860,7 +3565,9 @@ void PointShadow::Flush(bool animate_noise) {
     const vk::ImageView colour_view = use_rays && colour_mode ? *colour_image.view : vk::ImageView{};
     const vk::Image colour_vk_image = use_rays && colour_mode ? vk::Image(colour_image.image) : vk::Image{};
     const bool colour_lay_out = bool(colour_view) && !std::exchange(colour_laid_out, true);
-    EffectPass::Mark(card_bind ? 64 : 6, card_bind ? "point shadows (leaf cards)" : "point shadows");
+    // bbport (r130c_glass-lamp-light): a pass with the glass flag has its own row (key 131; 129 and 130 are t129c's and r129a's)
+    EffectPass::Mark(card_bind ? 64 : glass_pass ? 131 : 6,
+                     card_bind ? "point shadows (leaf cards)" : glass_pass ? "point shadows (glass light)" : "point shadows");
     if (batch_apart) {
         lamp_dirty = false; // the pass zeroes every lamp texel that holds light
         ++apart_passes;
@@ -2873,18 +3580,95 @@ void PointShadow::Flush(bool animate_noise) {
     // resolve at full resolution; the first half's trace, its resolve, the second half's trace and
     // its resolve at half resolution. Without the profiler, or a split, it is one part, as before.
     const bool own_resolve = split && (use_half ? bool(half_resolve_pipeline) : bool(resolve_pipeline));
+    vk::Pipeline probe_main{}, probe_resolve{};
+    bool probe_clear = false;
+    if (colour_probe && colour_pass && !card_bind && tune.view == 0) {
+        auto& probe = *colour_probe;
+        const auto& main = use_half ? probe.half : probe.full;
+        const auto& resolve = use_half ? probe.half_resolve : probe.full_resolve;
+        // Cap the counts, and use the original pipeline whenever a matching probe or staging is unavailable.
+        if (main && (!own_resolve || resolve) && probe.pending < ProbeSlots &&
+            probe.passes < ProbeMaxPasses && u64(width) * height <= (1u << 24)) {
+            probe_main = *main;
+            probe_resolve = own_resolve ? *resolve : vk::Pipeline{};
+            probe_clear = probe.passes++ == 0;
+        } else {
+            ++probe.skipped;
+        }
+    }
+    std::optional<std::array<u32, LAB_HEADER>> blocker_header;
+    if (blocker_scope) {
+        auto& s = *blocker_scope;
+        auto& probe = *actual_blocker;
+        const auto matrices = camera_motion.PassMatrices();
+        const auto& observed = *s.observation.scene;
+        s.stamp = {1, rt_shadow.WindowDiagnosticFrame(), observed.serial, observed.tlas_view, depth.image_uid};
+        s.frame = frame_index;
+        s.header[0] = frame_index + 1u;
+        s.size = {width, height};
+        s.reduced = reduced;
+        s.trigger = probe.sample.trigger;
+        const auto matched = s.observation.Match(s.stamp, rt_shadow.WindowSceneSerial(),
+            {matrices.view, matrices.inv_view}, matrices.proj, depth_id, depth.image_uid);
+        const bool supported = use_half && half_centred && split && with_answers && repair &&
+            history_at && (data[history_at] & HistoryBlend) && tune.view == 0 && !card_bind &&
+            !colour_mode && !glass_mode && !colour_pass && !glass_pass &&
+            (data[tune_at] & (LampTuneFlame | LampTuneFlameTall | LampLayersAllBits)) == 0;
+        const bool scene_bound = matrices.valid && matched.scene && prepared_scene &&
+            prepared_scene == rt_shadow.Scene() && camera_motion.Depth() == depth_id && depth_view &&
+            rt_shadow.LampSceneMatches(s.observation, depth_id, depth.image_uid);
+        const bool projected = supported && scene_bound && !reduced && s.Project(data, history_at, covered);
+        if (scene_bound) {
+            const auto& proof = s.observation;
+            std::printf("Lamp blocker (t195) frame=%u rt_frame=%llu serial=%llu write=%llu emitted=%u "
+                        "source=%s consumption=%s receivers=%s\n",
+                        frame_index, static_cast<unsigned long long>(s.stamp.frame),
+                        static_cast<unsigned long long>(s.stamp.generation),
+                        static_cast<unsigned long long>(proof.lamp_identity.write), proof.lamp_identity.emitted,
+                        proof.lamp_source == Blocker::LampSceneSource::NativeWrite
+                            ? "native-write" : "exact-bytewise",
+                        proof.lamp_via_earlier ? "earlier-preparation" : "immediate",
+                        projected ? "projected" : "not-admitted");
+        }
+        if (!supported || !probe.main || (own_resolve && !probe.resolve)) {
+            probe.failure = "unsupported-half-grey-trace-resolve";
+        } else if (!scene_bound) {
+            probe.failure = "scene-camera-depth-scope-mismatch";
+        } else if (!projected) {
+            probe.failure = reduced ? "depth-proxy-unattested" : "projected-receivers-outside-scope";
+        } else {
+            s.FindStock(data, table);
+            blocker_header = s.header;
+            probe.sample = std::move(s);
+            probe_main = *probe.main;
+            probe_resolve = own_resolve ? *probe.resolve : vk::Pipeline{};
+            probe.submitted = true;
+        }
+    }
+
+    if (use_rays && pane_inventory) {
+        auto& inventory = pane_inventory->frame;
+        const auto rt_scene = rt_shadow.GlassScene();
+        ++inventory.rt_passes;
+        inventory.camera_mismatch |= !rt_scene.this_frame || rt_scene.view != inventory.view;
+    }
     const int parts = split && GpuProfiler::Get() ? (use_half ? 4 : 2) : 0;
     auto record =
         [push, base_word = std::bit_cast<u32>(push.thickness_m), last_part = parts - 1, // bbport (r61)
-         resolve_pipe = own_resolve ? (use_half ? *half_resolve_pipeline : *resolve_pipeline) : vk::Pipeline{},
+         probing = bool(probe_main), probe_clear,
+         blocker_header,
+         resolve_pipe = probe_resolve ? probe_resolve
+                       : own_resolve ? (use_half ? *half_resolve_pipeline : *resolve_pipeline)
+                                     : vk::Pipeline{},
          resolve_pipe_layout = own_resolve ? (use_half ? *half_resolve_layout : *resolve_layout)
                                            : vk::PipelineLayout{},
          target_views, depth_view, sampler = *sampler, snap0 = *before[0].view,
          snap1 = *before[1].view, batch = std::move(batch), words = std::move(data),
          buffer = light_data->Handle(),
-         pipeline = card_full ? *card_ray_pipeline : use_rays ? *ray_pipeline : *pipeline, // (r63)
+         pipeline = !use_half && probe_main ? probe_main
+                  : card_full ? *card_ray_pipeline : use_rays ? *ray_pipeline : *pipeline, // (r63)
          layout = card_full ? *card_ray_layout : use_rays ? *ray_layout : *layout, use_rays,
-         scene = rt_shadow.Scene(), covered,
+         scene = blocker_header ? prepared_scene : rt_shadow.Scene(), covered,
          table, tile_count, history_prev, history_cur, history_cur_image,
          history_images, lay_out, clear_history,
          follow_prev, follow_cur, follow_images, follow_lay_out, // bbport (r52_follow-soft)
@@ -2893,12 +3677,15 @@ void PointShadow::Flush(bool animate_noise) {
          colour_view, colour_vk_image, colour_lay_out, // bbport (r92_lamp-shadow-colour)
          half_with_answers = with_answers && use_half && half_centred,     // bbport (r60)
          // bbport (r32_lamp-half): null unless this pass runs in two halves
-         half_pipe = card_half ? *card_half_pipeline : use_half ? *half_pipeline : vk::Pipeline{}, // (r63)
+         half_pipe = use_half && probe_main ? probe_main
+                   : card_half ? *card_half_pipeline : use_half ? *half_pipeline : vk::Pipeline{}, // (r63)
          half_pipe_layout = card_half ? *card_half_layout : use_half ? *half_layout : vk::PipelineLayout{},
          half_view = use_half ? *half_answers.view : vk::ImageView{},
          half_image = use_half ? vk::Image(half_answers.image) : vk::Image{},
          half_count_buffer = use_half ? half_counts->Handle() : vk::Buffer{},
-         half_read_buffer = use_half ? half_readback->Handle() : vk::Buffer{}, half_lay_out,
+         half_read_buffer = use_half ? half_readback->Handle() : vk::Buffer{},
+         half_bytes = half_words * sizeof(u32), // bbport (r130g_glass-light-forward): the counters copy's size
+         half_lay_out,
          half_count, half_clear](vk::CommandBuffer cmdbuf, int part) mutable {
             // bbport (r61_lamp-window-cost): part: -1 the whole pass; else one part of the split pass
             // (above). The first part lays out, clears and fills what the pass uses, as the whole pass
@@ -2991,6 +3778,19 @@ void PointShadow::Flush(bool animate_noise) {
                         cmdbuf.clearColorImage(follow_images[i], vk::ImageLayout::eGeneral, zero, ColorRange);
                     }
                 }
+                if (probe_clear) {
+                    constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+                    // The last frame may still be copying the same tail to a different staging slot.
+                    EffectPass::MemoryBarrier(cmdbuf, Transfer, vk::AccessFlagBits2::eTransferRead,
+                                              Transfer, vk::AccessFlagBits2::eTransferWrite);
+                    cmdbuf.fillBuffer(buffer, ProbeOffset, ProbeBytes, 0);
+                }
+                if (blocker_header) {
+                    cmdbuf.updateBuffer(buffer, ProbeOffset,
+                                        sizeof(*blocker_header), blocker_header->data());
+                    cmdbuf.fillBuffer(buffer, ProbeOffset + sizeof(*blocker_header),
+                                      BlockerBytes - sizeof(*blocker_header), 0);
+                }
                 for (u32 at = 0; at < words.size(); at += UpdateWords) {
                     const u32 count = std::min<u32>(UpdateWords, u32(words.size()) - at);
                     cmdbuf.updateBuffer(buffer, at * sizeof(u32), count * sizeof(u32), words.data() + at);
@@ -3003,7 +3803,9 @@ void PointShadow::Flush(bool animate_noise) {
                                      vk::AccessFlagBits2::eShaderWrite};
                 cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
             }
-            const vk::DescriptorBufferInfo lights{buffer, 0, words.size() * sizeof(u32)};
+            const vk::DescriptorBufferInfo lights{
+                buffer, 0, blocker_header ? ProbeOffset + BlockerBytes :
+                           probing ? ProbeOffset + ProbeBytes : words.size() * sizeof(u32)};
             const vk::DescriptorImageInfo depth_info{sampler, depth_view,
                                                      vk::ImageLayout::eGeneral};
             const vk::DescriptorImageInfo cur0{{}, target_views[0], vk::ImageLayout::eGeneral};
@@ -3216,7 +4018,7 @@ void PointShadow::Flush(bool animate_noise) {
                                      vk::AccessFlagBits2::eMemoryWrite};
                 cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &half_after});
                 if (half_count) { // to the host (OnFrameEnd reads it); later counting waits
-                    const vk::BufferCopy region{0, 0, HalfSlots * sizeof(u32)};
+                    const vk::BufferCopy region{0, 0, half_bytes}; // bbport (r130g_glass-light-forward): half_words * 4
                     cmdbuf.copyBuffer(half_count_buffer, half_read_buffer, region);
                     EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eCopy,
                                               vk::AccessFlagBits2::eTransferWrite |
@@ -3291,17 +4093,29 @@ void PointShadow::Flush(bool animate_noise) {
     if (parts == 0) {
         scheduler.RecordCrumb({.name = "Point shadows"},
                               [record = std::move(record)](vk::CommandBuffer cmdbuf) mutable { record(cmdbuf, -1); });
-        return;
-    }
-    // bbport (r61_lamp-window-cost): the parts in order, one closure shared by them (it holds the
-    // pass's words and tiles once); the marks are written where each part starts
-    const auto shared = std::make_shared<decltype(record)>(std::move(record));
-    for (int part = 0; part < parts; ++part) {
-        if (part > 0) {
-            EffectPass::Mark(part % 2 != 0 ? 61 : 6, part % 2 != 0 ? "point shadows: resolve" : "point shadows");
+    } else {
+        // The parts use one closure, so the renderer holds the words and tiles once.
+        const auto shared = std::make_shared<decltype(record)>(std::move(record));
+        for (int part = 0; part < parts; ++part) {
+            if (part > 0) {
+                EffectPass::Mark(part % 2 != 0 ? 61 : 6, part % 2 != 0 ? "point shadows: resolve" : "point shadows");
+            }
+            scheduler.RecordCrumb({.name = "Point shadows"},
+                                  [shared, part](vk::CommandBuffer cmdbuf) { (*shared)(cmdbuf, part); });
         }
-        scheduler.RecordCrumb({.name = "Point shadows"},
-                              [shared, part](vk::CommandBuffer cmdbuf) { (*shared)(cmdbuf, part); });
+    }
+    if (blocker_header) {
+        scheduler.Record([lights = light_data->Handle(), host = actual_blocker->readback->Handle()]
+                         (vk::CommandBuffer cmd) {
+            constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+            EffectPass::MemoryBarrier(cmd, Compute | Transfer,
+                                      vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+                                      Transfer, vk::AccessFlagBits2::eTransferRead);
+            cmd.copyBuffer(lights, host, vk::BufferCopy{ProbeOffset, 0, BlockerBytes});
+            EffectPass::MemoryBarrier(cmd, Transfer, vk::AccessFlagBits2::eTransferWrite,
+                                      vk::PipelineStageFlagBits2::eHost, vk::AccessFlagBits2::eHostRead);
+        });
+        actual_blocker->tick = scheduler.CurrentTick();
     }
 }
 

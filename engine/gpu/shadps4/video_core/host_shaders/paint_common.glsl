@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // bbport (r45_drawn-look): shared by the drawn look's passes (paint_prep.comp, paint_stats.comp,
-// paint_key.comp, paint_strokes.comp and paint_lock.comp, recorded by
+// paint_key.comp, paint_strokes.comp, paint_lock.comp and paint_ink.comp, recorded by
 // renderer_vulkan/vk_drawn_look.cpp). The look lays brush strokes ("dabs") on the scene's solid
 // surfaces. A dab belongs to a place in the world, not to a place on the screen: every pixel finds its dabs from its own world position with the frame's jitter
 // taken out, and nothing here depends on the frame's number. So a dab stays on its wall while

@@ -46,6 +46,17 @@ void TestKnob() {
     CHECK(!CardAlphaMisread("2")); // (r62_leaf-stage3)
     CHECK(CardAlphaMisread("3"));
     CHECK(CardAlphaMisread("on"));
+    // bbport (r131b_lrt-settings): the setting graphics_rt_foliage_shadows next to the variables (a variable set and not empty decides)
+    CHECK(EnvGiven("0") && EnvGiven("x") && !EnvGiven("") && !EnvGiven(nullptr));
+    CHECK(CardAlphaOf("0", 2) == CardAlphaOff);                                  // the variable "0" with setting 2: off
+    CHECK(CardAlphaOf(nullptr, 1) == CardAlphaLayers && CardAlphaOf(nullptr, 2) == CardAlphaLayers); // unset: the setting
+    CHECK(CardAlphaOf(nullptr, 0) == CardAlphaOff && CardAlphaOf("", 0) == CardAlphaOff);
+    CHECK(CardAlphaOf("", 2) == CardAlphaLayers);                                // an empty variable falls to the setting
+    CHECK(CardAlphaOf("x", 2) == CardAlphaOff && CardAlphaOf("3", 2) == CardAlphaOff);
+    CHECK(CardAlphaOf("1", 0) == CardAlphaUv && CardAlphaOf("2", 0) == CardAlphaLayers);
+    CHECK(CardLampsOf(nullptr, 1) && CardLampsOf(nullptr, 2) && !CardLampsOf(nullptr, 0));
+    CHECK(!CardLampsOf("0", 2) && CardLampsOf("1", 0) && CardLampsOf("", 1) && !CardLampsOf("", 0));
+    CHECK(!CardLampsOf("x", 2) && !CardLampsOf("11", 2) && !CardLampsOf("true", 1));
 }
 
 void TestSizes() {

@@ -441,16 +441,17 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "graphics_drawn_look_strength") {
         v.graphics_drawn_look_strength = Clamp(std::isfinite(f) ? f : DrawnLookStrengthDefault, 0.0f, 1.0f);
     } else if (key == "graphics_drawn_look_stroke_size") {
-        v.graphics_drawn_look_stroke_size =
-            Clamp(std::isfinite(f) ? f : 1.0f, DrawnLookStrokeSizeMin, DrawnLookStrokeSizeMax);
+        v.graphics_drawn_look_stroke_size = Clamp(std::isfinite(f) ? f : DrawnLookStrokeSizeDefault,
+                                                  DrawnLookStrokeSizeMin, DrawnLookStrokeSizeMax);
     } else if (key == "graphics_drawn_look_texture") {
-        v.graphics_drawn_look_texture = Clamp(std::isfinite(f) ? f : 1.0f, 0.0f, DrawnLookTextureMax);
+        v.graphics_drawn_look_texture =
+            Clamp(std::isfinite(f) ? f : DrawnLookTextureDefault, 0.0f, DrawnLookTextureMax);
     } else if (key == "graphics_drawn_look_outlines") {
         v.graphics_drawn_look_outlines = Clamp(std::isfinite(f) ? f : DrawnLookOutlinesDefault, 0.0f, 1.0f);
     } else if (key == "graphics_drawn_look_shadow_edges") {
         v.graphics_drawn_look_shadow_edges = Clamp(std::isfinite(f) ? f : 1.0f, 0.0f, 1.0f);
     } else if (key == "graphics_drawn_look_ink_world") {
-        v.graphics_drawn_look_ink_world = Clamp(std::isfinite(f) ? f : 0.0f, 0.0f, 1.0f);
+        v.graphics_drawn_look_ink_world = Clamp(std::isfinite(f) ? f : DrawnLookInkWorldDefault, 0.0f, 1.0f);
     } else if (key == "graphics_drawn_look_characters") {
         v.graphics_drawn_look_characters = Clamp(std::isfinite(f) ? f : DrawnLookCharactersDefault, 0.0f, 1.0f);
     } else if (key == "graphics_drawn_look_shadow_soft") {
@@ -458,8 +459,6 @@ void Set(Values& v, const std::string& key, const std::string& value) {
                                                   DrawnLookShadowSoftMin, DrawnLookShadowSoftMax);
     } else if (key == "graphics_drawn_look_quality") {
         v.graphics_drawn_look_quality = std::clamp(i, 0, 1);
-    } else if (key == "graphics_drawn_look_debug") {
-        v.graphics_drawn_look_debug = std::clamp(i, 0, DrawnLookDebugMax);
     } else if (key == "graphics_halation_strength") { // bbport (r109a_strength-settings-engine)
         v.graphics_halation_strength =
             Clamp(std::isfinite(f) ? f : HalationStrengthDefault, HalationStrengthMin, HalationStrengthMax);
@@ -469,12 +468,32 @@ void Set(Values& v, const std::string& key, const std::string& value) {
     } else if (key == "graphics_lamp_flicker_on_game_strength") {
         v.graphics_lamp_flicker_on_game_strength =
             Clamp(std::isfinite(f) ? f : LampFlickerOnGameDefault, LampFlickerStrengthMin, LampFlickerStrengthMax);
+    } else if (key == "graphics_water_caustics_sun_strength") { // bbport (r128b_lrt-caustics-water)
+        v.graphics_water_caustics_sun_strength =
+            Clamp(std::isfinite(f) ? f : WaterCausticsStrengthDefault, WaterCausticsStrengthMin, WaterCausticsStrengthMax);
+    } else if (key == "graphics_water_caustics_lamps_strength") {
+        v.graphics_water_caustics_lamps_strength =
+            Clamp(std::isfinite(f) ? f : WaterCausticsStrengthDefault, WaterCausticsStrengthMin, WaterCausticsStrengthMax);
+    } else if (key == "graphics_water_motion_strength") { // bbport (r130b_water-moves)
+        v.graphics_water_motion_strength =
+            Clamp(std::isfinite(f) ? f : WaterMotionStrengthDefault, WaterMotionStrengthMin, WaterMotionStrengthMax);
     } else if (key == "graphics_heat_haze_strength") { // bbport (r97e_heat-haze-option)
         v.graphics_heat_haze_strength =
             Clamp(std::isfinite(f) ? f : HeatHazeStrengthDefault, HeatHazeStrengthMin, HeatHazeStrengthMax);
     } else if (key == "graphics_interior_brightness") { // bbport (r99c_interior-default)
         v.graphics_interior_brightness =
             Clamp(std::isfinite(f) ? f : InteriorBrightnessDefault, InteriorBrightnessMin, InteriorBrightnessMax);
+    } else if (key == "graphics_blood_sheen") { // bbport (r128d_lrt-sheen-interior)
+        v.graphics_blood_sheen = Clamp(std::isfinite(f) ? f : BloodSheenDefault, BloodSheenMin, BloodSheenMax);
+    } else if (key == "graphics_rt_foliage_shadows") { // bbport (r131b_lrt-settings)
+        v.graphics_rt_foliage_shadows = std::clamp(i, RtFoliageOff, RtFoliageLampsSun);
+    } else if (key == "graphics_blood_sheen_tint") {
+        if (value != "0" && value != "1" && value != "2") {
+            std::printf("Settings: unknown graphics_blood_sheen_tint '%s' (expected 0, 1 or 2); red\n", value.c_str());
+        }
+        v.graphics_blood_sheen_tint = value == "0" ? 0 : value == "2" ? 2 : 1;
+    } else if (key == "graphics_foliage_translucency") { // bbport (r131a_foliage-translucency)
+        v.graphics_foliage_translucency = std::clamp(i, FoliageTranslucencyOff, FoliageTranslucencyBoth);
     } else if (key == "engine_previous_paths") { // bbport (r39_master-debug)
         v.engine_previous_paths = ZeroOrOne(key, value, false);
     } else if (const int debug = DebugSwitchOfKey(key); debug >= 0) { // bbport (r39_master-debug)
@@ -797,6 +816,9 @@ void Load() {
     v.startup_shadow_resolution = v.graphics_shadow_resolution;
     v.startup_local_shadow_resolution = v.graphics_local_shadow_resolution;
     v.startup_sun_far_shadows = v.graphics_sun_far_shadows; // bbport (r15_far-shadow-setting)
+    v.startup_rt_foliage_shadows = v.graphics_rt_foliage_shadows; // bbport (r131b_lrt-settings)
+    v.startup_blood_sheen = v.graphics_blood_sheen;
+    v.startup_foliage_translucency = v.graphics_foliage_translucency; // bbport (r131a_foliage-translucency)
     v.startup_object_motion_store = v.object_motion_store; // bbport (r37_menu-options)
     v.startup_engine_previous_paths = v.engine_previous_paths; // bbport (r39_master-debug)
     for (int d = 0; d < DebugSwitchCount; ++d) {
@@ -1047,13 +1069,18 @@ void Save() {
     put("graphics_drawn_look_characters", fixed(v.graphics_drawn_look_characters, 2));
     put("graphics_drawn_look_shadow_soft", fixed(v.graphics_drawn_look_shadow_soft, 2));
     put("graphics_drawn_look_quality", std::to_string(std::clamp(v.graphics_drawn_look_quality.load(), 0, 1)));
-    put("graphics_drawn_look_debug",
-        std::to_string(std::clamp(v.graphics_drawn_look_debug.load(), 0, DrawnLookDebugMax)));
     put("graphics_halation_strength", fixed(v.graphics_halation_strength, 2)); // bbport (r109a)
     put("graphics_lamp_flicker_strength", fixed(v.graphics_lamp_flicker_strength, 2));
     put("graphics_lamp_flicker_on_game_strength", fixed(v.graphics_lamp_flicker_on_game_strength, 2));
+    put("graphics_water_caustics_sun_strength", fixed(v.graphics_water_caustics_sun_strength, 2)); // bbport (r128b)
+    put("graphics_water_caustics_lamps_strength", fixed(v.graphics_water_caustics_lamps_strength, 2));
+    put("graphics_water_motion_strength", fixed(v.graphics_water_motion_strength, 2)); // bbport (r130b)
     put("graphics_heat_haze_strength", fixed(v.graphics_heat_haze_strength, 2)); // bbport (r97e)
     put("graphics_interior_brightness", fixed(v.graphics_interior_brightness, 2)); // bbport (r99c)
+    put("graphics_blood_sheen", fixed(v.graphics_blood_sheen, 2)); // bbport (r128d_lrt-sheen-interior)
+    put("graphics_rt_foliage_shadows", std::to_string(std::clamp(v.graphics_rt_foliage_shadows.load(), RtFoliageOff, RtFoliageLampsSun))); // bbport (r131b)
+    put("graphics_blood_sheen_tint", std::to_string(std::clamp(v.graphics_blood_sheen_tint.load(), BloodSheenTintMin, BloodSheenTintMax)));
+    put("graphics_foliage_translucency", std::to_string(std::clamp(v.graphics_foliage_translucency.load(), FoliageTranslucencyOff, FoliageTranslucencyBoth))); // bbport (r131a)
     put("engine_previous_paths", flag(v.engine_previous_paths)); // bbport (r39_master-debug)
     for (int d = 0; d < DebugSwitchCount; ++d) {
         put(DebugSwitches[d].key, flag(v.debug_switches[d]));

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <cmath>
 #include "lifter/lift_core.h"
+#include "shader_recompiler/runtime_info.h"
 #include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
 #include "bbport_wind_shelter.h" // bbport (r117_wind-shelter)
 #include "bbport_wind_hang.h" // bbport (r112_wind-more-things)
 #include "bbport_wind_twigs.h" // bbport (r89d_tree-twigs)
+#include "bbport_wind_lantern.h" // bbport (r112v_lantern-hangs)
 
 namespace Lifter {
 
@@ -81,8 +83,12 @@ void Lift_::DefineBaseTypes() {
     ptr_push_u32 = PtrType(u32(spv::StorageClass::PushConstant), t_u32);
     ptr_push_f32 = PtrType(u32(spv::StorageClass::PushConstant), t_f32);
     const std::array<u32, 14> members{t_f32, t_f32, t_f32, t_f32, t_v4u, t_v4u, t_v4u,
-                                      t_v4u, t_v4u, t_v4u, t_v2u, t_u32, t_u32, t_v4f};
-    const u32 member_count = in.tone_apply ? 14 : 13;
+                                      t_v4u, t_v4u, t_v4u, t_v2u, t_u32, t_u32,
+                                      in.foliage_mask ? t_u32 : t_v4f};
+    if (in.foliage_mask && (in.tone_apply || in.stage != Stage::Fragment || in.dual_source)) {
+        Fail("incompatible foliage mask fragment output");
+    }
+    const u32 member_count = in.tone_apply || in.foliage_mask ? 14 : 13;
     push_type = m.AddUniqueType(O(spv::Op::OpTypeStruct), std::span<const u32>(members.data(), member_count));
     m.Decorate(push_type, u32(spv::Decoration::Block));
     const std::array<u32, 14> offsets{0, 4, 8, 12, 16, 32, 48, 64, 80, 96, 112, 120, 124, 128};
@@ -872,6 +878,20 @@ void Lift_::Epilogue() {
     if (in.fragment_motion && !var_color[7]) {
         FragmentMotion();
     }
+    if (in.foliage_mask) {
+        constexpr u32 location = Shader::FoliageMaskOutput::Location;
+        if (var_color[location]) {
+            Fail("guest owns foliage mask location");
+        }
+        if (!var_foliage_mask) {
+            var_foliage_mask = OutputVar(t_f32, location, std::nullopt);
+        }
+        const u32 ptr = Emit(O(spv::Op::OpAccessChain), ptr_push_u32, Ty::None,
+                             {push_block, CU(Shader::FoliageMaskOutput::PushMember)});
+        const u32 value = Emit(O(spv::Op::OpLoad), t_u32, Ty::U32, {ptr});
+        const u32 tag = Emit(O(spv::Op::OpConvertUToF), t_f32, Ty::F32, {value});
+        EmitVoid(O(spv::Op::OpStore), {var_foliage_mask, tag});
+    }
     if ((in.stage == Stage::Vertex || in.stage == Stage::Domain) && (in.emulate_depth || in.clip_disable)) {
         if (!var_position) {
             Fail("position conversion without a position");
@@ -1196,6 +1216,7 @@ void Lift_::VertexSway() {
     // only, as the recompiler's EmitVertexSway (BbWindHang::HangDisplace in C++). Off: nothing of it is emitted.
     const bool hang_on = BbWindHang::KnobOnce().on;
     u32 hang = 0, top_ptr = 0, stored_top = 0;
+    u32 post_flag = 0, lantern_ht = 0; // bbport (r112v_lantern-hangs): a post word's flag and its lantern weight (for the proof tint)
     u32 ddx_all = ddx, ddz_all = ddz;
     if (hang_on) {
         namespace H = BbWindHang;
@@ -1215,7 +1236,32 @@ void Lift_::VertexSway() {
             const u32 post_height = Ext(GLSLstd450FMax, t_f32, Ty::F32, {ext, CF(H::PostExtMin)});
             const u32 post_below = Emit(O(spv::Op::OpFDiv), t_f32, Ty::F32, {hh, post_height});
             const u32 ht_post = clamp_f(FMul(FSub(CF(H::PostBelow), post_below), CF(1.0f / H::PostSpan)), zero, CF(1.0f));
-            ht = Select(post, ht_post, ht);
+            u32 ht_used = ht_post;
+            if (BbWindLantern::On()) { // bbport (r112v_lantern-hangs): the lantern's weight in place of the top fifth's (BbWindLantern::Weight in C++)
+                namespace BL = BbWindLantern;
+                // the slot's plan: the twigs' box keys hold the post's axis (the centre) and R0, R1 (the half widths), the top key the arm's lower edge
+                const auto key_lo = [&](u32 key) { return FSub(Emit(O(spv::Op::OpBitcast), t_f32, Ty::F32, {key}), CF(W::HeightBias)); };
+                const auto key_hi = [&](u32 key) { return FSub(CF(W::HeightBias), Emit(O(spv::Op::OpBitcast), t_f32, Ty::F32, {key})); };
+                const u32 lx_lo = key_lo(tk_x0);
+                const u32 lx_hi = key_hi(tk_x1);
+                const u32 lz_lo = key_lo(tk_z0);
+                const u32 lz_hi = key_hi(tk_z1);
+                const u32 lcx = FMul(CF(0.5f), FAdd(lx_lo, lx_hi));
+                const u32 lcz = FMul(CF(0.5f), FAdd(lz_lo, lz_hi));
+                const u32 lr0 = FMul(CF(0.5f), FSub(lx_hi, lx_lo));
+                const u32 lr1 = FMul(CF(0.5f), FSub(lz_hi, lz_lo));
+                const u32 ldx = FSub(FAdd(comp(wind_e, 2), rx), lcx);
+                const u32 ldz = FSub(FAdd(comp(wind_e, 3), rz), lcz);
+                const u32 lr = Ext(GLSLstd450Sqrt, t_f32, Ty::F32, {FAdd(FMul(ldx, ldx), FMul(ldz, ldz))});
+                const u32 lspan = Ext(GLSLstd450FMax, t_f32, Ty::F32, {FSub(lr1, lr0), CF(BL::SpanMin)});
+                const u32 lw_r = clamp_f(Emit(O(spv::Op::OpFDiv), t_f32, Ty::F32, {FSub(lr, lr0), lspan}), zero, CF(1.0f));
+                const u32 lw_o = clamp_f(FMul(FSub(CF(BL::OuterZero), lr), CF(1.0f / (BL::OuterZero - BL::OuterFull))), zero, CF(1.0f));
+                const u32 lw_v = clamp_f(FMul(FSub(hh, CF(BL::HookStill)), CF(1.0f / BL::HookSpan)), zero, CF(1.0f));
+                ht_used = FMul(FMul(lw_r, lw_o), lw_v);
+            }
+            ht = Select(post, ht_used, ht);
+            post_flag = post;
+            lantern_ht = ht_used;
         }
         const u32 hw = FMul(FMul(FMul(FMul(ht, ht), FSub(CF(3.0f), FMul(CF(2.0f), ht))), ramp), sc);
         const u32 push = scaled(at(region, u64(H::PushAt) * 4u), IOp(O(spv::Op::OpIAdd), IOp(O(spv::Op::OpIMul), view_index, CU(W::GustSamples)), i), 4);
@@ -1324,7 +1370,11 @@ void Lift_::VertexSway() {
         // every output attribute of a vertex with a hang word whose ramp is above 0 (a pushed one: the words that only
         // fill the keys have a ramp of 0) moves BbWindHang::ProofShare toward cyan (0, 1, 1); the twigs' proof tints yellow
         const u32 pushed = hang; // bbport (r112r_hang-bracket-judge): every vertex with the hang bit, whatever its ramp (r112m: only a ramp above 0)
-        const u32 share = Select(pushed, CF(BbWindHang::ProofShare), zero);
+        u32 share = Select(pushed, CF(BbWindHang::ProofShare), zero);
+        if (BbWindLantern::On()) { // bbport (r112v_lantern-hangs): a post's tint only where its vertex moves (weight above BbWindLantern::ProofMin)
+            const u32 lantern_moved = FCmp(O(spv::Op::OpFOrdGreaterThan), lantern_ht, CF(BbWindLantern::ProofMin));
+            share = Select(post_flag, Select(lantern_moved, CF(BbWindHang::ProofShare), zero), share);
+        }
         for (u32 p = 0; p < u32(var_param_out.size()); ++p) {
             if (!var_param_out[p]) {
                 continue;
@@ -1363,8 +1413,10 @@ void Lift_::VertexSway() {
         const u32 k_z1 = offer_key(FSub(CF(W::HeightBias), az));
         const auto lower = [&](u32 key, u32 stored_key) { return ICmp(O(spv::Op::OpULessThan), key, stored_key); };
         const auto either = [&](u32 a, u32 b) { return Emit(O(spv::Op::OpLogicalOr), t_bool, Ty::Bool, {a, b}); };
+        // bbport (r112v_lantern-hangs): a post word (PostBit) offers nothing to the box keys: the CPU wrote the post's plan there
+        const u32 twig_fin = BbWindLantern::On() ? Emit(O(spv::Op::OpLogicalAnd), t_bool, Ty::Bool, {fin, post_none}) : fin;
         const u32 offer_twig = Emit(O(spv::Op::OpLogicalAnd), t_bool, Ty::Bool,
-                                    {fin, either(either(lower(k_x0, tk_x0), lower(k_x1, tk_x1)), either(lower(k_z0, tk_z0), lower(k_z1, tk_z1)))});
+                                    {twig_fin, either(either(lower(k_x0, tk_x0), lower(k_x1, tk_x1)), either(lower(k_z0, tk_z0), lower(k_z1, tk_z1)))});
         const u32 twig_label = m.NewId();
         const u32 twig_merge = m.NewId();
         EmitVoid(O(spv::Op::OpSelectionMerge), {twig_merge, 0}, 2);

@@ -3,17 +3,21 @@
 
 #pragma once
 
+#include "video_core/renderer_vulkan/vk_foliage_mask.h"
+
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
 #include "common/recursive_lock.h"
 #include "engine/batch.h"
 #include "bbport_wind.h" // bbport (r82_wind-stage1)
 #include "bbport_wind_sway.h" // bbport (r89_wind-foliage-sway)
 #include "bbport_wind_game.h" // bbport (r122_game-wind-drive)
+#include "bbport_wind_game_particles.h" // bbport (r122b_game-particles-follow-wind)
 #include "video_core/renderer_vulkan/vk_wind_shelter.h" // bbport (r117_wind-shelter)
 #include "bbport_wind_hang.h" // bbport (r112_wind-more-things)
 #include "bbport_wind_twigs.h" // bbport (r89d_tree-twigs)
@@ -41,9 +45,15 @@
 #include "video_core/renderer_vulkan/vk_card_alpha.h" // bbport (r62_leaf-stage3)
 #include "video_core/renderer_vulkan/vk_heat_haze.h" // bbport (r97_heat-haze)
 #include "video_core/renderer_vulkan/vk_halation.h" // bbport (r95_halation)
+#include "video_core/renderer_vulkan/window_pane_cold.h"
 #include "video_core/renderer_vulkan/vk_test_world_at.h" // bbport (r120_test-camera-lookat, TOOL): BB_TEST_WORLD_AT
 #include "video_core/renderer_vulkan/vk_blood_sheen.h" // bbport (r100_blood-sheen)
+#include "video_core/renderer_vulkan/vk_glass_view.h" // bbport (r129a_glass-registry)
+#include "video_core/renderer_vulkan/vk_glass_clear.h" // bbport (r131c_cabinet-glass-clear)
+#include "video_core/renderer_vulkan/vk_sun_term_view.h" // bbport (t129c_sun-term-view)
 #include "video_core/renderer_vulkan/vk_glass_glint.h" // bbport (r86b_glass-visible)
+#include "video_core/renderer_vulkan/vk_foliage_glow.h" // bbport (r131a_foliage-translucency)
+#include "video_core/renderer_vulkan/vk_bottle_caustic.h"
 #include "video_core/renderer_vulkan/rt_glass_pick.h" // bbport (r86l_glint-pick-glass, TOOL)
 #include "video_core/renderer_vulkan/rt_glass_tri.h" // bbport (r86m_glint-pane-from-triangle, TOOL)
 #include "video_core/renderer_vulkan/vk_caustics.h" // bbport (r107_caustics)
@@ -65,6 +75,7 @@
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/ui_composition.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/ivy_material_probe.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -76,7 +87,21 @@ namespace Core {
 class MemoryManager;
 }
 
+namespace WorkflowProbe {
+struct DrawCommand;
+struct Renderer;
+struct ScissorQuery;
+}
+
 namespace Vulkan {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+namespace SewerBridge { struct PostDraw; }
+namespace BottleDisplay182 { struct Draw; }
+#endif
+namespace WindowPathProbe {
+enum class PaneOwnerGap : u8;
+struct ReceiverCapture;
+}
 
 class GraphicsPipeline;
 class Occlusion;
@@ -87,6 +112,28 @@ public:
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
+
+    [[nodiscard]] bool HasSewerReceiverWitness() const noexcept {
+        return bool(sewer_receiver);
+    }
+    void NoteSewerDepthBlockCopy(VideoCore::ImageId src_id, const VideoCore::Image& src,
+                                 VideoCore::ImageId dst_id, const VideoCore::Image& dst,
+                                 u64 bytes, u64 previous_dst_write, bool native);
+
+    std::string SewerJoinedCopyBefore(VideoCore::ImageId src_id, const VideoCore::Image& src,
+                                      VideoCore::ImageId dst_id, const VideoCore::Image& dst);
+    void SewerJoinedCopyAfter(const std::string& before, VideoCore::ImageId src_id,
+                              const VideoCore::Image& src, VideoCore::ImageId dst_id,
+                              const VideoCore::Image& dst, u64 bytes, bool product_wanted);
+    bool SewerReducedBeforeCopy(VideoCore::ImageId source, const VideoCore::Image& src,
+                                VideoCore::ImageId destination, const VideoCore::Image& dst, u64 bytes);
+    void SewerReducedFallbackCopy(VideoCore::ImageId source);
+    void SewerReducedAfterCopy(VideoCore::ImageId source, VideoCore::ImageId destination,
+                               const VideoCore::Image& dst, vk::ImageView sampled, vk::ImageView written);
+    [[nodiscard]] bool WantsNativeBedCopy(VideoCore::ImageId src_id) const;
+    void NoteNativeBedCopy(VideoCore::ImageId src_id, const VideoCore::Image& src,
+                           VideoCore::ImageId dst_id, const VideoCore::Image& dst, u64 bytes,
+                           u64 previous_dst_write);
 
     [[nodiscard]] Runtime& GetRuntime() noexcept {
         return runtime;
@@ -431,6 +478,10 @@ private:
     vk::Rect2D DrawScissor(u32 viewport) const;
     void EffectsOnFrameEnd();
     void WindOnFrameEnd(); ///< bbport (r82_wind-stage1): first in EffectsOnFrameEnd
+    /// bbport (r122b_game-particles-follow-wind): called only while BbWindParticles::On(), before a draw binds its
+    /// resources (vk_wind_game_particles.cpp): sets the push constant word (PushData::motion_param) the patched
+    /// particle vertex stage 4cd21a0f reads: the lean of this frame's wind for the particle pairs, else 0
+    void WindGameParticlesDraw(const GraphicsPipeline* pipeline, const Shader::Info* fragment);
     /// bbport (r89_wind-foliage-sway): a skinned draw of a pipeline with MotionVectors::Sway: its
     /// motion param word 7 (BbWindSway::PackWord; 0: no sway); the log lines at each frame end
     /// bbport (r89e_twigs-big-trees): small_palette 0 or 1 for a static cut-out candidate of the twigs
@@ -548,6 +599,10 @@ private:
     /// traced scene's counts before its frame end. Called only while surface_probe_on.
     void SurfaceProbeBlendedScene();
     void SurfaceProbeRtScene();
+    /// bbport (t70b_mirror-probe, TOOL): BB_REFLECT_PROBE_HIDE / BB_REFLECT_PROBE_RECT (only with
+    /// BB_SURFACE_PROBE=1, log only): the rectangle's readback (false, at a blended draw) and its lines (true,
+    /// at the frame end).
+    void SurfaceProbeRect(bool frame_end);
     const bool surface_probe_on = SurfaceProbeWanted(); ///< bbport (r64_surface-probe)
     const bool cloud_probe_on = CloudProbe::Wanted(); ///< bbport (r104_cloud-probe): TOOL
     /// bbport (r108_spark-probe, TOOL): BB_SPARK_PROBE=1 (read once at start, off by default) logs, a
@@ -567,10 +622,48 @@ private:
     const bool weapon_sparks_on = WeaponSparksWanted(); ///< bbport (r110_weapon-sparks)
     /// Lamps apart (vk_point_shadow.h): something that is not a draw may touch the light targets.
     void EffectsEndLampBatch();
+    void NoteWindowPaneDraw(const AmdGpu::Regs&, const GraphicsPipeline*, bool indexed, u32 first);
     void EffectsCaptureDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
-                            u32 index_offset);
+                            u32 index_offset, RtShadow::BottleDrawToken& bottle,
+                            RtShadow::ReflectionDrawToken& reflection,
+                            ReflectionDiscard::StockRole original_stock_role,
+                            vk::Pipeline& classified_stock);
     void EffectsBeforeTargets(const GraphicsPipeline* pipeline);
     void EffectsAfterTargets(const GraphicsPipeline* pipeline);
+    void LampPaneTargets(const GraphicsPipeline* pipeline, bool gbuffer);
+    bool LampPaneDraw(LampPaneProbe& probe, const AmdGpu::Regs& regs,
+                      const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset,
+                      const RtShadow::Draw& draw);
+    void LampPaneDepth(LampPaneProbe& probe);
+    bool LampMaterialSample(LampPaneProbe& probe, const RenderState& state,
+                            const struct LampMaterialDelivery& delivery, bool after);
+    bool SampleDrawRaw(struct DrawRawRead&, const RenderState&,
+                       const struct LampMaterialDelivery&, bool after);
+    void RecordDrawRaw(const std::array<VideoCore::Image*, 4>& images,
+                       std::span<const struct RawDrawPixel> samples, vk::Buffer buffer,
+                       const std::array<u64, 4>& offsets);
+    struct SewerReceiverProbe;
+    std::unique_ptr<SewerReceiverProbe> sewer_receiver;
+    friend class Caustics;
+    struct SewerJoinedDraw;
+    void NoteNativeBedDraw(const RenderState& state, const GraphicsPipeline& pipeline,
+                           bool ground, SewerJoinedDraw* joined);
+    void SewerReceiverFrameEnd();
+    void SewerReceiverGBufferChange();
+    void SewerReceiverWaterDraw(const RenderState&, const GraphicsPipeline*);
+    void SewerReceiverCopyReport();
+    bool SewerReceiverSample(const RenderState&, const struct LampMaterialDelivery&, bool after);
+    bool SewerReceiverApply(u64 frame, VideoCore::ImageId depth_id);
+    void SewerReceiverConsumer(u64 frame, VideoCore::ImageId depth_id, VideoCore::ImageId albedo_id,
+                               VideoCore::Image& depth, VideoCore::Image* albedo,
+                               vk::ImageView depth_view, vk::ImageView albedo_view,
+                               const ::BbCaustics::Push& push, const std::array<float, 12>& view,
+                               bool native);
+    bool SampleWindowOwner(const RenderState&, const struct LampMaterialDelivery&, bool after);
+    void NoteWindowOwnerTargets(const GraphicsPipeline*);
+    bool NoteWindowOwnerGap(WindowPathProbe::PaneOwnerGap kind);
+    void LogWindowOwnerGap(const char* kind, const char* identity);
+    void FinalWindowOwner(u64 direction_draw, u64 depth_uid, u64 depth_tick);
     void EffectsBlendedScene();
     void EffectsSceneComposite(const GraphicsPipeline* pipeline); // bbport (r45_drawn-look)
     void EffectsBeforeUpscaler(u64 compute_hash);
@@ -584,7 +677,19 @@ private:
     vk::Rect2D EffectTile(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                           u32 index_offset, u32 first_vertex) const;
     void EffectsAfterDraw(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed, u32 num_indices,
-                          u32 num_instances, u32 first_vertex);
+                          u32 num_instances, u32 first_vertex,
+                          const RtShadow::ReflectionDrawToken& reflection,
+                          const GraphicsPipeline& raster_pipeline, bool classified_stock_issued);
+    bool ReflectionStamp(const AmdGpu::Regs&);
+    bool ReflectionCapture(const AmdGpu::Regs&, const GraphicsPipeline&, const RtShadow::Draw&,
+                           u32 index_offset, RtShadow::ReflectionDrawToken&);
+    void ReflectionBlendedScene();
+    void ReflectionFrameEnd();
+    void ReflectionNativeBeforeDraw(ReflectionNativeProbe::Draw&);
+    void ReflectionNativeAfterDraw(const ReflectionNativeProbe::Draw&);
+    void ReflectionNativePoll();
+    void ReflectionNativeDestroy();
+    void ReflectionPollRequest();
     /// Sky dome seam/zenith correction before the dome draw; true when it resolved the inputs.
     bool SkyBeforeRendering(const AmdGpu::Regs& regs, const GraphicsPipeline* pipeline, bool is_indexed,
                             u32 index_offset, const PreparedDraw* prepared, bool inputs_resolved);
@@ -648,7 +753,8 @@ private:
     static void RunDrawPacket(void* rasterizer, const u8* packet, u32 size);
     struct RingBinding;
     void CollectRingBindings(const Shader::Info& stage, const PreparedDraw* prepared,
-                             boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out);
+                             boost::container::static_vector<RingBinding, Shader::NUM_BUFFERS>& out,
+                             u32* wall_reason);
     void PrintPipeStats();
     /// The registers of the draw being recorded: stage B's copy there, else Liverpool's.
     const AmdGpu::Regs& Regs() const;
@@ -929,6 +1035,9 @@ private:
     void BloodPoolProbeBefore(const GraphicsPipeline* pipeline, bool indirect, bool light);
     /// bbport (r100d_blood-pool-draws, TOOL): a probed draw's index range and textures once they are
     /// bound (vk_blood_pool_probe.cpp); called only while blood_pool_probe is made.
+    [[nodiscard]] BloodPoolProbe::FoliageFacts FoliageProbeFacts(
+        const GraphicsPipeline& pipeline, bool camera_gbuffer, bool indirect, bool is_indexed,
+        u32 index_offset);
     void BloodPoolProbeNote(const GraphicsPipeline* pipeline, bool indirect, bool is_indexed,
                             u32 index_offset);
     std::unique_ptr<DepthOfField> depth_of_field;
@@ -939,13 +1048,103 @@ private:
     /// bbport (r120_test-camera-lookat, TOOL): null until the first BB_TEST_WORLD_AT read (or BB_TEST_CAMERA=lookat:centre), then made
     /// (EffectsBeforeUpscaler) and kept; its hooks are null pointer tests.
     std::unique_ptr<TestWorldAt> test_world_at;
+    std::unique_ptr<WindowPathProbe::ReceiverCapture> window_receiver;
+    WindowPathProbe::ColdPaneWatch window_cold_pane;
+    void InitColdWindowPane();
+    void ExpireColdWindowPane();
+    void ArmWindowPane(WindowPathProbe::ReceiverCapture&, bool wait_for_natural);
+    bool window_receiver_enabled = false;
+    u32 window_receiver_generation = 0, window_receiver_last_request = 0;
+    void CaptureWindowReceiver(const AmdGpu::Regs&, u64 ps_hash);
+    void CaptureWindowDepth();
+    void PollWindowReceiver();
     /// bbport (r100_blood-sheen): made only with BB_BLOOD_SHEEN on (BloodSheen::Wanted), else
     /// null: its hooks are null pointer tests.
     std::unique_ptr<BloodSheen> blood_sheen;
+    /// bbport (r129a_glass-registry): made only with BB_GLASS_TABLE naming a valid entry (GlassRegistryRules::Load), else null:
+    /// the draw hook is one null pointer test. glass_view: also BB_GLASS_VIEW=1 or the live knobs file (GlassView::Wanted).
+    std::unique_ptr<GlassRegistry> glass_registry;
+    std::unique_ptr<GlassView> glass_view;
+    /// bbport (r131c_cabinet-glass-clear): BB_GLASS_CLEAR=1 or the live knobs file, with a valid registry (GlassClear::Wanted);
+    /// otherwise none is made and the hooks are null pointer tests.
+    std::unique_ptr<GlassClear> glass_clear;
+    /// bbport (t129c_sun-term-view, TOOL): made only with BB_RT_SUN_TERM_VIEW=1 or the live knobs file (SunTermView::Wanted), else
+    /// null: its hooks are null pointer tests.
+    std::unique_ptr<SunTermView> sun_term_view;
+    /// bbport (r129a_glass-registry): from DrawRecord, right before EffectsBeforeResources, only with glass_registry:
+    /// looks the draw up, counts a hit, sets DrawContext::glass_hit and, with the view on, records the SNAPSHOT.
+    void GlassRegistryDraw(const GraphicsPipeline* pipeline, bool is_indexed, u32 index_offset);
     /// bbport (r86b_glass-visible): made only with BB_GLASS_GLINT and BB_RT_GLASS on
     /// (GlassGlint::Wanted), else null: its hooks are null pointer tests. glint_pending: the
     /// pipeline of the pane draw EffectsCaptureDraw admitted, for its EffectsAfterDraw.
     std::unique_ptr<GlassGlint> glass_glint;
+    /// bbport (r131a_foliage-translucency): made only with the back-lit glow on (FoliageGlow::Wanted: BB_FOLIAGE_GLOW or the setting, with BB_RT_CARD_ALPHA=2
+    /// and BB_RT_CARD_LAMPS=1), else null: its hooks are null pointer tests.
+    std::unique_ptr<FoliageGlow> foliage_glow;
+    std::unique_ptr<BottleCaustic::Pass> bottle_caustic;
+    struct ReflectionProbe {
+        ReflectionProbe(const Instance& instance, Scheduler& scheduler,
+                        VideoCore::TextureCache& textures, Runtime& runtime)
+            : pass(instance, scheduler, textures, runtime) {}
+        ReflectionFirstHit::Pass pass;
+        std::optional<ReflectionFirstHit::Stamp> stamp;
+        std::optional<ReflectionFirstHit::Request> request;
+        u64 pass_serial{}, last_request{}, blended_pass{}, input_frame{};
+        u64 input_bytes{}, input_refused{}, source_attempts{}, bad_stamp{};
+        u32 knob_generation = ~u32{0};
+        u64 request_frame{};
+        bool tainted{};
+    };
+    std::unique_ptr<ReflectionProbe> reflection_probe;
+    struct ReflectionNativeSlot {
+        vk::Buffer buffer{};
+        VmaAllocation allocation{};
+        void* mapped{};
+        u64 bytes{}, tick{}, generation{}, serial{};
+        ReflectionNativeProbe::Key key{};
+        std::array<u32, ReflectionNativeProbe::MaxBindings> binding_bytes{};
+        bool confirmed{};
+    };
+    std::array<ReflectionNativeSlot, 8> reflection_native_slots{};
+    struct ReflectionNativePace {
+        u64 frame{}, phase{}, retry_until{}, retry_generation{};
+        u32 phase_used{}, total{}, retries{};
+        bool cap_logged{};
+    };
+    std::array<ReflectionNativePace, ReflectionNativeProbe::WitnessCount> reflection_native_pace{};
+    u64 reflection_native_serial{};
+    std::unique_ptr<FoliageMask> foliage_mask;
+    std::atomic<bool> foliage_collect{};
+    struct MaskReceivers {
+        FoliageMask::Key key{};
+        std::array<VideoCore::ImageId, 3> ids{};
+        std::array<vk::ImageView, 3> views{};
+        std::array<u64, 3> writes{};
+        std::array<VAddr, 3> starts{}, ends{};
+        std::array<float, 12> view{};
+        std::array<float, 4> projection{};
+        std::array<float, 2> jitter{};
+        u64 proxy_generation{};
+    } mask_receivers;
+    u64 mask_serial{}, mask_frame{}, mask_capture{}, mask_diag_started{};
+    bool mask_diagnostic{}, mask_diag_requested{}, mask_frame_started{}, mask_finished{};
+    u32 mask_draws{}, mask_tags{};
+    struct MaskWriterEvidence {
+        const char* guard{};
+        u32 subject{};
+        u64 observed{}, expected{};
+    } mask_writer_evidence;
+    void FoliageRefuseWriter(const char* guard, u32 subject = 0, u64 observed = 0, u64 expected = 0);
+    void FoliageCheckReceivers();
+    void FoliageWriter(VAddr address, u64 size,
+                       FoliageBoundary::Source source = FoliageBoundary::Source::NonDraw);
+    void FoliageObserveDraw(const GraphicsPipeline* pipeline, FoliageBoundary::Source source,
+                            bool tagged);
+    void FoliageFrameEnd();
+    bool FoliageClass(const GraphicsPipeline& pipeline, bool is_indexed, u32 index_offset);
+    const GraphicsPipeline* FoliageAttach(const GraphicsPipeline* pipeline, const RenderState& original,
+                                          RenderState& state, FoliageBoundary::Source source);
+    vk::ImageView FoliageDiagnosticView();
     const GraphicsPipeline* glint_pending = nullptr;
     /// bbport (r86i_glint-find-gbuffer): a pane drawn by the G-buffer (BB_GLASS_BOX_PANES): its glint waits
     /// for the lit scene (EffectsBlendedScene); the draw's pair and counts for the log; cleared at the frame end.
@@ -1194,6 +1393,28 @@ private:
     UiComposition::CleanShotFrame clean_shot_state;
     /// bbport: the scene depth of the frame before (SkipUncompiledDraw).
     VideoCore::ImageId previous_scene_depth{};
+    void Round2CaptureFrame(VideoCore::ImageId target);
+    void WorkflowFrameEnd();
+    void WorkflowNative(VideoCore::ImageId target);
+    WorkflowProbe::ScissorQuery WorkflowQueryDraw(const GraphicsPipeline* pipeline, const RenderState& state,
+                                                  const WorkflowProbe::DrawCommand& command, bool competing_probe,
+                                                  u32 sway_off_slot = 0, u32 capture_word = 0);
+    void WorkflowCopyIndex(const RenderState& state, u32 row);
+    std::unique_ptr<WorkflowProbe::Renderer> workflow;
+    struct Round2FrameReadbacks {
+        // A single atomic tracks count and VMA bytes at the same acquisition/release point.
+        // At most three 1080p staging buffers occupy the lower 60 bits.
+        static constexpr u64 CountUnit = 1ull << 60;
+        std::atomic<u64> live{0};
+    };
+    struct Round2FrameSeries {
+        u32 generation = ~0u, series = 0, remaining = 0, stride = 1, last_pick = 0, ordinal = 0;
+        u64 next_scene = 0;
+        bool long_series_used = false;
+        u32 peak_inflight = 0;
+        u64 peak_allocated_bytes = 0;
+        std::shared_ptr<Round2FrameReadbacks> inflight;
+    } round2_frames;
     std::unique_ptr<ObjectMotion> object_motion;
     bool gbuffer_draw = false;
     std::unique_ptr<HdrNative> hdr_native; // bbport: native HDR output (docs/hdr.md); before
@@ -1415,8 +1636,16 @@ private:
     struct RingBinding {
         u32 index;  ///< buffer resource of the stage
         u32 size;
-        u64 offset; ///< in the ring
+        u64 location; ///< Physical offset in ordinary builds, absolute allocation in observer builds.
         VAddr address;
+
+        u64 Offset() const {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            return location % ConstantRing::Capacity;
+#else
+            return location;
+#endif
+        }
     };
     /// Stage A: the newest draw pipe packet that reads guest memory, hashed per granule: 256 bytes
     /// for bindings up to 4 KiB, 16 KiB up to 256 KiB, 1 MiB above (a note costs a few granules,
@@ -1554,7 +1783,19 @@ private:
     bool SealedLookup(VAddr base, u64 size, const VideoCore::Buffer*& buffer, u64& offset);
     static constexpr u64 RangeBindKey = 0x52414e4745ull;
     u64 range_binds = 0, range_hits = 0, range_checked = 0, range_differ = 0;
+    unsigned ivy_material_attempts{};
+    bool ivy_material_recorded{};
+    void RecordIvyMaterial(const GraphicsPipeline& pipeline, const RenderState& state,
+                           const IvyMaterialProbe::Snapshot& draw);
+
     struct DrawContext {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        SewerBridge::PostDraw* shared_post{};
+#endif
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    BottleDisplay182::Draw* bottle_display_operands{};
+#endif
+        IvyMaterialProbe::Snapshot* ivy_material{};
         bool motion_draw = false;
         bool capture_draw = false;
         u64 motion_geometry{};
@@ -1580,13 +1821,32 @@ private:
         bool ui_additive = false;
         std::array<RingStage, Shader::MaxStageTypes> ring_stages{};
         u32 num_ring_stages = 0;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        u64 ring_packet_end{};
+#endif
         std::span<const AmdGpu::Buffer> packet_vsharps;
         std::span<const u64> packet_vkeys;
         std::span<const u64> packet_view_keys;
         u64 packet_index_key = 0;
         VertexBinds vertex_binds;
+        BloodPoolProbe::BoundIndex* blood_index = nullptr; // t178, direct draw scope
         IndexBind index_bind{};
         DrawInputs draw_inputs{};
+        ReflectionNativeProbe::Draw* reflection_native{};
+        u32 wall_stream_packet{}, wall_stream_reason{};
+        struct {
+            VideoCore::BufferCache::WallStreamProbe* receipt{};
+            vk::DescriptorBufferInfo descriptor{};
+            VAddr guest{};
+            u32 slot{}, adjust{}, write_index{};
+            bool origin5{}, checked{};
+        } wall_stream;
+        /// bbport (r129a_glass-registry): the registry entry of the draw being recorded, index + 1 (0: none); set by
+        /// GlassRegistryDraw only, so 0 while the registry is off; valid to the end of DrawRecord.
+        u8 glass_hit = 0;
+        /// bbport (r131c_cabinet-glass-clear): this draw is the cabinet's pane and goes into side images (set by GlassRegistryDraw,
+        /// false while no GlassClear is made); read by DrawRecord before the pass begins.
+        bool clear_draw = false;
         // bbport (r62_leaf-stage3): with card_bound_on, what the pixel shader's texture binding
         // of this draw found, image by image (a texture set hit: the set's entries; otherwise its
         // lookups, before any depth redirect), with the image uids, for NoteCardLayer. stage:

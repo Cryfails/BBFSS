@@ -71,6 +71,13 @@ float card_kept_lod = 0.0;
 // the cards passed that way (the lamp pass counts them and zeroes it).
 float card_skip_from = 1e30;
 uint card_housing_skips = 0u;
+// bbport (r128c_lrt-cutout-props) FEATURE (CARD_SUN_SELF is defined by rt_shadow.comp's CARDS builds only; the lamp builds do not define it, so
+// their SPIR-V is unchanged): card_skip_below: a card met at a hit nearer than this many metres along the ray is the pixel's own surface and is passed
+// untested (0: none); card_self_skips: the cards passed that way (the sun trace counts them and the pass zeroes nothing: one value a pixel).
+#ifdef CARD_SUN_SELF
+float card_skip_below = 0.0;
+uint card_self_skips = 0u;
+#endif
 float cardTexel(vec2 uv, uint layer, float lod, uint op) {
     if (card_dilate && lod <= 0.0 && (op == CARD_OP_GREATER || op == CARD_OP_GREATER_EQUAL)) {
         const vec4 g = textureGather(card_alpha, vec3(uv, float(layer)), 0);
@@ -209,6 +216,34 @@ CardResult cardTestLod(uint slot, uint primitive, vec2 bary, float lod) {
     return r;
 }
 
+#ifdef CARD_TRANSMIT
+// bbport (r131a_foliage-translucency) FEATURE (compiled only with CARD_TRANSMIT: every other build's SPIR-V is unchanged): a kept leaf texel
+// passes a share of the light, tinted by the leaf. The including shader defines CARD_BINDING_COLOUR (the colour layers: a sampler2DArray, rgb the
+// square root of the linear leaf colour, a 1 for a layer with colour, 0 for a mask texture: it passes grey). card_pass_share (T, the LUMA share
+// passed, 0: the texel blocks as before), card_pass_tint (0 grey to 1 all of the hue) and card_pass_floor (a product below it blocks) are set by
+// the caller before a ray; card_pass (the product of what the leaves passed) and the counts are reset by it too.
+layout(set = CARD_SET, binding = CARD_BINDING_COLOUR) uniform sampler2DArray card_colour;
+float card_pass_share = 0.0;
+float card_pass_tint = 1.0;
+float card_pass_floor = 0.02;
+vec3 card_pass = vec3(1.0);
+uint card_pass_n = 0u;       // leaves passed by this ray
+uint card_pass_grey = 0u;    // of them (or in many rays, until the caller zeroes it) without colour
+uint card_pass_floor_n = 0u; // 1 when this ray ended at the floor
+vec3 cardLeafPass(CardResult c) {
+    const uint layer = c.flags & CARD_ROW_LAYER_MASK;
+    const vec4 t = textureLod(card_colour, vec3(c.uv, float(layer)), 0.0);
+    if (t.a < 0.5) {
+        ++card_pass_grey;
+        return vec3(card_pass_share);
+    }
+    const vec3 leaf = t.rgb * t.rgb;
+    const float l = max(dot(leaf, vec3(0.299, 0.587, 0.114)), 1e-3);
+    const vec3 hue = min(leaf / l, vec3(3.0));
+    return card_pass_share * mix(vec3(1.0), hue, card_pass_tint);
+}
+#endif
+
 // The test at the layer's level 0 (the debug view's ray; bbport r63_leaf-stage4: the lamp rays
 // read the level of their footprint, cardTraceShadow).
 CardResult cardTest(uint slot, uint primitive, vec2 bary) {
@@ -267,6 +302,12 @@ CardRay cardTraceShadow(accelerationStructureEXT scene, uint flags, uint mask, v
                 ++card_housing_skips;
                 continue;
             }
+#ifdef CARD_SUN_SELF
+            if (t < card_skip_below) { // bbport (r128c_lrt-cutout-props) FEATURE: the pixel's own surface
+                ++card_self_skips;
+                continue;
+            }
+#endif
             const float texels = max(width0 + t * width_per_t, 0.0) * CARD_RAY_TEXELS_PER_M;
             const float lod = texels > 1.0 ? min(log2(texels), float(CARD_LAYER_MIPS - 1)) : 0.0;
             const uint hit_slot = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, false));
@@ -302,6 +343,18 @@ CardRay cardTraceShadow(accelerationStructureEXT scene, uint flags, uint mask, v
             r.zero_reads += c.alpha <= 0.0 ? 1u : 0u;
             r.partial_reads += c.status != CARD_KEPT && c.alpha > 0.0 ? 1u : 0u;
             if (c.status == CARD_KEPT) {
+                // bbport (r131a_foliage-translucency) FEATURE (CARD_TRANSMIT builds only): a kept texel passes light and the query goes on (not
+                // confirmed), unless what is left falls below the floor: then it blocks as before. The product is order independent.
+#ifdef CARD_TRANSMIT
+                if (card_pass_share > 0.0) {
+                    card_pass *= cardLeafPass(c);
+                    ++card_pass_n;
+                    if (max(max(card_pass.x, card_pass.y), card_pass.z) >= card_pass_floor) {
+                        continue;
+                    }
+                    ++card_pass_floor_n;
+                }
+#endif
                 r.how = CARD_RAY_KEPT;
                 block = true;
                 card_kept_slot = hit_slot; // bbport (r62m_cutout-name-blocker) TOOL

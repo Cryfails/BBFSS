@@ -182,7 +182,8 @@ int main() {
         assert(FillWeight(1.0f, 0.35f, 8) == 0.0f && FillWeight(1.0f, -1.0f, 8) == 0.0f);  // a wall or a side
         assert(Near(FillWeight(1.0f, 0.475f, 8), 0.5));                                      // the up gate's middle
         assert(Near(FilledLevelShare(1.0f, 1.0f, 1.0f, 8), 1.0) && FilledLevelShare(1.0f, 1.0f, 0.0f, 8) == 0.0f);
-        assert(Near(FilledLevelShare(1.0f, 0.65f, 1.0f, 8), 0.5) && Near(FilledLevelShare(1.0f, 1.0f, 0.5f, 8), 0.5));
+        // r129b_sheen-no-glow: the rim levels by fill squared x rim share (0.5 x 0.5 x 0.35 = 0.0875 at share 0.65)
+        assert(Near(FilledLevelShare(1.0f, 0.65f, 1.0f, 8), 0.0875) && Near(FilledLevelShare(1.0f, 1.0f, 0.5f, 8), 0.5));
         for (float f = 0.0f; f < 1.0f; f += 0.01f) { // never decreases as more of its surroundings is pool
             assert(FilledLevelShare(1.0f, f + 0.01f, 1.0f, 8) >= FilledLevelShare(1.0f, f, 1.0f, 8));
         }
@@ -214,7 +215,7 @@ int main() {
             assert(Near(rim2.g, body2.g * 0.5, 1e-4) && Near(rim2.r, body2.r * 0.5, 1e-4));
         }
         // k. bbport (r100k_sheen-no-hot-spot): the rim's squared falloff and the luminance ceiling.
-        assert(Near(PeakDefault, 0.7, 1e-6) && Near(PeakKnee, 0.5, 1e-6));
+        assert(Near(PeakDefault, 6.0, 1e-6) && Near(PeakKnee, 0.5, 1e-6)); // r129b: 6 times the dry scene's reference
         assert(SpecWeight(0.6f, 1.0f, false, 0.7f) == 0.6f && SpecWeight(1.0f, 1.0f, false, 0.0f) == 1.0f);
         assert(Near(SpecWeight(0.5f, 0.5f, true, 0.65f), 0.5 * 0.5 * 0.35));        // half fill at the rim: 0.0875
         assert(Near(SpecWeight(1.0f, 1.0f, true, 0.8f), 0.35));                      // full fill at the rim: the cap
@@ -241,6 +242,141 @@ int main() {
         assert(ReadPeak("0") == 0.0f && ReadPeak("1.5") == 1.5f && ReadPeak(" 2") == 2.0f);
         assert(ReadPeak("99") == MaxPeak && ReadPeak("-1") == 0.0f && ReadPeak("0.5x") == PeakDefault);
         assert(ReadPeak("nan") == PeakDefault && ReadPeak("inf") == PeakDefault);
+    }
+
+    // bbport (r128d_lrt-sheen-interior): ReadUsable, the ini strength and the default pick.
+    {
+        // neither draw nor rule set: the pool's draw and the albedo rule
+        const Knobs d = ReadUsable("1", nullptr, nullptr, 0.0f);
+        assert(d.strength == 1.0f && d.key_count == 1 && d.keys[0].vs == 0xc829ee58ull &&
+               d.keys[0].ps == 0xdbb222ebull && d.keys[0].indices == 0 && d.keys_bad == 0);
+        assert(d.rule == Rule::Albedo && !d.rule_bad && d.default_pick && !d.from_ini && CanPick(d));
+        assert(Flags(d, 0) == (FlagKeyed | FlagRuleAlbedo));
+        // one of them set, even empty: exactly Read
+        const Knobs e = ReadUsable("1", "", nullptr, 0.0f);
+        assert(e.key_count == 0 && e.rule == Rule::Draw && !e.default_pick && !CanPick(e));
+        const Knobs r = ReadUsable("1", nullptr, "draw", 0.0f);
+        assert(r.key_count == 0 && r.rule == Rule::Draw && !r.default_pick);
+        const Knobs a = ReadUsable("1", nullptr, "albedo", 0.0f);
+        assert(a.key_count == 0 && a.rule == Rule::Albedo && !a.default_pick);
+        const Knobs p = ReadUsable("1", "1:2", nullptr, 0.0f);
+        assert(p.key_count == 1 && p.keys[0].vs == 1 && p.rule == Rule::Draw && !p.default_pick);
+        assert(ReadUsable("1", "", "", 0.0f).key_count == 0 && !ReadUsable("1", "", "", 0.0f).default_pick);
+        // the sheen's own text, the test view and off
+        assert(ReadUsable("show", nullptr, nullptr, 0.0f).show && ReadUsable("show", nullptr, nullptr, 0.0f).default_pick);
+        assert(ReadUsable("2.5", nullptr, nullptr, 0.0f).strength == 2.5f);
+        for (const char* off : {static_cast<const char*>(nullptr), "", "0", "-1", "yes", "nan"}) {
+            const Knobs k = ReadUsable(off, nullptr, nullptr, 0.0f);
+            assert(k.strength == 0.0f && !k.default_pick && !k.from_ini); // nothing to pick for
+        }
+        // the ini strength: only when BB_BLOOD_SHEEN is unset or empty
+        const Knobs i = ReadUsable(nullptr, nullptr, nullptr, 2.0f);
+        assert(i.strength == 2.0f && i.from_ini && i.default_pick && i.key_count == 1 && !i.show);
+        assert(ReadUsable("", nullptr, nullptr, 2.0f).from_ini && ReadUsable("", nullptr, nullptr, 2.0f).strength == 2.0f);
+        assert(ReadUsable(nullptr, nullptr, nullptr, 0.1f).strength == MinStrength);
+        assert(ReadUsable(nullptr, nullptr, nullptr, 9.0f).strength == MaxStrength);
+        for (const float no : {0.0f, -1.0f, std::nanf(""), INFINITY}) {
+            const Knobs k = ReadUsable(nullptr, nullptr, nullptr, no);
+            assert(k.strength == 0.0f && !k.from_ini && !k.default_pick);
+        }
+        // set and not empty: the environment wins, 0 and text turn it off whatever the key says
+        assert(ReadUsable("3", nullptr, nullptr, 2.0f).strength == 3.0f && !ReadUsable("3", nullptr, nullptr, 2.0f).from_ini);
+        assert(ReadUsable("0", nullptr, nullptr, 2.0f).strength == 0.0f && !ReadUsable("0", nullptr, nullptr, 2.0f).default_pick);
+        assert(ReadUsable("off", nullptr, nullptr, 2.0f).strength == 0.0f);
+        assert(ReadUsable("show", nullptr, nullptr, 2.0f).show && !ReadUsable("show", nullptr, nullptr, 2.0f).from_ini);
+        // ini with a named draw: the draw is kept, no default taken
+        const Knobs n = ReadUsable(nullptr, "1:2", nullptr, 1.0f);
+        assert(n.from_ini && !n.default_pick && n.key_count == 1 && n.rule == Rule::Draw);
+        // Read itself is unchanged: nothing named, nothing picked
+        assert(!CanPick(Read("1", nullptr, nullptr)));
+        assert(IniStrength() == 0.0f);
+    }
+
+    // bbport (r129b_sheen-no-glow): the ceiling on the max channel relative to the dry scene, and the rim's levelling.
+    {
+        assert(Near(PeakDefault, 6.0, 1e-6) && Near(PeakFallback, 0.25, 1e-6) && MaxPeak == 64.0f && FlagRimFull == 64u);
+        assert(RefBase == Slots * SlotWords && RefSlotWords == 3u);
+        // the code: 64 steps a stop from 2^-16; a dry pixel's max channel counts, not its luminance
+        assert(RefCode(1.0f, 0.5f, 0.2f) == 1024u && RefCode(0.25f, 0.1f, 0.0f) == 896u && RefCode(0.0f, 0.0f, 0.0f) == 256u);
+        assert(RefCode(0.0f, 0.0f, 0.25f) == 896u && RefCode(1.0e9f, 0.0f, 0.0f) == 2047u);
+        assert(RefCode(1.0e-30f, 0.0f, 0.0f) == 256u);                          // never below RefMin
+        assert(RefUsable(0.0f, 1.0f, 2.0f) && !RefUsable(std::nanf(""), 0.0f, 0.0f) && !RefUsable(0.0f, INFINITY, 0.0f));
+        // the mean of the codes is the geometric mean of the max channels: 1 and 0.25 give 0.5
+        assert(RefMean(0u, 0u) == 0.0f && RefMean(12345u, 0u) == 0.0f);
+        assert(Near(RefMean(896u * 10u, 10u), 0.25, 1e-6) && Near(RefMean(1024u + 896u, 2u), 0.5, 1e-6));
+        // the ceiling: 0 when off, the fallback with no sample, PEAK x the reference else
+        assert(PeakOf(0.0f, 896u, 1u) == 0.0f && PeakOf(-1.0f, 896u, 1u) == 0.0f && PeakOf(0.0f, 0u, 0u) == 0.0f);
+        assert(PeakOf(6.0f, 0u, 0u) == PeakFallback && PeakOf(1.0f, 99u, 0u) == PeakFallback);
+        assert(Near(PeakOf(6.0f, 896u * 4u, 4u), 1.5, 1e-5) && Near(PeakOf(3.0f, 1024u * 7u, 7u), 3.0, 1e-5));
+        // a torch highlight on the film (red 3, green 0.3, blue 0.1) with the night ceiling 0.27: red at most 0.27, hue kept
+        {
+            const std::array<float, 3> hot = CapRgb({3.0f, 0.3f, 0.1f}, 0.27f);
+            assert(hot[0] <= 0.27f + 1e-5f && hot[0] > 0.26f);
+            assert(Near(hot[1] / hot[0], 0.1, 1e-5) && Near(hot[2] / hot[0], 0.1 / 3.0, 1e-5));
+            // the red highlight r100k let through: luminance 0.28 of red 1.0, under the old knee 0.35, now over the knee 0.135
+            const std::array<float, 3> red = CapRgb({1.0f, 0.09f, 0.03f}, 0.27f);
+            assert(red[0] < 0.27f && red[0] > 0.2f);
+            // a dark moonlit sheet is unchanged, so is anything with the ceiling off
+            const std::array<float, 3> sheet = CapRgb({0.03f, 0.005f, 0.004f}, 0.27f);
+            assert(sheet[0] == 0.03f && sheet[1] == 0.005f && sheet[2] == 0.004f);
+            const std::array<float, 3> off = CapRgb({3.0f, 0.3f, 0.1f}, 0.0f);
+            assert(off[0] == 3.0f && off[1] == 0.3f && off[2] == 0.1f);
+            // the max channel decides, whichever channel it is (green and blue as well as red)
+            assert(CapRgb({0.1f, 4.0f, 0.1f}, 0.27f)[1] <= 0.27f + 1e-5f && CapRgb({0.1f, 0.1f, 4.0f}, 0.27f)[2] <= 0.27f + 1e-5f);
+        }
+        float last = 0.0f;                                                       // monotonic in the max channel, never above the ceiling
+        for (float top = 0.0f; top < 40.0f; top += 0.01f) {
+            const float out = CapRgb({top, 0.0f, 0.0f}, 0.27f)[0];
+            assert(out >= last - 1e-6f && out <= 0.27f + 1e-5f && out <= top + 1e-6f);
+            last = out;
+        }
+        // the rim: the old levelling (the film weight alone) with rim_full, the new one else; deep inside the pool they agree
+        assert(Near(FilledLevelShare(1.0f, 0.65f, 1.0f, 8, true), 0.5) && Near(FilledLevelShare(1.0f, 1.0f, 1.0f, 8, true), 1.0));
+        assert(Near(FilledLevelShare(1.0f, 1.0f, 1.0f, 8), 1.0) && Near(FilledLevelShare(1.0f, 0.8f, 1.0f, 8), 0.35));
+        {
+            const float wet = FillWeight(0.65f, 1.0f, 8);                         // 0.5 at the rim: SpecWeight's w x wet x rim
+            assert(Near(FilledLevelShare(1.0f, 0.65f, 1.0f, 8), SpecWeight(wet, wet, true, 0.65f)));
+        }
+        for (float share = 0.0f; share <= 1.0f; share += 0.01f) {                // never above the old value, a rim keeps relief
+            assert(FilledLevelShare(1.0f, share, 1.0f, 8) <= FilledLevelShare(1.0f, share, 1.0f, 8, true) + 1e-6f);
+        }
+    }
+
+    // bbport (r130a_sheen-colour): the film colour knobs: parsing, the packed shares, the clear film, the redness.
+    {
+        assert(ReadTint(nullptr) == 1 && ReadTint("") == 1 && ReadTint("1") == 1 && ReadTint("0") == 0 && ReadTint("2") == 2);
+        assert(ReadTint("7") == 1 && ReadTint("x") == 1 && ReadTint(" 2 ") == 2 && ReadTint("20") == 1 && ReadTint("2x") == 1);
+        // bbport (r131b_lrt-settings): the tint variable (unset or empty: -1, the setting decides) and the setting rule
+        assert(ReadTintEnv(nullptr) == -1 && ReadTintEnv("") == -1 && ReadTintEnv("2") == 2 && ReadTintEnv("0") == 0);
+        assert(ReadTintEnv("x") == 1 && ReadTintEnv("7") == 1 && ReadTintEnv(" 2 ") == 2);
+        assert(TintOf(-1, 2) == 2 && TintOf(0, 2) == 0 && TintOf(-1, 9) == 2 && TintOf(-1, -4) == 0 && TintOf(2, 0) == 2);
+        static_assert(TintOf(-1, 1) == 1 && TintOf(0, 1) == 0 && TintOf(1, 2) == 1);
+        assert(ReadShare(nullptr) == 1.0f && ReadShare("") == 1.0f && ReadShare("x") == 1.0f && ReadShare("0.5x") == 1.0f);
+        assert(ReadShare("0") == 0.0f && ReadShare("0.25") == 0.25f && ReadShare(" 0.5 ") == 0.5f);
+        assert(ReadShare("7") == 1.0f && ReadShare("-3") == 0.0f && ReadShare("nan") == 1.0f);
+        assert(PackScales(1.0f, 1.0f) == 0xFFFFFFFFu && PackScales(0.0f, 1.0f) == 0xFFFF0000u);
+        assert(PackScales(1.0f, 0.0f) == 0x0000FFFFu && PackScales(0.0f, 0.0f) == 0u && PackScales(9.0f, -1.0f) == 0x0000FFFFu);
+        assert(FlagTintOff == 128u && FlagTintClear == 256u && Near(ClearRoot, 0.15, 1e-6));
+        // the clear film: grey at weight 1 (strength 1), untouched at weight 0, and it may go down
+        {
+            const SpecRoot grey = ClearSpec(0.3f, 0.1f, 0.05f, 1.0f, 1.0f);
+            assert(Near(grey.r, 0.15) && Near(grey.g, 0.15) && Near(grey.b, 0.15));
+            const SpecRoot none = ClearSpec(0.3f, 0.1f, 0.05f, 1.0f, 0.0f);
+            assert(none.r == 0.3f && none.g == 0.1f && none.b == 0.05f);
+            assert(ClearSpec(0.6f, 0.6f, 0.6f, 1.0f).r < 0.6f);
+        }
+        // WetSpec: the default is r100i's; tint_off is grey (the same root in all channels)
+        {
+            const SpecRoot tinted = WetSpec(0.1f, 0.1f, 0.1f, 1.0f);
+            assert(Near(tinted.r, 0.45 * 0.85) && Near(tinted.g, 0.45 * 0.35) && Near(tinted.b, 0.45 * 0.30));
+            const SpecRoot same = WetSpec(0.1f, 0.1f, 0.1f, 1.0f, 1.0f, false);
+            assert(same.r == tinted.r && same.g == tinted.g && same.b == tinted.b);
+            const SpecRoot untinted = WetSpec(0.1f, 0.1f, 0.1f, 1.0f, 1.0f, true);
+            assert(Near(untinted.r, 0.45) && Near(untinted.g, 0.45) && Near(untinted.b, 0.45));
+        }
+        // the redness: a moonlit highlight (blue at least red) has none, the red body most of it
+        assert(RedShare(0.3f, 0.35f, 0.45f) == 0.0f && RedShare(0.5f, 0.5f, 0.5f) == 0.0f);
+        assert(Near(RedShare(0.05f, 0.005f, 0.005f), 0.9) && RedShare(0.0f, 0.0f, 0.0f) == 0.0f && Near(RedShare(1.0f, 0.0f, 0.0f), 1.0));
     }
 
     std::puts("blood sheen: ok");

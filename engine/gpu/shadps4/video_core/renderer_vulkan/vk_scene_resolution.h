@@ -11,6 +11,9 @@
 #include "video_core/renderer_vulkan/scene_proxy_release.h"
 #include "video_core/renderer_vulkan/scene_resolution.h"
 #include "video_core/texture_cache/image.h"
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#include "video_core/renderer_vulkan/vk_post_proxy_proof.h"
+#endif
 
 namespace VideoCore { class TextureCache; }
 namespace Vulkan {
@@ -68,6 +71,20 @@ public:
         vk::ImageLayout layout;
         vk::ImageUsageFlags usage;
     };
+    struct SewerProxy {
+        Target target{};
+        vk::Extent3D extent{};
+        vk::Format format{};
+        vk::ImageAspectFlags aspects{};
+        bool valid{}, dirty{};
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+        u64 incarnation{};
+#endif
+    };
+    /// Inspect a previously returned proxy and (if supplied) its exact owned view.
+    [[nodiscard]] SewerProxy InspectSewerProxy(VideoCore::ImageId id, u64 uid,
+                                              vk::ImageView view = {}) const;
+    using SewerCopyViews = std::array<vk::ImageView, 2>;
     /// bbport: `cleared`: the pass clears all of the proxy (load op clear; a reduced pass has the
     /// proxy's size), so a proxy a native write dropped needs no fill first (experiment bit
     /// 1073741824: filled as before).
@@ -81,6 +98,16 @@ public:
     /// General and the destination of its last barrier covers this read with only reads declared
     /// since, no barrier is recorded (experiment 140737488355328 set: always, as Read()).
     Target ReadNext(VideoCore::ImageId, const VideoCore::ImageViewInfo&);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    // Replaces the single selected ordinary colour Read. The image receipt and its
+    // emitted transition stay separate from any later writes and scheduler/submit order.
+    Target ReadPostProxy(VideoCore::ImageId, const VideoCore::ImageViewInfo&,
+                         const PostProxyProof::Key&, PostProxyProof::Lease&,
+                         vk::PipelineStageFlags2 = vk::PipelineStageFlagBits2::eComputeShader,
+                         vk::AccessFlags2 = vk::AccessFlagBits2::eShaderRead);
+    PostProxyProof::BackingCheck CheckPostProxyBacking(const PostProxyProof::Lease&,
+                                                       const PostProxyProof::Key&, Target) const;
+#endif
     void NativeAccess(VideoCore::Image&, vk::AccessFlags2,
                       vk::ImageLayout = vk::ImageLayout::eUndefined);
     /// The proxy of `image` for sampling when it holds the current content (else nullopt: the
@@ -123,7 +150,8 @@ public:
     /// mapping of the resolve), without resolving the native depth image. `dst` ends as after
     /// Runtime::CopyImage: written through Runtime::Transit (layout, write_seq), GpuModified as
     /// the source, not Dirty. False (nothing recorded) when CanCopyDepthProxyToColor is false.
-    bool CopyDepthProxyToColor(VideoCore::Image& depth, VideoCore::Image& dst);
+    bool CopyDepthProxyToColor(VideoCore::Image& depth, VideoCore::Image& dst,
+                               SewerCopyViews* sewer_views = nullptr);
     /// bbport: why a whole-image copy of `src` into `dst` cannot be done between their proxies
     /// at the reduced size (nullptr: it can). Needs reduced targets, single-level single-sample
     /// colour images of one format and size that both have a level-0 proxy, and a source proxy
@@ -179,6 +207,9 @@ private:
         u64 uid = 0;
         u32 level = 0; ///< mip level of the native image this proxy stands for
         VideoCore::UniqueImage image;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        u64 post_proxy_incarnation{};
+#endif
         std::vector<std::pair<VideoCore::ImageViewInfo, vk::UniqueImageView>> views;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
         SceneResolution::Coherence state;
@@ -214,7 +245,17 @@ private:
     void CreateResampleResources();
     vk::Pipeline DepthToColorPipeline();
     void Transition(Entry&, vk::ImageAspectFlags, vk::ImageLayout,
-                    vk::PipelineStageFlags2, vk::AccessFlags2, bool discard = false);
+                    vk::PipelineStageFlags2, vk::AccessFlags2, bool discard = false
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                    , std::shared_ptr<const PostProxyProof::Trace>* post_trace = nullptr
+#endif
+                    );
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    Target ReadImpl(VideoCore::ImageId, const VideoCore::ImageViewInfo&, vk::PipelineStageFlags2,
+                    vk::AccessFlags2, const PostProxyProof::Key&, PostProxyProof::Lease*);
+    PostProxyProof::Binding SnapshotPostProxy(const Entry&, const VideoCore::Image&, Target,
+                                              const PostProxyProof::Key&) const;
+#endif
     u32 clear_calls = 0, clear_proxies = 0, clear_resolves_saved = 0; ///< bbport (r9_clear)
     const Instance& instance;
     Scheduler& scheduler;

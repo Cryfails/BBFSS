@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+// This define exists only while the private D302 patch is staged.
+#if defined(_WIN32) && !defined(BB_TEST_GUEST_PRECULL_VISITS_OFF) && !defined(BB_TEST_GUEST_PRECULL_VISITS)
+#define BB_TEST_GUEST_PRECULL_VISITS 1
+#endif
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +36,24 @@ enum : unsigned { kSavedRbx = 6, kSavedRbp, kSavedR12, kSavedR13, kSavedR14, kSa
 bool PrepareBranch(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
                    std::span<const std::uint8_t> expected, Callback callback,
                    std::span<const std::uint8_t> taken, std::size_t taken_offset);
+#ifdef BB_TEST_GUEST_PRECULL_VISITS
+// saved[-2] is guest RAX. The body layout adds 8 bytes before the YMM area for entry alignment.
+inline constexpr std::ptrdiff_t kPassiveRax = -2;
+inline constexpr std::ptrdiff_t kPassiveFlags = 80;
+inline constexpr std::ptrdiff_t kPassiveStack = 97;
+std::uint8_t* PreparePassiveObserver(Callback callback, std::uint64_t event, std::uint64_t resume,
+                                     bool entry);
+bool PrepareGatedEntryObserver(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
+                               std::span<const std::uint8_t> expected, Callback callback,
+                               std::uint64_t event, std::uint64_t gate_address);
+// Observe a position-independent guest block. Hook points and stack alignment are caller-pinned.
+// With a second event, bytes [before, after) execute between the two callbacks.
+bool PrepareGatedBodyObserver(Hook& hook, std::uint8_t* image, std::size_t size, std::size_t offset,
+                             std::span<const std::uint8_t> expected, Callback callback, std::uint64_t gate_address,
+                             std::uint64_t first_event, std::size_t before,
+                             std::uint64_t second_event = 0, std::size_t after = 0,
+                             std::uint8_t** between_return = nullptr);
+#endif
 std::uint8_t* OriginalStub(const Hook& hook);
 void Discard(Hook& hook);
 std::uint8_t* TailStub(Callback callback, std::uint64_t resume);

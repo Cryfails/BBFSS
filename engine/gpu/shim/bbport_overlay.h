@@ -33,6 +33,10 @@ u32 PadChords();
 
 bool MenuOpen();
 
+/// Camera mode ended (any thread, takes no lock): puts back the HUD that camera mode's H key hid and
+/// ends a freeze. Called with MouseCamera's lock held.
+void CameraModeEnded();
+
 void SetTextPrompt(bool active, const std::string& prompt, const std::string& text);
 
 }

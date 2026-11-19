@@ -28,9 +28,14 @@
 //                         0.25..4 (up to 1 the share of the way to the wet film; above 1 also a brighter
 //                         specular colour, root 0.45 * sqrt(strength), at most 0.65, tinted deep red); "show": strength 1
 //                         and the test view
+//                         bbport (r128d_lrt-sheen-interior): unset or empty, the lantern.ini key graphics_blood_sheen
+//                         (0..4, 0: off, read once at the start) gives the strength; set and not empty this wins
+//                         (0 or text there is off, whatever the key says)
 //   BB_BLOOD_SHEEN_DRAW   the keyed G-buffer draws: "vs:ps" (every draw of that hex pair) or
 //                         "vs:ps:N" (only its draws of N indices, decimal), at most MaxKeys, separated by
-//                         ';', ',' or spaces. No default: unset, only the albedo rule can pick
+//                         ';', ',' or spaces. bbport (r128d_lrt-sheen-interior): when neither this nor
+//                         BB_BLOOD_SHEEN_RULE is set (not even empty) the default is "c829ee58:dbb222eb", the
+//                         graveyard pool's own ground draw (with the albedo rule); one of the two set: no default
 //   BB_BLOOD_SHEEN_RULE   "draw" (or unset): every pixel a keyed draw wrote last; "albedo": of those
 //                         (or, with no key, of every G-buffer pixel) the dark red ones: linear red at
 //                         least RedMin, at least Ratio times green and blue, luminance (0.2126 r +
@@ -40,9 +45,23 @@
 //                         dimmed and reddened after the lighting (times the strength, at most 1); 0: that
 //                         pass does not run (the test view "show" never dims). Unset or other text:
 //                         the default.
-//   BB_BLOOD_SHEEN_PEAK   bbport (r100k): 0..8, default 0.7: the lit scene's luminance ceiling for the picked
-//                         pixels (a soft roll-off above half of it: a near light's highlight cannot blow
-//                         out); 0: no ceiling. Unset or other text: the default.
+//   BB_BLOOD_SHEEN_PEAK   bbport (r100k): 0..64, default 6: the lit scene's ceiling for the picked pixels (a soft
+//                         roll-off above half of it: a near light's highlight cannot blow out); 0: no ceiling.
+//                         bbport (r129b_sheen-no-glow): a MULTIPLE of the dry scene's reference (the geometric mean of the
+//                         max channel of the untagged pixels, measured on the GPU one frame late; 0.25 absolute
+//                         before the first), applied to the max channel (r100k: 0..8 absolute luminance, default 0.7).
+//                         Unset or other text: the default.
+//   BB_BLOOD_SHEEN_RIM_FULL bbport (r129b): a live test knob (live knobs header only; else 0): 1: the pool's rim
+//                         (gap-fill) pixels level their normal by the fill weight as r100h-r100k did; 0 or unset:
+//                         by their specular weight (fill squared times the rim share)
+//   BB_BLOOD_SHEEN_TINT   bbport (r130a): a live test knob (live knobs header only; else 1): 1, unset or other text: the
+//                         r100i red specular tint; 0: no tint (the same root in all channels, f0 0.20 grey); 2: clear film
+//                         (grey f0 0.0225, and the after-lighting dimming acts by the pixel's redness only)
+//   BB_BLOOD_SHEEN_GLOSS  bbport (r130a): a live test knob, 0..1, default 1: the share of the way the gloss goes to the
+//                         film's (0: the ground's own gloss)
+//   BB_BLOOD_SHEEN_LEVEL  0..1: normal levelling (0 keeps the ground's relief). Defaults to 0.25 in clear film and 1
+//                         in the other tint modes. A valid startup or live value overrides the default.
+//   BB_BLOOD_SHEEN_DARKEN is live as well (r130a, live knobs header only)
 // No Vulkan here: tests/test_blood_sheen.cpp builds it alone.
 
 #include <algorithm>
@@ -71,8 +90,14 @@ inline constexpr std::uint32_t FlagKeyed = BLOOD_SHEEN_FLAG_KEYED;
 inline constexpr std::uint32_t FlagRuleAlbedo = BLOOD_SHEEN_FLAG_RULE_ALBEDO;
 inline constexpr std::uint32_t FlagClear = BLOOD_SHEEN_FLAG_CLEAR;
 inline constexpr std::uint32_t FlagNormal = BLOOD_SHEEN_FLAG_NORMAL; ///< EDIT: the normal target is bound
+inline constexpr std::uint32_t FlagRimFull = BLOOD_SHEEN_FLAG_RIM_FULL;     ///< r129b EDIT: rim pixels level by the fill weight
+inline constexpr std::uint32_t FlagTintOff = BLOOD_SHEEN_FLAG_TINT_OFF;       ///< r130a EDIT: the specular target is untinted
+inline constexpr std::uint32_t FlagTintClear = BLOOD_SHEEN_FLAG_TINT_CLEAR;   ///< r130a EDIT: clear film; SHOW: dim by redness
+inline constexpr std::uint32_t FlagAutoGround = BLOOD_SHEEN_FLAG_AUTO_GROUND; ///< EDIT: default ground selector
 static_assert(Group == 8u && SlotWords == 8u);
-static_assert((FlagShow | FlagSlot | FlagKeyed | FlagRuleAlbedo | FlagClear | FlagNormal) == 63u);
+static_assert((FlagShow | FlagSlot | FlagKeyed | FlagRuleAlbedo | FlagClear | FlagNormal | FlagRimFull) == 127u);
+static_assert((FlagShow | FlagSlot | FlagKeyed | FlagRuleAlbedo | FlagClear | FlagNormal | FlagRimFull | FlagTintOff |
+               FlagTintClear | FlagAutoGround) == 1023u);
 inline constexpr std::uint32_t WordKeyed = BLOOD_SHEEN_WORD_KEYED, WordKept = BLOOD_SHEEN_WORD_KEPT;
 inline constexpr std::uint32_t WordLost = BLOOD_SHEEN_WORD_LOST, WordRule = BLOOD_SHEEN_WORD_RULE;
 inline constexpr std::uint32_t WordWet = BLOOD_SHEEN_WORD_WET;
@@ -91,6 +116,9 @@ static_assert(BLOOD_SHEEN_WET_GLOSS == 0.86 && BLOOD_SHEEN_WET_SPEC_ROOT == 0.45
 inline constexpr float TintR = float(BLOOD_SHEEN_TINT_R), TintG = float(BLOOD_SHEEN_TINT_G);
 inline constexpr float TintB = float(BLOOD_SHEEN_TINT_B);
 static_assert(BLOOD_SHEEN_TINT_R == 0.85 && BLOOD_SHEEN_TINT_G == 0.35 && BLOOD_SHEEN_TINT_B == 0.30);
+// bbport (r130a_sheen-colour): the clear film's specular root (grey, f0 0.0225).
+inline constexpr float ClearRoot = float(BLOOD_SHEEN_CLEAR_ROOT);
+static_assert(BLOOD_SHEEN_CLEAR_ROOT == 0.15);
 // bbport (r100e_blood-sheen-visible): the normal's flattening and the dimming, as the shader and the README name them.
 inline constexpr float NormalSmooth = float(BLOOD_SHEEN_NORMAL_SMOOTH);
 inline constexpr float DarkenRed = float(BLOOD_SHEEN_DARKEN_RED), DarkenOther = float(BLOOD_SHEEN_DARKEN_OTHER);
@@ -104,8 +132,15 @@ inline constexpr float FillSpec = float(BLOOD_SHEEN_FILL_SPEC); ///< r100j_sheen
 static_assert(BLOOD_SHEEN_FILL_SPEC == 0.35);
 inline constexpr float PeakDefault = float(BLOOD_SHEEN_PEAK_DEFAULT); ///< r100k: BB_BLOOD_SHEEN_PEAK's default
 inline constexpr float PeakKnee = float(BLOOD_SHEEN_PEAK_KNEE);       ///< r100k: the knee, as a share of the peak
-inline constexpr float MaxPeak = 8.0f;                                ///< r100k: the largest BB_BLOOD_SHEEN_PEAK
-static_assert(BLOOD_SHEEN_PEAK_DEFAULT == 0.7 && BLOOD_SHEEN_PEAK_KNEE == 0.5);
+inline constexpr float MaxPeak = 64.0f;                               ///< r100k: the largest BB_BLOOD_SHEEN_PEAK (r129b: 64)
+static_assert(BLOOD_SHEEN_PEAK_DEFAULT == 6.0 && BLOOD_SHEEN_PEAK_KNEE == 0.5 && BLOOD_SHEEN_PEAK_FALLBACK == 0.25);
+// bbport (r129b_sheen-no-glow): the dry-scene reference the ceiling is relative to (blood_sheen_layout.h has the words).
+inline constexpr float PeakFallback = float(BLOOD_SHEEN_PEAK_FALLBACK); ///< the absolute max-channel ceiling before a reference
+inline constexpr std::uint32_t RefBase = BLOOD_SHEEN_REF_BASE, RefSlotWords = BLOOD_SHEEN_REF_SLOT_WORDS;
+inline constexpr float RefBias = float(BLOOD_SHEEN_REF_BIAS), RefScale = float(BLOOD_SHEEN_REF_SCALE);
+inline constexpr float RefMaxCode = float(BLOOD_SHEEN_REF_MAX_CODE), RefMin = float(BLOOD_SHEEN_REF_MIN);
+static_assert(RefBase == Slots * SlotWords && RefSlotWords == 3u && BLOOD_SHEEN_REF_BIAS == 16.0 && BLOOD_SHEEN_REF_SCALE == 64.0);
+static_assert(BLOOD_SHEEN_REF_MAX_CODE == 2047.0 && BLOOD_SHEEN_REF_MIN == 0.000244140625);
 inline constexpr float NormalEdge = float(BLOOD_SHEEN_NORMAL_EDGE);
 // bbport (r100g_sheen-sheets): GLSL's smoothstep.
 inline float SmoothStep(float lo, float hi, float x) {
@@ -138,11 +173,16 @@ inline float FillWeight(float pool_share, float up, int near_hits) {
 }
 // bbport (r100h_sheen-liquid): the share of the way to world up of such a gap pixel (the weight already
 // holds the up gate): the film weight times mix(EDGE, 1, cover).
-inline float FilledLevelShare(float up, float pool_share, float strength, int near_hits) {
+// bbport (r129b_sheen-no-glow): times the fill weight once more and the rim's specular share (FILL_SPEC at the rim, 1 deep
+// inside the pool: RimSpecShare(true, share)), so the rim stones keep their relief; `rim_full` (BB_BLOOD_SHEEN_RIM_FULL):
+// the r100h-r100k value, the film weight alone.
+inline float FilledLevelShare(float up, float pool_share, float strength, int near_hits, bool rim_full = false) {
     const float cover = SmoothStep(float(BLOOD_SHEEN_COVER_LO), float(BLOOD_SHEEN_COVER_HI), pool_share);
     const float edge = float(BLOOD_SHEEN_NORMAL_EDGE);
-    return NormalSmooth * std::clamp(strength, 0.0f, 1.0f) * FillWeight(pool_share, up, near_hits) *
-           (edge + (1.0f - edge) * cover);
+    const float fill = FillWeight(pool_share, up, near_hits);
+    const float rim = FillSpec + (1.0f - FillSpec) * SmoothStep(float(BLOOD_SHEEN_FILL_HI), 1.0f, pool_share);
+    return NormalSmooth * std::clamp(strength, 0.0f, 1.0f) * fill * (edge + (1.0f - edge) * cover) *
+           (rim_full ? 1.0f : fill * rim);
 }
 static_assert(BLOOD_SHEEN_DARKEN_RED == 0.7 && BLOOD_SHEEN_DARKEN_OTHER == 0.4);
 static_assert(BLOOD_SHEEN_DARKEN_LUMA_LO == 0.1 && BLOOD_SHEEN_DARKEN_LUMA_HI == 0.6);
@@ -164,6 +204,8 @@ struct Knobs {
     bool rule_bad = false; ///< BB_BLOOD_SHEEN_RULE was other text (taken as "draw")
     float ratio = DefaultRatio, lum_max = DefaultLumMax;
     float darken = DefaultDarken; ///< BB_BLOOD_SHEEN_DARKEN, 0..1 (0: no dimming pass)
+    bool from_ini = false;     ///< bbport (r128d): the strength came from graphics_blood_sheen
+    bool default_pick = false; ///< bbport (r128d): the pool's own draw and the albedo rule are the defaults taken
 };
 
 /// BB_BLOOD_SHEEN's text: the strength (0: off) and the test view.
@@ -358,6 +400,34 @@ inline Knobs Read(const char* sheen, const char* draw, const char* rule) {
     return k;
 }
 
+// bbport (r128d_lrt-sheen-interior): the draw and the rule the pool was tested with (r100c/r100d probes, every
+// graveyard job since b52), taken when neither BB_BLOOD_SHEEN_DRAW nor BB_BLOOD_SHEEN_RULE is set.
+inline constexpr const char* DefaultDrawText = "c829ee58:dbb222eb";
+inline constexpr const char* DefaultRuleText = "albedo";
+
+/// bbport (r128d): the strength lantern.ini's graphics_blood_sheen gives (0: none), handed over once by the engine
+/// (BloodSheen::Wanted) before the first Load.
+inline float& IniStrength() {
+    static float strength = 0.0f;
+    return strength;
+}
+
+/// bbport (r128d): Read, plus the ini strength and the defaults. `sheen` set and not empty decides alone (0 or other
+/// text: off); else `ini` (finite and above 0, put into MinStrength..MaxStrength) gives the strength. `draw` and
+/// `rule` both nullptr (unset): the pool's draw and the albedo rule; one of them set, even empty: as Read.
+inline Knobs ReadUsable(const char* sheen, const char* draw, const char* rule, float ini) {
+    const bool env = sheen != nullptr && sheen[0] != '\0';
+    const bool from_ini = !env && std::isfinite(ini) && ini > 0.0f;
+    const bool defaults = draw == nullptr && rule == nullptr;
+    Knobs k = Read(env ? sheen : nullptr, defaults ? DefaultDrawText : draw, defaults ? DefaultRuleText : rule);
+    if (from_ini) {
+        k.strength = std::clamp(ini, MinStrength, MaxStrength);
+    }
+    k.from_ini = from_ini;
+    k.default_pick = defaults && k.strength > 0.0f;
+    return k;
+}
+
 /// BB_BLOOD_SHEEN_DARKEN's text: a number into 0..1; unset, empty or other text: the default.
 inline float ReadDarken(const char* text) {
     if (text == nullptr || text[0] == '\0') {
@@ -394,8 +464,8 @@ inline float ReadPeak(const char* text) {
 /// The knobs, read once.
 inline const Knobs& Load() {
     static const Knobs knobs = [] {
-        Knobs k = Read(std::getenv("BB_BLOOD_SHEEN"), std::getenv("BB_BLOOD_SHEEN_DRAW"),
-                       std::getenv("BB_BLOOD_SHEEN_RULE"));
+        Knobs k = ReadUsable(std::getenv("BB_BLOOD_SHEEN"), std::getenv("BB_BLOOD_SHEEN_DRAW"),
+                             std::getenv("BB_BLOOD_SHEEN_RULE"), IniStrength()); // bbport (r128d)
         k.darken = ReadDarken(std::getenv("BB_BLOOD_SHEEN_DARKEN"));
         return k;
     }();
@@ -441,12 +511,84 @@ inline Film Wet(float gloss, float root, float strength, float weight = 1.0f) {
 struct SpecRoot {
     float r = 0.0f, g = 0.0f, b = 0.0f;
 };
-inline SpecRoot WetSpec(float ground_r, float ground_g, float ground_b, float strength, float weight = 1.0f) {
+inline SpecRoot WetSpec(float ground_r, float ground_g, float ground_b, float strength, float weight = 1.0f,
+                        bool tint_off = false) { // r130a: tint_off = BB_BLOOD_SHEEN_TINT 0 (FlagTintOff)
     const float w = std::clamp(strength, 0.0f, 1.0f) * std::clamp(weight, 0.0f, 1.0f);
     const float root = std::min(WetSpecRoot * std::sqrt(std::max(strength, 1.0f)), SpecRootMax);
-    const float tr = root * TintR, tg = root * TintG, tb = root * TintB;
+    const float tr = root * (tint_off ? 1.0f : TintR), tg = root * (tint_off ? 1.0f : TintG),
+                tb = root * (tint_off ? 1.0f : TintB);
     return {std::max(ground_r, ground_r + (tr - ground_r) * w), ground_g + (tg - ground_g) * w,
             ground_b + (tb - ground_b) * w};
+}
+/// bbport (r130a_sheen-colour): BB_BLOOD_SHEEN_TINT's text: 0, 1 or 2 (spaces around it allowed); unset, empty or other text: 1.
+inline int ReadTint(const char* text) {
+    if (text == nullptr) {
+        return 1;
+    }
+    while (*text == ' ') {
+        ++text;
+    }
+    if (text[0] < '0' || text[0] > '2') {
+        return 1;
+    }
+    const char* end = text + 1;
+    while (*end == ' ') {
+        ++end;
+    }
+    return *end == '\0' ? text[0] - '0' : 1;
+}
+/// bbport (r131b_lrt-settings): BB_BLOOD_SHEEN_TINT as the variable half of the setting rule: unset or empty: -1 (the setting decides),
+/// else ReadTint (a variable that is set decides, also with text: 1).
+inline int ReadTintEnv(const char* text) {
+    return text == nullptr || text[0] == '\0' ? -1 : ReadTint(text);
+}
+/// The tint in force: the variable's (0..2) when it is set and not empty (env >= 0), else the setting graphics_blood_sheen_tint into 0..2.
+constexpr int TintOf(int env, int setting) {
+    return env >= 0 ? env : std::clamp(setting, 0, 2);
+}
+/// A finite share clamped to 0..1, or fallback if the text is absent or invalid.
+inline float ReadShareOr(const char* text, float fallback) {
+    if (text == nullptr || text[0] == '\0') {
+        return fallback;
+    }
+    char* end = nullptr;
+    const float value = std::strtof(text, &end);
+    if (end == text || !std::isfinite(value)) {
+        return fallback;
+    }
+    while (*end == ' ') {
+        ++end;
+    }
+    return *end == '\0' ? std::clamp(value, 0.0f, 1.0f) : fallback;
+}
+
+/// BB_BLOOD_SHEEN_GLOSS has the same default in every mode.
+inline float ReadShare(const char* text) {
+    return ReadShareOr(text, 1.0f);
+}
+
+constexpr float LevelOf(int tint, float override_share) {
+    return override_share >= 0.0f ? override_share : (tint == 2 ? 0.25f : 1.0f);
+}
+/// bbport (r130a_sheen-colour): the EDIT push word: the gloss share in the low 16 bits, the level share in the high 16, each
+/// a unorm16 (GLSL unpackUnorm2x16: x low half); (1, 1) is 0xFFFFFFFF, which unpacks to exactly (1.0, 1.0).
+inline std::uint32_t PackScales(float gloss, float level) {
+    const auto unorm = [](float v) {
+        return static_cast<std::uint32_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 65535.0f));
+    };
+    return unorm(gloss) | (unorm(level) << 16);
+}
+/// bbport (r130a_sheen-colour): a wet pixel's specular after the clear film (the shader's arithmetic): every channel moves to
+/// ClearRoot by the wet weight (strength, at most 1, times `weight`); it may go down.
+inline SpecRoot ClearSpec(float ground_r, float ground_g, float ground_b, float strength, float weight = 1.0f) {
+    const float w = std::clamp(strength, 0.0f, 1.0f) * std::clamp(weight, 0.0f, 1.0f);
+    return {ground_r + (ClearRoot - ground_r) * w, ground_g + (ClearRoot - ground_g) * w,
+            ground_b + (ClearRoot - ground_b) * w};
+}
+/// bbport (r130a_sheen-colour): the redness of a lit pixel (the SHOW shader's red_share): 0 for a light-coloured highlight
+/// (blue or green at least red), up to 1 for pure red.
+inline float RedShare(float r, float g, float b) {
+    return std::clamp((r - std::max(g, b)) / std::max(r, 1e-6f), 0.0f, 1.0f);
 }
 /// bbport (r100j_sheen-clean-rim): the share of the body's specular tint and gloss a made-wet pixel gets (the
 /// shader's arithmetic; multiply it into the weight given to Wet and WetSpec): 1 for a pixel that passes the
@@ -473,6 +615,42 @@ inline float PeakRoll(float luma, float peak) {
     const float knee = PeakKnee * peak;
     const float span = peak - knee;
     return luma <= knee ? luma : knee + span * (1.0f - std::exp(-(luma - knee) / span));
+}
+
+/// bbport (r129b_sheen-no-glow): a dry pixel's reference code (the shader's arithmetic): the log2 of its max channel (at
+/// least RefMin) on a scale of RefScale steps a stop from -RefBias, clamped to 0..RefMaxCode, truncated.
+inline std::uint32_t RefCode(float r, float g, float b) {
+    const float top = std::max(std::max(r, g), std::max(b, RefMin));
+    return static_cast<std::uint32_t>(std::clamp((std::log2(top) + RefBias) * RefScale, 0.0f, RefMaxCode));
+}
+/// A dry pixel is counted only when all three channels are finite (the shader skips a NaN or an Inf).
+inline bool RefUsable(float r, float g, float b) {
+    return std::isfinite(r) && std::isfinite(g) && std::isfinite(b);
+}
+/// The dry scene's reference of a show's slot: the geometric mean of the max channel, 2^(sum / n / RefScale - RefBias); 0 when
+/// n (the samples) is 0.
+inline float RefMean(std::uint32_t sum, std::uint32_t n) {
+    return n == 0 ? 0.0f : std::exp2(float(sum) / float(n) / RefScale - RefBias);
+}
+/// The ceiling (max channel) of a show: `rel` (BB_BLOOD_SHEEN_PEAK; 0: none, 0 out) times the reference of the other slot
+/// (sum, n); PeakFallback while that slot holds no sample.
+inline float PeakOf(float rel, std::uint32_t sum, std::uint32_t n) {
+    if (!(rel > 0.0f)) {
+        return 0.0f;
+    }
+    return n == 0 ? PeakFallback : rel * RefMean(sum, n);
+}
+/// A wet pixel's colour after the ceiling `peak` (> 0; else unchanged), the shader's arithmetic: the max channel through
+/// PeakRoll, the colour scaled by it (hue kept).
+inline std::array<float, 3> CapRgb(std::array<float, 3> rgb, float peak) {
+    const float top = std::max(rgb[0], std::max(rgb[1], rgb[2]));
+    if (peak > 0.0f && top > PeakKnee * peak) {
+        const float scale = PeakRoll(top, peak) / top;
+        for (float& c : rgb) {
+            c *= scale;
+        }
+    }
+    return rgb;
 }
 
 /// SHOW's dimming share of a pixel of luminance `luma` (the shader's arithmetic): `darken` where it is

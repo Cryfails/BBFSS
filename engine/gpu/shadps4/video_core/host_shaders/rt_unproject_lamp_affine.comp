@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) buffer Positions { vec4 p[]; } positions;
+layout(std430, set = 0, binding = 1) readonly buffer Referenced { uint bits[]; } referenced;
+
+layout(push_constant) uniform Constants {
+    vec4 legacy0;
+    vec4 legacy1;
+    vec4 legacy2;
+    vec4 relative0;
+    vec4 relative1;
+    vec4 relative2;
+    vec3 origin;
+    uint first;
+    uint count;
+    uint vertices;
+    float a;
+    float b;
+};
+
+// Consecutive finite values have consecutive keys. Both signed zeros have the same key.
+uint FloatKey(float value) {
+    const uint bits = floatBitsToUint(value);
+    return (bits & 0x80000000u) != 0u ? 0u - bits : bits ^ 0x80000000u;
+}
+
+bool ClipDepthMatches(vec4 clip) {
+    precise float expected = fma(a, clip.w, b);
+    const uint z = FloatKey(clip.z);
+    const uint expected_z = FloatKey(expected);
+    return !isnan(expected) && !isinf(expected) && max(z, expected_z) - min(z, expected_z) <= 1u;
+}
+
+vec3 AffinePosition(vec4 clip) {
+    precise vec3 world = vec3(dot(relative0, clip), dot(relative1, clip),
+                              dot(relative2, clip)) + origin;
+    return world;
+}
+
+void main() {
+    const uint id = gl_GlobalInvocationID.x;
+    if (id >= count) {
+        return;
+    }
+    const uint slot = id % vertices;
+    const vec4 clip = positions.p[first + id];
+    if ((referenced.bits[slot >> 5u] & (1u << (slot & 31u))) != 0u &&
+        clip.w > 0.0 && !any(isnan(clip)) && !any(isinf(clip)) && ClipDepthMatches(clip)) {
+        const vec3 world = AffinePosition(clip);
+        if (!any(isnan(world)) && !any(isinf(world))) {
+            positions.p[first + id] = vec4(world, 1.0);
+            return;
+        }
+    }
+    positions.p[first + id] = vec4(dot(legacy0, clip), dot(legacy1, clip), dot(legacy2, clip), 1.0);
+}

@@ -8,6 +8,8 @@
 #include <cstdio>
 
 #include "bbport_settings.h"
+#include "bbport_wind_game_particles.h" // bbport (r122b_game-particles-follow-wind)
+#include "shader_recompiler/native/froyok_composite.h"
 #include "video_core/host_shaders/gtao_frag.h"
 #include "video_core/host_shaders/gtao_hq_frag.h"
 #include "video_core/host_shaders/bloom_downsample_frag.h"
@@ -31,10 +33,6 @@ constexpr u32 CompositeLiftedChecksum = 0xa5e815fc;
 
 std::atomic<bool> gtao_active{false}, ssr_active{false}, composite_active{false};
 
-bool PatchSharpness(std::vector<u32>& spv) {
-    return GgxLobes::ScaleLightSharpness(spv, BbSettings::Get().startup_light_sharpness) != 0;
-}
-
 bool LobesWanted() {
     const auto& s = BbSettings::Get();
     return s.startup_local_ggx || s.startup_specular_aa || s.startup_env_ggx_tails;
@@ -45,25 +43,48 @@ bool SharpnessWanted() {
 }
 
 // PatchLobes then PatchSharpness; the module is scanned once unless the lobes rewrite it.
-bool PatchSpecular(std::vector<u32>& spv) {
+bool PatchSpecular(std::vector<u32>& spv, PatchReport* report) {
     const bool lobes_wanted = LobesWanted(), sharpness_wanted = SharpnessWanted();
     if (!lobes_wanted && !sharpness_wanted) {
         return false;
     }
     const auto& s = BbSettings::Get();
     auto index = SpirvIndex::Build(spv);
-    const bool lobed =
-        lobes_wanted &&
-        GgxLobes::Patch(spv, {s.startup_local_ggx, s.startup_specular_aa, s.startup_env_ggx_tails},
-                        index)
-            .Changed();
-    if (!sharpness_wanted) {
-        return lobed;
+    GgxLobes::Stats lobes{};
+    if (lobes_wanted) {
+        lobes = GgxLobes::Patch(spv, {s.startup_local_ggx, s.startup_specular_aa,
+                                     s.startup_env_ggx_tails}, index);
     }
-    if (lobed) {
-        index = SpirvIndex::Build(spv);
+    const bool lobed = lobes.Changed();
+    u32 sharpness = 0;
+    if (sharpness_wanted) {
+        if (lobed) {
+            index = SpirvIndex::Build(spv);
+        }
+        sharpness = GgxLobes::ScaleLightSharpness(spv, s.startup_light_sharpness, index);
     }
-    return GgxLobes::ScaleLightSharpness(spv, s.startup_light_sharpness, index) != 0 || lobed;
+    if (report) {
+        report->phong = lobes.phong;
+        report->blinn = lobes.blinn;
+        report->env = lobes.env;
+        report->filtered = lobes.filtered;
+        report->sharpness = sharpness;
+    }
+    return sharpness != 0 || lobed;
+}
+
+bool PatchLocalLights(std::vector<u32>& spv, u32 hash, const BbSettings::Values& settings,
+                      PatchReport* report) {
+    const auto unified = LocalLightUnify::Patch(spv, hash, settings.startup_uniform_local_light);
+    const auto falloff = LocalFalloff::Patch(spv, hash, settings.startup_local_inverse_square,
+                                            settings.startup_local_light_intensity,
+                                            settings.startup_local_light_core);
+    if (report) {
+        report->unified = unified.pairs;
+        report->standard_falloff = falloff.standard;
+        report->special_falloff = falloff.special;
+    }
+    return unified.Changed() || falloff.Changed();
 }
 
 bool Wanted(int effect) {
@@ -179,7 +200,37 @@ std::span<const u32> Replacement(const Shader::Info& info, const Shader::Profile
     return {};
 }
 
-std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<const u32> spv) {
+std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<const u32> spv,
+                                        PatchReport* report) {
+    const auto& settings = BbSettings::Get();
+    if (report) {
+        *report = {.options = {settings.startup_local_ggx, settings.startup_specular_aa,
+                               settings.startup_env_ggx_tails, settings.startup_uniform_local_light,
+                               settings.startup_local_inverse_square, settings.startup_light_sharpness,
+                               settings.startup_local_light_intensity, settings.startup_local_light_core}};
+    }
+    const auto note = [report](PatchBranch branch) {
+        if (report) {
+            report->branch = branch;
+        }
+    };
+    // bbport (r122b_game-particles-follow-wind): the game's particle vertex stage (the LS 4cd21a0f of the tessellation
+    // pipelines) gets the wind lean's offset (BB_WIND_GAME=1 only); a module the patch does not read stays as it is
+    if (info.pgm_hash == BbWindParticles::LocalHash && info.hw_stage != Shader::HwStage::Fragment &&
+        BbWindParticles::On()) {
+        std::vector<u32> patched(spv.begin(), spv.end());
+        if (BbWindParticles::PatchLocal(patched)) {
+            BbWindParticles::Count().patched.fetch_add(1, std::memory_order_relaxed);
+            note(PatchBranch::Particles);
+            return patched;
+        }
+        if (BbWindParticles::Count().declined.fetch_add(1, std::memory_order_relaxed) == 0) {
+            std::printf("Wind game particles (r122b): the particle vertex shader 4cd21a0f (%zu words) is not the "
+                        "module the patch reads; the game's shader stays as it is\n",
+                        spv.size());
+        }
+        return std::nullopt;
+    }
     if (info.hw_stage != Shader::HwStage::Fragment) {
         return std::nullopt;
     }
@@ -201,11 +252,13 @@ std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<cons
             return std::nullopt;
         }
         composite_active.store(true, std::memory_order_relaxed);
+        note(PatchBranch::SsrComposite);
         return std::vector<u32>(kSsrCompositeSpv.begin(), kSsrCompositeSpv.end());
     }
     if (info.pgm_hash == WaterHash && Wanted(BbSettings::EffectModernSsr)) {
         std::vector<u32> patched(spv.begin(), spv.end());
         if (PatchWater(patched)) {
+            note(PatchBranch::Water);
             return patched;
         }
         return std::nullopt;
@@ -213,7 +266,11 @@ std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<cons
     if (info.pgm_hash == Ggx::DirectionalHash) {
         auto ggx = DirectionalGgxModule(info.pgm_hash, true, spv);
         if (!ggx.empty()) {
-            PatchSharpness(ggx);
+            const u32 sharpness = GgxLobes::ScaleLightSharpness(ggx, settings.startup_light_sharpness);
+            if (report) {
+                report->sharpness = sharpness;
+            }
+            note(PatchBranch::DirectionalGgx);
             return ggx;
         }
     }
@@ -221,16 +278,12 @@ std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<cons
         std::vector<u32> patched(spv.begin(), spv.end());
         Pom::PatchPom(info.pgm_hash, true, patched);
         if (patched.size() != spv.size()) {
-            LocalLightUnify::Patch(patched, info.pgm_hash,
-                                   BbSettings::Get().startup_uniform_local_light);
-            LocalFalloff::Patch(patched, info.pgm_hash,
-                                BbSettings::Get().startup_local_inverse_square,
-                                BbSettings::Get().startup_local_light_intensity, BbSettings::Get().startup_local_light_core);
-            PatchSpecular(patched);
+            PatchLocalLights(patched, info.pgm_hash, settings, report);
+            PatchSpecular(patched, report);
+            note(PatchBranch::Pom);
             return patched;
         }
     }
-    const auto& settings = BbSettings::Get();
     const bool falloff_possible = LocalFalloff::Target(info.pgm_hash) &&
                                   (settings.startup_uniform_local_light ||
                                    settings.startup_local_inverse_square);
@@ -238,23 +291,36 @@ std::optional<std::vector<u32>> Patched(const Shader::Info& info, std::span<cons
         return std::nullopt;
     }
     std::vector<u32> lobes(spv.begin(), spv.end());
-    const bool unified = LocalLightUnify::Patch(lobes, info.pgm_hash,
-                                                BbSettings::Get().startup_uniform_local_light)
-                             .Changed();
-    const bool falloff = LocalFalloff::Patch(lobes, info.pgm_hash,
-                                             BbSettings::Get().startup_local_inverse_square,
-                                             BbSettings::Get().startup_local_light_intensity, BbSettings::Get().startup_local_light_core)
-                             .Changed();
-    const bool specular = PatchSpecular(lobes);
-    if (specular || falloff || unified) {
+    const bool local_lights = PatchLocalLights(lobes, info.pgm_hash, settings, report);
+    const bool specular = PatchSpecular(lobes, report);
+    if (specular || local_lights) {
+        note(PatchBranch::GenericSpecular);
         return lobes;
     }
     return std::nullopt;
 }
 
+bool CanComposeFoliagePatch(const PatchReport& original, const PatchReport& masked) {
+    return original == masked && original.branch == PatchBranch::GenericSpecular &&
+           !original.unified && !original.standard_falloff && !original.special_falloff &&
+           !original.phong && !original.env && original.blinn == u32(original.options.specular_aa) &&
+           original.filtered == original.blinn &&
+           original.sharpness == u32(original.options.sharpness > 1.0f);
+}
+
 bool KeepRecompiled(const Shader::Info& info) {
+    // bbport (r122b_game-particles-follow-wind): the patch reads the recompiler's module of the particle vertex stage
+    if (info.pgm_hash == BbWindParticles::LocalHash && info.hw_stage != Shader::HwStage::Fragment &&
+        BbWindParticles::On()) {
+        return true;
+    }
     if (info.hw_stage != Shader::HwStage::Fragment) {
         return false;
+    }
+    // The Froyok composite's blend exists only in the recompiler's IR (native/froyok_composite.h);
+    // the lifter would emit the game's original bloom addition for the same shader.
+    if (info.pgm_hash == Shader::Native::FroyokCompositeHash && info.uses_froyok_bloom) {
+        return true;
     }
     return ((info.pgm_hash == SsrCompositeHash || info.pgm_hash == WaterHash) &&
             Wanted(BbSettings::EffectModernSsr)) ||

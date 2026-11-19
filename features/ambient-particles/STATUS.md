@@ -1,5 +1,15 @@
 # Ambient particles and weapon sparks
 
+## Development snapshot, 2026-11-19
+
+PRT 30%. Feature work is paused.
+
+- Verified scope. Dust, ash and embers render in the scoped 4K tests.
+- Open scope. Many nearby flames, HDR and frame generation still need combined validation.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 50%
 
 Dust, ash and embers float in the air, lit by the scene and by lamps. The owner likes the particles. The rating is held down by stage 3 (moths around lamps, not started), by the indoor fix that nobody has judged yet, and by the weapon sparks, which are only a modest extra.
@@ -51,3 +61,6 @@ No fork branch yet. The branch plan names visual/ambient-particles.
 - graveyard-blood: outdoors, wind drift and embers.
 - dream-house: with density 0 it must do nothing.
 - lamp-test-spot: transform button press for the sparks.
+
+
+</details>

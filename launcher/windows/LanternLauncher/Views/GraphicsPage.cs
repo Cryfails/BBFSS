@@ -174,6 +174,8 @@ namespace BloodborneLauncher.Views
                 L.T("Off adds no indirect lighting. Medium is screen-space indirect light with a single bounce. High uses screen-space radiance probes for the diffuse bounce and rough specular reflections and costs more. Ultra traces indirect light against the scene, needs a GPU with ray tracing and is the most expensive. Takes effect on the next game start."),
                 Choices.GiQualities, () => Choices.GiMode(Ini), v => Choices.SetGiMode(Ini, v), changed: UpdatePerformance);
             IniCombo(SymbolRegular.Lightbulb24, L.T("Motion blur quality"), L.T("Applied when the game starts"), Choices.MotionBlurQuality, "graphics_motion_blur_quality");
+            ComboRow(SymbolRegular.Lightbulb24, L.T("Bloom quality"), L.T("Applied when the game starts"), Choices.BloomQuality,
+                () => Ini.Get(Choices.BloomQualityKey, Choices.BloomQualityFallback), v => Ini.Set(Choices.BloomQualityKey, v));
             IniSlider(SymbolRegular.Lightbulb24, L.T("Indirect lighting strength"), 0, 12, "graphics_gi_strength", fallback: 1.5);
             IniSlider(SymbolRegular.Lightbulb24, L.T("Reflection strength"), 0, 3, "graphics_ssr_intensity");
             IniSlider(SymbolRegular.Lightbulb24, L.T("Volumetric sunlight strength"), 0, 3, "graphics_volumetric_intensity");
@@ -186,6 +188,18 @@ namespace BloodborneLauncher.Views
             StrengthSlider(SymbolRegular.Lightbulb24, L.T("Flicker strength on already flickering lamps"), 1, "graphics_lamp_flicker_on_game_strength", 0);
             // r97e: the heat haze, off by default (0); the in-game menu has the same slider, live.
             StrengthSlider(SymbolRegular.Lightbulb24, L.T("Heat haze"), 2, "graphics_heat_haze_strength", 0);
+            // r128b: the water caustics, off by default (0); the in-game menu has the same sliders, live.
+            StrengthSlider(SymbolRegular.Lightbulb24, L.T("Water caustics from lamps"), 4, "graphics_water_caustics_lamps_strength", 0);
+            StrengthSlider(SymbolRegular.Lightbulb24, L.T("Water caustics from the sun and moon"), 4, "graphics_water_caustics_sun_strength", 0);
+            // r131b: the water motion (live) and the blood sheen strength (read at the start), the ray traced foliage shadows
+            // (applied at the start) and the blood sheen colour (live); the in-game menu has the same rows.
+            StrengthSlider(SymbolRegular.Lightbulb24, L.T("Water motion"), 4, "graphics_water_motion_strength", 0);
+            StrengthSlider(SymbolRegular.Lightbulb24, L.T("Blood sheen"), 4, "graphics_blood_sheen", 0);
+            IniCombo(SymbolRegular.Lightbulb24, L.T("Ray traced foliage shadows"), L.T("Applied when the game starts"), Choices.RtFoliageShadows, "graphics_rt_foliage_shadows");
+            IniCombo(SymbolRegular.Lightbulb24, L.T("Blood sheen colour"), null, Choices.BloodSheenTint, "graphics_blood_sheen_tint");
+            // r131b: end (a later row anchors here)
+            // r131a: the foliage translucency (applied at the start; needs the ray traced foliage shadows above); the in-game menu has the same row.
+            IniCombo(SymbolRegular.Lightbulb24, L.T("Foliage translucency"), L.T("Applied when the game starts"), Choices.FoliageTranslucency, "graphics_foliage_translucency");
 
             // The engine's faster modes of the lighting above and the size of its motion-vector store.
             // The in-game menu has the same rows and switches the four toggles live; the engine reads

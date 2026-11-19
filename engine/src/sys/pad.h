@@ -53,7 +53,8 @@ _Static_assert(offsetof(PadData, timestamp) == 80, "PadData timestamp at 80");
 uint64_t pad_now_us(void);
 void pad_touch_click(PadData *pad, int right_half);
 
-void pad_host_sample(PadData *pad);
+struct BbPcRestWitness;
+void pad_host_sample(PadData *pad, struct BbPcRestWitness *rest);
 void pad_host_refresh(void);
 uint8_t pad_host_connected_count(void);
 int pad_host_sdl_state(void);
@@ -63,5 +64,24 @@ const char *pad_host_gamepad_name(void);
 void pad_script_record(const PadData *pad);
 void pad_script_buttons(PadData *pad);
 void pad_script_overrides(PadData *pad);
+
+/* Private guest-read observation, under the existing pad lock. */
+typedef enum {
+    PAD_RECEIPT_UNSEEN, PAD_RECEIPT_RX, PAD_RECEIPT_CLEAR, PAD_RECEIPT_EMPTY, PAD_RECEIPT_FOREIGN,
+    PAD_RECEIPT_FILE_ERROR, PAD_RECEIPT_OVERLAY, PAD_RECEIPT_FINISH
+} PadReceiptKind;
+
+typedef struct {
+    uint64_t native_generation, command_generation;
+    uint32_t buttons;
+    int axes[4], touch_side;
+    PadReceiptKind kind;
+    int healthy_file, replay_state;
+} PadScriptReceipt;
+
+const char *pad_guest_receipt_nonce(void);
+PadScriptReceipt pad_script_receipt(void);
+/* Same read lock. Includes canonical stale tags and retains cached ownership on open failure. */
+uint64_t pad_script_observed_command(void);
 
 #endif

@@ -658,6 +658,79 @@ int main() {
         Expect(std::strstr(once, "BB_WIND_FREEZE=1") != nullptr && std::strlen(once) < 520, "the freeze once line");
     }
 
+    { // bbport (r89q_twigs-limb-discard): the cut-out limb size rule and the three text functions
+        Expect(B::CutoutMinDefault == 6.0f && B::CutoutMin() == 6.0f, "the cut-out limb size rule is 6.0 (BB_WIND_TWIGS_CUTOUT_MIN_MODEL unset)");
+        Expect(!B::CutoutSizeOk(2.48f) && !B::CutoutSizeOk(5.99f) && B::CutoutSizeOk(6.0f) && B::CutoutSizeOk(6.94f) && B::CutoutSizeOk(27.0f),
+               "a chain-like piece (2.48) is too small as a cut-out, the bare trees' limb pieces (6.94, 7.25) are not");
+        Expect(!B::CutoutOn(), "the cut-out limb route is off without BB_WIND_TWIGS_TREES (the limb rule is off)");
+        B::Stats st;
+        st.limb_cut = 4321;
+        st.limb_cut_small = 77;
+        char line[400];
+        B::CutoutLineText(st, line, sizeof(line));
+        Expect(std::strstr(line, "r89q") != nullptr && std::strstr(line, "4321") != nullptr && std::strstr(line, "77") != nullptr &&
+                   std::strlen(line) < 360,
+               "the cut-out counter line");
+        char once[500];
+        B::CutoutOnceText(once, sizeof(once));
+        Expect(std::strstr(once, "BB_WIND_TWIGS_LIMB_CUTOUT=0") != nullptr && std::strlen(once) < 460, "the cut-out once line (off in the test)");
+        B::Mesh mesh;
+        mesh.verts = 12738;
+        mesh.shape.height = 6.94f;
+        mesh.shape.up = 2;
+        char said[320];
+        B::CutLimbText(mesh, 0x10841b45b0ull, said, sizeof(said));
+        Expect(std::strstr(said, "10841b45b0") != nullptr && std::strstr(said, "12738") != nullptr && std::strstr(said, "6.94") != nullptr &&
+                   std::strlen(said) < 300,
+               "the cut-out limb piece line");
+    }
+
+    { // bbport (r89r_twigs-limb-units): the model rule is the old one, the census, the two text functions, the world height knob
+        Expect(!B::LimbWorldOn(), "the limb world rule is off without BB_WIND_TWIGS_TREES");
+        Expect(B::LimbOldRuleRefuses(0.11f, false) && B::LimbOldRuleRefuses(0.07f, true) && B::LimbOldRuleRefuses(3.5f, false) &&
+                   !B::LimbOldRuleRefuses(7.0f, true) && B::LimbOldRuleRefuses(5.5f, true) && !B::LimbOldRuleRefuses(7.0f, false),
+               "r89q's model rules refuse a 0.11 piece, a 5.5 cut-out, a 3.5 opaque limb and take 7.0");
+        Expect(BbWindTwigs::LimbMinHeight() == BbWindTwigs::LimbMinH, "the limb world height is the old 3.0 m without its knob");
+        B::LimbCensus c;
+        c.Add(true, false, nullptr, 0.0f);
+        c.Add(false, true, nullptr, 7.5f);
+        c.Add(false, false, "short", 2.0f);
+        c.Add(false, false, "short", 1.5f);
+        c.Add(false, false, "moved", 4.0f);
+        c.Add(false, false, "tall", 41.0f);
+        c.Add(false, false, "no-keys", 0.0f);
+        Expect(c.entries == 7 && c.waiting == 1 && c.tree == 1 && c.short_h == 2 && c.moved == 1 && c.tall == 1 && c.other == 1 &&
+                   c.judged == 5 && c.h_min == 1.5f && c.h_max == 41.0f,
+               "the limb census counts by verdict and keeps the lowest and highest world height");
+        B::Stats st;
+        st.limbs = 9876;
+        st.limb_cut = 5432;
+        st.lr_old = 4321;
+        st.lr_model = 11;
+        st.limb_cut_small = 22;
+        st.lr_indoors = 33;
+        st.limb_cutout = 44;
+        char line[720];
+        B::UnitsLineText(st, c, line, sizeof(line));
+        Expect(std::strstr(line, "r89r") != nullptr && std::strstr(line, "9876") != nullptr && std::strstr(line, "5432") != nullptr &&
+                   std::strstr(line, "4321") != nullptr && std::strstr(line, "1.5 to 41.0 m") != nullptr && std::strlen(line) < 640 &&
+                   std::strstr(line, "limb piece") == nullptr && std::strstr(line, "mesh:") == nullptr,
+               "the counts line (short enough, none of the words the slot runner's evidence filter drops)");
+        char once[720];
+        B::UnitsOnceText(once, sizeof(once));
+        Expect(std::strstr(once, "BB_WIND_TWIGS_LIMB_WORLD=0") != nullptr && std::strstr(once, "limb piece") == nullptr &&
+                   std::strlen(once) < 560,
+               "the once line (off in the test)");
+        char said[320];
+        B::Mesh mesh;
+        mesh.verts = 5875;
+        mesh.shape.height = 0.11f;
+        B::CutLimbText(mesh, 0x114a55da70ull, said, sizeof(said));
+        Expect(std::strstr(said, "limb part taken") != nullptr && std::strstr(said, "limb piece") == nullptr, "r89q's per-part line is reworded");
+        B::CutoutLineText(st, line, sizeof(line));
+        Expect(std::strstr(line, "limb piece") == nullptr, "r89q's counter line is reworded");
+    }
+
     if (failures == 0) {
         std::printf("wind-trees-test: ok\n");
     }

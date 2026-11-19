@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// bbport (t129c_sun-term-view, TOOL): the ray traced sun and moon shadow term as a grey picture (renderer_vulkan/vk_sun_term_view.cpp
+// records the passes). Two builds, one per pass:
+//   SUN_TERM_COPY  right after the sun trace: the screen shadow target's alpha (the visibility the directional light reads) into an R8 image
+//   SUN_TERM_SHOW  over the lit scene: the scene colour is overwritten with the term as grey (white lit, black shadowed), alpha kept
+#version 450
+
+#define SUN_TERM_BUILDS 0
+#if defined(SUN_TERM_COPY)
+#undef SUN_TERM_BUILDS
+#define SUN_TERM_BUILDS 1
+#endif
+#if defined(SUN_TERM_SHOW)
+#if SUN_TERM_BUILDS != 0
+#error "sun_term_view.comp: define exactly one of SUN_TERM_COPY, SUN_TERM_SHOW"
+#endif
+#undef SUN_TERM_BUILDS
+#define SUN_TERM_BUILDS 1
+#endif
+#if SUN_TERM_BUILDS != 1
+#error "sun_term_view.comp: define exactly one of SUN_TERM_COPY, SUN_TERM_SHOW"
+#endif
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// SunTermView::Push (vk_sun_term_view.h), word for word (8 bytes).
+layout(push_constant) uniform Push {
+    vec2 size; // pixels
+};
+
+#if defined(SUN_TERM_COPY)
+layout(binding = 0, rgba8) uniform readonly image2D target_img; // the screen shadow target (alpha: the sun/moon visibility)
+layout(binding = 1, r8) uniform writeonly image2D term_img;
+#else
+layout(binding = 0, r8) uniform readonly image2D term_img;
+layout(binding = 1, rgba16f) uniform image2D scene_img; // the lit scene colour
+#endif
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(size.x) || p.y >= int(size.y)) {
+        return;
+    }
+#if defined(SUN_TERM_COPY)
+    imageStore(term_img, p, vec4(clamp(imageLoad(target_img, p).a, 0.0, 1.0), 0.0, 0.0, 1.0));
+#else
+    const float v = imageLoad(term_img, p).x;
+    const vec4 c = imageLoad(scene_img, p);
+    imageStore(scene_img, p, vec4(v, v, v, c.a));
+#endif
+}

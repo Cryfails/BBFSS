@@ -23,6 +23,7 @@
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_reflection_ordinal3.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -705,11 +706,116 @@ void BufferCache::RunGuestCopy(const BbCopy::Item& item) {
     buffer->Flush(dst - buffer->mapped_data.data(), item.size);
 }
 
+thread_local BufferCache::WallStreamProbe* BufferCache::watched_wall_stream = nullptr;
+
+BufferCache::WallStreamProbe* BufferCache::WatchWallStream(VAddr guest, u32 size, u64 generation,
+                                                          u32 packet) {
+    if (size != WallStreamProbe::Bytes || !guest || watched_wall_stream ||
+        wall_stream_probe.route != WallStreamProbe::Route::None) {
+        return nullptr;
+    }
+    wall_stream_probe.owner = this;
+    wall_stream_probe.guest = guest;
+    wall_stream_probe.generation = generation;
+    wall_stream_probe.packet = packet;
+    watched_wall_stream = &wall_stream_probe;
+    return watched_wall_stream;
+}
+
+void BufferCache::UnwatchWallStream() {
+    watched_wall_stream = nullptr;
+}
+
+const char* BufferCache::WallStreamRoute(WallStreamProbe::Route route) {
+    constexpr std::array names{"none", "map-commit", "reserve-inline", "reserve-recorder", "reserve-pool"};
+    return names[u8(route)];
+}
+
+void BufferCache::CompleteWallStreamCopy(WallStreamProbe& observation, const u8* bytes) {
+    std::memcpy(observation.owned.data(), bytes, observation.owned.size());
+    if (observation.receipt.fetch_or(WallStreamProbe::Completed, std::memory_order_release) &
+        WallStreamProbe::Preflight) {
+        const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+        std::printf("Reflection wall stream event=completion-after-checkpoint packet=%u generation=%llu "
+                    "source=%llx buffer=%llx offset=%llu bytes=%u tick=%llu route=%s\n",
+                    observation.packet, u(observation.generation), u(observation.guest),
+                    u(std::bit_cast<u64>(observation.handle)), u(observation.offset),
+                    WallStreamProbe::Bytes, u(observation.tick), WallStreamRoute(observation.route));
+    }
+}
+
+void BufferCache::RunWallStreamCopy(const BbCopy::Item& item) {
+    auto& observation = *static_cast<WallStreamProbe*>(item.context);
+    auto copy = item;
+    copy.context = observation.owner;
+    RunGuestCopy(copy);
+    const auto& stream = observation.owner->stream_buffer;
+    if (item.source == observation.guest && item.size == WallStreamProbe::Bytes &&
+        item.extra == reinterpret_cast<u64>(static_cast<const Buffer*>(&stream)) &&
+        observation.handle == stream.Handle() &&
+        item.destination == reinterpret_cast<u64>(stream.mapped_data.data() + observation.offset)) {
+        CompleteWallStreamCopy(observation, reinterpret_cast<const u8*>(item.destination));
+    }
+}
+
+void BufferCache::RunOrdinal3Copy(const BbCopy::Item& item) {
+    auto& witness = *static_cast<Vulkan::ReflectionOrdinal3::Writer*>(item.context);
+    auto copy = item;
+    copy.context = witness.cache;
+    RunGuestCopy(copy);
+    const auto& stream = static_cast<BufferCache*>(witness.cache)->stream_buffer;
+    if (item.source == witness.source && item.size == Vulkan::ReflectionOrdinal3::Bytes &&
+        witness.buffer == static_cast<const Buffer*>(&stream) &&
+        item.extra == reinterpret_cast<u64>(witness.buffer) &&
+        witness.handle == std::bit_cast<u64>(stream.Handle()) &&
+        item.destination == reinterpret_cast<u64>(stream.mapped_data.data() + witness.offset)) {
+        witness.Complete(reinterpret_cast<const u8*>(item.destination));
+    } else {
+        witness.callback_conflict.store(1, std::memory_order_release);
+    }
+}
+
+PostGeometry::Reservation BufferCache::GeometryReservation(VAddr guest, u32 bytes, u64 offset,
+                                                            u64 tick) const {
+    return {{static_cast<const Buffer*>(&stream_buffer), std::bit_cast<u64>(stream_buffer.Handle()),
+             reinterpret_cast<u64>(stream_buffer.buffer.allocation), StructureGeneration()},
+            guest, offset, tick, bytes};
+}
+
+void BufferCache::RunPostGeometryCopy(const BbCopy::Item& item) {
+    auto& batch = *static_cast<PostGeometry::Capture::Copy*>(item.context);
+    auto* owner = batch.owner;
+    auto* cache = const_cast<BufferCache*>(static_cast<const BufferCache*>(owner->Cache()));
+    auto ordinary = item;
+    ordinary.context = cache;
+    RunGuestCopy(ordinary);
+    const auto& stream = cache->stream_buffer;
+    const auto& stamp = batch.reservation;
+    const PostGeometry::Reservation actual{
+        {reinterpret_cast<const Buffer*>(item.extra), std::bit_cast<u64>(stream.Handle()),
+         reinterpret_cast<u64>(stream.buffer.allocation), stamp.backing.cache_generation},
+        item.source, stamp.offset, stamp.tick, static_cast<u32>(item.size)};
+    const bool mapped = item.size == stamp.bytes && stamp.offset <= stream.mapped_data.size() &&
+                        item.size <= stream.mapped_data.size() - stamp.offset &&
+                        item.destination == reinterpret_cast<u64>(stream.mapped_data.data() + stamp.offset);
+    PostGeometry::Capture::Complete(batch, batch.route, actual,
+                                    mapped ? reinterpret_cast<const u8*>(item.destination) : nullptr);
+    if (batch.route == PostGeometry::Route::ReservePool) owner->Release();
+}
+
 // Small guest copies run on the recording thread (it spins for work: no wakeup, and it is
 // idle most of the time); PoolSmallCopies (toggle 524288) batches them for the copy threads.
 // Each source is noted once the copy is queued (a WaitHostCopies started after the note covers it).
-void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
+void BufferCache::SmallGuestCopy(const BbCopy::Item& item, WallStreamProbe* observation,
+                                 Vulkan::ReflectionOrdinal3::Writer* object3,
+                                 PostGeometry::Capture::Copy* geometry) {
+    using Vulkan::ReflectionOrdinal3::Route;
     if (!scheduler.IsRecordingDeferred()) {
+        if (observation) {
+            observation->route = WallStreamProbe::Route::ReserveInline;
+        }
+        if (object3) object3->route = Route::ReserveInline;
+        if (geometry) PostGeometry::Capture::SetRoute(*geometry, PostGeometry::Route::ReserveInline);
         // bbport: commands recorded on this thread (direct mode: the draw or dispatch after the
         // upscaler's passes; or BB_VK_RECORD_THREAD=0): the copy runs now, before the commands
         // that read it. In this thread's copy batch it ran at the next submission at the
@@ -718,8 +824,26 @@ void BufferCache::SmallGuestCopy(const BbCopy::Item& item) {
         // BB_VK_RECORD_THREAD=0 (issue #39).
         item.run(item);
     } else if (!BbToggle::Disabled(BbToggle::PoolSmallCopies)) {
-        scheduler.RecordHostCopy([item] { item.run(item); });
+        if (observation) {
+            observation->route = WallStreamProbe::Route::ReserveRecorder;
+        }
+        if (object3) object3->route = Route::ReserveRecorder;
+        if (geometry) {
+            PostGeometry::Capture::SetRoute(*geometry, PostGeometry::Route::ReserveRecorder);
+            auto owner = PostGeometry::DrawWatch::Current(this)->Owner();
+            scheduler.RecordHostCopy([item, owner = std::move(owner)] { item.run(item); });
+        } else {
+            scheduler.RecordHostCopy([item] { item.run(item); });
+        }
     } else {
+        if (observation) {
+            observation->route = WallStreamProbe::Route::ReservePool;
+        }
+        if (object3) object3->route = Route::ReservePool;
+        if (geometry) {
+            PostGeometry::Capture::SetRoute(*geometry, PostGeometry::Route::ReservePool);
+            geometry->owner->Retain();
+        }
         BbCopy::QueueCopy(item);
     }
     scheduler.NoteHostCopySource(item.source, item.size);
@@ -1057,6 +1181,9 @@ bool BufferCache::MemoAllowed() const noexcept {
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
     BB_SECTION(ObtainBuffer);
+    auto* geometry_draw = PostGeometry::DrawWatch::Current(this);
+    auto* geometry_upload = geometry_draw ? geometry_draw->Claim(device_addr, size, is_written, is_texel_buffer)
+                                          : nullptr;
     const bool stats = BufferStatsEnabled();
     const auto note_hle = [&](u32 path) {
         if (hle_obtain) {
@@ -1116,6 +1243,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             TraceBinding(device_addr, size, is_written, is_written ? 0 : 2);
             note_hle(0);
             ++obtain_paths[is_written ? 1 : 0];
+            if (geometry_upload) geometry_upload->Resident();
             if (!is_written && !is_texel_buffer) {
                 if (const auto shadow = ShadowCopy(device_addr, size)) {
                     return *shadow;
@@ -1141,26 +1269,85 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
             ++region.stream_count;
             region.stream_bytes += size;
         }
+        auto* observation = watched_wall_stream;
+        if (observation && (observation->owner != this || observation->guest != device_addr ||
+                            size != WallStreamProbe::Bytes || observation->route != WallStreamProbe::Route::None)) {
+            observation = nullptr;
+        }
+        namespace Object3 = Vulkan::ReflectionOrdinal3;
+        auto* object3 = Object3::watch;
+        if (object3 && (object3->cache != this || object3->source != device_addr ||
+                        size != Object3::Bytes || object3->reservation || observation)) {
+            object3 = nullptr;
+        }
+        const auto record_reservation = [&](u64 offset) {
+            if (observation) {
+                observation->handle = stream_buffer.Handle();
+                observation->offset = offset;
+                observation->tick = stream_buffer.LastTick();
+                observation->cache_generation = StructureGeneration();
+            }
+            if (object3) {
+                object3->buffer = static_cast<const Buffer*>(&stream_buffer);
+                object3->handle = std::bit_cast<u64>(stream_buffer.Handle());
+                object3->offset = offset;
+                object3->tick = stream_buffer.LastTick();
+                object3->cache_generation = StructureGeneration();
+                object3->reservation = Object3::reservation_serial.fetch_add(1, std::memory_order_relaxed) + 1;
+            }
+        };
+        const auto geometry_reservation = [&](u64 offset, u64 tick) -> PostGeometry::Capture::Copy* {
+            if (!geometry_draw) return nullptr;
+            return geometry_draw->Reserve(geometry_upload, GeometryReservation(device_addr, size, offset, tick),
+                std::bit_cast<u64>(scheduler.GetWorkSemaphore()->Handle()), observation || object3);
+        };
         // bbport: the guest data is copied on a copy thread, started now; submission and
         // guest-visible fences wait for it (Scheduler::WaitHostCopies).
         if (!stream_buffer.mapped_data.empty() &&
             !BbToggle::Disabled(BbToggle::DeferredStreamCopies)) {
             if (const auto offset = stream_buffer.Reserve(size, instance.UniformMinAlignment())) {
+                record_reservation(*offset);
+                auto* geometry = geometry_draw ? geometry_reservation(*offset, stream_buffer.LastTick()) : nullptr;
                 SmallGuestCopy({
-                    .run = &RunGuestCopy,
-                    .context = this,
+                    .run = observation ? &RunWallStreamCopy : object3 ? &RunOrdinal3Copy :
+                           geometry ? &RunPostGeometryCopy : &RunGuestCopy,
+                    .context = observation ? static_cast<void*>(observation) : object3 ? static_cast<void*>(object3) :
+                               geometry ? static_cast<void*>(geometry) : static_cast<void*>(this),
                     .source = device_addr,
                     .destination = reinterpret_cast<u64>(stream_buffer.mapped_data.data() + *offset),
                     .size = size,
                     .extra = reinterpret_cast<u64>(static_cast<Buffer*>(&stream_buffer)),
-                });
+                }, observation, object3, geometry);
                 TraceBinding(device_addr, size, false, 3);
                 return {&stream_buffer, *offset};
             }
+            if (object3) object3->reserve_failed = true;
         }
         const auto [data, offset] = stream_buffer.Map(size, instance.UniformMinAlignment());
+        auto* geometry = geometry_draw ? geometry_reservation(offset, scheduler.CurrentTick()) : nullptr;
         memory->CopySparseMemory(device_addr, data, size);
         stream_buffer.Commit();
+        if (geometry) {
+            PostGeometry::Capture::SetRoute(*geometry, PostGeometry::Route::MapCommit);
+            const auto actual = GeometryReservation(device_addr, size, offset, stream_buffer.LastTick());
+            const bool mapped = offset <= stream_buffer.mapped_data.size() &&
+                                size <= stream_buffer.mapped_data.size() - offset &&
+                                data == stream_buffer.mapped_data.data() + offset;
+            PostGeometry::Capture::Complete(*geometry, geometry->route, actual, mapped ? data : nullptr);
+        }
+        if (observation || object3) record_reservation(offset);
+        if (observation) {
+            observation->route = WallStreamProbe::Route::MapCommit;
+            CompleteWallStreamCopy(*observation, data);
+        }
+        if (object3) {
+            object3->route = Object3::Route::MapCommit;
+            if (data == stream_buffer.mapped_data.data() + offset) {
+                object3->Complete(data);
+            } else {
+                object3->callback_conflict.store(1, std::memory_order_release);
+            }
+        }
         TraceBinding(device_addr, size, false, 3);
         return {&stream_buffer, offset};
     }
@@ -1169,6 +1356,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     BB_SECTION(ObtainVram);
+    if (geometry_upload) geometry_upload->Resident();
     note_hle(2);
     ++obtain_paths[is_written ? 4 : 3];
     const u64 uploaded_before = BbStats::buffer_upload_bytes.load(std::memory_order_relaxed);
@@ -1317,6 +1505,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
 
 bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionCpuModified(addr, size);
+}
+
+bool BufferCache::IsOrdinal3CpuModified(VAddr addr, size_t size) {
+    return memory_tracker->IsRegionCpuModifiedRead(addr, size);
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {

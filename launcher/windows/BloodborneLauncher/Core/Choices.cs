@@ -120,14 +120,14 @@ namespace BloodborneLauncher.Core
         public static readonly Effect[] Effects =
         {
             new("effect_chromatic_aberration", L.T("Chromatic aberration"), false),
-            new("effect_dof", L.T("Depth of field"), false),
+            new("effect_dof", L.T("Depth of field"), true), // Froyok bloom needs it (engine default too)
             new("effect_motion_blur", L.T("Motion blur"), false),
             new("effect_game_aa", L.T("Game's own anti-aliasing"), false),
             new("effect_dynamic_shadows", L.T("Shadows from dynamic lights"), true),
             new("effect_ssr", L.T("Screen-space reflections"), true, L.T("Not in the original game")),
             new("effect_modern_ssr", L.T("Improved reflections"), true, L.T("Needs Screen-space reflections on")),
             new("effect_pom_cavity", L.T("Deeper parallax surfaces"), true),
-            new("effect_contact_shadows", L.T("Contact shadows"), false),
+            new("effect_contact_shadows", L.T("Bend Studio Screenspace Shadows"), false),
             new("effect_pcss", L.T("Soft sun shadows (PCSS)"), false),
             new("effect_volumetric_light", L.T("Volumetric sunlight"), true, L.T("Heavy")),
             new("effect_point_fog", L.T("Fog around lamps"), true, L.T("Heavy")),
@@ -156,6 +156,15 @@ namespace BloodborneLauncher.Core
         {
             new(L.T("Game's own"), "0"),
             new(L.T("High"), "1"),
+        };
+
+        /// <summary>graphics_bloom_quality. Without the key the engine uses the game's own bloom, so
+        /// the launcher shows that too (BloomQualityKey, BloomQualityFallback).</summary>
+        public const string BloomQualityKey = "graphics_bloom_quality", BloomQualityFallback = "original";
+        public static readonly Choice[] BloomQuality =
+        {
+            new(L.T("Game's own"), "original"),
+            new("Froyok Bloom", "froyok"),
         };
 
         /// <summary>The ambient occlusion choice: effect_ssao, effect_gtao and graphics_ao_quality together
@@ -278,6 +287,34 @@ namespace BloodborneLauncher.Core
         /// reads a value it does not know as soft (bbport_settings.cpp), so the row shows soft.</summary>
         public static string LampShadowSoftnessValue(string? saved) =>
             Array.Exists(LampShadowSoftness, c => c.Value == saved) ? saved! : "soft";
+
+        /// <summary>graphics_rt_foliage_shadows (r131b): the ray traced foliage shadows, 0 off, 1 the lamps, 2 the lamps and the sun and
+        /// moon. The engine reads it when the game starts; BB_RT_CARD_ALPHA, BB_RT_CARD_LAMPS and BB_RT_CARD_SUN win when set.</summary>
+        public static readonly Choice[] RtFoliageShadows =
+        {
+            new(L.T("Off"), "0"),
+            new(L.T("Lamps"), "1"),
+            new(L.T("Lamps and sun"), "2"),
+        };
+
+        /// <summary>graphics_blood_sheen_tint (r131b): the blood sheen's colour, live in the game: 0 the grey test view, 1 red (the
+        /// default, and what the engine reads for text it does not know), 2 the clear film.</summary>
+        public static readonly Choice[] BloodSheenTint =
+        {
+            new(L.T("Grey (test)"), "0"),
+            new(L.T("Red"), "1"),
+            new(L.T("Clear"), "2"),
+        };
+
+        /// <summary>graphics_foliage_translucency (r131a): 0 off, 1 light through leaves, 2 the back-lit glow, 3 both. The engine reads it when the game
+        /// starts; it needs the ray traced foliage shadows (Lamps, or Lamps and sun); BB_FOLIAGE_TRANSLUCENCY wins when set.</summary>
+        public static readonly Choice[] FoliageTranslucency =
+        {
+            new(L.T("Off"), "0"),
+            new(L.T("Light through leaves"), "1"),
+            new(L.T("Back-lit glow"), "2"),
+            new(L.T("Both"), "3"),
+        };
 
         public static readonly Choice[] FpsModes =
         {

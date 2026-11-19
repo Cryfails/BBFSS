@@ -1,5 +1,15 @@
 # Ray tracing crash guards: status
 
+## Development snapshot, 2026-11-19
+
+LRT T09 parked. Feature work is paused.
+
+- Verified scope. Existing guards are in the tree.
+- Open scope. Crash-free acceptance remains open. The owner parked this task.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 75% (rated by the weakest part: the second crash cause is not proven closed, because the fix guards the paths that were found but cannot see garbage inside a BLAS).
 
 ## What works
@@ -39,3 +49,6 @@ None is on a fork branch yet.
 - graveyard-blood with BB_RT_GLASS set, torch out: the glass hang.
 - dark interior, about 180 s.
 - lamp-test-spot: do-nothing check. The later_differ and dropped counters must stay small and the picture unchanged.
+
+
+</details>

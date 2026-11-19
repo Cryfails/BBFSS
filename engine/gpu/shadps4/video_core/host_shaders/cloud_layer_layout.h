@@ -14,6 +14,13 @@
 #define CL_WG 8
 // The push word `flags` (CloudLayerParams::Flag*).
 #define CL_FLAG_SHOW 1 // BB_VOLUMETRIC_CLOUDS_SHOW=1: the opacity painted in a test colour
+// bbport (r119j_clouds-banding): bits 4 to 7 of `flags` are BB_VOLUMETRIC_CLOUDS_SMOOTH (the march's banding fixes; 0 = the r119i march)
+#define CL_FLAG_SMOOTH_SHIFT 4
+#define CL_SMOOTH_JITTER 1u // the march start is hash noise plus a golden ratio step a frame (not interleaved gradient noise)
+#define CL_SMOOTH_EDGE 2u   // the coverage edge is widened to about a step (no all or nothing density between two steps)
+#define CL_SMOOTH_PAINT 4u  // the painted share reads twelve different radii, the nearer ones weigh more
+#define CL_SMOOTH_GLOW 8u   // the colour cap has a soft knee
+#define CL_SMOOTH_ALL 15u
 // The counter buffer's words (CloudLayerParams::Word*): this frame's totals, cleared before each
 // frame's march and copied to the host after the composite. Counted per workgroup in shared
 // memory and added once a workgroup.

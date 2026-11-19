@@ -1,5 +1,15 @@
 # Halation
 
+## Development snapshot, 2026-11-19
+
+HAL 60%. Feature work is paused.
+
+- Verified scope. Scoped off/on checks passed.
+- Open scope. Combined 4K acceptance and performance remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 80%
 
 A soft red-orange glow bleeds from very bright small sources (lamps, candles, the torch, bright windows, the moon) into the dark around them. It is separate from the game's own bloom.
@@ -41,3 +51,6 @@ No fork branch yet. The branch plan names visual/halation.
 - dark-alley: lit lanterns, the best place to see the halo (compare strength 0, 1, 2).
 - church-candles: small flames, a weak case.
 - dream-house: a bright window; it is not a strict do-nothing place.
+
+
+</details>

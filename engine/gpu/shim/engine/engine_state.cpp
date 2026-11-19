@@ -2,6 +2,7 @@
 #include "engine_state.h"
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -37,6 +38,19 @@ const Stat* StatNamed(const char* name) {
 std::atomic<std::uint64_t> g_said_player{0};
 
 constexpr std::size_t kPlayerChr = 0x60, kPlayerBlock = 0x3f8;
+
+bool ReadPlayerPosition(std::uint64_t chr, float pos[3]) {
+    static constexpr std::array<std::size_t, 4> kChain{0x58, 0x8, 0x3b0, 0x68};
+    constexpr std::size_t kPosition = 0x1e0;
+    std::uint64_t at = chr;
+    for (const std::size_t link : kChain) at = at ? Follow(at + link) : 0;
+    float v[3] = {};
+    if (!at || !Peek(at + kPosition, &v)) return false;
+    pos[0] = v[0];
+    pos[1] = v[1];
+    pos[2] = v[2];
+    return true;
+}
 
 constexpr std::size_t kFlagsPerBlock = 0x1c, kPoolStride = 0x20, kPool = 0x28, kBlocks = 0x38;
 
@@ -203,16 +217,27 @@ bool world_player_block(std::uint32_t* block) {
 // null or unreadable. Six pointer reads and one 12-byte read; only BB_FOOTPRINTS calls it (once a
 // frame, on the render thread; the floats may be from two game steps, which does not matter).
 bool world_player_position(float pos[3]) {
-    static constexpr std::array<std::size_t, 4> kChain{0x58, 0x8, 0x3b0, 0x68};
-    constexpr std::size_t kPosition = 0x1e0;
     const std::uint64_t man = Singleton(kWorldChrMan);
-    std::uint64_t at = man ? Follow(man + kPlayerChr) : 0;
-    for (const std::size_t link : kChain) at = at ? Follow(at + link) : 0;
-    float v[3] = {};
-    if (!at || !Peek(at + kPosition, &v)) return false;
-    pos[0] = v[0];
-    pos[1] = v[1];
-    pos[2] = v[2];
+    return ReadPlayerPosition(man ? Follow(man + kPlayerChr) : 0, pos);
+}
+
+bool world_player_region_sample(WorldPlayerRegionSample& out) {
+    // These 1.09 field locations are also used by the local-player helpers in online_fixes.cpp.
+    constexpr std::size_t kChrData = 0x3b0, kVitals = 0x20, kHp = 0xf8, kRawRegion = 0x278;
+    const std::uint64_t man = Singleton(kWorldChrMan);
+    const std::uint64_t chr = man ? Follow(man + kPlayerChr) : 0;
+    const std::uint64_t data = chr ? Follow(chr + kChrData) : 0;
+    const std::uint64_t vitals = data ? Follow(data + kVitals) : 0;
+    std::int32_t hp = 0;
+    WorldPlayerRegionSample sample{};
+    if (!vitals || !Peek(vitals + kHp, &hp) || hp <= 0 ||
+        !Peek(chr + kPlayerBlock, &sample.block) || sample.block == 0xffffffffu ||
+        !Peek(chr + kRawRegion, &sample.region_raw) || !ReadPlayerPosition(chr, sample.position))
+        return false;
+    for (const float coordinate : sample.position) {
+        if (!std::isfinite(coordinate)) return false;
+    }
+    out = sample;
     return true;
 }
 

@@ -1,5 +1,15 @@
 # Clouds (cloud shadows and a volumetric cloud layer below the painted sky)
 
+## Development snapshot, 2026-11-19
+
+CLD 18%. Feature work is paused.
+
+- Verified scope. The separate cloud-rendering path is in development.
+- Open scope. The requested sky behaviour, foliage movement and normal presentation are still open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 25%. Rated by the weakest part: the cloud layer looks wrong in the owner's hand test (looks weird, clips with the painted sky, shows horizontal banding stripes). Cloud shadows run but cannot be seen in stills.
 
 ## What works
@@ -39,3 +49,6 @@ Not on a fork branch yet.
 ## Test places
 - lamp-test-spot (arches looking up, painted dusk), church-puddles arch, graveyard-blood (night; mostly the bridge above, little open sky). Do-nothing place: dark-interior.
 - For real sky: walk the hunter out from cover and tilt up (the open-sky jobs of the r119f series).
+
+
+</details>

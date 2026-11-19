@@ -150,6 +150,12 @@ private:
     bool tried = false;
     bool failed = false;
     u64 frame = 0;
+    // bbport (r129b_sheen-no-glow): SHOW's dry-scene reference words (2 slots after the counters' slots, by show parity).
+    u32 show_count = 0;          ///< shows recorded: a show's slot is its parity
+    bool ref_fresh = true;       ///< no show yet: the first one clears both reference slots (the buffer is not initialised)
+    u32 ref_slot_last = 0;       ///< the slot of the last show recorded
+    u32 ref_read_slot = 0;       ///< ref_slot_last when the last host copy was recorded (the log reads that slot)
+    bool ref_read_valid = false; ///< a show was recorded before that copy: its words are real
 
     // This G-buffer pass, from BeforeDraw.
     VideoCore::ImageId gbuffer_depth{}, gbuffer_material{}, gbuffer_albedo{}, gbuffer_specular{};

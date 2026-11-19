@@ -7,6 +7,8 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include "gpu/shim/bbport_drawn_look_texts.h" // bbport (r55_drawn-look-lines)
+#include "gpu/shim/bbport_menu_i18n.h"
 #include "gpu/shim/bbport_settings.h"
 #include "gpu/shim/bbport_toggles.h" // bbport (r39_master-debug): its two readers of static initialization
 
@@ -394,6 +396,26 @@ int main(int argc, char** argv) {
     assert(std::string(BbSettings::MenuText("Close", "Закрыть")) == "Kapat");
     s.menu_language = BbSettings::MenuLanguage::Russian;
     assert(std::string(BbSettings::MenuText("Close", "Закрыть")) == "Закрыть");
+    // bbport (r55_drawn-look-lines): every text of the drawn look's rows and problems has its entry
+    // in all eight tables (a text changed in bbport_drawn_look_texts.h without them fails here),
+    // and a problem the renderer set is shown in Russian too.
+    namespace DrawnText = BbSettings::DrawnLookTexts;
+    for (const DrawnText::Text* text : DrawnText::All) {
+        for (int l = int(BbSettings::MenuLanguage::Spanish); l < BbSettings::MenuLanguageCount;
+             ++l) {
+            const auto language = BbSettings::MenuLanguage(l);
+            if (BbSettings::MenuTranslation(language, text->english) == text->english) {
+                std::fprintf(stderr, "no %s entry for \"%s\"\n", BbSettings::MenuLanguageCodes[l],
+                             text->english);
+                assert(false);
+            }
+        }
+    }
+    for (const DrawnText::Text* text : DrawnText::Problems) {
+        const char* const russian = DrawnText::RussianOf(text->english);
+        assert(std::string(BbSettings::MenuText(text->english, russian)) == text->russian);
+    }
+    assert(std::string(DrawnText::RussianOf("not a problem")) == "not a problem");
     { std::ofstream file(path); file << "cheat_vials=infinite\ncheat_bullets=50\n"; }
     BbSettings::Load();
     assert(s.cheat_vials == BbSettings::CheatInfinite && s.cheat_bullets == 50);
@@ -751,9 +773,10 @@ int main(int argc, char** argv) {
     assert(!s.graphics_drawn_look && s.graphics_drawn_look_strength == 0.6f &&
            s.graphics_drawn_look_stroke_size == 1.0f && s.graphics_drawn_look_texture == 1.0f &&
            s.graphics_drawn_look_outlines == 0.35f && s.graphics_drawn_look_shadow_edges == 1.0f &&
-           s.graphics_drawn_look_ink_world == 0.0f && s.graphics_drawn_look_characters == 0.5f &&
-           s.graphics_drawn_look_shadow_soft == 0.12f && s.graphics_drawn_look_quality == 1 &&
-           s.graphics_drawn_look_debug == 0 && !s.drawn_look_problem.load());
+           s.graphics_drawn_look_ink_world == BbSettings::DrawnLookInkWorldDefault &&
+           s.graphics_drawn_look_characters == 0.5f && s.graphics_drawn_look_shadow_soft == 0.12f &&
+           s.graphics_drawn_look_quality == 1 && !s.drawn_look_problem.load());
+    static_assert(BbSettings::DrawnLookInkWorldDefault == 0.35f);
     BbSettings::Save();
     {
         const std::string text = Read(path);
@@ -761,11 +784,12 @@ int main(int argc, char** argv) {
              {"graphics_drawn_look=0\n", "graphics_drawn_look_strength=0.60\n",
               "graphics_drawn_look_stroke_size=1.00\n", "graphics_drawn_look_texture=1.00\n",
               "graphics_drawn_look_outlines=0.35\n", "graphics_drawn_look_shadow_edges=1.00\n",
-              "graphics_drawn_look_ink_world=0.00\n", "graphics_drawn_look_characters=0.50\n",
-              "graphics_drawn_look_shadow_soft=0.12\n", "graphics_drawn_look_quality=1\n",
-              "graphics_drawn_look_debug=0\n"}) {
+              "graphics_drawn_look_ink_world=0.35\n", "graphics_drawn_look_characters=0.50\n",
+              "graphics_drawn_look_shadow_soft=0.12\n", "graphics_drawn_look_quality=1\n"}) {
             assert(text.find(line) != std::string::npos);
         }
+        // (r55_drawn-look-lines) The test views are BB_DRAWN_LOOK_VIEW only: no key.
+        assert(text.find("graphics_drawn_look_debug") == std::string::npos);
     }
     { std::ofstream file(path); file << "graphics_drawn_look=1\ngraphics_drawn_look_strength=0.25\n"
                                         "graphics_drawn_look_stroke_size=1.3\ngraphics_drawn_look_texture=1.1\n"
@@ -778,10 +802,9 @@ int main(int argc, char** argv) {
            s.graphics_drawn_look_stroke_size == 1.3f && s.graphics_drawn_look_texture == 1.1f &&
            s.graphics_drawn_look_outlines == 0.8f && s.graphics_drawn_look_shadow_edges == 0.5f &&
            s.graphics_drawn_look_ink_world == 0.4f && s.graphics_drawn_look_characters == 0.9f &&
-           s.graphics_drawn_look_shadow_soft == 0.2f && s.graphics_drawn_look_quality == 0 &&
-           s.graphics_drawn_look_debug == 4);
-    s.graphics_drawn_look_strength = 0.0f; // the menu's slider at its lower end: the look does no work
-    s.graphics_drawn_look_debug = 1;
+           s.graphics_drawn_look_shadow_soft == 0.2f && s.graphics_drawn_look_quality == 0);
+    s.graphics_drawn_look_strength = 0.0f; // the menu's slider at its lower end: no strokes
+    s.graphics_drawn_look_ink_world = 0.7f;
     BbSettings::Save();
     {
         const std::string text = Read(path);
@@ -790,14 +813,15 @@ int main(int argc, char** argv) {
         assert(text.find("graphics_drawn_look_stroke_size=1.30\n") != std::string::npos);
         assert(text.find("graphics_drawn_look_shadow_soft=0.20\n") != std::string::npos);
         assert(text.find("graphics_drawn_look_quality=0\n") != std::string::npos);
-        assert(text.find("graphics_drawn_look_debug=1\n") != std::string::npos);
+        assert(text.find("graphics_drawn_look_ink_world=0.70\n") != std::string::npos);
+        // The old key's line stays as it was, and nothing reads it.
+        assert(text.find("graphics_drawn_look_debug=4\n") != std::string::npos);
     }
     { std::ofstream file(path); file << "graphics_drawn_look=2\ngraphics_drawn_look_strength=7\n"
                                         "graphics_drawn_look_stroke_size=0.1\ngraphics_drawn_look_texture=9\n"
                                         "graphics_drawn_look_outlines=-1\ngraphics_drawn_look_shadow_edges=3\n"
                                         "graphics_drawn_look_ink_world=2\ngraphics_drawn_look_characters=-0.5\n"
-                                        "graphics_drawn_look_shadow_soft=1\ngraphics_drawn_look_quality=5\n"
-                                        "graphics_drawn_look_debug=9\n"; }
+                                        "graphics_drawn_look_shadow_soft=1\ngraphics_drawn_look_quality=5\n"; }
     BbSettings::Load();
     assert(!s.graphics_drawn_look && s.graphics_drawn_look_strength == 1.0f &&
            s.graphics_drawn_look_stroke_size == BbSettings::DrawnLookStrokeSizeMin &&
@@ -805,13 +829,13 @@ int main(int argc, char** argv) {
            s.graphics_drawn_look_outlines == 0.0f && s.graphics_drawn_look_shadow_edges == 1.0f &&
            s.graphics_drawn_look_ink_world == 1.0f && s.graphics_drawn_look_characters == 0.0f &&
            s.graphics_drawn_look_shadow_soft == BbSettings::DrawnLookShadowSoftMax &&
-           s.graphics_drawn_look_quality == 1 && s.graphics_drawn_look_debug == BbSettings::DrawnLookDebugMax);
+           s.graphics_drawn_look_quality == 1);
     { std::ofstream file(path); file << "graphics_drawn_look_stroke_size=9\ngraphics_drawn_look_shadow_soft=0\n"
-                                        "graphics_drawn_look_quality=-3\ngraphics_drawn_look_debug=-1\n"; }
+                                        "graphics_drawn_look_quality=-3\ngraphics_drawn_look_ink_world=-1\n"; }
     BbSettings::Load();
     assert(s.graphics_drawn_look_stroke_size == BbSettings::DrawnLookStrokeSizeMax &&
            s.graphics_drawn_look_shadow_soft == BbSettings::DrawnLookShadowSoftMin &&
-           s.graphics_drawn_look_quality == 0 && s.graphics_drawn_look_debug == 0);
+           s.graphics_drawn_look_quality == 0 && s.graphics_drawn_look_ink_world == 0.0f);
     { std::ofstream file(path); file << "graphics_drawn_look=on\ngraphics_drawn_look_strength=nan\n"
                                         "graphics_drawn_look_stroke_size=inf\ngraphics_drawn_look_texture=nan\n"
                                         "graphics_drawn_look_outlines=nan\ngraphics_drawn_look_shadow_edges=nan\n"
@@ -822,9 +846,132 @@ int main(int argc, char** argv) {
     assert(!s.graphics_drawn_look && s.graphics_drawn_look_strength == BbSettings::DrawnLookStrengthDefault &&
            s.graphics_drawn_look_stroke_size == 1.0f && s.graphics_drawn_look_texture == 1.0f &&
            s.graphics_drawn_look_outlines == BbSettings::DrawnLookOutlinesDefault &&
-           s.graphics_drawn_look_shadow_edges == 1.0f && s.graphics_drawn_look_ink_world == 0.0f &&
+           s.graphics_drawn_look_shadow_edges == 1.0f &&
+           s.graphics_drawn_look_ink_world == BbSettings::DrawnLookInkWorldDefault &&
            s.graphics_drawn_look_characters == BbSettings::DrawnLookCharactersDefault &&
            s.graphics_drawn_look_shadow_soft == BbSettings::DrawnLookShadowSoftDefault);
+    // bbport (r131b_lrt-settings): graphics_rt_foliage_shadows (0, 1, 2; restart) and graphics_blood_sheen_tint (0, 1, 2; live). Nothing above
+    // sets them: the defaults 0 and 1; written back; read (and the start copy); saved after a change; the foliage setting out of range is
+    // the nearest end and text is 0; the tint setting out of range or text is 1 (never the grey test view). The water motion's and the
+    // blood sheen's keys are tested elsewhere in this file (r130b, r128d).
+    static_assert(BbSettings::RtFoliageOff == 0 && BbSettings::RtFoliageLamps == 1 && BbSettings::RtFoliageLampsSun == 2 &&
+                  BbSettings::RtFoliageDefault == 0 && BbSettings::BloodSheenTintMin == 0 &&
+                  BbSettings::BloodSheenTintMax == 2 && BbSettings::BloodSheenTintDefault == 1);
+    assert(s.graphics_rt_foliage_shadows == BbSettings::RtFoliageDefault &&
+           s.graphics_blood_sheen_tint == BbSettings::BloodSheenTintDefault);
+    BbSettings::Save();
+    assert(Read(path).find("graphics_rt_foliage_shadows=0\n") != std::string::npos &&
+           Read(path).find("graphics_blood_sheen_tint=1\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_rt_foliage_shadows=2\n"
+                                        "graphics_blood_sheen_tint=0\n"; }
+    BbSettings::Load();
+    assert(s.graphics_rt_foliage_shadows == 2 && s.graphics_blood_sheen_tint == 0);
+    assert(s.startup_rt_foliage_shadows == 2); // the start copy is taken at Load
+    s.graphics_rt_foliage_shadows = 1;
+    s.graphics_blood_sheen_tint = 2;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_rt_foliage_shadows=1\n") != std::string::npos &&
+           Read(path).find("graphics_blood_sheen_tint=2\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_rt_foliage_shadows=9\n"
+                                        "graphics_blood_sheen_tint=9\n"; }
+    BbSettings::Load();
+    assert(s.graphics_rt_foliage_shadows == BbSettings::RtFoliageLampsSun && s.graphics_blood_sheen_tint == 1);
+    { std::ofstream file(path); file << "graphics_rt_foliage_shadows=-3\n"
+                                        "graphics_blood_sheen_tint=-1\n"; }
+    BbSettings::Load();
+    assert(s.graphics_rt_foliage_shadows == BbSettings::RtFoliageOff && s.graphics_blood_sheen_tint == 1);
+    { std::ofstream file(path); file << "graphics_rt_foliage_shadows=abc\n"
+                                        "graphics_blood_sheen_tint=abc\n"; }
+    s.graphics_rt_foliage_shadows = 2; // not the default before this Load
+    s.graphics_blood_sheen_tint = 2;
+    BbSettings::Load();
+    assert(s.graphics_rt_foliage_shadows == BbSettings::RtFoliageDefault &&
+           s.graphics_blood_sheen_tint == BbSettings::BloodSheenTintDefault);
+    BbSettings::Save();
+    // bbport (r131a_foliage-translucency): graphics_foliage_translucency (0 to 3; restart): the default 0, read (and the start copy), written back, a value
+    // out of range is the nearest end and text is 0.
+    static_assert(BbSettings::FoliageTranslucencyOff == 0 && BbSettings::FoliageTranslucencyBoth == 3 &&
+                  BbSettings::FoliageTranslucencyDefault == 0);
+    { std::ofstream file(path); file << "graphics_foliage_translucency=3\n"; }
+    BbSettings::Load();
+    assert(s.graphics_foliage_translucency == 3 && s.startup_foliage_translucency == 3);
+    s.graphics_foliage_translucency = 1;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_foliage_translucency=1\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_foliage_translucency=9\n"; }
+    BbSettings::Load();
+    assert(s.graphics_foliage_translucency == BbSettings::FoliageTranslucencyBoth);
+    { std::ofstream file(path); file << "graphics_foliage_translucency=-3\n"; }
+    BbSettings::Load();
+    assert(s.graphics_foliage_translucency == BbSettings::FoliageTranslucencyOff);
+    { std::ofstream file(path); file << "graphics_foliage_translucency=abc\n"; }
+    s.graphics_foliage_translucency = 2;
+    BbSettings::Load();
+    assert(s.graphics_foliage_translucency == BbSettings::FoliageTranslucencyDefault);
+    BbSettings::Save();
+    // bbport (r128b_lrt-caustics-water): the water caustics' strengths. Nothing above sets them: the default 0
+    // (off); written back; read; saved after a change; a value outside 0..4 is the nearest end; a text that is
+    // no number is 0; a value that is not finite is the default.
+    static_assert(BbSettings::WaterCausticsStrengthMin == 0.0f && BbSettings::WaterCausticsStrengthMax == 4.0f &&
+                  BbSettings::WaterCausticsStrengthDefault == 0.0f);
+    assert(s.graphics_water_caustics_sun_strength == BbSettings::WaterCausticsStrengthDefault &&
+           s.graphics_water_caustics_lamps_strength == BbSettings::WaterCausticsStrengthDefault);
+    BbSettings::Save();
+    assert(Read(path).find("graphics_water_caustics_sun_strength=0.00\n") != std::string::npos &&
+           Read(path).find("graphics_water_caustics_lamps_strength=0.00\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_water_caustics_sun_strength=1.5\n"
+                                        "graphics_water_caustics_lamps_strength=2.25\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_caustics_sun_strength == 1.5f && s.graphics_water_caustics_lamps_strength == 2.25f);
+    s.graphics_water_caustics_sun_strength = 4.0f;
+    s.graphics_water_caustics_lamps_strength = 0.5f;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_water_caustics_sun_strength=4.00\n") != std::string::npos &&
+           Read(path).find("graphics_water_caustics_lamps_strength=0.50\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_water_caustics_sun_strength=9\n"
+                                        "graphics_water_caustics_lamps_strength=-1\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_caustics_sun_strength == BbSettings::WaterCausticsStrengthMax &&
+           s.graphics_water_caustics_lamps_strength == 0.0f);
+    { std::ofstream file(path); file << "graphics_water_caustics_sun_strength=abc\n"
+                                        "graphics_water_caustics_lamps_strength=2\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_caustics_sun_strength == 0.0f && s.graphics_water_caustics_lamps_strength == 2.0f);
+    { std::ofstream file(path); file << "graphics_water_caustics_sun_strength=nan\n"
+                                        "graphics_water_caustics_lamps_strength=inf\n"; }
+    s.graphics_water_caustics_sun_strength = 3.0f; // not the default before this Load
+    s.graphics_water_caustics_lamps_strength = 3.0f;
+    BbSettings::Load();
+    assert(s.graphics_water_caustics_sun_strength == BbSettings::WaterCausticsStrengthDefault &&
+           s.graphics_water_caustics_lamps_strength == BbSettings::WaterCausticsStrengthDefault);
+    BbSettings::Save();
+    // bbport (r130b_water-moves): the moving water's strength. The default 0 (off); written back; read; saved after a change; a value
+    // outside 0..4 is the nearest end; a text that is no number is 0; a value that is not finite is the default.
+    static_assert(BbSettings::WaterMotionStrengthMin == 0.0f && BbSettings::WaterMotionStrengthMax == 4.0f &&
+                  BbSettings::WaterMotionStrengthDefault == 0.0f);
+    assert(s.graphics_water_motion_strength == BbSettings::WaterMotionStrengthDefault);
+    BbSettings::Save();
+    assert(Read(path).find("graphics_water_motion_strength=0.00\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_water_motion_strength=2.25\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_motion_strength == 2.25f);
+    s.graphics_water_motion_strength = 4.0f;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_water_motion_strength=4.00\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_water_motion_strength=-1\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_motion_strength == 0.0f);
+    { std::ofstream file(path); file << "graphics_water_motion_strength=9\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_motion_strength == BbSettings::WaterMotionStrengthMax);
+    { std::ofstream file(path); file << "graphics_water_motion_strength=abc\n"; }
+    BbSettings::Load();
+    assert(s.graphics_water_motion_strength == 0.0f);
+    { std::ofstream file(path); file << "graphics_water_motion_strength=inf\n"; }
+    s.graphics_water_motion_strength = 3.0f; // not the default before this Load
+    BbSettings::Load();
+    assert(s.graphics_water_motion_strength == BbSettings::WaterMotionStrengthDefault);
+    BbSettings::Save();
     // bbport (r109a_strength-settings-engine): the halation's and the lamp flicker's strengths.
     // Nothing above sets them: the defaults; written back; read; saved after a change; a value
     // outside its range is the nearest end; a text that is no number is 0; a value that is not
@@ -945,6 +1092,38 @@ int main(int argc, char** argv) {
     s.graphics_interior_brightness = 1.0f; // not the default before this Load
     BbSettings::Load();
     assert(s.graphics_interior_brightness == BbSettings::InteriorBrightnessDefault);
+    BbSettings::Save();
+    // bbport (r128d_lrt-sheen-interior): graphics_blood_sheen. Nothing above sets it: the default 0 (off); written
+    // back; read; saved after a change; a value outside 0..4 is the nearest end; a text that is no number is 0;
+    // a value that is not finite is the default.
+    static_assert(BbSettings::BloodSheenMin == 0.0f && BbSettings::BloodSheenMax == 4.0f &&
+                  BbSettings::BloodSheenDefault == 0.0f);
+    assert(s.graphics_blood_sheen == BbSettings::BloodSheenDefault);
+    BbSettings::Save();
+    assert(Read(path).find("graphics_blood_sheen=0.00\n") != std::string::npos);
+    { std::ofstream file(path); file << "graphics_blood_sheen=1.50\n"; }
+    BbSettings::Load();
+    assert(s.graphics_blood_sheen == 1.5f);
+    s.graphics_blood_sheen = 0.0f;
+    BbSettings::Save();
+    assert(Read(path).find("graphics_blood_sheen=0.00\n") != std::string::npos);
+    s.graphics_blood_sheen = 2.0f;
+    BbSettings::Load();
+    assert(s.graphics_blood_sheen == 0.0f);
+    { std::ofstream file(path); file << "graphics_blood_sheen=9\n"; }
+    BbSettings::Load();
+    assert(s.graphics_blood_sheen == BbSettings::BloodSheenMax);
+    { std::ofstream file(path); file << "graphics_blood_sheen=-2\n"; }
+    BbSettings::Load();
+    assert(s.graphics_blood_sheen == 0.0f);
+    { std::ofstream file(path); file << "graphics_blood_sheen=abc\n"; }
+    s.graphics_blood_sheen = 1.0f;
+    BbSettings::Load();
+    assert(s.graphics_blood_sheen == 0.0f);
+    { std::ofstream file(path); file << "graphics_blood_sheen=nan\n"; }
+    s.graphics_blood_sheen = 1.0f; // not the default before this Load
+    BbSettings::Load();
+    assert(s.graphics_blood_sheen == BbSettings::BloodSheenDefault);
     BbSettings::Save();
     // bbport (r39_master-debug): engine_previous_paths and the debug_* keys. Nothing above sets
     // them: off by default, written back, read, saved after a change (the start values stay),

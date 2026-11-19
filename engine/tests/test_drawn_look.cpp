@@ -13,7 +13,11 @@
 //  - (r45b_drawn-look-fixes) what moves by itself is told against the camera's own move: a wall
 //    with a vector in the object motion image gets its strokes whatever the camera does, a ball
 //    that lies still does too, one that moves does not; and which small draws count as
-//    transparents (DrawnLookParams::SmallTransparent).
+//    transparents (DrawnLookParams::SmallTransparent);
+//  - (r55_drawn-look-lines) the ink lines (paint_ink.comp), the passes recorded as
+//    DrawnLookParams::PassesFor says: on the silhouettes, on the near side, not on plain
+//    surfaces; a line pixel is its own colour darker; the same at another exposure and under the
+//    jitter; on top of the strokes; the ink page (test view 3).
 //
 // drawn-look-test [picture.bmp]: with a path, four views of the scene are also written.
 // drawn-look-test --picture in.bmp out [2]: the look on a picture (24-bit BMP, sRGB), laid on a
@@ -38,6 +42,7 @@
 #define VULKAN_HPP_NO_EXCEPTIONS
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #include <vulkan/vulkan.hpp>
+#include "video_core/host_shaders/paint_ink_comp.h"
 #include "video_core/host_shaders/paint_key_comp.h"
 #include "video_core/host_shaders/paint_key_last_comp.h"
 #include "video_core/host_shaders/paint_lock_comp.h"
@@ -423,6 +428,7 @@ public:
         lock = MakePass({eCombinedImageSampler, eSampledImage, eSampledImage, eStorageImage,
                          eCombinedImageSampler},
                         PAINT_LOCK_COMP);
+        ink = MakePass({eCombinedImageSampler, eSampledImage, eStorageImage}, PAINT_INK_COMP);
         sampler = Check(device->createSamplerUnique(
             {.magFilter = vk::Filter::eLinear,
              .minFilter = vk::Filter::eLinear,
@@ -433,14 +439,28 @@ public:
              .maxLod = VK_LOD_CLAMP_NONE}));
     }
 
-    /// The scene colour after the passes.
-    std::vector<Half4> Run(const Scene& scene, const Look::Params& params) {
+    /// The scene colour after the passes, recorded as the renderer records them on a frame
+    /// painted before the transparents (DrawnLookParams::PassesFor). `ink_world`, `line_scale`:
+    /// the ink lines' knobs (r55_drawn-look-lines; 0: no ink, as before).
+    std::vector<Half4> Run(const Scene& scene, const Look::Params& params, float ink_world = 0.0f,
+                           float line_scale = 1.0f) {
+        Look::Knobs knobs;
+        knobs.strength = params.strength;
+        knobs.ink_world = ink_world;
+        knobs.line_scale = line_scale;
+        knobs.view = int(Look::ViewOf(params.flags));
+        const Look::Passes passes = Look::PassesFor(knobs, false);
         Load(scene);
         Begin();
         RecordMasks(params);
-        RecordStrokes(params);
-        if (ShowsLook(params)) {
+        if (passes.strokes) {
+            RecordStrokes(params);
+        }
+        if (passes.lock) {
             RecordLock(params);
+        }
+        if (passes.ink) {
+            RecordInk(Look::MakeInk(params, ink_world, knobs.outlines, line_scale));
         }
         const vk::BufferImageCopy region{
             .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
@@ -508,12 +528,6 @@ private:
         vk::UniquePipelineLayout layout;
         vk::UniquePipeline pipeline;
     };
-
-    /// The colour lock runs with the look; a test view has no colours to lock.
-    static bool ShowsLook(const Look::Params& params) {
-        const u32 view = Look::ViewOf(params.flags);
-        return view == Look::ViewOff || view == Look::ViewInk;
-    }
 
     void Load(const Scene& scene) {
         Resize(scene.width, scene.height);
@@ -639,6 +653,16 @@ private:
                                 Write(3, eStorageImage, &infos[3]),
                                 Write(4, eCombinedImageSampler, &infos[4])};
         Dispatch(lock, params, writes, width, height);
+    }
+
+    /// (r55_drawn-look-lines) As vk_drawn_look.cpp records it, last.
+    void RecordInk(const Look::Params& ink_params) {
+        using enum vk::DescriptorType;
+        const std::array infos{Info(copy.view, true), Info(depth.view), Info(colour.view)};
+        const std::array writes{Write(0, eCombinedImageSampler, &infos[0]),
+                                Write(1, eSampledImage, &infos[1]),
+                                Write(2, eStorageImage, &infos[2])};
+        Dispatch(ink, ink_params, writes, width, height);
     }
 
     Pass MakePass(std::initializer_list<vk::DescriptorType> types, std::span<const u32> code) {
@@ -809,7 +833,7 @@ private:
     vk::UniqueQueryPool queries;
     double period_ns = 1.0;
     bool timed = false;
-    Pass prep, stats, mips, key_sums, key_last, strokes, lock_first, lock_down, lock;
+    Pass prep, stats, mips, key_sums, key_last, strokes, lock_first, lock_down, lock, ink;
     vk::UniqueSampler sampler;
     u32 width = 0, height = 0;
     Image colour, copy, marks, means, depth, normal, motion;
@@ -1401,11 +1425,6 @@ int main(int argc, char** argv) {
         Expect(sky > n / 20 && sky_changed == 0, "the sky is not painted");
         Expect(alpha_changed == 0, "the alpha is kept");
         Expect(painted > surface * 0.6, "strokes cover most of the surfaces");
-        if (view == Look::ViewOff) {
-            // The view kept for the ink lines shows the look, as no view does.
-            Expect(gpu.Run(scene, Words(lens, straight, Look::ViewInk)) == out,
-                   "view 3 (kept for the ink lines) shows the look");
-        }
     }
     {
         // The jitter moved by whole pixels: the same picture, moved by as much.
@@ -2004,6 +2023,436 @@ int main(int argc, char** argv) {
         std::printf("three broken pixels in the scene: %u other pixels are no colour after the "
                     "look\n", bad);
         Expect(bad == 0, "a broken pixel does not spread");
+    }
+    {
+        // bbport (r55_drawn-look-lines): the ink lines (paint_ink.comp) on the lit scene at
+        // 1920x1080, recorded as DrawnLookParams::PassesFor says: with the strokes' strength at
+        // 0 the strokes and the lock do not run (lines only).
+        const Scene lit = MakeScene(large, straight, Paint::Lit);
+        const u32 w = large.width, h = large.height, count = w * h;
+        const auto ratio = [](const Scene& in, const std::vector<Half4>& out, u32 i) {
+            return double(Luminance(out[i])) / std::max(double(Luminance(in.colour[i])), 1e-12);
+        };
+        // A pixel whose 7x7 neighbourhood is all of its own surface.
+        const auto plain = [&](const Scene& in, u32 i) {
+            const int x = int(i % w), y = int(i / w);
+            if (x < 3 || y < 3 || x + 3 >= int(w) || y + 3 >= int(h)) {
+                return false;
+            }
+            for (int dy = -3; dy <= 3; ++dy) {
+                for (int dx = -3; dx <= 3; ++dx) {
+                    if (in.surface[u32(y + dy) * w + u32(x + dx)] != in.surface[i]) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        // A pixel of `what` with a 4-neighbour that is farther and of `behind` (Sky: of any
+        // other surface).
+        const auto rim = [&](const Scene& in, u32 i, Surface what, Surface behind) {
+            const int x = int(i % w), y = int(i / w);
+            if (in.surface[i] != what || x < 1 || y < 1 || x + 1 >= int(w) || y + 1 >= int(h)) {
+                return false;
+            }
+            for (const u32 j : {i - 1, i + 1, i - w, i + w}) {
+                if (in.surface[j] != what && (behind == Sky || in.surface[j] == behind) &&
+                    in.depth[j] > in.depth[i]) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        const auto inked = [&](const Scene& in, const std::vector<Half4>& out, Surface what,
+                               Surface behind, double most, u32& of) {
+            u32 dark = 0;
+            of = 0;
+            for (u32 i = 0; i < count; ++i) {
+                if (rim(in, i, what, behind)) {
+                    ++of;
+                    dark += ratio(in, out, i) <= most;
+                }
+            }
+            return dark;
+        };
+        const auto hue = [](const Half4& pixel) {
+            const Rgb c = Colour(pixel);
+            const double sum = std::max(double(c[0]) + c[1] + c[2], 1e-12);
+            return std::array<double, 3>{c[0] / sum, c[1] / sum, c[2] / sum};
+        };
+        const auto lines = gpu.Run(lit, Words(large, straight, Look::ViewOff, true, false, 0.0f),
+                                   1.0f);
+
+        u32 ball_of = 0, column_of = 0;
+        const u32 ball_dark = inked(lit, lines, Ball, Sky, 0.65, ball_of);
+        const u32 column_dark = inked(lit, lines, Column, BackWall, 0.65, column_of);
+        u32 beside = 0, beside_changed = 0, floor_plain = 0, floor_changed = 0, column_plain = 0,
+            column_changed = 0, changed = 0, brighter = 0, sky_changed = 0, alpha_changed = 0;
+        double worst_hue = 0.0;
+        for (u32 i = 0; i < count; ++i) {
+            const bool same = lines[i] == lit.colour[i];
+            alpha_changed += lines[i][3] != lit.colour[i][3];
+            if (lit.surface[i] == Sky) {
+                sky_changed += !same;
+                continue;
+            }
+            if (!same) {
+                ++changed;
+                brighter += Luminance(lines[i]) >= Luminance(lit.colour[i]);
+                const auto a = hue(lit.colour[i]), b = hue(lines[i]);
+                for (int k = 0; k < 3; ++k) {
+                    worst_hue = std::max(worst_hue, std::abs(a[k] - b[k]));
+                }
+            }
+            if (plain(lit, i)) {
+                if (lit.surface[i] == Floor) {
+                    ++floor_plain;
+                    floor_changed += !same;
+                } else if (lit.surface[i] == Column) {
+                    ++column_plain;
+                    column_changed += !same;
+                }
+            }
+            // Beside the ball and farther, with nothing else in its 7x7 neighbourhood.
+            if (lit.surface[i] != Ball) {
+                const int x = int(i % w), y = int(i / w);
+                bool near_ball = false;
+                bool alone = x >= 3 && y >= 3 && x + 3 < int(w) && y + 3 < int(h);
+                for (const u32 j : {i - 1, i + 1, i - w, i + w}) {
+                    near_ball |= j < count && lit.surface[j] == Ball && lit.depth[j] < lit.depth[i];
+                }
+                for (int dy = -3; alone && near_ball && dy <= 3; ++dy) {
+                    for (int dx = -3; dx <= 3; ++dx) {
+                        const Surface there = lit.surface[u32(y + dy) * w + u32(x + dx)];
+                        alone &= there == Ball || there == lit.surface[i];
+                    }
+                }
+                if (near_ball && alone) {
+                    ++beside;
+                    beside_changed += !same;
+                }
+            }
+        }
+        std::printf("ink lines alone (ink 1): %u of %u ball outline pixels at 0.65 of their "
+                    "brightness or darker, %u of %u of the column's against the back wall; %u of "
+                    "%u pixels beside the ball changed; %u of %u plain floor, %u of %u plain "
+                    "column pixels changed; %u pixels changed, %u of them not darker, hue moved "
+                    "by %.5f at most; %u sky pixels and %u alphas changed\n",
+                    ball_dark, ball_of, column_dark, column_of, beside_changed, beside,
+                    floor_changed, floor_plain, column_changed, column_plain, changed, brighter,
+                    worst_hue, sky_changed, alpha_changed);
+        Expect(ball_of > 500 && ball_dark >= ball_of * 0.9,
+               "the ball's outline is inked (0.65 of its brightness or darker on 90%)");
+        Expect(column_of > 500 && column_dark >= column_of * 0.8,
+               "the column's outline against the back wall is inked (on 80%)");
+        Expect(beside > 200 && beside_changed == 0,
+               "the farther side of an edge is left as it was (the line is on the near side)");
+        Expect(floor_plain > 100000 && floor_changed == 0 && column_plain > 5000 &&
+                   column_changed == 0,
+               "plain floor and the column's round inside get no ink");
+        Expect(changed > 0 && brighter == 0 && worst_hue < 1e-3 && sky_changed == 0 &&
+                   alpha_changed == 0,
+               "lines only: a pixel is either as it was or its own colour darker; sky and alpha "
+               "untouched");
+
+        // Another exposure: the same lines (the ink is a share of the pixel's brightness or of
+        // the key). Two roundings to half floats (the input's, the output's) lie in each ratio.
+        double worst_exposure = 0.0;
+        for (const float exposure : {8.0f, 0.125f}) {
+            const Scene other = MakeScene(large, straight, Paint::Lit, exposure);
+            const auto out =
+                gpu.Run(other, Words(large, straight, Look::ViewOff, true, false, 0.0f), 1.0f);
+            for (u32 i = 0; i < count; ++i) {
+                if (lit.surface[i] != Sky && Luminance(lit.colour[i]) > 0.0f) {
+                    const double apart = std::abs(ratio(other, out, i) - ratio(lit, lines, i));
+                    worst_exposure = std::max(worst_exposure, apart);
+                }
+            }
+        }
+        std::printf("ink lines at 8 and 1/8 times the brightness: out/in differs by %.5f at "
+                    "most\n", worst_exposure);
+        Expect(worst_exposure < 2e-3, "the lines do not depend on how bright the scene is");
+
+        // A pixel off the scale on the ball's outline glows: no ink on it.
+        {
+            Scene spark = lit;
+            u32 at = count;
+            for (u32 i = 0; i < count && at == count; ++i) {
+                if (rim(lit, i, Ball, Sky) && ratio(lit, lines, i) < 0.65) {
+                    at = i;
+                }
+            }
+            assert(at < count);
+            spark.colour[at] = {ToHalf(60000.0f), ToHalf(60000.0f), ToHalf(60000.0f),
+                                spark.colour[at][3]};
+            const auto out =
+                gpu.Run(spark, Words(large, straight, Look::ViewOff, true, false, 0.0f), 1.0f);
+            Expect(out[at] == spark.colour[at], "a pixel that glows on an outline gets no ink");
+            // A colour with a channel that is no number (a half float NaN) on an outline is
+            // left as it is.
+            Scene broken = lit;
+            broken.colour[at][1] = 0x7E00;
+            const auto kept =
+                gpu.Run(broken, Words(large, straight, Look::ViewOff, true, false, 0.0f), 1.0f);
+            Expect(kept[at] == broken.colour[at],
+                   "a pixel whose colour is no number keeps it, on an outline too");
+        }
+
+        // Under the jitter: the ink on the ball as a whole stays.
+        {
+            static constexpr std::array<std::array<float, 2>, 8> Jitters{{{0.0f, 0.0f},
+                                                                         {0.25f, -0.17f},
+                                                                         {-0.25f, 0.17f},
+                                                                         {0.375f, 0.39f},
+                                                                         {-0.125f, -0.39f},
+                                                                         {0.125f, 0.06f},
+                                                                         {-0.375f, -0.28f},
+                                                                         {0.44f, -0.06f}}};
+            double least = 1e30, most = 0.0;
+            for (const auto& jitter : Jitters) {
+                Camera moved = straight;
+                moved.jitter = jitter;
+                const Scene scene_j = MakeScene(large, moved, Paint::Lit);
+                const auto out =
+                    gpu.Run(scene_j, Words(large, moved, Look::ViewOff, true, false, 0.0f), 1.0f);
+                double ink = 0.0;
+                for (u32 i = 0; i < count; ++i) {
+                    if (scene_j.surface[i] == Ball) {
+                        ink += 1.0 - ratio(scene_j, out, i);
+                    }
+                }
+                least = std::min(least, ink);
+                most = std::max(most, ink);
+            }
+            std::printf("ink on the ball under 8 jitters: %.1f to %.1f (pixels' darkening "
+                        "summed)\n", least, most);
+            Expect(least > 0.0 && most / least - 1.0 < 0.1,
+                   "the ink on the ball stays within 10% under the jitter");
+        }
+
+        // The default weight: a little of the frame.
+        {
+            const auto out =
+                gpu.Run(lit, Words(large, straight, Look::ViewOff, true, false, 0.0f), 0.35f);
+            double before = 0.0, after = 0.0;
+            u32 surfaces = 0, darker = 0;
+            for (u32 i = 0; i < count; ++i) {
+                before += Luminance(lit.colour[i]);
+                after += Luminance(out[i]);
+                if (lit.surface[i] != Sky) {
+                    ++surfaces;
+                    darker += ratio(lit, out, i) < 0.98;
+                }
+            }
+            const double loss = 1.0 - after / before, share = double(darker) / surfaces;
+            std::printf("ink lines 0.35: the frame's mean brightness %.2f%% lower, %.2f%% of the "
+                        "surface pixels inked\n", 100.0 * loss, 100.0 * share);
+            // (This scene has few silhouettes: a ball, a column, the walls' corners.)
+            Expect(loss < 0.015 && share > 0.002 && share < 0.06,
+                   "at 0.35 the lines darken the frame by under 1.5%, on 0.2% to 6% of its "
+                   "surfaces");
+        }
+
+        // BB_DRAWN_LOOK_LINE: a wider line inks more pixels.
+        {
+            u32 inked_at[3] = {};
+            const float scales[3] = {0.6f, 1.0f, 1.6f};
+            for (int k = 0; k < 3; ++k) {
+                const auto out = gpu.Run(
+                    lit, Words(large, straight, Look::ViewOff, true, false, 0.0f), 1.0f, scales[k]);
+                for (u32 i = 0; i < count; ++i) {
+                    inked_at[k] += !(out[i] == lit.colour[i]);
+                }
+            }
+            std::printf("ink lines at line scale 0.6, 1 and 1.6: %u, %u and %u pixels\n",
+                        inked_at[0], inked_at[1], inked_at[2]);
+            Expect(inked_at[0] < inked_at[1] && inked_at[1] < inked_at[2],
+                   "the line scale widens the lines");
+        }
+
+        // With the strokes: the ink comes after the colour lock, which would otherwise take
+        // it back.
+        {
+            const auto strokes =
+                gpu.Run(lit, Words(large, straight, Look::ViewOff, true, false, 0.6f), 0.0f);
+            const auto both =
+                gpu.Run(lit, Words(large, straight, Look::ViewOff, true, false, 0.6f), 0.35f);
+            u32 of = 0, dark = 0;
+            for (u32 i = 0; i < count; ++i) {
+                if (rim(lit, i, Ball, Sky)) {
+                    ++of;
+                    dark += Luminance(both[i]) <= 0.8f * Luminance(strokes[i]);
+                }
+            }
+            std::printf("strokes 0.6 with ink lines 0.35: %u of %u ball outline pixels at 0.8 "
+                        "of the strokes' brightness or darker\n", dark, of);
+            Expect(of > 500 && dark >= of * 0.9, "the ink lies on top of the strokes");
+        }
+
+        // Test view 3, the ink page: the key's grey with the lines dark on it, every line at
+        // weight 1, the sky as it was; no strokes (the strength is 0.6 here).
+        {
+            const auto page =
+                gpu.Run(lit, Words(large, straight, Look::ViewInk, true, false, 0.6f), 0.0f);
+            std::vector<u16> greys;
+            u32 sky_kept = 0, sky = 0, coloured = 0;
+            for (u32 i = 0; i < count; ++i) {
+                if (lit.surface[i] == Sky) {
+                    ++sky;
+                    sky_kept += page[i] == lit.colour[i];
+                } else {
+                    coloured += !(page[i][0] == page[i][1] && page[i][1] == page[i][2]);
+                    if (plain(lit, i)) {
+                        greys.push_back(page[i][0]);
+                    }
+                }
+            }
+            std::sort(greys.begin(), greys.end());
+            const u16 paper = greys.empty() ? 0 : greys[greys.size() / 2];
+            u32 plain_off = 0, above = 0, of = 0, dark = 0;
+            for (u32 i = 0; i < count; ++i) {
+                if (lit.surface[i] == Sky) {
+                    continue;
+                }
+                above += FromHalf(page[i][0]) > FromHalf(paper);
+                plain_off += plain(lit, i) && page[i][0] != paper;
+                if (rim(lit, i, Ball, Sky)) {
+                    ++of;
+                    dark += FromHalf(page[i][0]) <= 0.65f * FromHalf(paper);
+                }
+            }
+            std::printf("test view 3: paper %.4f, %u of %u sky pixels kept, %u surface pixels "
+                        "not grey, %u above the paper, %u plain pixels off it; %u of %u ball "
+                        "outline pixels dark\n", FromHalf(paper), sky_kept, sky, coloured, above,
+                        plain_off, dark, of);
+            Expect(paper != 0 && sky_kept == sky && coloured == 0 && above == 0 &&
+                       plain_off == 0 && of > 500 && dark >= of * 0.9,
+                   "test view 3 is the ink page: the key's grey, the lines dark, the sky kept");
+        }
+
+        // Other render sizes: where the lines show does not depend on the size, and the ink
+        // along an outline goes with the line's width in the picture (a line under one pixel
+        // is drawn one pixel wide at a share of its weight).
+        {
+            const Lens sizes[3] = {{960, 540}, {1920, 1080}, {2560, 1440}};
+            double share[3] = {}, column_share[3] = {}, per_line[3] = {};
+            for (int k = 0; k < 3; ++k) {
+                const Lens& at = sizes[k];
+                const u32 wk = at.width, hk = at.height;
+                const Scene in = k == 1 ? lit : MakeScene(at, straight, Paint::Lit);
+                const auto out =
+                    gpu.Run(in, Words(at, straight, Look::ViewOff, true, false, 0.0f), 1.0f);
+                u32 of = 0, dark = 0, column_of = 0, column_dark = 0;
+                double ink = 0.0;
+                for (u32 y = 1; y + 1 < hk; ++y) {
+                    for (u32 x = 1; x + 1 < wk; ++x) {
+                        const u32 i = y * wk + x;
+                        const double r = double(Luminance(out[i])) /
+                                         std::max(double(Luminance(in.colour[i])), 1e-12);
+                        if (in.surface[i] == Ball) {
+                            ink += 1.0 - r;
+                        }
+                        bool edge = false;
+                        for (const u32 j : {i - 1, i + 1, i - wk, i + wk}) {
+                            edge |= in.surface[j] != in.surface[i] && in.depth[j] > in.depth[i] &&
+                                    (in.surface[i] == Ball || in.surface[j] == BackWall);
+                        }
+                        if (edge && in.surface[i] == Ball) {
+                            ++of;
+                            dark += r <= 0.65;
+                        } else if (edge && in.surface[i] == Column) {
+                            ++column_of;
+                            column_dark += r <= 0.65;
+                        }
+                    }
+                }
+                share[k] = of ? double(dark) / of : 0.0;
+                column_share[k] = column_of ? double(column_dark) / column_of : 0.0;
+                // The ink per outline pixel, per pixel of a 1080-line scene.
+                per_line[k] = of ? ink / of / (hk / 1080.0) : 0.0;
+                std::printf("ink lines at %ux%u: %u of %u ball outline pixels and %u of %u of the "
+                            "column's at 0.65 or darker; %.3f ink per outline pixel per 1080-line "
+                            "pixel\n", wk, hk, dark, of, column_dark, column_of, per_line[k]);
+            }
+            bool same_place = true, same_ink = true;
+            for (int k = 0; k < 3; ++k) {
+                same_place &= share[k] >= 0.9 && column_share[k] >= 0.8;
+                same_ink &= per_line[k] > 0.7 * per_line[1] && per_line[k] < 1.4 * per_line[1];
+            }
+            Expect(same_place, "at 960x540, 1920x1080 and 2560x1440 the outlines are inked alike");
+            Expect(same_ink, "the ink along an outline goes with the line's width in the picture "
+                             "(within 0.7 to 1.4 of 1920x1080's)");
+        }
+
+        // Thin things (a railing, a branch): bars 1, 2, 3 and 8 pixels wide and 200 high, 40%
+        // nearer than the back wall in front of it. A bar narrower than about twice the line
+        // gets half the weight; the wide bar's edges get the full line.
+        {
+            Scene bars = lit;
+            std::vector<int> bar(count, 0);
+            // Where 200 rows of 100 pixels are all back wall.
+            u32 x0 = 0, y0 = 0;
+            for (u32 y = 0; y + 200 < h && !x0; y += 10) {
+                for (u32 x = 0; x + 100 < w && !x0; x += 10) {
+                    bool wall = true;
+                    for (u32 dy = 0; dy < 200 && wall; ++dy) {
+                        for (u32 dx = 0; dx < 100 && wall; ++dx) {
+                            wall = lit.surface[(y + dy) * w + x + dx] == BackWall;
+                        }
+                    }
+                    if (wall) {
+                        x0 = x;
+                        y0 = y;
+                    }
+                }
+            }
+            assert(x0);
+            const u32 widths[4] = {1, 2, 3, 8};
+            for (int b = 0; b < 4; ++b) {
+                for (u32 dy = 0; dy < 200; ++dy) {
+                    for (u32 dx = 0; dx < widths[b]; ++dx) {
+                        const u32 i = (y0 + dy) * w + x0 + 10 + 22 * u32(b) + dx;
+                        const double t = Near / (1.0 - double(lit.depth[i]));
+                        bars.depth[i] = float(1.0 - Near / (0.6 * t));
+                        bar[i] = b + 1;
+                    }
+                }
+            }
+            const auto out =
+                gpu.Run(bars, Words(large, straight, Look::ViewOff, true, false, 0.0f), 1.0f);
+            double mean[4] = {}, edge_most = 0.0;
+            u32 n[4] = {};
+            for (u32 dy = 10; dy < 190; ++dy) {
+                for (u32 x = x0; x < x0 + 100; ++x) {
+                    const u32 i = (y0 + dy) * w + x;
+                    if (bar[i]) {
+                        mean[bar[i] - 1] += ratio(bars, out, i);
+                        ++n[bar[i] - 1];
+                        if (bar[i] == 4 && (bar[i - 1] == 0 || bar[i + 1] == 0)) {
+                            edge_most = std::max(edge_most, ratio(bars, out, i));
+                        }
+                    }
+                }
+            }
+            for (int b = 0; b < 4; ++b) {
+                mean[b] /= std::max(n[b], 1u);
+            }
+            // A full line's darkening: the wide bar's edges'. A thin bar's, over its width, about
+            // half of it.
+            const double full = 1.0 - edge_most;
+            bool half = true;
+            for (int b = 0; b < 3; ++b) {
+                half &= 1.0 - mean[b] >= 0.3 * full && 1.0 - mean[b] <= 0.6 * full;
+            }
+            std::printf("thin bars at ink 1: mean brightness 1 px %.3f, 2 px %.3f, 3 px %.3f, 8 px "
+                        "%.3f of their own; the 8-pixel bar's edges at %.3f at most (a thin bar "
+                        "darkened by %.2f, %.2f and %.2f of a full line)\n",
+                        mean[0], mean[1], mean[2], mean[3], edge_most, (1.0 - mean[0]) / full,
+                        (1.0 - mean[1]) / full, (1.0 - mean[2]) / full);
+            Expect(edge_most <= 0.4, "a wide bar's edges get the full line");
+            Expect(half, "a bar 1 to 3 pixels wide is darkened over its width by 0.3 to 0.6 of a "
+                         "full line (half the weight)");
+        }
     }
     if (argc > 1) {
         const Lens half{960, 540};

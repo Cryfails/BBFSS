@@ -573,6 +573,22 @@ int main() {
         assert(Near(SharesOf(t).painted, 0.25, 1e-9) && SharesOf(Totals{}).painted == 0.0);
         assert(CL_WORD_PAINTED == 16u && CL_WORDS == 17u && CL_WORD_PAINTED < CL_WORDS);
     }
+    // q. (r119j_clouds-banding) BB_VOLUMETRIC_CLOUDS_SMOOTH: parsing, the default, the knob in the push word's bits 4 to 7.
+    {
+        assert(DefaultSoften == 15u && CL_SMOOTH_ALL == 15u && ParseSoften(nullptr) == DefaultSoften &&
+               ParseSoften("0") == 0u && ParseSoften("5") == 5u && ParseSoften("2.4") == 2u && ParseSoften("99") == 15u &&
+               ParseSoften("-3") == 0u && ParseSoften("x") == DefaultSoften);
+        assert(SoftenFlags(0u) == 0u && SoftenFlags(15u) == 240u && SoftenFlags(1u) == 16u && SoftenFlags(31u) == 240u &&
+               (SoftenFlags(15u) & std::uint32_t(CL_FLAG_SHOW)) == 0u);
+        const Knobs d = MakeKnobs("1", nullptr, nullptr, nullptr, nullptr);
+        assert(d.soften == 15u);
+        const Knobs off = MakeKnobs("1", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "0");
+        assert(off.soften == 0u && SoftenFlags(off.soften) == 0u);
+        // the four bits are distinct and below the SHOW flag's bit 0 (flags: SHOW | the bits << 4)
+        assert((CL_SMOOTH_JITTER | CL_SMOOTH_EDGE | CL_SMOOTH_PAINT | CL_SMOOTH_GLOW) == CL_SMOOTH_ALL &&
+               (CL_SMOOTH_JITTER & CL_SMOOTH_EDGE) == 0u && (CL_SMOOTH_PAINT & CL_SMOOTH_GLOW) == 0u);
+    }
     std::puts("cloud layer: ok");
     return 0;
 }

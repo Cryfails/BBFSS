@@ -2,6 +2,8 @@
 #include <vulkan/vulkan.h>
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +18,12 @@
 #include "video_core/host_shaders/rt_shadow_filter_comp.h"
 #include "video_core/host_shaders/rt_lab_comp.h"
 #include "video_core/host_shaders/point_shadow_ray_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_cards_comp.h"
+#include "video_core/host_shaders/point_shadow_ray_colour_glass_comp.h"
+#include "gpu/shadps4/video_core/host_shaders/glass_light_layout.h"
+#include "gpu/shadps4/video_core/host_shaders/glass_view_layout.h"
+#include "gpu/shadps4/video_core/host_shaders/rt_card_layers_layout.h"
+#include "gpu/shadps4/video_core/host_shaders/rt_card_uv_layout.h"
 #include "video_core/host_shaders/point_shadow_ray_half_comp.h" // bbport (r42_lamp-soft)
 // bbport (r60_lamp-centred-window): the BB_LAMP_SHADOW_WINDOW=2 builds
 #include "video_core/host_shaders/point_shadow_ray_centred_comp.h"
@@ -307,11 +315,12 @@ struct Vk {
         vkFreeMemory(device, b.memory, nullptr);
         b = {};
     }
-    Image MakeImage(unsigned w, unsigned h, VkFormat format) {
+    Image MakeImage(unsigned w, unsigned h, VkFormat format, unsigned mips = 1,
+                    VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D) {
         Image i;
         VkImageCreateInfo info{.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .imageType = VK_IMAGE_TYPE_2D, .format = format, .extent = {w, h, 1},
-            .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+            .mipLevels = mips, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                 VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
         CHECK(vkCreateImage(device, &info, nullptr, &i.image));
@@ -322,13 +331,14 @@ struct Vk {
         CHECK(vkAllocateMemory(device, &alloc, nullptr, &i.memory));
         CHECK(vkBindImageMemory(device, i.image, i.memory, 0));
         VkImageViewCreateInfo view{.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = i.image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
-            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            .image = i.image, .viewType = view_type, .format = format,
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, 1}};
         CHECK(vkCreateImageView(device, &view, nullptr, &i.view));
         return i;
     }
     Pipeline MakePipeline(std::initializer_list<VkDescriptorType> types, unsigned push_bytes,
-                          const std::uint32_t* code, std::size_t code_bytes, VkPipelineCreateFlags create_flags = 0) {
+                          const std::uint32_t* code, std::size_t code_bytes, VkPipelineCreateFlags create_flags = 0,
+                          VkDescriptorSetLayout ordinary_set = VK_NULL_HANDLE) {
         Pipeline p;
         std::vector<VkDescriptorSetLayoutBinding> bindings;
         for (const auto type : types)
@@ -338,8 +348,10 @@ struct Vk {
             .bindingCount = unsigned(bindings.size()), .pBindings = bindings.data()};
         CHECK(vkCreateDescriptorSetLayout(device, &si, nullptr, &p.set));
         VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
+        const std::array layouts{p.set, ordinary_set};
         VkPipelineLayoutCreateInfo li{.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            .setLayoutCount = 1, .pSetLayouts = &p.set, .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
+            .setLayoutCount = ordinary_set ? 2u : 1u, .pSetLayouts = layouts.data(),
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
         CHECK(vkCreatePipelineLayout(device, &li, nullptr, &p.layout));
         VkShaderModule module;
         VkShaderModuleCreateInfo mi{.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = code_bytes, .pCode = code};
@@ -736,13 +748,17 @@ void WritePgm(const char* path, const std::vector<float>& image) {
 
 struct PcssPush {
     unsigned offsets = 0, frame = 0;
-    float width = W, height = H, length = 0.6f, thickness = 0.35f, strength = 0.75f, flip = 1;
+    float width = W, height = H;
+    std::array<float, 4> light_coordinate{};
+    std::array<int, 2> wave_offset{};
+    float surface = 0.005f, bilinear = 0.02f, strength = 0.75f, contrast = 4;
     unsigned debug = 0, contact = 0, pcss = 1;
     float light = 0.02f, maximum = 0.3f, minimum = 0.0f, bias = 0.04f;
     unsigned filter = 1;
     float blend = 0.1f;
+    float bend_scale = 0;
 };
-static_assert(sizeof(PcssPush) == 68);
+static_assert(sizeof(PcssPush) == 96);
 struct RtPush {
     unsigned offsets = 0, frame = 0;
     float width = W, height = H;
@@ -870,8 +886,9 @@ struct Lab {
             {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = 4, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &u}}};
         vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pcss.pipeline);
         vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pcss.layout, 0, 5, writes.data());
+        // PCSS only (contact = 0): one thread per pixel, in rows of 64.
         vkCmdPushConstants(vk.cmd, pcss.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
-        vkCmdDispatch(vk.cmd, (W + 7) / 8, (H + 7) / 8, 1);
+        vkCmdDispatch(vk.cmd, (W + 63) / 64, H, 1);
     }
     std::vector<float> Read(Image& image, VkFormat format) {
         vk.Begin();
@@ -1147,12 +1164,397 @@ bool StillLab(Vk& vk) {
     std::puts(ok ? "Still check: ok" : "Still check: FAILED");
     return ok;
 }
+namespace MaterialFixture {
+constexpr unsigned Width = 96, Height = 64;
+constexpr double ReceiverZ = 4.0, CasterZ = 3.0, LampZ = 2.0;
+constexpr float Bias = 0.02f;
+// Across this plane distance squared is below 17. With 2^-32 inverse radius
+// squared, (1 - distanceSquared * inverseRadiusSquared) rounds to exactly 1
+// in F32. This isolates visibility from falloff division before packed storage.
+constexpr float FlatInvRadiusSquared = 0x1p-32f;
+constexpr std::array<unsigned, 3> Tint{192, 96, 48};
+constexpr std::uint32_t White = (15u << 6) | (15u << 17) | (15u << 27);
+constexpr std::array<const char*, 5> ClassName{"clear", "glass", "hole", "kept", "opaque"};
+enum Class { Clear, Glass, Hole, Kept, Opaque, Excluded };
+struct Quad { double left, right; };
+constexpr std::array<Quad, 3> Quads{{{-1.25, -0.6}, {-0.4, 0.4}, {0.9, 1.2}}};
+constexpr double Bottom = -0.6, Top = 0.6;
+
+// With a constant depth plane the origin is shifted towards the lamp by the
+// shader's depth-scaled bias. Solve the plane intersection in double precision.
+Class ExpectedClass(unsigned x, unsigned y) {
+    constexpr double Fraction = (CasterZ - LampZ) / (ReceiverZ - Bias - 0.0015 * ReceiverZ - LampZ);
+    constexpr double GuardX = 6.0 / Width * Fraction, GuardY = 4.0 / Height * Fraction;
+    if (x == 0 || x + 1 == Width || y == 0 || y + 1 == Height) return Excluded;
+    const double hit_x = 3.0 * (2.0 * (x + 0.5) / Width - 1.0) * Fraction;
+    const double hit_y = 2.0 * (1.0 - 2.0 * (y + 0.5) / Height) * Fraction;
+    for (unsigned i = 0; i < Quads.size(); ++i) {
+        const auto [left, right] = Quads[i];
+        if (hit_x < left - GuardX || hit_x > right + GuardX || hit_y < Bottom - GuardY || hit_y > Top + GuardY) continue;
+        // Leave one projected pixel on each side of edges, the shared diagonal
+        // and the filtered alpha transition. Do not fit these guards to readback.
+        if (hit_x <= left + GuardX || hit_x >= right - GuardX || hit_y <= Bottom + GuardY || hit_y >= Top - GuardY) {
+            return Excluded;
+        }
+        const double u = (hit_x - left) / (right - left), v = (hit_y - Bottom) / (Top - Bottom);
+        if (std::abs(u + v - 1.0) <= GuardX / (right - left) + GuardY / (Top - Bottom)) return Excluded;
+        if (i == 0) return Glass;
+        if (i == 2) return Opaque;
+        if (std::abs(u - 0.5) <= std::max(GuardX / (right - left), 0.5 / CARD_LAYER_SIZE)) return Excluded;
+        return u < 0.5 ? Hole : Kept;
+    }
+    return Clear;
+}
+
+unsigned PackedLane(std::uint32_t word, unsigned lane) {
+    return (word >> (11 * lane)) & (lane == 2 ? 1023u : 2047u);
+}
+
+double LaneValue(unsigned code, unsigned bits) {
+    const unsigned exponent = code >> bits;
+    const double fraction = double(code & ((1u << bits) - 1u)) / (1u << bits);
+    return exponent == 0 ? std::ldexp(fraction, -14) : std::ldexp(1.0 + fraction, int(exponent) - 15);
+}
+
+std::array<unsigned, 2> TintCodes(unsigned byte, unsigned bits) {
+    unsigned lo = 0;
+    while (LaneValue(lo + 1, bits) * 255.0 <= byte) ++lo;
+    return {lo, lo + unsigned(LaneValue(lo, bits) * 255.0 != byte)};
+}
+
+bool Tinted(std::uint32_t word) {
+    static const std::array bounds{TintCodes(Tint[0], 6), TintCodes(Tint[1], 6), TintCodes(Tint[2], 5)};
+    for (unsigned i = 0; i != 3; ++i) {
+        const unsigned code = PackedLane(word, i);
+        if (code < bounds[i][0] || code > bounds[i][1]) return false;
+    }
+    return true;
+}
+
+void Fingerprint(const char* name, const std::uint32_t* code, std::size_t bytes) {
+    std::uint64_t hash = 14695981039346656037ull;
+    for (std::size_t i = 0; i < bytes / sizeof(*code); ++i) {
+        for (unsigned shift = 0; shift < 32; shift += 8) {
+            hash = (hash ^ ((code[i] >> shift) & 255u)) * 1099511628211ull;
+        }
+    }
+    std::printf("Material fixture module %s: bytes=%zu fnv64=%016llx\n", name, bytes, static_cast<unsigned long long>(hash));
+}
+
+bool Run(Vk& vk) {
+    std::printf("GPU: %s, %ux%u, atlas 0\n", vk.name, Width, Height);
+    std::puts("Torch lab case: material-fixture");
+    std::vector<Mesh> meshes(Quads.size());
+    for (std::size_t n = 0; n < meshes.size(); ++n) {
+        const auto [left, right] = Quads[n];
+        AddGrid(meshes[n], {float(left), float(Bottom), float(CasterZ)}, {float(right - left), 0, 0},
+                {0, float(Top - Bottom), 0}, 1);
+    }
+    Scene scene{vk, std::move(meshes)};
+    constexpr auto Fast = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+    scene.Create(Fast);
+    scene.Allocate();
+    scene.BuildAll(Fast);
+    auto tlas = CreateTlas(vk, scene);
+    WriteTlasInstances(tlas, scene, Identity());
+    auto* instances = static_cast<VkAccelerationStructureInstanceKHR*>(tlas.instances.data);
+    instances[0].mask = GLASS_LIGHT_MASK;
+    instances[0].instanceCustomIndex = GLASS_INDEX_BIT;
+    instances[1].mask = CARD_LAMP_MASK;
+    instances[1].instanceCustomIndex = 1;
+    instances[1].flags = VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR;
+    instances[2].mask = 0x04u;
+    BuildTlas(vk, tlas, scene, Identity(), false);
+    std::printf("== Speed: %u triangles in %zu BLAS\n", scene.triangles, scene.blas.size());
+
+    constexpr auto Store = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    constexpr auto Buf = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    constexpr auto Sample = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    constexpr auto Accel = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+    const std::initializer_list<VkDescriptorType> plain_types{Buf, Sample, Store, Store, Store, Store, Accel, Store, Store, Store, Store};
+    const std::initializer_list<VkDescriptorType> glass_types{Buf, Sample, Store, Store, Store, Store, Accel, Store, Store, Store, Store, Store};
+    constexpr std::array card_types{Buf, Buf, Buf, Sample, Buf};
+    std::array<VkDescriptorSetLayoutBinding, card_types.size()> card_bindings{};
+    for (unsigned n = 0; n < card_bindings.size(); ++n) card_bindings[n] = {n, card_types[n], 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+    VkDescriptorSetLayoutCreateInfo layout_info{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = unsigned(card_bindings.size()), .pBindings = card_bindings.data()};
+    VkDescriptorSetLayout card_layout{};
+    CHECK(vkCreateDescriptorSetLayout(vk.device, &layout_info, nullptr, &card_layout));
+    constexpr std::array pool_sizes{VkDescriptorPoolSize{Buf, 4}, VkDescriptorPoolSize{Sample, 1}};
+    VkDescriptorPoolCreateInfo pool_info{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = 1, .poolSizeCount = unsigned(pool_sizes.size()), .pPoolSizes = pool_sizes.data()};
+    VkDescriptorPool pool{};
+    CHECK(vkCreateDescriptorPool(vk.device, &pool_info, nullptr, &pool));
+    VkDescriptorSetAllocateInfo alloc{.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &card_layout};
+    VkDescriptorSet card_set{};
+    CHECK(vkAllocateDescriptorSets(vk.device, &alloc, &card_set));
+    struct Push {
+        unsigned first_light = 48, frame = 0;
+        float width = Width, height = Height, length = 0;
+        unsigned mode = 16u | (100u << 8);
+        float strength = 1, fade_start = 6, fade_end = 8;
+        unsigned count = 1, steps = 0;
+        float bias = Bias;
+        std::array<int, 4> rect{0, 0, int(Width), int(Height)};
+    } push;
+    static_assert(sizeof(Push) == 64);
+    const auto plain = vk.MakePipeline(plain_types, sizeof(push), POINT_SHADOW_RAY_COMP, sizeof(POINT_SHADOW_RAY_COMP));
+    const auto cards = vk.MakePipeline(plain_types, sizeof(push), POINT_SHADOW_RAY_CARDS_COMP,
+                                       sizeof(POINT_SHADOW_RAY_CARDS_COMP), 0, card_layout);
+    const auto glass = vk.MakePipeline(glass_types, sizeof(push), POINT_SHADOW_RAY_COLOUR_GLASS_COMP,
+                                       sizeof(POINT_SHADOW_RAY_COLOUR_GLASS_COMP));
+    Fingerprint("plain", POINT_SHADOW_RAY_COMP, sizeof(POINT_SHADOW_RAY_COMP));
+    Fingerprint("cards", POINT_SHADOW_RAY_CARDS_COMP, sizeof(POINT_SHADOW_RAY_CARDS_COMP));
+    Fingerprint("glass", POINT_SHADOW_RAY_COLOUR_GLASS_COMP, sizeof(POINT_SHADOW_RAY_COLOUR_GLASS_COMP));
+
+    std::array<Image, 12> images{};
+    images[1] = vk.MakeImage(Width, Height, VK_FORMAT_R32_SFLOAT);
+    for (unsigned n = 2; n <= 5; ++n) images[n] = vk.MakeImage(Width, Height, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
+    for (unsigned n = 7; n <= 8; ++n) images[n] = vk.MakeImage(Width, Height, VK_FORMAT_R16G16B16A16_SFLOAT);
+    for (unsigned n = 9; n <= 10; ++n) images[n] = vk.MakeImage(Width, Height, VK_FORMAT_R32_SFLOAT);
+    images[11] = vk.MakeImage(Width, Height * 3, VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    const auto alpha = vk.MakeImage(CARD_LAYER_SIZE, CARD_LAYER_SIZE, VK_FORMAT_R8_UNORM,
+                                    CARD_LAYER_MIPS, VK_IMAGE_VIEW_TYPE_2D_ARRAY);
+    VkSamplerCreateInfo alpha_sampler_info{.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .maxLod = float(CARD_LAYER_MIPS - 1)};
+    VkSampler alpha_sampler{};
+    CHECK(vkCreateSampler(vk.device, &alpha_sampler_info, nullptr, &alpha_sampler));
+
+    constexpr unsigned LampAt = 16, TableAt = 48, TuneAt = 100;
+    constexpr unsigned DataWords = TuneAt + Vulkan::LampTuneWordCount + GLASS_WORDS;
+    auto data = vk.MakeBuffer(DataWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    auto rows = vk.MakeBuffer(2 * CARD_ROW_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    auto records = vk.MakeBuffer(2 * CARD_UV_RECORD_BYTES, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    auto layers = vk.MakeBuffer(sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    auto counts = vk.MakeBuffer(CARD_LAMP_BUFFER_WORDS * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+    auto download = vk.MakeBuffer(Width * Height * sizeof(std::uint32_t), 0, true);
+    constexpr std::uint32_t RowFlags = CARD_ROW_READY | (CARD_OP_GREATER << CARD_ROW_OP_SHIFT) |
+        (CARD_UV_MODE_CLAMP << CARD_ROW_MODE_U_SHIFT) | (CARD_UV_MODE_CLAMP << CARD_ROW_MODE_V_SHIFT);
+    const std::array<std::uint32_t, 16> row_words{0, 0, 0, 0, 0, 0, 0, 0, 0, 2, RowFlags, std::bit_cast<std::uint32_t>(0.5f), 0, 0, 0, 1};
+    std::memcpy(rows.data, row_words.data(), sizeof(row_words));
+    // AddGrid's two triangles [a,b,c] then [b,d,c], with half-precision 0 and 1 UVs.
+    constexpr unsigned U = 0x00003c00u, V = 0x3c000000u, AV = 0x00ffffffu;
+    constexpr std::array<unsigned, 8> record_words{0, U, V, AV, U, U | V, V, AV};
+    std::memcpy(records.data, record_words.data(), sizeof(record_words));
+    *static_cast<std::uint32_t*>(layers.data) = CARD_LAYER_READY | 1u;
+
+    std::array<VkBufferImageCopy, CARD_LAYER_MIPS> alpha_regions{};
+    VkDeviceSize alpha_bytes = 0;
+    for (unsigned n = 0; n < alpha_regions.size(); ++n) {
+        const unsigned dim = CARD_LAYER_SIZE >> n;
+        alpha_regions[n] = {.bufferOffset = alpha_bytes, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, n, 0, 1},
+                            .imageExtent = {dim, dim, 1}};
+        alpha_bytes += dim * dim;
+    }
+    auto alpha_upload = vk.MakeBuffer(alpha_bytes, 0, true);
+    const std::array<VkDescriptorBufferInfo, 5> card_buffers{{
+        {rows.buffer, 0, rows.size}, {records.buffer, 0, records.size}, {layers.buffer, 0, layers.size},
+        {}, {counts.buffer, 0, counts.size}}};
+    const VkDescriptorImageInfo alpha_info{alpha_sampler, alpha.view, VK_IMAGE_LAYOUT_GENERAL};
+    std::array<VkWriteDescriptorSet, card_types.size()> card_writes{};
+    for (unsigned n = 0; n < card_writes.size(); ++n) {
+        card_writes[n] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = card_set, .dstBinding = n,
+                          .descriptorCount = 1, .descriptorType = card_types[n], .pImageInfo = n == 3 ? &alpha_info : nullptr,
+                          .pBufferInfo = n == 3 ? nullptr : &card_buffers[n]};
+    }
+    vkUpdateDescriptorSets(vk.device, unsigned(card_writes.size()), card_writes.data(), 0, nullptr);
+
+    VkDeviceSize resource_bytes = 0;
+    for (const auto& i : images) {
+        if (i.image) { VkMemoryRequirements req; vkGetImageMemoryRequirements(vk.device, i.image, &req); resource_bytes += req.size; }
+    }
+    VkMemoryRequirements req;
+    vkGetImageMemoryRequirements(vk.device, alpha.image, &req);
+    resource_bytes += req.size;
+    for (const auto* b : {&data, &rows, &records, &layers, &counts, &download, &alpha_upload, &scene.geometry,
+                          &scene.staging, &scene.storage, &scene.scratch, &tlas.instances, &tlas.storage, &tlas.scratch}) {
+        vkGetBufferMemoryRequirements(vk.device, b->buffer, &req);
+        resource_bytes += req.size;
+    }
+    std::printf("Material fixture resources: allocation_requirements=%llu\n", static_cast<unsigned long long>(resource_bytes));
+
+    vk.Begin();
+    for (const auto& i : images) if (i.image) vk.ToGeneral(i.image);
+    const VkImageMemoryBarrier alpha_init{.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = alpha.image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, CARD_LAYER_MIPS, 0, 1}};
+    vkCmdPipelineBarrier(vk.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                         1, &alpha_init);
+    const VkImageSubresourceRange full{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const VkClearColorValue depth_value{.float32 = {0.5f, 0, 0, 0}};
+    vkCmdClearColorImage(vk.cmd, images[1].image, VK_IMAGE_LAYOUT_GENERAL, &depth_value, 1, &full);
+    vk.Barrier();
+    vk.End();
+
+    enum Stage { Plain, GlassOn, GlassOff, CardsNormal, CardsInverted, CardsRestored };
+    constexpr std::array<const char*, 6> stage_names{"plain", "glass-on", "glass-off", "cards-normal", "cards-inverted", "cards-restored"};
+    std::vector<std::uint32_t> plain_pixels, normal_pixels;
+    bool good = true;
+    for (unsigned stage = Plain; stage <= CardsRestored; ++stage) {
+        const bool is_cards = stage >= CardsNormal;
+        const bool is_glass = stage == GlassOn || stage == GlassOff;
+        const auto& pipeline = is_cards ? cards : is_glass ? glass : plain;
+        const char* label = stage_names[stage];
+        std::array<std::uint32_t, DataWords> words{};
+        const auto set_float = [&](unsigned slot, float value) { words[slot] = std::bit_cast<std::uint32_t>(value); };
+        set_float(0, 3); set_float(5, 2); set_float(10, 8); set_float(15, 1);
+        set_float(LampAt + 2, float(LampZ)); set_float(LampAt + 3, FlatInvRadiusSquared);
+        set_float(LampAt + 4, 1); set_float(LampAt + 5, 1); set_float(LampAt + 6, 1);
+        const std::array<unsigned, 8> tile{0, 0, Width, Height, LampAt, 1, 0, 0};
+        std::copy(tile.begin(), tile.end(), words.begin() + TableAt);
+        if (is_glass) words[TuneAt] = 1u << 25;
+        set_float(TuneAt + 1, 0.18f);
+        words[TuneAt + 16] = stage == GlassOn ? GLASS_FLAG_ACTIVE : 0;
+        words[TuneAt + 17] = Tint[0] | (Tint[1] << 8) | (Tint[2] << 16) | (GLASS_VIEW_KIND_WINDOW << 24);
+        std::memcpy(data.data, words.data(), sizeof(words));
+        std::memset(counts.data, 0, counts.size);
+        if (is_cards) {
+            auto* dest = static_cast<std::uint8_t*>(alpha_upload.data);
+            for (const auto& region : alpha_regions) {
+                const unsigned dim = region.imageExtent.width;
+                for (unsigned p = 0; p < dim * dim; ++p) {
+                    dest[region.bufferOffset + p] = ((p % dim >= dim / 2) != (stage == CardsInverted)) ? 255 : 0;
+                }
+            }
+        }
+
+        std::array<VkDescriptorImageInfo, 12> image_info{};
+        std::array<VkWriteDescriptorSet, 12> writes{};
+        const VkDescriptorBufferInfo data_info{data.buffer, 0, data.size};
+        const VkWriteDescriptorSetAccelerationStructureKHR as_info{.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR,
+              .accelerationStructureCount = 1, .pAccelerationStructures = &tlas.handle};
+        for (unsigned n = 0; n < writes.size(); ++n) {
+            image_info[n] = {n == 1 ? vk.sampler : VK_NULL_HANDLE, images[n].view, VK_IMAGE_LAYOUT_GENERAL};
+            writes[n] = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstBinding = n,
+                         .descriptorCount = 1, .descriptorType = glass_types.begin()[n], .pImageInfo = &image_info[n]};
+        }
+        writes[0].pImageInfo = nullptr; writes[0].pBufferInfo = &data_info;
+        writes[6].pImageInfo = nullptr; writes[6].pNext = &as_info;
+        vk.Begin();
+        const VkClearColorValue white{.float32 = {1, 1, 1, 1}}, black{};
+        for (unsigned n = 2; n < images.size(); ++n) {
+            if (images[n].image) vkCmdClearColorImage(vk.cmd, images[n].image, VK_IMAGE_LAYOUT_GENERAL, n == 2 ? &white : &black, 1, &full);
+        }
+        if (is_cards) vkCmdCopyBufferToImage(vk.cmd, alpha_upload.buffer, alpha.image, VK_IMAGE_LAYOUT_GENERAL,
+                                            unsigned(alpha_regions.size()), alpha_regions.data());
+        vk.Barrier();
+        vkCmdBindPipeline(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.pipeline);
+        vk.push(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 0,
+                unsigned(is_glass ? glass_types.size() : plain_types.size()), writes.data());
+        if (is_cards) vkCmdBindDescriptorSets(vk.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline.layout, 1, 1, &card_set, 0, nullptr);
+        vkCmdPushConstants(vk.cmd, pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+        vk.Stamp(0);
+        vkCmdDispatch(vk.cmd, Width / 8, Height / 8, 1);
+        vk.Stamp(1);
+        vk.Barrier();
+        const VkBufferImageCopy read{.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {Width, Height, 1}};
+        vkCmdCopyImageToBuffer(vk.cmd, images[2].image, VK_IMAGE_LAYOUT_GENERAL, download.buffer, 1, &read);
+        const VkBufferMemoryBarrier host{.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .buffer = download.buffer, .size = VK_WHOLE_SIZE};
+        vkCmdPipelineBarrier(vk.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &host, 0, nullptr);
+        const double gpu_ms = vk.End();
+
+        const auto* pixels = static_cast<const std::uint32_t*>(download.data);
+        if (stage == Plain) plain_pixels.assign(pixels, pixels + Width * Height);
+        if (stage == CardsNormal) normal_pixels.assign(pixels, pixels + Width * Height);
+        struct Score { unsigned count{}, mismatch{}, wrong_inversion{}, example{}, first_error{}; };
+        std::array<Score, ClassName.size()> scores{};
+        unsigned nonfinite = 0, control_difference = 0, excluded = 0;
+        const auto* control = stage == GlassOff ? &plain_pixels : stage == CardsRestored ? &normal_pixels : nullptr;
+        for (unsigned p = 0; p < Width * Height; ++p) {
+            const auto word = pixels[p];
+            nonfinite += (PackedLane(word, 0) >> 6) == 31 || (PackedLane(word, 1) >> 6) == 31 || (PackedLane(word, 2) >> 5) == 31;
+            if (control) control_difference += word != (*control)[p];
+            const Class material = ExpectedClass(p % Width, p / Width);
+            if (material == Excluded) { ++excluded; continue; }
+            auto& score = scores[material];
+            if (score.count++ == 0) score.example = word;
+            const auto expected = material == Opaque || (is_cards && material == Kept) ? 0u : White;
+            const bool match = stage == GlassOn && material == Glass ? Tinted(word) : word == expected;
+            if (!match && score.mismatch++ == 0) score.first_error = p;
+            if (stage == CardsInverted && (material == Hole || material == Kept)) score.wrong_inversion += word != (expected ^ White);
+        }
+        std::printf("Material fixture dispatch %s: pixels=%u excluded=%u nonfinite=%u control_diff=%u gpu_ms=%.6f\n",
+                    label, Width * Height, excluded, nonfinite, control_difference, gpu_ms);
+        good = good && nonfinite == 0 && control_difference == 0;
+        for (unsigned n = 0; n < scores.size(); ++n) {
+            const auto& score = scores[n];
+            const bool inverted_class = stage == CardsInverted && (n == Hole || n == Kept);
+            good = good && score.count != 0 && score.mismatch == (inverted_class ? score.count : 0) && score.wrong_inversion == 0;
+            std::printf("Material fixture class %s %s: count=%u mismatch=%u wrong_inversion=%u example=%08x first_bad=%u,%u\n",
+                        label, ClassName[n], score.count, score.mismatch, score.wrong_inversion, score.example,
+                        score.first_error % Width, score.first_error / Width);
+        }
+    }
+    for (const auto& pipeline : {plain, cards, glass}) {
+        vkDestroyPipeline(vk.device, pipeline.pipeline, nullptr);
+        vkDestroyPipelineLayout(vk.device, pipeline.layout, nullptr);
+        vkDestroyDescriptorSetLayout(vk.device, pipeline.set, nullptr);
+    }
+    vkDestroyDescriptorPool(vk.device, pool, nullptr);
+    vkDestroyDescriptorSetLayout(vk.device, card_layout, nullptr);
+    vkDestroySampler(vk.device, alpha_sampler, nullptr);
+    const auto free_image = [&](const Image& i) {
+        if (!i.image) return;
+        vkDestroyImageView(vk.device, i.view, nullptr);
+        vkDestroyImage(vk.device, i.image, nullptr);
+        vkFreeMemory(vk.device, i.memory, nullptr);
+    };
+    for (const auto& i : images) free_image(i);
+    free_image(alpha);
+    vk.destroy_as(vk.device, tlas.handle, nullptr);
+    for (const auto& b : scene.blas) vk.destroy_as(vk.device, b.handle, nullptr);
+    for (auto* b : {&data, &rows, &records, &layers, &counts, &download, &alpha_upload, &scene.geometry,
+                    &scene.staging, &scene.storage, &scene.scratch, &tlas.instances, &tlas.storage, &tlas.scratch}) vk.Free(*b);
+    std::printf("Material fixture comparison: %s\n", good ? "pass" : "fail");
+    std::puts("Torch lab complete: material-fixture");
+    return good;
+}
+} // namespace MaterialFixture
+
 }
 
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const char* dump = argc > 1 ? argv[1] : nullptr;
+    const bool torch_lab = argc > 1 && std::strcmp(argv[1], "--lamps") == 0;
+    enum class LampCase { Full, CameraPan, ResolveRepeat, MaterialFixture };
+    LampCase lamp_case = LampCase::Full;
+    const char* lamp_case_name = nullptr;
+    const char* lamp_dump = nullptr;
+    if (torch_lab && argc > 2) {
+        const char* option = argv[2];
+        if (argc == 3 && std::strcmp(option, "--case=camera-pan") == 0) {
+            lamp_case = LampCase::CameraPan;
+            lamp_case_name = "camera-pan";
+        } else if (argc == 3 && std::strcmp(option, "--case=resolve-repeat") == 0) {
+            lamp_case = LampCase::ResolveRepeat;
+            lamp_case_name = "resolve-repeat";
+        } else if (argc == 3 && std::strcmp(option, "--case=material-fixture") == 0) {
+            lamp_case = LampCase::MaterialFixture;
+        } else if (argc > 3 || std::strncmp(option, "--", 2) == 0) {
+            std::fprintf(stderr, "Usage: rt-shadow-test --lamps [directory | --case=camera-pan | --case=resolve-repeat | "
+                                 "--case=material-fixture]\n");
+            return 2;
+        } else {
+            lamp_dump = option;
+        }
+    }
     Vk vk;
+    if (lamp_case == LampCase::MaterialFixture) {
+        if (!MaterialFixture::Run(vk)) {
+            std::fputs("material fixture comparison failed\n", stderr);
+            return 1;
+        }
+        std::puts("torch lab: ok");
+        return 0;
+    }
     std::printf("GPU: %s, %ux%u, atlas %u\n", vk.name, W, H, Atlas);
     if (argc > 1 && std::strcmp(argv[1], "--still") == 0) { // bbport (r47_still-check)
         return StillLab(vk) ? 0 : 1;
@@ -1232,7 +1634,6 @@ int main(int argc, char** argv) {
     }};
     // bbport (r42_lamp-soft): --lamps [directory]: the torch lab (below), with the lamp pass's
     // images and pipeline as --speed makes them.
-    const bool torch_lab = argc > 1 && std::strcmp(argv[1], "--lamps") == 0;
     if (argc > 1 && (std::strcmp(argv[1], "--speed") == 0 || torch_lab)) {
         const unsigned total = argc > 2 && !torch_lab ? unsigned(std::strtoul(argv[2], nullptr, 10)) : 1500000u;
         Scene scene{vk, torch_lab ? MakeTorchScene() : MakeScene(total, total / 1875)};
@@ -1350,7 +1751,8 @@ int main(int argc, char** argv) {
             // hold), moves the scene and the camera between frames, and compares what the pass
             // shows with the mean of many single frames (the area lamp's true picture). With a
             // directory it writes the pictures there (PGM, the shadow ratio as grey).
-            const char* out_dir = argc > 2 ? argv[2] : nullptr;
+            const char* out_dir = lamp_dump;
+            if (lamp_case_name) std::printf("Torch lab case: %s\n", lamp_case_name);
             Pipeline half = vk.MakePipeline({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                                              VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -1805,6 +2207,63 @@ int main(int argc, char** argv) {
             // penumbra) before a check fails.
             constexpr double HalfAllMost = 1.25, HalfPenumbraMost = 1.25;
 
+            // 5. The camera moves 3 cm a frame over a still scene: the history follows it (the
+            // way back to the camera of the frame before), or, as a check that it matters, does
+            // not (as if the camera had stood still).
+            const auto camera_pan = [&] {
+                // (which: 0 the history follows the camera, 1 it does not; bbport r44_half-area-lamp:
+                // 2 as 0 in the half-resolution build)
+                std::array<Off, 3> offs{};
+                std::vector<float> pan_true;
+                HalfDid pan_did{};
+                for (const int which : {0, 1, 2}) {
+                    at_half = which == 2;
+                    restart();
+                    Views before = view;
+                    for (unsigned k = 0; k <= 24; ++k) {
+                        const Views now = camera(0.03f * float(k), 0.0f);
+                        place(now, 0.0f, 0.0f);
+                        if (k == 24) half_zero();
+                        frame(now, soft, which != 1 ? &before : nullptr);
+                        before = now;
+                    }
+                    const auto picture = values();
+                    if (which == 0) {
+                        pan_true = truth(before, soft);
+                        dump("pan_true", pan_true);
+                        dump("pan_default", picture);
+                    } else if (which == 2) {
+                        pan_did = half_did();
+                        dump("pan_half", picture);
+                    }
+                    offs[std::size_t(which)] = off(picture, pan_true);
+                }
+                at_half = false;
+                std::printf("Torch lab, the camera moves 3 cm a frame, the 25th frame against its true picture: %.4f / "
+                            "%.4f / %.2f%%; with the history left where it was on screen %.4f / %.4f / %.2f%%; in the "
+                            "half-resolution build %.4f / %.4f / %.2f%% (its second pass traced %.1f%% of its pixels on "
+                            "that frame)\n",
+                            offs[0].all, offs[0].penumbra, offs[0].far, offs[1].all, offs[1].penumbra, offs[1].far,
+                            offs[2].all, offs[2].penumbra, offs[2].far, traced_share(pan_did));
+                if (checked && !(offs[0].penumbra < offs[1].penumbra)) {
+                    std::fprintf(stderr, "the history does not follow the camera\n");
+                    return false;
+                }
+                if (checked && !(offs[2].all < HalfAllMost * offs[0].all && offs[2].penumbra < HalfPenumbraMost * offs[0].penumbra)) {
+                    std::fprintf(stderr, "a moving camera looks worse in the half-resolution build than at full resolution\n");
+                    return false;
+                }
+                return true;
+            };
+
+            const auto finish_lamp_lab = [&] {
+                vk.destroy_as(vk.device, tlas.handle, nullptr);
+                vk.Free(tlas.instances); vk.Free(tlas.storage); vk.Free(tlas.scratch);
+                if (lamp_case_name) std::printf("Torch lab complete: %s\n", lamp_case_name);
+                std::puts(checked ? "torch lab: ok" : "torch lab: done, not checked");
+                return 0;
+            };
+
             // 1. The point lamp: the same picture whatever the frame counter, and no history.
             place(view, 0.0f, 0.0f, false);
             run(view, {.tune = &point});
@@ -1818,6 +2277,11 @@ int main(int argc, char** argv) {
                 return 1;
             }
             dump("point", point_picture);
+            if (lamp_case_name) std::puts("Torch lab control: opaque point lamp exact; history disabled");
+            if (lamp_case == LampCase::CameraPan) {
+                if (!camera_pan()) return 1;
+                return finish_lamp_lab();
+            }
             // The stick's band: dark with the stick, lit without. The bodies' shadows: dark without it.
             std::vector<std::size_t> band, body;
             for (std::size_t i = 0; i < point_picture.size(); ++i) {
@@ -2315,6 +2779,8 @@ int main(int argc, char** argv) {
                                             lc.name, speed * 100.0f, half_build ? "half-resolution build" : "full resolution",
                                             differ_control, most_control, differ_61[0], most_61[0], differ_61[1], most_61[1],
                                             repeat_what);
+                                // The focused diagnostic keeps the full suite's exact run-up to this comparison.
+                                if (lamp_case == LampCase::ResolveRepeat) return finish_lamp_lab();
                             }
                             at_half = false;
                             const std::vector<std::pair<int, unsigned>> folds =
@@ -2637,53 +3103,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            // 5. The camera moves 3 cm a frame over a still scene: the history follows it (the
-            // way back to the camera of the frame before), or, as a check that it matters, does
-            // not (as if the camera had stood still).
-            {
-                // (which: 0 the history follows the camera, 1 it does not; bbport r44_half-area-lamp:
-                // 2 as 0 in the half-resolution build)
-                std::array<Off, 3> offs{};
-                std::vector<float> pan_true;
-                HalfDid pan_did{};
-                for (const int which : {0, 1, 2}) {
-                    at_half = which == 2;
-                    restart();
-                    Views before = view;
-                    for (unsigned k = 0; k <= 24; ++k) {
-                        const Views now = camera(0.03f * float(k), 0.0f);
-                        place(now, 0.0f, 0.0f);
-                        if (k == 24) half_zero();
-                        frame(now, soft, which != 1 ? &before : nullptr);
-                        before = now;
-                    }
-                    const auto picture = values();
-                    if (which == 0) {
-                        pan_true = truth(before, soft);
-                        dump("pan_true", pan_true);
-                        dump("pan_default", picture);
-                    } else if (which == 2) {
-                        pan_did = half_did();
-                        dump("pan_half", picture);
-                    }
-                    offs[std::size_t(which)] = off(picture, pan_true);
-                }
-                at_half = false;
-                std::printf("Torch lab, the camera moves 3 cm a frame, the 25th frame against its true picture: %.4f / "
-                            "%.4f / %.2f%%; with the history left where it was on screen %.4f / %.4f / %.2f%%; in the "
-                            "half-resolution build %.4f / %.4f / %.2f%% (its second pass traced %.1f%% of its pixels on "
-                            "that frame)\n",
-                            offs[0].all, offs[0].penumbra, offs[0].far, offs[1].all, offs[1].penumbra, offs[1].far,
-                            offs[2].all, offs[2].penumbra, offs[2].far, traced_share(pan_did));
-                if (checked && !(offs[0].penumbra < offs[1].penumbra)) {
-                    std::fprintf(stderr, "the history does not follow the camera\n");
-                    return 1;
-                }
-                if (checked && !(offs[2].all < HalfAllMost * offs[0].all && offs[2].penumbra < HalfPenumbraMost * offs[0].penumbra)) {
-                    std::fprintf(stderr, "a moving camera looks worse in the half-resolution build than at full resolution\n");
-                    return 1;
-                }
-            }
+            if (!camera_pan()) return 1;
 
             // 6. The half-resolution build on the still scene (bbport r44_half-area-lamp; its
             // moving scenes are in 4 and 5).
@@ -2879,10 +3299,7 @@ int main(int argc, char** argv) {
                             build_best[0], resolve_best[0], build_best[2], resolve_best[2], build_best[1], resolve_best[1],
                             build_best[3], resolve_best[3]);
             }
-            vk.destroy_as(vk.device, tlas.handle, nullptr);
-            vk.Free(tlas.instances); vk.Free(tlas.storage); vk.Free(tlas.scratch);
-            std::puts(checked ? "torch lab: ok" : "torch lab: done, not checked");
-            return 0;
+            return finish_lamp_lab();
         }
         std::vector<std::array<double, 3>> lamp_ms(variants.size()), sun_ms(variants.size());
         std::array<double, 3> per_tile_ms{}, pick_ms{}, reuse_ms{}, reuse_error{};

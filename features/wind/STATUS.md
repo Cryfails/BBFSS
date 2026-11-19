@@ -1,5 +1,15 @@
 # Wind (one shared wind for fog, plants, trees, particles)
 
+## Development snapshot, 2026-11-19
+
+WND 30%. Feature work is paused.
+
+- Verified scope. A shared wind signal drives fog and plants.
+- Open scope. Hanging props and the wider requested response and normal presentation remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 40%. Rated by the weakest part: the tree twigs are still not visible to the owner, and the game's own particles do not follow our wind yet. Cloth and hair were never started.
 
 ## What works
@@ -66,3 +76,6 @@ None of these are on a fork branch yet. All are built in the build tree up to bu
 - church-puddles: particles in the church.
 - Do-nothing check for every change: dark-interior with BB_WIND off.
 - Judge moving things as a 4K clip. Small test windows hide them.
+
+
+</details>

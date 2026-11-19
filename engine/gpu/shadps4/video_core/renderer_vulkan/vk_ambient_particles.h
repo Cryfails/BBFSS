@@ -16,7 +16,7 @@
 //
 // One draw a frame: 6 vertices x AmbientMotes::Instances instances (r98c_particles-visible: and
 // AmbientMotes::FlameInstances while the lamps are on), no vertex buffer, no image of its own;
-// r98c: one uniform buffer, the lamps' block (AmbientMotes::LampBlock, 672 bytes, written in the
+// r98c: one uniform buffer, the lamps' block (AmbientMotes::LampBlock, 928 bytes since r98e, written in the
 // draw's own commands); the frame is screened (colour + frame (1 - colour)) through the UI
 // image's UNORM view, alpha untouched. A GPU profile row "Ambient particles (r98)".
 
@@ -29,6 +29,7 @@
 #include "video_core/renderer_vulkan/ambient_particles.h"
 #include "video_core/renderer_vulkan/ambient_particles_lamps.h" // bbport (r98c_particles-visible)
 #include "video_core/renderer_vulkan/ambient_particles_still.h" // bbport (r98d_particles-still-indoors)
+#include "video_core/renderer_vulkan/ambient_particles_moths.h" // bbport (r98e_moths-at-lamps)
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 // bbport (r98c_particles-visible): after vk_common.h (its Vulkan configuration first)
@@ -113,6 +114,11 @@ private:
     // and what the r98d line of the last 10 s says.
     float open_follow = 1.0f;
     AmbientMotes::StillStats still_stats;
+    // bbport (r98e_moths-at-lamps): BB_PARTICLES_MOTHS (0: off; read once), the moths' lamps with their
+    // fades, and the counters of the r98e line (since `window`).
+    const int moth_level = AmbientMotes::MothLevel();
+    AmbientMotes::MothSet moths;
+    AmbientMotes::MothWindow moth_window;
 };
 
 } // namespace Vulkan

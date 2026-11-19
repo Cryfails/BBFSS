@@ -21,6 +21,7 @@
 
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_bottle_motion_t198.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/renderer_vulkan/vk_hdr_native.h"
@@ -41,6 +42,13 @@ class Runtime;
 class CameraMotion;
 class SceneTargets;
 class FrameGenerator;
+namespace SewerMotion { struct VendorCapture; struct Checkpoint; }
+namespace BottleDisplay182 { struct Draw; }
+namespace SewerBridge { struct Trace; struct Epoch; struct Draw; struct DrawFacts; struct Native; struct PostDraw; struct PostOrder; struct BottleDisplay; }
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+namespace BottleCutPresent { struct Scene; struct Regions; struct RawSearch; enum class Mode : u8; }
+namespace BottleColdSource177 { struct Closed; }
+#endif
 
 /// bbport BB_FINAL_DUMP_TRIGGER: the frame as presented (after FSR and post processing) is saved
 /// as final_<w>x<h> in BB_DUMP_DIR when the trigger file exists (consumed). `image` in General.
@@ -118,6 +126,8 @@ public:
     /// copies the finished frame into the display buffer at `address`; `frame` is the target
     /// the previous draw rendered into.
     void OnDisplayPass(VAddr address, VideoCore::ImageId frame);
+    /// Bounded test readback eligibility for the previous native LDR render target.
+    [[nodiscard]] bool Round2NativeLdr(VideoCore::ImageId frame) const;
     bool RasterScaling() const;
     /// bbport: LOD bias for scene materials, log2(render / output) while a reduced scene is
     /// upscaled (0 at native size, for TAA and without an upscaler).
@@ -172,14 +182,49 @@ public:
         vk::Image image;
         vk::Format format;
         u32 width, height;
+        BottleMotion::Mark motion{};
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        struct BottleScope {
+            u32 request{}, frame{};
+            u64 scene{}, epoch{};
+            VAddr address{};
+        } bottle_scope{};
+        vk::ImageCreateFlags bottle_backing_flags{};
+#endif
     };
     /// `view_format`: the format the presenter reads that buffer through; it names the byte
     /// order of a BB_PRESENT_DUMP_TRIGGER dump (bbport r75_present-dump-label).
     bool DisplayOverride(VAddr address, Display& display, vk::Format view_format);
+    bool MotionConsume(const BottleMotion::Mark& mark);
+    [[nodiscard]] bool HasSewerBridge() const noexcept { return bool(sewer_bridge); }
+    [[nodiscard]] bool SewerBridgeOpen() const;
+    SewerBridge::Draw SewerPlanDraw(const SewerBridge::DrawFacts& facts);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    std::shared_ptr<SewerBridge::PostDraw> SewerBeginPostDraw(u64 scene, u64 ps, VideoCore::ImageId target,
+                                                             const void* buffer_cache);
+    void SewerPostBindings(SewerBridge::PostDraw& draw, std::span<const VideoCore::ImageId> images);
+    void SewerPostFinal(SewerBridge::PostDraw& draw, const SewerBridge::DrawFacts& facts);
+    void SewerPostEndDisplay(const SewerBridge::Draw& draw);
+    [[nodiscard]] bool SewerPostDisplayPending() const;
+#endif
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    // The source owner must already have enrolled this exact scene and registered its patch roles.
+    bool BottleBeginPrepared(const BottleCutPresent::Scene&, BottleCutPresent::Mode, const BottleCutPresent::Regions&);
+    [[nodiscard]] bool BottleRawSearchRequested() const;
+    void BottleObserveRawSearch(const BottleColdSource177::Closed*);
+    [[nodiscard]] bool BottlePreparedPending() const;
+    std::shared_ptr<SewerBridge::BottleDisplay> BottlePlanPrepared(
+        const SewerBridge::DrawFacts&, const BottleDisplay182::Draw*,
+        std::shared_ptr<SewerBridge::BottleDisplay>& observed);
+    void BottleEndPrepared(const std::shared_ptr<SewerBridge::BottleDisplay>&);
+#endif
+    void SewerIndirectDisplayOrUi(VideoCore::ImageId color);
+    void MotionIssuedDisplay(VAddr address, vk::ImageView target,
+                             std::span<const vk::DescriptorImageInfo> inputs, bool issued);
     /// BB_PRESENT_DUMP_TRIGGER: whether this presented frame is to be saved (consumes the trigger).
     bool PresentDumpDue();
     /// Saves `image` (General layout, 4 bytes a pixel) as present_<w>x<h> in BB_DUMP_DIR.
-    void DumpPresented(vk::Image image, u32 width, u32 height, vk::Format format);
+    void DumpPresented(vk::Image image, u32 width, u32 height, vk::Format format, VAddr address);
 
 private:
     /// bbport: views of guest images the upscaler reads, kept across frames: FSR 4 registers
@@ -239,7 +284,8 @@ private:
     /// Records FSR 4 into output_image; on a permanent failure FSR 3 takes over. `reactive`: this
     /// frame's reactive mask is ready, given to DLSS as its bias-current-colour mask.
     bool RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color, Fsr4Upscaler::Image depth,
-                    u32 w, u32 h, u32 ow, u32 oh, float frame_ms, bool reactive = false);
+                    u32 w, u32 h, u32 ow, u32 oh, float frame_ms, bool reactive = false,
+                    SewerMotion::VendorCapture* sewer_observation = nullptr);
     void RecordTaa(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView depth);
     /// Additional RCAS sharpening; DLSS applies the whole requested range here.
     void ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h);
@@ -329,7 +375,44 @@ private:
         vk::Format format{};
         u32 width = 0, height = 0;
         bool valid = false;
+        vk::ImageView motion_target{};
+        BottleMotion::Mark motion{};
+        std::shared_ptr<SewerBridge::Epoch> sewer_epoch;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        std::shared_ptr<SewerBridge::BottleDisplay> bottle_epoch;
+#endif
+        vk::ImageView sewer_target{};
+        u64 sewer_generation{};
     };
+    std::shared_ptr<SewerBridge::Trace> sewer_bridge;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    std::shared_ptr<SewerBridge::BottleDisplay> bottle_prepared;
+    u64 bottle_ui_generation{}, bottle_display_generation{}, bottle_display_write{};
+    bool bottle_source_refusal_reported{};
+    u64 bottle_raw_end{};
+    u32 bottle_raw_boundary_frame{}, bottle_raw_remaining{};
+    bool bottle_raw_closed{}, bottle_raw_source_refused{};
+    bool BottleBeginPrepared(const BottleCutPresent::Scene&, BottleCutPresent::Mode,
+                             const BottleCutPresent::Regions&, const BottleCutPresent::RawSearch*);
+    void BottleCloseRawSearch();
+    void BottleOfferPrepared(const std::shared_ptr<SewerBridge::BottleDisplay>&);
+#endif
+    std::array<vk::Offset2D, 2> sewer_a_points{};
+    u64 sewer_a_request{}, sewer_ui_generation{}, sewer_display_generation{}, sewer_display_write{};
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    u64 sewer_output_generation{};
+#endif
+    SewerBridge::Native SewerNative(VideoCore::ImageId id, vk::Format format, vk::ImageView view);
+    void SewerArm(const std::shared_ptr<SewerMotion::Checkpoint>& sample, vk::CommandBuffer command,
+                   VideoCore::ImageId color
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                   , std::shared_ptr<SewerBridge::PostOrder> order
+#endif
+                   );
+    void SewerOffer(const std::shared_ptr<SewerBridge::Epoch>& epoch);
+    BottleMotion::Mark motion_finish{};
+    vk::Image motion_finish_ui{};
+    u64 motion_display_write{};
     std::mutex display_mutex;
     int present_dump_remaining = 0, present_dump_index = 0;
     std::unordered_map<VAddr, DisplayImage> displays;

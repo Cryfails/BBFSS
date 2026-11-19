@@ -100,9 +100,10 @@ public:
         vk::ImageView layers;
         vk::Sampler sampler;
         vk::Buffer info;
+        vk::ImageView colour; // bbport (r131a_foliage-translucency): the colour layers (null unless made: the light through leaves)
     };
     [[nodiscard]] Bindings ReaderBindings() const noexcept {
-        return {*layers_view, *layer_sampler, info_buffer.buffer};
+        return {*layers_view, *layer_sampler, info_buffer.buffer, colour_view ? *colour_view : vk::ImageView{}};
     }
 
 private:
@@ -147,6 +148,13 @@ private:
     vk::Image layers_image{};
     VmaAllocation layers_allocation{};
     vk::UniqueImageView layers_view;
+    // bbport (r131a_foliage-translucency): the colour layers: RGBA8, CARD_COLOUR_SIZE square, one level, CardLayerCount layers (2 MiB), written
+    // by the COLOUR build of the fill (rt_card_alpha_fill.comp) at the size of level 2; made only with FoliageTranslucency::LightThrough()
+    vk::Image colour_image{};
+    VmaAllocation colour_allocation{};
+    vk::UniqueImageView colour_view;
+    bool colour_on = false;
+    bool MakeColour();
     std::array<vk::UniqueImageView, CardLayerMips> level_views;
     vk::UniqueSampler layer_sampler;  ///< linear, clamp to edge, every level (readers)
     vk::UniqueSampler source_sampler; ///< linear, linear between levels (the fill's source)

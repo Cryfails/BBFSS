@@ -19,6 +19,9 @@ struct PushData;
 } // namespace Shader
 
 namespace Vulkan {
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+namespace BottleDisplay182 { class DescriptorTicket; }
+#endif
 
 static constexpr auto AllGraphicsStageBits =
     vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eTessellationControl |
@@ -120,7 +123,11 @@ public:
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data,
                        std::span<const vk::DescriptorImageInfo> image_infos = {},
                        std::span<const vk::DescriptorBufferInfo> buffer_infos = {},
-                       float froyok_blend = 0.0f) const;
+                       float froyok_blend = 0.0f
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+                       , const std::shared_ptr<BottleDisplay182::DescriptorTicket>& bottle = {}
+#endif
+                       ) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;

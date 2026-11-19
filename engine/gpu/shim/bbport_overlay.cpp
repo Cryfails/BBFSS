@@ -18,6 +18,7 @@
 #include <SDL3/SDL.h>
 #include "../bbnet/room/room_service.h"
 #include "../bbnet/thd/thd.h"
+#include "bbport_drawn_look_texts.h" // bbport (r55_drawn-look-lines)
 #include "bbport_menu_i18n.h"
 #include "bbport_settings.h"
 #include "bbport_usage.h"
@@ -28,6 +29,7 @@
 #include "engine/native_sss.h"
 #include "engine/online_fixes.h"
 #include "input/input.h"
+#include "input/camera_orbit.h" // bbport (r124_camera-mode-keys): AxisUnit
 #include "input/mouse_camera.h"
 #include "voice.h"
 #include "hud_gauge.h"
@@ -191,13 +193,16 @@ void SetOpen(bool value) {
     }
 }
 
-// Camera mode's clean shot (F3, or L3 + D-pad Left): the renderer leaves out the game's HUD and
-// menus (Rasterizer::CleanShotEarly) and Render what this overlay only shows. Turning it on closes
-// the co-op panel; what takes input (menu, panel, prompt) is never hidden.
+// Camera mode's clean shot (the H key in camera mode, Triangle on a pad): the renderer leaves out the
+// game's HUD and menus (Rasterizer::CleanShotEarly) and Render what this overlay only shows. Turning
+// it on closes the co-op panel; what takes input (menu, panel, prompt) is never hidden. Ending camera
+// mode ends it (CameraModeEnded), when camera mode's own key turned it on (cam_hid).
+std::atomic<bool> cam_hid{false};
 void ToggleCleanShot(const char* key) {
     auto& clean_shot = BbSettings::Get().clean_shot;
     const bool on = !clean_shot.load();
     clean_shot = on;
+    cam_hid = on; // bbport (r124_camera-mode-keys)
     // bbport (r102b_camera-clean-hud): the co-op panel it closed opens again when this key ends it
     // (not when the settings menu ends it).
     static bool coop_closed = false;
@@ -210,9 +215,10 @@ void ToggleCleanShot(const char* key) {
     std::printf("Camera: clean shot %s (%s)\n", on ? "on" : "off", key);
 }
 
-// bbport (r102_camera-mode-3-4): camera mode's freeze (F8). The game waits in its flip, so the
-// picture and the game hold together (lantern_video_out.cpp HoldFrozen) until F8 again, the
-// settings menu, or BB_CAMERA_FREEZE_S seconds. Not while a co-op party is up or while spectating.
+// bbport (r102_camera-mode-3-4): camera mode's freeze (Space in camera mode, Square on a pad). The game
+// waits in its flip, so the picture and the game hold together (lantern_video_out.cpp HoldFrozen)
+// until the key again, the settings menu, the end of camera mode, or BB_CAMERA_FREEZE_S seconds. Not
+// while a co-op party is up or while spectating.
 void ToggleFreeze(const char* key) {
     auto& freeze = BbSettings::Get().camera_freeze;
     if (freeze.exchange(false)) {
@@ -225,6 +231,55 @@ void ToggleFreeze(const char* key) {
     }
     freeze = true;
     std::printf("Camera: freeze on (%s)\n", key);
+}
+
+// bbport (r124_camera-mode-keys): camera mode's input. The arrow keys held and the pad's right
+// stick and triggers (the window's thread only) become MouseCamera::Look's three axes; the mouse's
+// counts reach the camera through MouseCamera already, the wheel and the + / - keys through Zoom.
+bool cam_arrow_left = false, cam_arrow_right = false, cam_arrow_up = false, cam_arrow_down = false;
+float cam_pad_x = 0.0f, cam_pad_y = 0.0f, cam_pad_in = 0.0f, cam_pad_out = 0.0f;
+
+void CameraLookPush() {
+    const float key_x = (cam_arrow_right ? 1.0f : 0.0f) - (cam_arrow_left ? 1.0f : 0.0f);
+    const float key_y = (cam_arrow_down ? 1.0f : 0.0f) - (cam_arrow_up ? 1.0f : 0.0f);
+    MouseCamera::Look(std::clamp(key_x + cam_pad_x, -1.0f, 1.0f), std::clamp(key_y + cam_pad_y, -1.0f, 1.0f),
+                      std::clamp(cam_pad_out - cam_pad_in, -1.0f, 1.0f));
+}
+
+void CameraInputReset() {
+    cam_arrow_left = cam_arrow_right = cam_arrow_up = cam_arrow_down = false;
+    cam_pad_x = cam_pad_y = cam_pad_in = cam_pad_out = 0.0f;
+    CameraLookPush();
+}
+
+// The key panel of camera mode (Render), in a corner; hidden with the HUD, so a clean shot has none.
+void CameraHints() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 16.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + viewport->WorkSize.y - pad),
+                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("##camera_hints", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted(BbSettings::MenuText("Camera mode: F4 or Esc leaves", "Режим камеры: F4 или Esc — выход"));
+    ImGui::Separator();
+    ImGui::TextUnformatted(BbSettings::MenuText(
+        "Mouse or arrow keys: turn round the hunter\n"
+        "Wheel or + / -: distance (wheel up and + come closer)\n"
+        "H: HUD on or off    Space: freeze or resume\n"
+        "K: add a path key    P: play the path    Backspace: clear the keys",
+        "Мышь или стрелки: поворот вокруг охотника\n"
+        "Колесо или + / -: расстояние (колесо вверх и + приближают)\n"
+        "H: показать или скрыть интерфейс    Пробел: заморозка или продолжение\n"
+        "K: добавить ключ пути    P: пройти путь    Backspace: очистить ключи"));
+    ImGui::Separator();
+    ImGui::TextUnformatted(BbSettings::MenuText(
+        "Pad: right stick turns, L2 / R2 distance, Triangle HUD on or off, Square freeze\n"
+        "Cross: add a path key, D-pad up: play the path, D-pad down: clear the keys, Circle: leave",
+        "Геймпад: правый стик — поворот, L2 / R2 — расстояние, Triangle — интерфейс, Square — заморозка\n"
+        "Cross: добавить ключ пути, вверх на крестовине: пройти путь, вниз: очистить ключи, Circle: выход"));
+    ImGui::End();
 }
 
 ImGuiKey KeyFromSdl(SDL_Keycode key) {
@@ -998,6 +1053,55 @@ void PictureSection() {
             EnvNote("BB_LAMP_SHADOW_SOFT");
         }
     }
+    // bbport (r131b_lrt-settings): the ray traced foliage shadows (BB_RT_CARD_ALPHA=2, BB_RT_CARD_LAMPS=1 and BB_RT_CARD_SUN=1 as one
+    // setting): 0 off, 1 the lamps, 2 the lamps and the sun and moon. Read once when the game starts (restart note). Each variable that
+    // is set and not empty decides for its own part (EnvNote).
+    if (const char* label = Item("Ray traced foliage shadows")) {
+        const char* names[] = {BbSettings::MenuText("Off"), BbSettings::MenuText("Lamps"),
+                               BbSettings::MenuText("Lamps and sun")};
+        int mode = std::clamp(s.graphics_rt_foliage_shadows.load(), BbSettings::RtFoliageOff, BbSettings::RtFoliageLampsSun);
+        const bool changed = ImGui::Combo(label, &mode, names, BbSettings::RtFoliageLampsSun + 1);
+        Store(s.graphics_rt_foliage_shadows, mode, changed);
+        Hint(BbSettings::MenuText(
+            "Off by default. Applied when the game restarts. Leaves, weeds and other cut-out "
+            "plants cast shadows in their true shape, with light through the gaps. Lamps: in Ray "
+            "traced lamp shadows. Lamps and sun: also in Ray traced sun shadows (sun and moon). "
+            "Costs GPU time and video memory while on."));
+        if (s.graphics_rt_foliage_shadows != s.startup_rt_foliage_shadows) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Applied when the game restarts.",
+                                                           "Применяется после перезапуска игры."));
+        }
+        EnvNote("BB_RT_CARD_ALPHA");
+        EnvNote("BB_RT_CARD_LAMPS");
+        EnvNote("BB_RT_CARD_SUN");
+    }
+    // r131b: end of the foliage shadows row (a later row anchors after this line)
+    // bbport (r131a_foliage-translucency): the foliage translucency (BB_FOLIAGE_TRANSLUCENCY as a setting): 0 off, 1 light through leaves, 2 back-lit
+    // glow, 3 both. Read once when the game starts (restart note). It needs the ray traced foliage shadows above (BB_RT_CARD_ALPHA=2; the lamp parts
+    // BB_RT_CARD_LAMPS=1, the sun part BB_RT_CARD_SUN=1). Each variable that is set and not empty decides for its part (EnvNote).
+    if (const char* label = Item("Foliage translucency")) {
+        const char* names[] = {BbSettings::MenuText("Off"), BbSettings::MenuText("Light through leaves"),
+                               BbSettings::MenuText("Back-lit glow"), BbSettings::MenuText("Both")};
+        int mode = std::clamp(s.graphics_foliage_translucency.load(), BbSettings::FoliageTranslucencyOff,
+                              BbSettings::FoliageTranslucencyBoth);
+        const bool changed = ImGui::Combo(label, &mode, names, BbSettings::FoliageTranslucencyBoth + 1);
+        Store(s.graphics_foliage_translucency, mode, changed);
+        Hint(BbSettings::MenuText(
+            "Off by default. Applied when the game restarts. Needs Ray traced foliage shadows: "
+            "Lamps for the lamp parts, Lamps and sun for the sun and moon. Leaves and grass let "
+            "a little light through, tinted by their own colour. Light through leaves: lamp, sun "
+            "and moon shadows of leaves are softer and take the leaf colour. Back-lit glow: "
+            "leaves and grass lit from behind glow in their own colour. Costs GPU time and video "
+            "memory while on."));
+        if (s.graphics_foliage_translucency != s.startup_foliage_translucency) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Applied when the game restarts.",
+                                                           "Применяется после перезапуска игры."));
+        }
+        EnvNote("BB_FOLIAGE_TRANSLUCENCY");
+        EnvNote("BB_FOLIAGE_LIGHT_THROUGH");
+        EnvNote("BB_FOLIAGE_GLOW");
+    }
+    // r131a: end of the foliage translucency row
     // bbport (r37_menu-options): BB_RT_REFIT_EVERY=8 as a setting. Live: vk_rt_shadow.cpp
     // RefitEvery reads it at each use. Only a built ray tracing scene has refits to skip (the
     // same test as RtShadow::SceneWanted: RTGI builds one only while High GI (probes) is not on).
@@ -1357,39 +1461,40 @@ void PictureSection() {
     ImGui::EndDisabled();
     // bbport (r45_drawn-look): the renderer's own pass, so not under the switch above, which
     // is for what the game's code does.
-    Section("Drawn look", "Рисованный стиль");
+    // bbport (r55_drawn-look-lines): the texts are bbport_drawn_look_texts.h's, which
+    // settings-test checks against the eight translation tables.
+    namespace DrawnText = BbSettings::DrawnLookTexts;
+    const auto drawn_text = [](const DrawnText::Text& text) {
+        return BbSettings::MenuText(text.english, text.russian);
+    };
+    Section(DrawnText::Section.english, DrawnText::Section.russian);
     const char* const drawn_problem = s.drawn_look_problem.load();
-    if (const char* label = Item("Drawn look (in development)", "Рисованный стиль (в разработке)")) {
+    if (const char* label = Item(DrawnText::Switch.english, DrawnText::Switch.russian)) {
         // While it cannot run it cannot be switched on; switched on, it can always be switched
         // off (the renderer then lets go of what it holds for it).
         ImGui::BeginDisabled(drawn_problem != nullptr && !s.graphics_drawn_look);
         Checkbox(label, s.graphics_drawn_look);
         ImGui::EndDisabled();
-        Hint(BbSettings::MenuText(
-            "An optional hand-painted look: brush strokes laid on the world's surfaces, bold on plain "
-            "walls and floors, fine where there is detail. Fire, glows, fog, particles and the HUD stay "
-            "as the game draws them, and colours are not changed. Applies at once. This build paints "
-            "the strokes; ink lines and painted shadow edges are not built yet.",
-            "Необязательный рисованный вид: мазки кисти ложатся на поверхности мира, крупные на ровных "
-            "стенах и полах, мелкие там, где есть детали. Огонь, свечение, туман, частицы и интерфейс "
-            "остаются такими, какими их рисует игра, цвета не меняются. Применяется сразу. В этой "
-            "сборке рисуются мазки; контурные линии и рисованные края теней ещё не сделаны."));
+        Hint(drawn_text(DrawnText::SwitchHint));
         if (drawn_problem) {
-            ImGui::TextDisabled("%s: %s", BbSettings::MenuText("Unavailable", "Недоступно"),
-                                BbSettings::MenuText(drawn_problem));
+            const char* const russian = DrawnText::RussianOf(drawn_problem);
+            ImGui::TextDisabled("%s: %s", drawn_text(DrawnText::Unavailable),
+                                BbSettings::MenuText(drawn_problem, russian));
         }
     }
-    if (const char* label = Item("Drawn look strength", "Сила рисованного стиля")) {
+    if (const char* label = Item(DrawnText::Strength.english, DrawnText::Strength.russian)) {
         ImGui::BeginDisabled(drawn_problem != nullptr || !s.graphics_drawn_look);
         Slider(label, s.graphics_drawn_look_strength, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
         ImGui::EndDisabled();
-        Hint(BbSettings::MenuText(
-            "How much of the strokes is laid over the game's picture: 1 is the full look, lower values "
-            "let more of the game's own picture through. At 0 the look does no work at all. Applies at "
-            "once.",
-            "Насколько мазки перекрывают изображение игры: 1 — стиль в полную силу, меньшие значения "
-            "оставляют больше исходного изображения. При 0 стиль вообще не работает. Применяется "
-            "сразу."));
+        Hint(drawn_text(DrawnText::StrengthHint));
+    }
+    // bbport (r55_drawn-look-lines): how dark the ink lines are (graphics_drawn_look_ink_world,
+    // host_shaders/paint_ink.comp). With the strength at 0 the look draws the lines alone.
+    if (const char* label = Item(DrawnText::Ink.english, DrawnText::Ink.russian)) {
+        ImGui::BeginDisabled(drawn_problem != nullptr || !s.graphics_drawn_look);
+        Slider(label, s.graphics_drawn_look_ink_world, 0.0f, 1.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::EndDisabled();
+        Hint(drawn_text(DrawnText::InkHint));
     }
     // bbport (r99c_interior-default): the interior brightness, the largest lift of the dark-interior
     // exposure lift (r99b): live (the renderer reads it every frame), 0 is off, steps of 0.25. A set
@@ -1479,6 +1584,83 @@ void PictureSection() {
             "ничего не рисуется."));
         EnvNote("BB_HEAT_HAZE");
     }
+    // bbport (r128b_lrt-caustics-water): the water caustics' strengths (r107), live: the renderer reads each
+    // every frame and makes its pass at the first frame above 0. A set BB_CAUSTICS (sun and moon) or
+    // BB_CAUSTICS_LAMPS (lamps) wins over its slider (EnvNote). 0 is the default: off.
+    Section("Water caustics",
+            "Блики от воды (каустика)");
+    if (const char* label = Item("Water caustics from lamps",
+                                 "Блики от воды: свет ламп")) {
+        Slider(label, s.graphics_water_caustics_lamps_strength, BbSettings::WaterCausticsStrengthMin,
+               BbSettings::WaterCausticsStrengthMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        Hint(BbSettings::MenuText(
+            "Live, off by default. The light of up to 4 lamps that a water surface reflects, as "
+            "a slowly moving net of bright lines on the walls and undersides beside it and over "
+            "puddles. It shows only where the game draws water as a mirror (the sewers) or on "
+            "very glossy wet ground. 0 is off, 1 is the lamps' own light, up to 4 adds a "
+            "stronger look. Needs the upscaler: with none nothing is drawn.",
+            "Работает сразу, по умолчанию выкл. Свет до 4 ламп, который отражает поверхность "
+            "воды, в виде медленно движущейся сетки ярких линий на ближних стенах и нижних "
+            "сторонах и над лужами. Виден только там, где игра рисует воду как зеркало "
+            "(канализация), или на очень блестящей мокрой земле. 0 — выкл., 1 — собственный свет "
+            "ламп, до 4 добавляет более сильный вид. Нужен апскейлер: без него ничего не "
+            "рисуется."));
+        EnvNote("BB_CAUSTICS_LAMPS");
+    }
+    if (const char* label = Item("Water caustics from the sun and moon",
+                                 "Блики от воды: солнце и луна")) {
+        Slider(label, s.graphics_water_caustics_sun_strength, BbSettings::WaterCausticsStrengthMin,
+               BbSettings::WaterCausticsStrengthMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        Hint(BbSettings::MenuText(
+            "Live, off by default. The same moving net from the light of the sun or moon, where "
+            "that light reaches the water, so not under a roof. 0 is off, 1 is the intended "
+            "look, up to 4 is stronger. Needs the upscaler: with none nothing is drawn.",
+            "Работает сразу, по умолчанию выкл. Та же движущаяся сетка от света солнца или луны "
+            "там, где он достигает воды, поэтому не под крышей. 0 — выкл., 1 — задуманный вид, "
+            "до 4 сильнее. Нужен апскейлер: без него ничего не рисуется."));
+        EnvNote("BB_CAUSTICS");
+    }
+    // bbport (r131b_lrt-settings): the moving water (r130b), live like the rows above; a set BB_WATER_MOTION wins over the slider
+    // (EnvNote). 0 is the default: off.
+    if (const char* label = Item("Water motion")) {
+        Slider(label, s.graphics_water_motion_strength, BbSettings::WaterMotionStrengthMin,
+               BbSettings::WaterMotionStrengthMax, "%.2f", ImGuiSliderFlags_AlwaysClamp);
+        Hint(BbSettings::MenuText(
+            "Live, off by default. The water surface moves in slow waves, with rings where the "
+            "hunter steps. It shows where the game draws water as a mirror (the sewers). 0 is "
+            "off, 1 is the intended look, up to 4 is stronger. Needs the upscaler: with none "
+            "nothing is drawn."));
+        EnvNote("BB_WATER_MOTION");
+    }
+    // bbport (r131b_lrt-settings): the blood sheen: its strength (r128d: read once when the game starts, so a restart note; 0 is off,
+    // the default) and its colour (r130a: live). A set BB_BLOOD_SHEEN or BB_BLOOD_SHEEN_TINT wins over its row (EnvNote).
+    Section("Blood sheen");
+    if (const char* label = Item("Blood sheen")) {
+        Slider(label, s.graphics_blood_sheen, BbSettings::BloodSheenMin, BbSettings::BloodSheenMax, "%.2f",
+               ImGuiSliderFlags_AlwaysClamp);
+        Hint(BbSettings::MenuText(
+            "Off by default. Applied when the game restarts. Fresh blood on the ground gets a "
+            "wet shine that catches lamp, sun and moon light. 0 is off, 1 is the intended look, "
+            "up to 4 is stronger."));
+        if (s.graphics_blood_sheen != s.startup_blood_sheen) {
+            ImGui::TextDisabled("%s", BbSettings::MenuText("Applied when the game restarts.",
+                                                           "Применяется после перезапуска игры."));
+        }
+        EnvNote("BB_BLOOD_SHEEN");
+    }
+    if (const char* label = Item("Blood sheen colour")) {
+        const char* names[] = {BbSettings::MenuText("Grey (test)"), BbSettings::MenuText("Red"),
+                               BbSettings::MenuText("Clear")};
+        int mode = std::clamp(s.graphics_blood_sheen_tint.load(), BbSettings::BloodSheenTintMin, BbSettings::BloodSheenTintMax);
+        const bool changed = ImGui::Combo(label, &mode, names, BbSettings::BloodSheenTintMax + 1);
+        Store(s.graphics_blood_sheen_tint, mode, changed);
+        Hint(BbSettings::MenuText(
+            "Live, Red by default. The colour of the wet shine. Red is the look so far. Clear is "
+            "a clear liquid film that keeps the colour of what it reflects (no pink moon "
+            "glints). Grey is a test view."));
+        EnvNote("BB_BLOOD_SHEEN_TINT");
+    }
+    // r131b: end of the blood sheen rows (a later row anchors after this line)
 }
 
 // bbport (r39_master-debug): a measuring or tracing row of the Debug tab. The row writes a
@@ -2762,12 +2944,13 @@ void FpsSection() {
     if (const char* label = Item("FPS counter in corner", "Счётчик FPS в углу")) {
         Checkbox(label, s.show_fps);
         Hint(BbSettings::MenuText(
-            "F3 or L3 + D-pad Left in play: clean shot for filming. Hides the game's HUD and menus "
-            "(not on loading screens) and this overlay's counter and notes until pressed again or "
-            "this menu opens.",
-            "F3 или L3 + крестовина влево в игре: чистый кадр для съёмки. Скрывает интерфейс и меню "
-            "игры (кроме экранов загрузки), а также счётчик и надписи этого оверлея, пока клавишу не "
-            "нажмут снова или не откроют это меню."));
+            "In camera mode (F4, or L3 + D-pad Right in play) H hides the game's HUD and menus (not "
+            "on loading screens) and this overlay's counter and notes, until pressed again or camera "
+            "mode ends. The panel in the corner of camera mode lists its keys.",
+            "В режиме камеры (F4 или L3 + крестовина вправо в игре) клавиша H скрывает интерфейс и "
+            "меню игры (кроме экранов загрузки), а также счётчик и надписи этого оверлея, пока её не "
+            "нажмут снова или не закончится режим камеры. Панель в углу режима камеры перечисляет его "
+            "клавиши."));
     }
     if (const char* label = Item("Note while shaders build", "Надпись при сборке шейдеров")) {
         Checkbox(label, s.show_compile_note);
@@ -3272,6 +3455,9 @@ void Menu() {
         s.graphics_shadow_resolution != s.startup_shadow_resolution ||
         s.graphics_local_shadow_resolution != s.startup_local_shadow_resolution ||
         s.graphics_sun_far_shadows != s.startup_sun_far_shadows || // bbport (r15_far-shadow-setting)
+        s.graphics_rt_foliage_shadows != s.startup_rt_foliage_shadows || // bbport (r131b_lrt-settings)
+        s.graphics_foliage_translucency != s.startup_foliage_translucency || // bbport (r131a_foliage-translucency)
+        s.graphics_blood_sheen != s.startup_blood_sheen ||
         s.object_motion_store != s.startup_object_motion_store || // bbport (r37_menu-options)
         s.engine_previous_paths != s.startup_engine_previous_paths || // bbport (r39_master-debug)
         BbSettings::ResolutionNeedsRestart();
@@ -4191,36 +4377,53 @@ bool HandleEvent(const SDL_Event& event) {
             BbSettings::Save();
             return true;
         }
+        // bbport (r124_camera-mode-keys): while camera mode is on its own keys come first and the game
+        // has a neutral pad (MouseCamera::OrbitDriving, bbgpu_overlay_captures_input), so none of
+        // them reaches it. The arrow keys are tracked on their release too, so a key let go after
+        // camera mode ended does not stay held. F2 does nothing meanwhile; F4 and Insert end it.
+        {
+            const SDL_Keycode key = event.key.key;
+            const bool arrow = key == SDLK_LEFT || key == SDLK_RIGHT || key == SDLK_UP || key == SDLK_DOWN;
+            if (arrow && !down && !is_open) {
+                (key == SDLK_LEFT ? cam_arrow_left : key == SDLK_RIGHT ? cam_arrow_right : key == SDLK_UP ? cam_arrow_up : cam_arrow_down) = false;
+                CameraLookPush();
+            }
+            if (!is_open && down && MouseCamera::OrbitDriving() && !(event.key.mod & (SDL_KMOD_CTRL | SDL_KMOD_ALT))) {
+                const bool fresh = !event.key.repeat;
+                if (arrow) {
+                    (key == SDLK_LEFT ? cam_arrow_left : key == SDLK_RIGHT ? cam_arrow_right : key == SDLK_UP ? cam_arrow_up : cam_arrow_down) = true;
+                    CameraLookPush();
+                    return true;
+                }
+                if (key == SDLK_F2) return true;
+                if (key == SDLK_PLUS || key == SDLK_EQUALS || key == SDLK_KP_PLUS || key == SDLK_MINUS ||
+                    key == SDLK_KP_MINUS) {
+                    if (fresh) MouseCamera::Zoom(key == SDLK_PLUS || key == SDLK_EQUALS || key == SDLK_KP_PLUS ? -1 : 1, "key");
+                    return true;
+                }
+                if (key == SDLK_H || key == SDLK_SPACE || key == SDLK_K || key == SDLK_P || key == SDLK_BACKSPACE ||
+                    key == SDLK_ESCAPE) {
+                    if (!fresh) return true;
+                    if (key == SDLK_H) ToggleCleanShot("H");
+                    else if (key == SDLK_SPACE) ToggleFreeze("Space");
+                    else if (key == SDLK_K) MouseCamera::PathKey("K");
+                    else if (key == SDLK_P) MouseCamera::PathToggle("P");
+                    else if (key == SDLK_BACKSPACE) MouseCamera::PathClear("Backspace");
+                    else { MouseCamera::OrbitStop("Esc"); CameraInputReset(); }
+                    return true;
+                }
+            }
+        }
         if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F2) {
             coop_open = !coop_open;
             coop_armed.clear();
             return true;
         }
-        if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F3) {
-            ToggleCleanShot("F3");
-            return true;
-        }
-        // Camera mode's orbit (MouseCamera::OrbitToggle); Alt+F4 stays the window's.
+        // Camera mode (MouseCamera::OrbitToggle): F4 enters and leaves it, the only F key it has;
+        // Alt+F4 stays the window's.
         if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F4 && !(event.key.mod & SDL_KMOD_ALT)) {
             MouseCamera::OrbitToggle("F4");
-            return true;
-        }
-        // bbport (r102_camera-mode-3-4): camera paths (F5 adds a key, Shift+F5 clears them, F6 plays
-        // or stops) and the freeze for stills (F8).
-        if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F5) {
-            if (event.key.mod & SDL_KMOD_SHIFT) {
-                MouseCamera::PathClear("Shift+F5");
-            } else {
-                MouseCamera::PathKey("F5");
-            }
-            return true;
-        }
-        if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F6) {
-            MouseCamera::PathToggle("F6");
-            return true;
-        }
-        if (!is_open && down && !event.key.repeat && event.key.key == SDLK_F8) {
-            ToggleFreeze("F8");
+            CameraInputReset();
             return true;
         }
         if (!is_open && coop_open) {
@@ -4233,17 +4436,6 @@ bool HandleEvent(const SDL_Event& event) {
                 CoopInput(move, side, select, back);
             }
             return true;
-        }
-        // While the orbit runs the game has a neutral pad, so these keys reach only the orbit.
-        if (!is_open && down && !event.key.repeat && MouseCamera::OrbitDriving()) {
-            const SDL_Keycode key = event.key.key;
-            const int speed = key == SDLK_RIGHT ? 1 : key == SDLK_LEFT ? -1 : 0;
-            const int height = key == SDLK_UP ? 1 : key == SDLK_DOWN ? -1 : 0;
-            const int radius = key == SDLK_PAGEDOWN ? 1 : key == SDLK_PAGEUP ? -1 : 0;
-            if (speed || height || radius) {
-                MouseCamera::OrbitAdjust(speed, height, radius, "keyboard");
-                return true;
-            }
         }
         if (down && !event.key.repeat &&
             ((event.key.key == SDLK_INSERT && (is_open || MenuKeys() != OverlayKeys::Off)) ||
@@ -4273,9 +4465,11 @@ bool HandleEvent(const SDL_Event& event) {
         }
         // L3 + a D-pad direction: the chords below. Which D-pad press fired one is told to the
         // game's pad (NoteDpad, bbgpu_overlay_pad_chords).
+        // bbport (r124_camera-mode-keys): L3 + D-pad Right enters and leaves camera mode; L3 + D-pad
+        // Up opens the co-op panel, not while camera mode is on; D-pad Left is the game's again.
         const bool dpad_chord =
             !is_open && down && l3_down &&
-            (button == SDL_GAMEPAD_BUTTON_DPAD_UP || button == SDL_GAMEPAD_BUTTON_DPAD_LEFT ||
+            ((button == SDL_GAMEPAD_BUTTON_DPAD_UP && !MouseCamera::OrbitDriving()) ||
              button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
         NoteDpad(event, dpad_chord);
         if (down && l3_down && r3_down && (is_open || MenuKeys() == OverlayKeys::Both)) {
@@ -4288,12 +4482,9 @@ bool HandleEvent(const SDL_Event& event) {
             coop_armed.clear();
             return true;
         }
-        if (dpad_chord && button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) {
-            ToggleCleanShot("L3 + D-pad Left");
-            return true;
-        }
         if (dpad_chord && button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) {
             MouseCamera::OrbitToggle("L3 + D-pad Right");
+            CameraInputReset();
             return true;
         }
         if (!is_open && coop_open) {
@@ -4304,15 +4495,16 @@ bool HandleEvent(const SDL_Event& event) {
             }
             return true;
         }
+        // bbport (r124_camera-mode-keys): camera mode's pad buttons (the game's pad is neutral meanwhile).
         if (!is_open && down && !l3_down && MouseCamera::OrbitDriving()) {
-            const int speed = button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT ? 1 : button == SDL_GAMEPAD_BUTTON_DPAD_LEFT ? -1 : 0;
-            const int height = button == SDL_GAMEPAD_BUTTON_DPAD_UP ? 1 : button == SDL_GAMEPAD_BUTTON_DPAD_DOWN ? -1 : 0;
-            const int radius = button == SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER ? 1
-                             : button == SDL_GAMEPAD_BUTTON_LEFT_SHOULDER  ? -1
-                                                                           : 0;
-            if (speed || height || radius) {
-                MouseCamera::OrbitAdjust(speed, height, radius, "pad");
-                return true;
+            switch (button) {
+            case SDL_GAMEPAD_BUTTON_NORTH: ToggleCleanShot("Triangle"); return true;
+            case SDL_GAMEPAD_BUTTON_WEST: ToggleFreeze("Square"); return true;
+            case SDL_GAMEPAD_BUTTON_SOUTH: MouseCamera::PathKey("Cross"); return true;
+            case SDL_GAMEPAD_BUTTON_EAST: MouseCamera::OrbitStop("Circle"); CameraInputReset(); return true;
+            case SDL_GAMEPAD_BUTTON_DPAD_UP: MouseCamera::PathToggle("D-pad up"); return true;
+            case SDL_GAMEPAD_BUTTON_DPAD_DOWN: MouseCamera::PathClear("D-pad down"); return true;
+            default: break;
             }
         }
         if (!is_open) {
@@ -4324,6 +4516,19 @@ bool HandleEvent(const SDL_Event& event) {
         return true;
     }
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        // bbport (r124_camera-mode-keys): the right stick turns the camera, the triggers move it (R2 closer).
+        if (!is_open && MouseCamera::OrbitDriving()) {
+            const int raw = event.gaxis.value;
+            switch (event.gaxis.axis) {
+            case SDL_GAMEPAD_AXIS_RIGHTX: cam_pad_x = CameraOrbit::AxisUnit(raw); break;
+            case SDL_GAMEPAD_AXIS_RIGHTY: cam_pad_y = CameraOrbit::AxisUnit(raw); break;
+            case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: cam_pad_in = CameraOrbit::AxisUnit(raw); break;
+            case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: cam_pad_out = CameraOrbit::AxisUnit(raw); break;
+            default: return false;
+            }
+            CameraLookPush();
+            return true;
+        }
         if (!is_open) {
             return false;
         }
@@ -4371,11 +4576,19 @@ bool HandleEvent(const SDL_Event& event) {
         return true;
     }
     case SDL_EVENT_MOUSE_WHEEL:
+        // bbport (r124_camera-mode-keys): the wheel moves the camera (up: closer) while camera mode is on.
+        if (!is_open && MouseCamera::OrbitDriving()) {
+            if (event.wheel.y != 0.0f) MouseCamera::Zoom(event.wheel.y > 0.0f ? -1 : 1, "wheel");
+            return true;
+        }
         if (!is_open) {
             return false;
         }
         io.AddMouseWheelEvent(event.wheel.x, event.wheel.y);
         return true;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        CameraInputReset(); // bbport (r124_camera-mode-keys): no key or stick stays held in camera mode
+        return false;
     default:
         return false;
     }
@@ -4385,12 +4598,22 @@ bool Visible() {
     if (BbSettings::Get().clean_shot.load(std::memory_order_relaxed)) {
         return initialized && CapturesInput(); // camera mode's clean shot (Render)
     }
-    return initialized && (menu_open || prompt_active || BbSettings::Get().show_fps || CompileNoteActive() || RelayNoteActive() || RefusalNoteActive() || SummonNoteActive() || AnnouncementActive() || ReconnectNoteActive() || !ShownPartyLines().empty() || coop_open ||
+    return initialized && (menu_open || prompt_active || MouseCamera::OrbitDriving() || BbSettings::Get().show_fps || CompileNoteActive() || RelayNoteActive() || RefusalNoteActive() || SummonNoteActive() || AnnouncementActive() || ReconnectNoteActive() || !ShownPartyLines().empty() || coop_open ||
                            !BbEngine::OnlineFixes::PartyRows().empty() || BbEngine::OnlineFixes::Spectating() || BbFaceShot::JustTaken());
 }
 
 bool MenuOpen() {
     return menu_open;
+}
+
+void CameraModeEnded() {
+    // bbport (r124_camera-mode-keys): atomics only, so it can run under MouseCamera's lock on any thread
+    if (cam_hid.exchange(false) && BbSettings::Get().clean_shot.exchange(false)) {
+        std::printf("Camera: clean shot off (camera mode ended)\n");
+    }
+    if (BbSettings::Get().camera_freeze.exchange(false)) {
+        std::printf("Camera: freeze off (camera mode ended)\n");
+    }
 }
 
 bool CapturesInput() {
@@ -4809,6 +5032,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
         Announcement();
         ReconnectNote();
         PartyLines();
+    }
+    if (shows && MouseCamera::OrbitDriving()) {
+        CameraHints(); // bbport (r124_camera-mode-keys): camera mode's key panel; a clean shot has none
     }
     if (prompt_active && !menu_open) {
         TextPrompt();

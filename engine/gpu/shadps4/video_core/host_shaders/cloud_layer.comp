@@ -39,6 +39,11 @@
 // the share of a block's opacity where the painted sky has shapes of its own (painted_share: the block's brightness and view z
 // against 12 sky pixels on two rings round it); paint.w caps the cloud's colour at this times the sky's brightness behind it.
 // paint.x = 0 and paint.w = 0 give the r119h arithmetic.
+// bbport (r119j_clouds-banding): the stripes across the clouds (MARCH only; bits 4 to 7 of the push word `flags`,
+// BB_VOLUMETRIC_CLOUDS_SMOOTH, 0 = the r119i march): bit 1 a hash jitter with a golden ratio step a frame (the interleaved
+// gradient noise repeated a sawtooth every 3.2 rows), bit 2 a coverage edge about a step wide (12 steps against an edge of
+// about 40 m counted steps, not a density), bit 4 the painted share over twelve different radii, bit 8 a soft knee on the
+// colour cap. The header of r119j_clouds-banding.py says why.
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
 #extension GL_GOOGLE_include_directive : require
@@ -95,6 +100,18 @@ const vec3 SHADE_COOL = vec3(0.88, 0.94, 1.06); // the shade side is cooler than
 const ivec2 PAINT_DIRS[8] = ivec2[8](ivec2(1, 0), ivec2(-1, 0), ivec2(0, 1), ivec2(0, -1), ivec2(1, 1), ivec2(-1, 1),
                                      ivec2(1, -1), ivec2(-1, -1));
 const float PAINT_LO = 0.08, PAINT_SPAN = 0.30; // |l - l0| / (l + l0): a shape starts at the first, is whole at the sum
+// bbport (r119j_clouds-banding): the banding fixes' bits and numbers. The graded painted rings: sample k reads RING_R[k] pixels
+// (at 1080 lines when paint.z is RING_REF: scaled with it) along PAINT_DIRS[k & 7] and weighs 1 inside the near ring (paint.y)
+// down to RING_FAR_WEIGHT at the far one (paint.z). The coverage edge is widened by edge_soft (n units) each side, set per ray.
+#define SMOOTH_BITS ((flags >> CL_FLAG_SMOOTH_SHIFT) & 15u)
+const float RING_R[12] = float[12](6.0, 8.0, 7.0, 9.0, 14.0, 18.0, 22.0, 26.0, 32.0, 36.0, 40.0, 44.0);
+const float RING_REF = 44.0, RING_FAR_WEIGHT = 0.5;
+const float EDGE_PER_STEP = 0.24, EDGE_MAX = 0.10; // edge_soft = min(EDGE_PER_STEP x (the step's n change), EDGE_MAX)
+const float GLOW_KNEE = 0.6;                       // the colour cap's knee, of the cap
+float edge_soft = 0.0;
+#define EDGE_SOFT edge_soft
+#else
+#define EDGE_SOFT 0.0
 #endif
 
 // The view z (m) a depth gives (as heat_haze.comp).
@@ -170,7 +187,7 @@ float density_at(vec3 p, vec3 lod, out float v) {
     vec2 q = p.xz - plane.xy * slab.z;
     vec3 x = vec3(q.x, 0.0, q.y) * cloud_off0.w;
     if (any(isnan(x)) || any(isinf(x))) return 0.0;
-    float c = smoothstep(cloud_off1.w, cloud_off2.w, cloud_n(x, lod));
+    float c = smoothstep(cloud_off1.w - EDGE_SOFT, cloud_off2.w + EDGE_SOFT, cloud_n(x, lod)); // bbport (r119j): EDGE_SOFT 0 = as before
     if (c <= 0.0) return 0.0;
     float top = 0.35 + 0.65 * c;
     v = u / top;
@@ -184,6 +201,21 @@ float ign(vec2 p) {
     p += 5.588238 * float(frame & 63u);
     return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
 }
+
+#ifdef MARCH
+// bbport (r119j_clouds-banding): a PCG hash of the half resolution pixel (no row pattern) plus a golden ratio step a frame
+// (frame mod 256), so the frames an upscaler accumulates are a stratified sample of the march's first step.
+uint pcg_hash(uint v) {
+    uint s = v * 747796405u + 2891336453u;
+    uint w = ((s >> ((s >> 28u) + 4u)) ^ s) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+float hash_jitter(ivec2 hp) {
+    uint h = pcg_hash(uint(hp.x) + pcg_hash(uint(hp.y)));
+    return fract(float(h >> 8u) * (1.0 / 16777216.0) + float(frame & 255u) * 0.6180339887);
+}
+#endif
 
 // bbport (r119i): the composite does not count (its build keeps its old 16 words, so its SPIR-V does not change)
 #ifdef MARCH
@@ -207,8 +239,11 @@ float painted_share(ivec2 centre, float lum_c, float z_c) {
     float k_scale = float(scene.y) / 1080.0;
     int near_px = max(int(paint.y * k_scale + 0.5), 2);
     int far_px = max(int(paint.z * k_scale + 0.5), 4);
+    bool graded = (SMOOTH_BITS & CL_SMOOTH_PAINT) != 0u; // bbport (r119j_clouds-banding): twelve different radii, the farther the lighter
     for (int k = 0; k < 12; ++k) {
-        ivec2 q = centre + PAINT_DIRS[k & 7] * (k < 8 ? near_px : far_px);
+        float rr = RING_R[k] * paint.z * (1.0 / RING_REF); // bbport (r119j): this sample's radius at 1080 lines
+        int px = graded ? max(int(rr * k_scale + 0.5), 2) : (k < 8 ? near_px : far_px);
+        ivec2 q = centre + PAINT_DIRS[k & 7] * px;
         if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(scene)))) continue;
         float d = texelFetch(depth_tex, q, 0).r;
         if (!is_sky(d)) continue;
@@ -218,7 +253,8 @@ float painted_share(ivec2 centre, float lum_c, float z_c) {
         float by_light = smoothstep(PAINT_LO, PAINT_LO + PAINT_SPAN, abs(l - lum_c) / max(l + lum_c, LUM_FLOOR));
         float zq = d >= 1.0 ? 100000.0 : view_z(d);
         float by_depth = smoothstep(0.15, 0.5, abs(log(max(zq, 1.0) / max(z_c, 1.0))));
-        worst = max(worst, max(by_light, by_depth));
+        float wgt = graded ? mix(1.0, RING_FAR_WEIGHT, smoothstep(paint.y, paint.z, rr)) : 1.0; // bbport (r119j)
+        worst = max(worst, wgt * max(by_light, by_depth));
     }
     return clamp(worst * paint.x, 0.0, 1.0);
 }
@@ -266,10 +302,20 @@ vec4 march(ivec2 hp) {
     vec3 lod = clamp(vec3(1.6) - vec3(sh) / vec3(float(FOG_NOISE_RATIO0), float(FOG_NOISE_RATIO1),
                                                  float(FOG_NOISE_RATIO2)),
                      vec3(0.0), vec3(1.0));
+    // bbport (r119j_clouds-banding): the coverage edge is widened to about a step: the step moves the plane coordinate sh octave 0
+    // cells; n moves about 0.8 x sh x slope_sum there (octave weight over its cell ratio, with the lod); EDGE_PER_STEP of that each
+    // side, at most EDGE_MAX (bit 2; edge_soft 0 is the r119i coverage)
+    edge_soft = 0.0;
+    if ((SMOOTH_BITS & CL_SMOOTH_EDGE) != 0u) {
+        float slope_sum = float(FOG_NOISE_WEIGHT0) * lod.x / float(FOG_NOISE_RATIO0) +
+                          float(FOG_NOISE_WEIGHT1) * lod.y / float(FOG_NOISE_RATIO1) +
+                          float(FOG_NOISE_WEIGHT2) * lod.z / float(FOG_NOISE_RATIO2);
+        edge_soft = min(EDGE_PER_STEP * sh * slope_sum, EDGE_MAX);
+    }
     float cos_l = dot(dw, light.xyz);
     float cl = max(cos_l, 0.0); // bbport (r119c_clouds-gaps): a broad glow and a bright core toward the light
     float forward = 0.7 * pow(cl, 4.0) + 0.3 * pow(cl, 32.0);
-    float jitter = ign(vec2(hp));
+    float jitter = (SMOOTH_BITS & CL_SMOOTH_JITTER) != 0u ? hash_jitter(hp) : ign(vec2(hp)); // bbport (r119j_clouds-banding)
     float T = 1.0, acc_amb = 0.0, acc_lit = 0.0; // bbport (r119d): the shade and the lit light kept apart
     uint taken = 0u;
     for (int i = 0; i < steps; ++i) {
@@ -321,7 +367,16 @@ vec4 march(ivec2 hp) {
         // the cloud's own colour (rgb / alpha) is at most paint.w times the brightness of the sky behind it
         float own = dot(rgb, LUMA_W) / alpha;
         float cap = paint.w * sky_lum;
-        if (own > cap) rgb *= cap / own;
+        if ((SMOOTH_BITS & CL_SMOOTH_GLOW) != 0u) {
+            // bbport (r119j_clouds-banding): a soft knee from GLOW_KNEE of the cap (no flat topped rims), never above the cap
+            float knee = GLOW_KNEE * cap;
+            if (own > knee) {
+                float span = max(cap - knee, 1e-6);
+                rgb *= (knee + span * (1.0 - exp(-(own - knee) / span))) / own;
+            }
+        } else if (own > cap) {
+            rgb *= cap / own;
+        }
     }
     atomicAdd(group_counts[CL_WORD_HIT], 1u);
     if (taken_back >= float(CL_PAINTED_SHARE)) atomicAdd(group_counts[CL_WORD_PAINTED], 1u); // bbport (r119i)

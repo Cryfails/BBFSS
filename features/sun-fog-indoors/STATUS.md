@@ -1,5 +1,15 @@
 # Sun fog indoors (keep the volumetric sun fog out of interiors)
 
+## Development snapshot, 2026-11-19
+
+FSH scope. Feature work is paused.
+
+- Verified scope. The indoor and outdoor shaft paths have scoped evidence.
+- Open scope. Preservation across the full set of sheltered transitions remains open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 55%. Rated by the weakest part: the owner still sees sun fog inside the sewer and the library. The latest fix (r115b) clears the sewer but also removed sky haze under graveyard trees, and its repair (r115c) is not built.
 
 ## The owner's rules
@@ -52,3 +62,6 @@ None are on a fork branch yet (only r51 and r51b alone would apply even on the b
 ## Test places
 - dark-interior (the roofed library; test with the interior-exposure mod on and off), church-candles (hall), sewer-water (must clear), dream-house.
 - Do-nothing places: graveyard-blood (haze must stay, also under the trees looking up), lamp-test-spot, church-puddles, dark-alley.
+
+
+</details>

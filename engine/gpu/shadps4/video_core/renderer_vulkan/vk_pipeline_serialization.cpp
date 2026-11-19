@@ -10,6 +10,9 @@
 #include <mutex>
 #include <thread>
 #include <unordered_set>
+#include <xxhash.h>
+#include "bbport_workflow_probe.h"
+#include "lifter/lift.h"
 #include "common/serdes.h"
 #include "common/hash.h"
 #include <algorithm>
@@ -31,8 +34,21 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_effect_shaders.h"
+#include "video_core/renderer_vulkan/vk_reflection_fragment_discard.h"
+#include "video_core/renderer_vulkan/ivy_material_probe.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/vk_workflow_capture_proof.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+// The shader layout and winuser.h both define WS_GROUP.
+#pragma push_macro("WS_GROUP")
+#undef WS_GROUP
+#include <windows.h>
+#pragma pop_macro("WS_GROUP")
+#endif
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
@@ -40,6 +56,9 @@ static constexpr u32 ShaderBinaryVersion = 7u; // bbport: interpolated integer f
 static constexpr u32 MotionShaderBinaryVersion = 8u; // runtime address descriptor, set 1
 static constexpr u32 CaptureShaderBinaryVersion = 9u;
 static constexpr u32 ShaderMetaVersion = 8u; // bbport: HwFragmentRuntimeInfo::depth_first
+static constexpr u32 MaskShaderMetaVersion = 9u;
+static constexpr u32 MaskShaderBinaryVersion = 1u; // independent mask namespace
+static constexpr u32 MaskPipelineKeyVersion = 7u;
 static constexpr u32 PipelineKeyVersion = 6u; // pointer-free pipeline state + generated fragment
 // bbport (r89b_wind-sway-ripple): a vertex shader with the plant sway (MotionVectors::Sway): its
 // code changed with the ripple, so a sway shader saved by a build before it is built again
@@ -55,6 +74,147 @@ static_assert(HangShaderBinaryVersion != SwayShaderBinaryVersion &&
 } // namespace Serialization
 
 namespace Vulkan {
+
+namespace {
+using CaptureStamp = std::array<u64, 2>;
+using CaptureRecord = std::array<u64, 9>;
+constexpr u64 CaptureRecordVersion = 1;
+
+#ifdef _WIN32
+CaptureStamp FingerprintProducerModule(HMODULE module, const wchar_t* path) {
+    const HANDLE opened = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (opened == INVALID_HANDLE_VALUE) return {};
+    const std::unique_ptr<void, decltype(&CloseHandle)> file{opened, CloseHandle};
+    LARGE_INTEGER size{};
+    constexpr size_t MaxBytes = 128 * 1024 * 1024;
+    if (!GetFileSizeEx(file.get(), &size) || size.QuadPart <= 0 || size.QuadPart > MaxBytes) return {};
+    const std::unique_ptr<void, decltype(&CloseHandle)> mapping{
+        CreateFileMappingW(file.get(), nullptr, PAGE_READONLY, 0, 0, nullptr), CloseHandle};
+    if (!mapping) return {};
+    const std::unique_ptr<const void, decltype(&UnmapViewOfFile)> view{
+        MapViewOfFile(mapping.get(), FILE_MAP_READ, 0, 0, 1), UnmapViewOfFile};
+    using SameFile = LONG (NTAPI*)(void*, const void*);
+    const auto ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto same = ntdll ? reinterpret_cast<SameFile>(GetProcAddress(ntdll, "NtAreMappedFilesTheSame"))
+                            : nullptr;
+    // A filename can be reused. Compare the kernel's file backing objects before hashing
+    // the checked handle, then hold that handle without write or delete sharing until done.
+    if (!view || !same || same(module, view.get()) != 0) return {};
+    const std::unique_ptr<XXH3_state_t, decltype(&XXH3_freeState)> state{XXH3_createState(), XXH3_freeState};
+    if (!state || XXH3_128bits_reset(state.get()) != XXH_OK) return {};
+    constexpr size_t ChunkBytes = 256 * 1024;
+    auto chunk = std::make_unique<char[]>(ChunkBytes);
+    for (size_t remaining = size_t(size.QuadPart); remaining;) {
+        const DWORD count = DWORD(std::min(ChunkBytes, remaining));
+        DWORD read{};
+        if (!ReadFile(file.get(), chunk.get(), count, &read, nullptr) || read != count ||
+            XXH3_128bits_update(state.get(), chunk.get(), read) != XXH_OK) return {};
+        remaining -= read;
+    }
+    const auto digest = XXH3_128bits_digest(state.get());
+    return {digest.low64, digest.high64};
+}
+#endif
+
+CaptureStamp ProducerImage() {
+#ifdef _WIN32
+    // Identify the linked module which contains the actual producer, even in a dirty build.
+    HMODULE module{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(&Lifter::Lift), &module)) {
+        return {};
+    }
+    std::array<wchar_t, 32768> name{};
+    const DWORD length = GetModuleFileNameW(module, name.data(), DWORD(name.size()));
+    if (!length || length >= name.size()) return {};
+    return FingerprintProducerModule(module, name.data());
+#else
+    // Cold producer evidence is still available where a mapped producer cannot be sealed.
+    return {};
+#endif
+}
+
+CaptureRecord RecordCapture(CaptureStamp image, u64 perm, u32 mode, std::span<const u32> code,
+                            WorkflowCapture::Route route) {
+    const auto digest = XXH3_128bits(code.data(), code.size_bytes());
+    return {CaptureRecordVersion, image[0], image[1], perm, mode, code.size(),
+            digest.low64, digest.high64, u64(route)};
+}
+} // namespace
+
+void PipelineCache::ObserveCaptureModule(vk::ShaderModule module, const Shader::Info& info, u32 mode,
+                                         u64 perm_hash, std::span<const u32> code, bool lifted, bool warm) {
+    using namespace WorkflowCapture;
+    static const bool configured = [] { WorkflowProbeConfig config{}; return workflow_config_read(&config); }();
+    if (!configured || !module || !CaptureProofUnchanged() || !(mode & Shader::MotionVectors::VertexCapture) ||
+        code.empty() || code.size() > WordLimit ||
+        workflow_capture_modules.contains(module) || workflow_capture_module_attempts >= ModuleLimit ||
+        code.size() > ScanWordLimit - workflow_capture_scanned_words) return;
+    ++workflow_capture_module_attempts;
+    workflow_capture_scanned_words += u32(code.size());
+
+    auto& database = Storage::DataBase::Instance();
+    CaptureStamp image{};
+    std::string name;
+    if (database.IsOpened()) {
+        static const auto producer = [] {
+            const auto start = std::chrono::steady_clock::now();
+            const auto stamp = ProducerImage();
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start).count();
+            std::printf("Workflow capture proof: producer image seal %s, %lld us\n",
+                        stamp == CaptureStamp{} ? "unavailable" : "verified", static_cast<long long>(us));
+            return stamp;
+        }();
+        image = producer;
+        if (image != CaptureStamp{}) {
+            name = fmt::format("workflow-capture-{:#018x}", perm_hash);
+        }
+    }
+
+    Route sealed_route = Route::Unknown;
+    if (warm) {
+        if (name.empty()) return;
+        std::vector<u8> data;
+        database.Load(Storage::BlobType::ShaderMeta, name, data);
+        if (data.size() != sizeof(CaptureRecord)) return;
+        CaptureRecord saved{};
+        std::memcpy(&saved, data.data(), data.size());
+        if (saved.back() <= u64(Route::Unknown) || saved.back() >= u64(Route::Scope)) return;
+        sealed_route = Route(saved.back());
+        if (sealed_route == Route::AtomicPositionWarm ||
+            saved != RecordCapture(image, perm_hash, mode, code, sealed_route)) return;
+        lifted = sealed_route != Route::FallbackPosition;
+    }
+    using Motion = Shader::MotionVectors;
+    Route route = Route::Unknown;
+    if (mode & Motion::CaptureUv) {
+        route = Route::Uv;
+    } else if (mode & Motion::Sway) {
+        route = Route::Sway;
+    } else if (!lifted) {
+        route = Route::FallbackPosition;
+    } else if (info.uses_dma || info.has_storage_images ||
+               std::ranges::any_of(info.buffers, [](const auto& resource) { return resource.is_written; }) ||
+               std::ranges::any_of(info.images, [](const auto& resource) { return resource.is_written; }) ||
+               !DeterministicLifter(code, mode & Motion::VertexOutputs)) {
+        route = Route::Dynamic;
+    } else {
+        route = Route::AtomicPosition;
+    }
+    if (warm) {
+        if (sealed_route != route) return;
+        if (route == Route::AtomicPosition) route = Route::AtomicPositionWarm;
+    } else if (!name.empty()) {
+        const auto record = RecordCapture(image, perm_hash, mode, code, route);
+        std::vector<u8> data(sizeof(record));
+        std::memcpy(data.data(), &record, sizeof(record));
+        database.Save(Storage::BlobType::ShaderMeta, name, std::move(data));
+    }
+    workflow_capture_modules.emplace(module, CaptureModule{route, mode});
+}
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -84,7 +244,8 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
     Serialization::Archive ar{};
     Serialization::Writer pldata{ar};
 
-    pldata.Write(Serialization::PipelineKeyVersion);
+    pldata.Write(key.foliage_mask ? Serialization::MaskPipelineKeyVersion
+                                  : Serialization::PipelineKeyVersion);
     pldata.Write(u32{0}); // graphics
 
     key.Serialize(ar);
@@ -128,19 +289,27 @@ std::vector<u8> SerializeShaderMeta(const Shader::Info& info, const Shader::Stag
     return ar.TakeOff();
 }
 
+static bool MaskFragment(const Shader::StageSpecialization& spec) {
+    return spec.runtime_info.hw_stage == Shader::HwStage::Fragment &&
+           spec.runtime_info.hw.fs.foliage_mask;
+}
+
 bool ReadShaderMetaSpec(std::vector<u8>&& blob, Shader::StageSpecialization& spec, size_t& perm_idx) {
     Serialization::Archive ar{std::move(blob)};
     Serialization::Reader meta{ar};
     u32 meta_version{}, binary_version{};
     u64 perm_hash{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    if (meta_version != Serialization::ShaderMetaVersion &&
+        meta_version != Serialization::MaskShaderMetaVersion) {
         return false;
     }
     meta.Read(binary_version);
     meta.Read(perm_hash);
     meta.Read(perm_idx);
-    return spec.Deserialize(ar);
+    return spec.Deserialize(ar) &&
+           MaskFragment(spec) == (meta_version == Serialization::MaskShaderMetaVersion) &&
+           (!MaskFragment(spec) || binary_version == Serialization::MaskShaderBinaryVersion);
 }
 
 void RegisterShaderMeta(const Shader::Info& info,
@@ -154,14 +323,16 @@ void RegisterShaderMeta(const Shader::Info& info,
     Serialization::Archive ar;
     Serialization::Writer meta{ar};
 
-    meta.Write(Serialization::ShaderMetaVersion);
+    const bool mask = MaskFragment(spec);
+    meta.Write(mask ? Serialization::MaskShaderMetaVersion : Serialization::ShaderMetaVersion);
     const bool vertex_motion = info.hw_stage == Shader::HwStage::Vertex &&
                                spec.runtime_info.hw.vs.motion_vectors;
     const bool vertex_capture = vertex_motion && (spec.runtime_info.hw.vs.motion_vectors & 2) != 0;
-    meta.Write(SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
-                             : vertex_motion ? Serialization::MotionShaderBinaryVersion
-                             : Serialization::ShaderBinaryVersion,
-                      vertex_motion, spec)); // bbport (r89b_wind-sway-ripple)
+    meta.Write(mask ? Serialization::MaskShaderBinaryVersion
+                    : SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
+                                 : vertex_motion ? Serialization::MotionShaderBinaryVersion
+                                                 : Serialization::ShaderBinaryVersion,
+                             vertex_motion, spec));
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -190,7 +361,8 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
 
     u32 meta_version{};
     meta.Read(meta_version);
-    if (meta_version != Serialization::ShaderMetaVersion) {
+    const bool mask = meta_version == Serialization::MaskShaderMetaVersion;
+    if (!mask && meta_version != Serialization::ShaderMetaVersion) {
         return false;
     }
 
@@ -200,7 +372,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     // it with the current one); the known-version tests below see it with that add taken out
     const u32 binary_saved = binary_version;
     binary_version = BbWindHang::StripProofVersion(binary_version);
-    if (binary_version != Serialization::ShaderBinaryVersion &&
+    if (!mask && binary_version != Serialization::ShaderBinaryVersion &&
         binary_version != Serialization::MotionShaderBinaryVersion &&
         binary_version != Serialization::CaptureShaderBinaryVersion &&
         binary_version != Serialization::SwayShaderBinaryVersion && // bbport (r89b)
@@ -220,8 +392,14 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     if (!spec.Deserialize(ar) || !info.Deserialize(ar)) {
         return false;
     }
-    if (perm_idx >= 4096 || perm_hash_ar != expected_hash ||
-        HashCombine(info.pgm_hash, perm_idx) != expected_hash) {
+    if (MaskFragment(spec) != mask ||
+        (mask && (binary_saved != Serialization::MaskShaderBinaryVersion ||
+                  info.hw_stage != Shader::HwStage::Fragment || info.uses_tone_curve ||
+                  info.uses_froyok_bloom || (info.mrt_mask & (1u << Shader::FoliageMaskOutput::Location)) ||
+                  info.stores.GetAny(Shader::IR::Attribute::RenderTarget6) ||
+                  spec.runtime_info.hw.fs.dual_source_blending)) ||
+        perm_idx >= 4096 || perm_hash_ar != expected_hash ||
+        HashCombine(GraphicsProgramHash(info.pgm_hash, mask), perm_idx) != expected_hash) {
         return false;
     }
 
@@ -230,7 +408,7 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
     const bool vertex_motion = info.hw_stage == Shader::HwStage::Vertex &&
                                spec.runtime_info.hw.vs.motion_vectors;
     const bool vertex_capture = vertex_motion && (spec.runtime_info.hw.vs.motion_vectors & 2) != 0;
-    if (binary_saved != SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
+    if (!mask && binary_saved != SwayOr(vertex_capture ? Serialization::CaptureShaderBinaryVersion
                              : vertex_motion ? Serialization::MotionShaderBinaryVersion
                                         : Serialization::ShaderBinaryVersion,
                                  vertex_motion, spec)) { // bbport (r89b_wind-sway-ripple)
@@ -360,8 +538,19 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     return true;
 }
 
-bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy) {
+bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, u32 version) {
+    const bool legacy = version == 5;
     sel.graphics_key.Deserialize(ar);
+    const auto& key = sel.graphics_key;
+    constexpr auto location = Shader::FoliageMaskOutput::Location;
+    if (bool(key.foliage_mask) != (version == Serialization::MaskPipelineKeyVersion) ||
+        (key.foliage_mask &&
+         (!FoliageMaskAvailable() || (key.mrt_mask & (1u << location)) ||
+          key.cb_shader_mask.GetMask(location) || key.write_masks[location] ||
+          key.color_samples[location] || key.num_samples != 1 || key.depth_samples != 1 ||
+          key.logic_op != AmdGpu::ColorControl::LogicOp::Copy))) {
+        return false;
+    }
     if (sel.graphics_key.motion_vectors &&
         !instance.GetPhysicalDevice().getFeatures().vertexPipelineStoresAndAtomics) {
         return false;
@@ -477,6 +666,10 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy
     // A fragment shader that reads the motion varyings needs a vertex shader that writes them
     // (validation found keys pairing one with a vertex shader without them: undefined motion).
     const auto& fs_runtime = sel.runtime_infos[u32(Shader::SwStage::Fragment)];
+    const bool has_fragment = key.stage_hashes[u32(Shader::SwStage::Fragment)] != 0;
+    if (bool(key.foliage_mask) != (has_fragment && fs_runtime.hw.fs.foliage_mask)) {
+        return false;
+    }
     const auto& vs_runtime = sel.runtime_infos[u32(Shader::SwStage::Vertex)];
     if (sel.graphics_key.stage_hashes[u32(Shader::SwStage::Fragment)] && fs_runtime.hw.fs.motion_vectors &&
         !(sel.graphics_key.stage_hashes[u32(Shader::SwStage::Vertex)] &&
@@ -507,7 +700,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy
     }
     auto pipeline = std::make_unique<GraphicsPipeline>(
         instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true);
+        sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, true, CaptureProof(sel), this);
     graphics_pipelines.emplace(sel.graphics_key, std::move(pipeline));
 
     sel.infos.fill(nullptr);
@@ -536,9 +729,16 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
         return false;
     }
 
+    const bool mask = MaskFragment(spec);
+    // Saved masked SPIR-V is raw. Recompose this shader with the current host options on demand.
+    if (mask && (program->info.pgm_hash == EffectShaders::FoliageComposedHash ||
+                 !sel.graphics_key.foliage_mask || !FoliageMaskAvailable())) {
+        return false;
+    }
+    const auto cache_hash = GraphicsProgramHash(program->info.pgm_hash, mask);
     std::vector<u32> spv;
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-        fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx), spv);
+        fmt::format("{:#018x}_{}", cache_hash, perm_idx), spv);
     if (spv.size() < 5 || spv[0] != 0x07230203) {
         return false;
     }
@@ -576,7 +776,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
         }
     }
 
-    auto it = program_cache.find(program->info.pgm_hash);
+    auto it = program_cache.find(cache_hash);
     Program* target = it == program_cache.end() ? program.get() : it->second.get();
     program->info.has_discard |= discards;
     target->info.has_discard |= discards;
@@ -590,8 +790,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
         module = target->modules[perm_idx].module;
     } else {
         const auto effect_shader = EffectShaders::Replacement(program->info, profile, spec.start);
+        if (mask && !effect_shader.empty()) {
+            return false;
+        }
         const auto effect_patch =
-            effect_shader.empty() ? EffectShaders::Patched(program->info, spv) : std::nullopt;
+            !mask && effect_shader.empty() ? EffectShaders::Patched(program->info, spv) : std::nullopt;
         const std::span<const u32> code = !effect_shader.empty() ? effect_shader
                                           : effect_patch         ? std::span<const u32>(*effect_patch)
                                                                  : std::span<const u32>(spv);
@@ -601,6 +804,38 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
             throw Serialization::CorruptData{"cached SPIR-V rejected by the driver"};
         }
         module = compiled;
+        using Route = ReflectionDiscard::Route;
+        const auto route = !effect_shader.empty() ? Route::WarmReplacement
+                         : effect_patch ? Route::WarmHostPatch : Route::WarmOriginal;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+        if (!mask) RecordBottleDisplayModule(program->info, expected_hash, module, code,
+            !effect_shader.empty() ? "warm-replacement" : effect_patch ? "warm-host-patch" : "warm-original");
+#endif
+        if (const auto* role = ReflectionDiscard::StockFragmentForCreation(
+                program->info.pgm_hash, expected_hash, perm_idx)) {
+            RecordStockFragment(*role, program->info, mask, module, route, code);
+        }
+        if (!mask && program->info.hw_stage == Shader::HwStage::Fragment &&
+            program->info.sw_stage == Shader::SwStage::Fragment &&
+            ReflectionDiscard::GuestRole(program->info.pgm_hash) < ReflectionDiscard::RoleCount &&
+            ReflectionDiscard::On() && CaptureProofUnchanged()) {
+            ReflectionDiscard::Observe(this, program->info.pgm_hash, expected_hash, perm_idx,
+                                       module, route, code, discards);
+        }
+        if (!effect_patch && effect_shader.empty() && program->info.hw_stage == Shader::HwStage::Vertex &&
+            program->info.sw_stage == Shader::SwStage::Vertex) {
+            ObserveCaptureModule(module, program->info, spec.runtime_info.hw.vs.motion_vectors, expected_hash,
+                                 code, false, true);
+        }
+        if (!mask && program->info.sw_stage == Shader::SwStage::Fragment &&
+            program->info.pgm_hash == IvyMaterialProbe::Fragment && IvyMaterialProbe::Wanted()) {
+            const char* route = !effect_shader.empty() ? "warm-replacement" :
+                                effect_patch ? "warm-host-patch" : "warm-original";
+            IvyMaterialProbe::Modules().Remember(
+                expected_hash, std::bit_cast<u64>(module), route, "cached-emitter-unknown",
+                IvyMaterialProbe::Words(spv), IvyMaterialProbe::Words(code),
+                IvyMaterialProbe::ObjectBytes(profile), IvyMaterialProbe::ObjectBytes(spec.runtime_info));
+        }
     }
     // bbport: where this permutation's bindings start and how many it has, from its own record
     // (LoadGraphicsPipeline checks them against the stages before it).
@@ -629,7 +864,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, 
     sel.modules[stage] = module;
     if (it == program_cache.end()) {
         const auto hash = program->info.pgm_hash;
-        program_cache.emplace(hash, std::move(program));
+        program_cache.emplace(cache_hash, std::move(program));
     }
     return true;
 }
@@ -825,9 +1060,10 @@ void PipelineCache::WarmUp() {
             u32 version{}, is_compute{};
             reader.Read(version);
             reader.Read(is_compute);
-            if ((version == 5 || version == Serialization::PipelineKeyVersion) && is_compute <= 1) {
-                loaded = is_compute ? LoadComputePipeline(ar)
-                                    : LoadGraphicsPipeline(ar, version == 5);
+            const bool normal_version = version == 5 || version == Serialization::PipelineKeyVersion;
+            if ((normal_version && is_compute <= 1) ||
+                (version == Serialization::MaskPipelineKeyVersion && is_compute == 0)) {
+                loaded = is_compute ? LoadComputePipeline(ar) : LoadGraphicsPipeline(ar, version);
             }
         } catch (const std::exception& error) {
             ++damaged;
@@ -899,6 +1135,10 @@ void PipelineCache::WarmUp() {
                 if (permutation.module) modules.insert(VkShaderModule(permutation.module));
             }
         }
+        // A rebuilt shader can reuse any of the discarded Vulkan handles.
+        stock_fragments = {};
+        ReflectionDiscard::Clear(this);
+        workflow_capture_modules.clear();
         for (const auto module : modules) instance.GetDevice().destroyShaderModule(vk::ShaderModule{module});
         program_cache.clear();
         database.Clear();

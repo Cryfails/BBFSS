@@ -9,6 +9,7 @@
 #include "bbport_wind_shelter.h" // bbport (r117_wind-shelter)
 #include "bbport_wind_hang.h" // bbport (r112_wind-more-things)
 #include "bbport_wind_twigs.h" // bbport (r89d_tree-twigs)
+#include "bbport_wind_lantern.h" // bbport (r112v_lantern-hangs)
 
 namespace Shader::Backend::SPIRV {
 
@@ -653,6 +654,7 @@ static void EmitVertexSway(EmitContext& ctx) {
     // vertex (BbWindHang::HangDisplace is this code in C++). Off: nothing of it is emitted.
     const bool hang_on = BbWindHang::KnobOnce().on;
     Id hang{}, top_ptr{}, stored_top{};
+    Id post_flag{}, lantern_ht{}; // bbport (r112v_lantern-hangs): a post word's flag and its lantern weight (for the proof tint)
     Id ddx_all = ddx, ddz_all = ddz;
     if (hang_on) {
         namespace H = BbWindHang;
@@ -685,7 +687,32 @@ static void EmitVertexSway(EmitContext& ctx) {
             const Id post_below = ctx.OpFDiv(f32_type, hh, post_height);
             const Id ht_post = ctx.OpFClamp(f32_type, mul(sub(f(H::PostBelow), post_below), f(1.0f / H::PostSpan)), zero,
                                             f(1.0f));
-            ht = ctx.OpSelect(f32_type, post, ht_post, ht);
+            Id ht_used = ht_post;
+            if (BbWindLantern::On()) { // bbport (r112v_lantern-hangs): the lantern's weight in place of the top fifth's (BbWindLantern::Weight in C++)
+                namespace BL = BbWindLantern;
+                // the slot's plan: the twigs' box keys hold the post's axis (the centre) and R0, R1 (the half widths), the top key the arm's lower edge
+                const auto key_lo = [&](Id key) { return sub(ctx.OpBitcast(f32_type, key), f(W::HeightBias)); };
+                const auto key_hi = [&](Id key) { return sub(f(W::HeightBias), ctx.OpBitcast(f32_type, key)); };
+                const Id lx_lo = key_lo(tk_x0);
+                const Id lx_hi = key_hi(tk_x1);
+                const Id lz_lo = key_lo(tk_z0);
+                const Id lz_hi = key_hi(tk_z1);
+                const Id lcx = mul(f(0.5f), add(lx_lo, lx_hi));
+                const Id lcz = mul(f(0.5f), add(lz_lo, lz_hi));
+                const Id lr0 = mul(f(0.5f), sub(lx_hi, lx_lo));
+                const Id lr1 = mul(f(0.5f), sub(lz_hi, lz_lo));
+                const Id ldx = sub(add(comp(wind_e, 2u), rx), lcx);
+                const Id ldz = sub(add(comp(wind_e, 3u), rz), lcz);
+                const Id lr = ctx.OpSqrt(f32_type, add(mul(ldx, ldx), mul(ldz, ldz)));
+                const Id lspan = ctx.OpFMax(f32_type, sub(lr1, lr0), f(BL::SpanMin));
+                const Id lw_r = ctx.OpFClamp(f32_type, ctx.OpFDiv(f32_type, sub(lr, lr0), lspan), zero, f(1.0f));
+                const Id lw_o = ctx.OpFClamp(f32_type, mul(sub(f(BL::OuterZero), lr), f(1.0f / (BL::OuterZero - BL::OuterFull))), zero, f(1.0f));
+                const Id lw_v = ctx.OpFClamp(f32_type, mul(sub(hh, f(BL::HookStill)), f(1.0f / BL::HookSpan)), zero, f(1.0f));
+                ht_used = mul(mul(lw_r, lw_o), lw_v);
+            }
+            ht = ctx.OpSelect(f32_type, post, ht_used, ht);
+            post_flag = post;
+            lantern_ht = ht_used;
         }
         const Id hw = mul(mul(mul(mul(ht, ht), sub(f(3.0f), mul(f(2.0f), ht))), ramp), sc);
         const Id push = scaled(
@@ -830,7 +857,11 @@ static void EmitVertexSway(EmitContext& ctx) {
     }
     if (hang_on && BbWindHang::ProofOn()) { // bbport (r112r_hang-bracket-judge, TOOL): the proof's tint, as the lifter's: every float output
         // of a vertex with the hang bit (whatever its ramp) moves BbWindHang::ProofShare toward cyan (0, 1, 1)
-        const Id tint_share = ctx.OpSelect(f32_type, hang, f(BbWindHang::ProofShare), zero);
+        Id tint_share = ctx.OpSelect(f32_type, hang, f(BbWindHang::ProofShare), zero);
+        if (BbWindLantern::On()) { // bbport (r112v_lantern-hangs): a post's tint only where its vertex moves (weight above BbWindLantern::ProofMin)
+            const Id lantern_moved = ctx.OpFOrdGreaterThan(bool_type, lantern_ht, f(BbWindLantern::ProofMin));
+            tint_share = ctx.OpSelect(f32_type, post_flag, ctx.OpSelect(f32_type, lantern_moved, f(BbWindHang::ProofShare), zero), tint_share);
+        }
         for (u32 p = 0; p < IR::NumParams; ++p) {
             const auto& output = ctx.output_params[p];
             if (!Sirit::ValidId(output.id) || output.is_integer || output.is_array ||
@@ -885,8 +916,10 @@ static void EmitVertexSway(EmitContext& ctx) {
             return ctx.OpULessThan(bool_type, key, stored_key);
         };
         const auto either = [&](Id a, Id b) { return ctx.OpLogicalOr(bool_type, a, b); };
+        // bbport (r112v_lantern-hangs): a post word (PostBit) offers nothing to the box keys: the CPU wrote the post's plan there
+        const Id twig_fin = BbWindLantern::On() ? ctx.OpLogicalAnd(bool_type, fin, post_none) : fin;
         const Id offer_twig = ctx.OpLogicalAnd(
-            bool_type, fin,
+            bool_type, twig_fin,
             either(either(lower(k_x0, tk_x0), lower(k_x1, tk_x1)),
                    either(lower(k_z0, tk_z0), lower(k_z1, tk_z1))));
         const Id twig_label = ctx.OpLabel();
@@ -958,6 +991,12 @@ void EmitEpilogue(EmitContext& ctx) {
     }
     if (Sirit::ValidId(ctx.motion_frag_out)) {
         EmitFragmentMotion(ctx);
+    }
+    if (Sirit::ValidId(ctx.foliage_mask_out)) {
+        const Id ptr = ctx.OpAccessChain(
+            ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]), ctx.push_data_block,
+            ctx.ConstU32(FoliageMaskOutput::PushMember));
+        ctx.OpStore(ctx.foliage_mask_out, ctx.OpConvertUToF(ctx.F32[1], ctx.OpLoad(ctx.U32[1], ptr)));
     }
     if (ctx.hw_stage == HwStage::Vertex &&
         ctx.runtime_info.hw.vs.emulate_depth_negative_one_to_one) {

@@ -18,8 +18,69 @@
 #include "video_core/texture_cache/image.h"
 
 #include <vulkan/vulkan_format_traits.hpp>
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#include <vk_mem_alloc.h>
+#endif
 
 namespace Vulkan {
+
+#ifdef BB_TEST_SHARED_POST_GRAPH
+namespace {
+PostImageBarriers::Backing SnapshotBarrierBacking(const Runtime& owner,
+        const VideoCore::Image& image, const VideoCore::Image::BackingImage* backing,
+        bool alias, bool replacement = false) {
+    if (!backing) return {};
+    const auto& native = backing->image;
+    const auto& ci = native.image_ci;
+    const auto& info = image.info;
+    constexpr auto sparse = vk::ImageCreateFlagBits::eSparseBinding |
+        vk::ImageCreateFlagBits::eSparseResidency | vk::ImageCreateFlagBits::eSparseAliased |
+        vk::ImageCreateFlagBits::eDisjoint;
+    const auto end = [](u64 begin, u64 size) {
+        return size && begin <= ~u64{} - size ? begin + size : 0u;
+    };
+    PostImageBarriers::Backing fact{
+        .image = native.image, .uid = image.image_uid,
+        .allocation = reinterpret_cast<u64>(native.allocation), .requested_write_serial = image.write_seq,
+        .guest_begin = info.guest_address, .guest_end = end(info.guest_address, info.guest_size),
+        .stencil_begin = info.stencil_addr, .stencil_end = end(info.stencil_addr, info.stencil_size),
+        .metadata = {info.meta_info.cmask_addr, info.meta_info.fmask_addr, info.meta_info.htile_addr},
+        .format = ci.format, .samples = ci.samples, .aspects = image.aspect_mask,
+        .mips = ci.mipLevels, .layers = ci.arrayLayers,
+        .bounded = image.runtime == &owner && !image.scene_proxy && !ci.pNext &&
+            native.allocator && native.allocation && !(ci.flags & sparse),
+        .alias = alias || bool(ci.flags & vk::ImageCreateFlagBits::eAlias),
+        .foreign = image.runtime != &owner, .replacement = replacement,
+    };
+    if (fact.bounded) {
+        VmaAllocationInfo memory{};
+        vmaGetAllocationInfo(native.allocator, native.allocation, &memory);
+        fact.memory = memory.deviceMemory;
+        fact.offset = memory.offset;
+        fact.bytes = memory.size;
+    }
+    return fact;
+}
+} // namespace
+
+u64 Runtime::ArmPostImageBarriers(const PostImageBarriers::Key& key) {
+    if (!key.request || !key.frame || post_image_barriers || post_image_barrier_window == ~u64{}) return 0;
+    BeforeImageAccess();
+    post_image_barriers = std::make_shared<PostImageBarriers::Session>(key, ++post_image_barrier_window);
+    return post_image_barrier_window;
+}
+
+bool Runtime::ReadPostImageBarriers(u64 window, PostImageBarriers::Report& report) const {
+    return post_image_barriers && post_image_barriers->Read(window, report);
+}
+
+void Runtime::DisarmPostImageBarriers(u64 window) {
+    if (post_image_barriers && window == post_image_barriers->Window()) {
+        BeforeImageAccess();
+        post_image_barriers.reset();
+    }
+}
+#endif
 
 static vk::ImageType ConvertImageType(AmdGpu::ImageType type) noexcept {
     switch (type) {
@@ -291,6 +352,14 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     }
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
     image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (post_image_barriers && image_barriers.size() != prev_num_barriers) {
+        const auto backing = SnapshotBarrierBacking(*this, *image, image->backing, bool(aliased));
+        for (size_t i = prev_num_barriers; i < image_barriers.size(); ++i) {
+            post_image_barriers->Mark(i, image_barriers[i].image, backing);
+        }
+    }
+#endif
     if (BbStats::enabled && image_barriers.size() != prev_num_barriers) { // bbport (r22)
         r22_counts.texture_issued.fetch_add(image_barriers.size() - prev_num_barriers,
                                             std::memory_order_relaxed);
@@ -837,6 +906,13 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
                 .layerCount = image->info.resources.layers,
             },
         });
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (post_image_barriers) {
+            const auto backing_fact = SnapshotBarrierBacking(*this, *image, new_backing,
+                                                             bool(aliased), true);
+            post_image_barriers->Mark(image_barriers.size() - 1, image_barriers.back().image, backing_fact);
+        }
+#endif
         FlushBarriers();
 
         // Copy between ms and non ms backing images
@@ -850,8 +926,16 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.pl_stage = dst_stage;
     }
 
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    const auto prior_image = post_image_barriers ? backing->image.image : vk::Image{};
+#endif
     backing = new_backing;
     ++image->write_seq; // other contents from here on (BB_IMAGE_TILE_MEMO)
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (post_image_barriers) {
+        post_image_barriers->Rebind(image->image_uid, prior_image, backing->image.image);
+    }
+#endif
 }
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
@@ -970,6 +1054,9 @@ void Runtime::FlushBarriers() {
     BeforeImageAccess();
     // bbport BB_CHUNK_BUFFERS: an aliased access is done with once this barrier follows it (or
     // after a few barriers without it: a binding taken for residency only is never accessed).
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    const bool pending_alias = bool(aliased);
+#endif
     if (aliased && (aliased->recorded || ++aliased->flushes > 4)) {
         aliased.reset();
     }
@@ -1000,9 +1087,55 @@ void Runtime::FlushBarriers() {
         return value && value[0] == '1';
     }();
 
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    const auto observer = post_image_barriers;
+    PostImageBarriers::Session::Ticket barrier_ticket;
+    if (observer) {
+        barrier_ticket = observer->Prepare(dep_info, {
+            reinterpret_cast<u64>(&scheduler), std::bit_cast<u64>(instance.GetGraphicsQueue()),
+            scheduler.CurrentTick(), instance.GetGraphicsQueueFamilyIndex(), pending_alias});
+    }
+#endif
     if (direct_image_barriers && dep_info.imageMemoryBarrierCount != 0) {
-        scheduler.CommandBuffer().pipelineBarrier2(dep_info);
-    } else {
+        const auto cmd = scheduler.CommandBuffer();
+        cmd.pipelineBarrier2(dep_info);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (barrier_ticket) observer->Commit(barrier_ticket, cmd, dep_info, true, false);
+#endif
+    }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    else if (barrier_ticket) {
+        const auto encode = [observer, barrier_ticket, memory = memory_barrier,
+                             has_memory = dep_info.memoryBarrierCount != 0,
+                             images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
+                                 image_barriers.data(), image_barriers.size()))](
+                                 vk::CommandBuffer cmd, bool with_encoder) {
+            const vk::DependencyInfo info = {
+                .memoryBarrierCount = has_memory ? 1U : 0U,
+                .pMemoryBarriers = has_memory ? &memory : nullptr,
+                .imageMemoryBarrierCount = static_cast<u32>(images.size()),
+                .pImageMemoryBarriers = images.data(),
+            };
+            bool committed{};
+            PostImageBarriers::EncodeThenObserve(info,
+                [cmd](const auto& actual) { cmd.pipelineBarrier2(actual); },
+                [&](const auto& actual) {
+                    committed = observer->Commit(barrier_ticket, cmd, actual, false, with_encoder);
+                });
+            return committed;
+        };
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        scheduler.RecordNativeWriteSuffix([encode, cookie = barrier_ticket.cookie](
+                vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) {
+            if (encode(cmd, true)) encoder.Note(NativeWriteSuffix::Kind::NativeOperation, cookie);
+            else encoder.Note(NativeWriteSuffix::Kind::UnknownRecord);
+        });
+#else
+        scheduler.Record([encode](vk::CommandBuffer cmd) { encode(cmd, false); });
+#endif
+    }
+#endif
+    else {
         scheduler.Record([memory = memory_barrier, has_memory = dep_info.memoryBarrierCount != 0,
                           images = scheduler.RecordData(std::span<const vk::ImageMemoryBarrier2>(
                               image_barriers.data(), image_barriers.size()))](vk::CommandBuffer cmdbuf) {

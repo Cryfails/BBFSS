@@ -116,9 +116,9 @@ class DebugPatchTests(unittest.TestCase):
                     self.assertNotIn(offset+i, camera_bytes, patch)
 
     def test_missing_effect_keys_follow_the_engine_defaults(self):
-        self.assertEqual(effect_patches({}), ['Disable Chromatic Aberration', 'Disable DoF',
+        self.assertEqual(effect_patches({}), ['Disable Chromatic Aberration',
                                               'Disable Motion Blur (perf increase)', 'Disable AA'])
-        self.assertNotIn('Disable DoF', effect_patches({'effect_dof': '1'}))
+        self.assertIn('Disable DoF', effect_patches({'effect_dof': '0'}))
 
     def test_debug_menu_checks_both_fonts_but_camera_does_not_need_them(self):
         names = effect_patches({'debug_menu': '1'})

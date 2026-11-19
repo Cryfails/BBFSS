@@ -757,6 +757,12 @@ void EmitContext::DefineOutputs() {
             motion_in_prev = DefineInput(F32[4], MotionVectors::PreviousLocation);
             Name(motion_frag_out, "motion_vector");
         }
+        if (FragmentFoliageMask()) {
+            ASSERT(!runtime_info.hw.fs.dual_source_blending &&
+                   !info.stores.GetAny(IR::Attribute::RenderTarget6));
+            foliage_mask_out = DefineOutput(F32[1], FoliageMaskOutput::Location);
+            Name(foliage_mask_out, "foliage_mask");
+        }
         // Dual source blending allows at most 2 render targets, one for each source.
         // Fewer targets are allowed but the missing blending source values will be
         // undefined.
@@ -808,8 +814,14 @@ void EmitContext::DefineMotionAddressBlock() {
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
     // bbport: modules with the tone curve extension declare its parameters after the block.
+    const bool mask = FragmentFoliageMask();
+    ASSERT(!mask || (!info.uses_tone_curve && !info.uses_froyok_bloom));
+    static_assert(sizeof(PushData) == FoliageMaskOutput::PushOffset);
+    static_assert(PushData::SceneSizeIndex + 1 == FoliageMaskOutput::PushMember);
     const Id struct_type{Name(
-        info.uses_froyok_bloom
+        mask ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[4],
+                          U32[4], U32[4], U32[2], U32[1], U32[1], U32[1])
+        : info.uses_froyok_bloom
             ? TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4], U32[4], U32[4],
                          U32[4], U32[2], U32[1], U32[1], F32[4], F32[4])
             : info.uses_tone_curve
@@ -854,6 +866,11 @@ void EmitContext::DefinePushDataBlock() {
         MemberName(struct_type, PushData::FroyokIndex, "froyok_bloom");
         MemberDecorate(struct_type, PushData::FroyokIndex, spv::Decoration::Offset,
                        Native::FroyokPushOffset);
+    }
+    if (mask) {
+        MemberName(struct_type, FoliageMaskOutput::PushMember, "foliage_class");
+        MemberDecorate(struct_type, FoliageMaskOutput::PushMember, spv::Decoration::Offset,
+                       FoliageMaskOutput::PushOffset);
     }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");

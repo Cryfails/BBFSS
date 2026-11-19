@@ -14,6 +14,7 @@
 #include "gpu/shadps4/video_core/renderer_vulkan/ambient_particles.h"
 #include "gpu/shadps4/video_core/renderer_vulkan/ambient_particles_lamps.h" // r98c
 #include "gpu/shadps4/video_core/renderer_vulkan/ambient_particles_still.h" // r98d
+#include "gpu/shadps4/video_core/renderer_vulkan/ambient_particles_moths.h" // r98e
 
 using namespace Vulkan::AmbientMotes;
 
@@ -315,6 +316,149 @@ int main() {
                    std::strstr(line, "(r98d)") != nullptr,
                "the 10 s line: counts, range, under 300 characters");
         Expect(sizeof(LampBlock) == AP_LAMP_BLOCK_BYTES, "the block's word w changes no size");
+    }
+
+    // h. bbport (r98e_moths-at-lamps): moths at lamps (ambient_particles_moths.h).
+    {
+        for (const char* off : {static_cast<const char*>(nullptr), "", "0", "-1", "abc", "nan", "inf", "0.4"}) {
+            Expect(ParseMothLevel(off) == 0, "an unset, 0 or unreadable BB_PARTICLES_MOTHS is off");
+        }
+        Expect(ParseMothLevel("1") == 1 && ParseMothLevel("1.4") == 1 && ParseMothLevel("2") == 2 &&
+                   ParseMothLevel("1.6") == 2 && ParseMothLevel("9") == 2,
+               "BB_PARTICLES_MOTHS 1 and 2, above 2 is 2");
+        // The counts: 2 to 4 at level 1, 3 to 6 at level 2, every number of the range reached.
+        int low1 = 99, high1 = 0, low2 = 99, high2 = 0;
+        for (int i = 0; i < 2000; ++i) {
+            const float seed = SeedOf(std::uint32_t(i + 1));
+            const int one = MothCount(1, seed), two = MothCount(2, seed);
+            low1 = std::min(low1, one);
+            high1 = std::max(high1, one);
+            low2 = std::min(low2, two);
+            high2 = std::max(high2, two);
+        }
+        Expect(low1 == 2 && high1 == 4 && low2 == 3 && high2 == 6 && MothCount(0, 0.5f) == 0 &&
+                   MothCount(1, std::numeric_limits<float>::quiet_NaN()) >= 2,
+               "2 to 4 moths a lamp at level 1, 3 to 6 at level 2, none at 0");
+        // Which lights: the street lamp, the wall lantern and a candle; not the hand torch, the fill
+        // light, a cold light, a faint one or a reach under 1 m.
+        Expect(IsMothLight({0.72f, 0.42f, 0.26f, 1.0f}, 6.0f) && IsMothLight({1.5f, 1.12f, 0.75f, 1.0f}, 6.0f) &&
+                   IsMothLight({2.67f, 1.83f, 0.96f, 1.0f}, 2.0f) &&
+                   !IsMothLight({2.6f, 1.45f, 0.65f, 1.0f}, 8.5f) &&
+                   !IsMothLight({0.60f, 0.45f, 0.30f, 1.0f}, 9.0f) &&
+                   !IsMothLight({0.2f, 0.4f, 1.0f, 1.0f}, 6.0f) &&
+                   !IsMothLight({0.05f, 0.03f, 0.02f, 1.0f}, 6.0f) &&
+                   !IsMothLight({1.0f, 0.6f, 0.3f, 1.0f}, 0.5f) &&
+                   !IsMothLight({1.0f, 0.6f, std::numeric_limits<float>::quiet_NaN(), 1.0f}, 6.0f),
+               "moths go to warm or white lamps of 1 to 7.5 m reach, not to the torch or fill lights");
+        Expect(MothScale(6.0f) == 1.0f && MothScale(1.0f) == MothScaleMin && MothScale(20.0f) == MothScaleMax,
+               "the loops' scale follows the reach");
+        // Apply: eight street lamps in a row at 2 to 9 m, the camera at the origin.
+        const auto make = [](std::size_t lamps) {
+            LampBlock b{};
+            b.info = {float(lamps), 0.0f, 1.0f, 0.5f};
+            for (std::size_t i = 0; i < lamps; ++i) {
+                b.place[i] = {2.0f + float(i), 0.0f, 0.0f, 6.0f};
+                b.colour[i] = {0.72f, 0.42f, 0.26f, 1.0f};
+                b.moth[i] = {0.0f, SeedOf(std::uint32_t(i + 10)), 0.0f, 0.0f};
+            }
+            return b;
+        };
+        const std::array<float, 3> eye{0.0f, 0.0f, 0.0f};
+        const std::array<float, 3> nobody{};
+        {
+            MothSet set;
+            LampBlock b = make(8);
+            MothStats s = set.Apply(b, eye, false, nobody, 1, 0.0f, 0.1);
+            Expect(s.candidates == 8 && s.capped == 2 && s.lamps == 6 &&
+                       Near(b.moth[0][0], double(MothCount(1, b.moth[0][1])) * 0.125, 1e-5) &&
+                       b.moth[6][0] == 0.0f && b.moth[7][0] == 0.0f && b.moth[0][3] == 0.0f,
+                   "the nearest six lamps start to fade their moths in (0.1 s of 0.8 s), the others none");
+            for (int i = 0; i < 20; ++i) {
+                b = make(8);
+                s = set.Apply(b, eye, false, nobody, 1, 0.0f, 0.1);
+            }
+            bool all = true;
+            std::uint32_t most = 0;
+            for (std::size_t i = 0; i < 6; ++i) {
+                all = all && b.moth[i][0] == float(MothCount(1, b.moth[i][1]));
+                most += std::uint32_t(b.moth[i][0]);
+            }
+            Expect(all && most <= std::uint32_t(AP_MOTH_LAMPS * AP_MOTH_SLOTS) && s.shown == most &&
+                       b.moth[6][0] == 0.0f && Near(b.moth[0][2], 1.0, 1e-6),
+                   "after 2 s the six nearest lamps carry their full count, never over 6 x 6");
+            // The hunter holds a light: the lamp at 2 m is near his chest, gets none; the seventh takes over.
+            LampBlock c = make(8);
+            s = set.Apply(c, eye, true, {1.2f, -1.0f, 0.0f}, 1, 0.0f, 0.1);
+            Expect(s.carried == 1 && s.candidates == 7 && s.capped == 1 && c.moth[0][0] < b.moth[0][0],
+                   "a lamp within 1.5 m of the hunter's chest is kept out (and fades out)");
+            for (int i = 0; i < 20; ++i) {
+                c = make(8);
+                s = set.Apply(c, eye, true, {1.2f, -1.0f, 0.0f}, 1, 0.0f, 0.1);
+            }
+            Expect(c.moth[0][0] == 0.0f && c.moth[6][0] > 0.0f && s.lamps == 6,
+                   "the carried lamp has no moths after the fade, the next lamp has");
+            // Level 0 and lamps off: nothing; a lamp beyond 13 m: nothing.
+            LampBlock d = make(8);
+            s = set.Apply(d, eye, false, nobody, 0, 0.0f, 0.1);
+            Expect(s.lamps == 0 && s.shown == 0 && d.moth[0][0] == 0.0f && set.Remembered() == 0,
+                   "level 0 shows no moth and forgets");
+            LampBlock e = make(8);
+            e.info[2] = 0.0f;
+            s = set.Apply(e, eye, false, nobody, 2, 0.0f, 0.1);
+            Expect(s.shown == 0 && e.moth[0][0] == 0.0f, "no lamp light (BB_PARTICLES_LAMPS=0): no moth");
+            LampBlock far = make(1);
+            far.place[0] = {20.0f, 0.0f, 0.0f, 6.0f};
+            s = set.Apply(far, eye, false, nobody, 2, 0.0f, 0.1);
+            Expect(s.candidates == 0 && s.shown == 0, "a lamp 20 m away carries none");
+            LampBlock torch = make(1);
+            torch.place[0] = {3.0f, 0.0f, 0.0f, 8.5f};
+            torch.colour[0] = {2.6f, 1.45f, 0.65f, 1.0f};
+            s = set.Apply(torch, eye, false, nobody, 2, 0.0f, 0.1);
+            Expect(s.candidates == 0 && s.shown == 0, "the hand torch (reach 8.5 m) carries none");
+        }
+        {
+            // The calm goes to the block's word w; the lamp's own fade (weight) scales the count; a
+            // lamp seen again with the same seed keeps its presence in another slot.
+            MothSet set;
+            LampBlock b = make(2);
+            b.colour[0][3] = 0.5f;
+            MothStats s;
+            for (int i = 0; i < 20; ++i) {
+                b = make(2);
+                b.colour[0][3] = 0.5f;
+                s = set.Apply(b, eye, false, nobody, 2, 1.0f, 0.1);
+            }
+            Expect(b.moth[0][3] == 1.0f &&
+                       Near(b.moth[0][0], 0.5 * double(MothCount(2, b.moth[0][1])), 1e-5),
+                   "w is the calm and the count follows the lamp's weight");
+            std::swap(b.place[0], b.place[1]);
+            std::swap(b.colour[0], b.colour[1]);
+            std::swap(b.moth[0], b.moth[1]);
+            s = set.Apply(b, eye, false, nobody, 2, 1.0f, 0.1);
+            Expect(b.moth[1][0] > 0.0f && Near(b.moth[1][0], 0.5 * double(MothCount(2, b.moth[1][1])), 1e-5),
+                   "a lamp keeps its presence when its slot changes");
+            Expect(set.Apply(b, eye, false, nobody, 2, std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN()).lamps == 2 &&
+                       b.moth[0][3] == 0.0f,
+                   "a calm or time step that is not a number counts as 0");
+        }
+        MothWindow window;
+        MothStats some;
+        some.shown = 12;
+        some.lamps = 3;
+        some.carried = 1;
+        window.Add(some);
+        window.Add(MothStats{});
+        char moth_line[360];
+        const int moth_length = window.Text(moth_line, sizeof(moth_line), 10.0);
+        Expect(moth_length > 0 && moth_length < 320 && window.frames == 2 && window.with_moths == 1 &&
+                   window.carried_frames == 1 && window.unknown_frames == 2 &&
+                   std::strstr(moth_line, "(r98e)") != nullptr,
+               "the 10 s line: counts, under 320 characters");
+        Expect(sizeof(LampBlock) == AP_LAMP_BLOCK_BYTES && AP_LAMP_BLOCK_BYTES == 928 &&
+                   AP_MOTH_INSTANCES == 96 && AP_MOTH_RADIUS > 0.0 && AP_MOTH_FAR0 < AP_MOTH_FAR1 &&
+                   AP_MOTH_ORBIT_MIN < AP_MOTH_ORBIT_MAX && AP_MOTH_TURN_MIN < AP_MOTH_TURN_MAX,
+               "the block's bytes, the moths' instances and numbers");
     }
 
     std::printf("ambient-particles-test: %u cells, %s\n", Instances,

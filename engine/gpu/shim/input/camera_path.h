@@ -6,7 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-// bbport (r102_camera-mode-3-4): camera mode's paths (F5 adds a key, Shift+F5 clears the keys, F6
+// bbport (r102_camera-mode-3-4): camera mode's paths (K adds a key, Backspace clears the keys, P
 // plays them). A key is a pose of the game's follow camera around the hunter: its yaw and pitch
 // (radians, the fields MouseCamera turns) and the orbit's distance factor. Playing starts at the
 // camera's pose of the moment and passes through every key on a Catmull-Rom curve, the same time
@@ -19,7 +19,7 @@ constexpr float kPi = 3.14159274f;
 constexpr float kRadiansPerDegree = 0.0174532924f;
 // Seconds from one key to the next (BB_CAMERA_PATH_S), and the ease at each end of a play.
 constexpr float kSecondsDefault = 4.0f, kSecondsLeast = 0.5f, kSecondsMost = 60.0f, kEaseMost = 1.5f;
-// Keys kept (F5 refuses more), not counting the pose a play starts from.
+// Keys kept (K refuses more), not counting the pose a play starts from.
 constexpr std::size_t kKeysMost = 32;
 // The distance factor's range (the orbit's, CameraOrbit::kRadiusLeast..kRadiusMost).
 constexpr float kRadiusLeast = 0.5f, kRadiusMost = 1.5f;

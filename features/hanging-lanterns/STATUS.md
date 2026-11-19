@@ -1,5 +1,15 @@
 # Hanging lanterns (things that hang lean with the wind)
 
+## Development snapshot, 2026-11-19
+
+WND scope. Feature work is paused.
+
+- Verified scope. The lantern investigation has a retained target-selection record.
+- Open scope. A current verified hanging-lantern feature result is pending.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 10%. Rated by the weakest part: no lantern has ever moved in the game. Everything built so far is detection and proof work.
 
 ## What works
@@ -40,3 +50,6 @@ None are on a fork branch yet. The base r112_wind-more-things is listed under th
 ## Test places
 - graveyard-blood: the lamp post with a bracket lantern (pick pixels near 1676,1016 and 1677,990 at 1920x1080), the bridge above (must stay still), coffins with chains (must stay still).
 - dream house and dark-interior: do-nothing checks.
+
+
+</details>

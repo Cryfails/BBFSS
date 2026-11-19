@@ -1,5 +1,15 @@
 # Interior brightness: lift for dark rooms
 
+## Development snapshot, 2026-11-19
+
+LRT T08. Feature work is paused.
+
+- Verified scope. The library slider has a verified exposure response.
+- Open scope. The matched outdoor gate can lift incorrectly. The live panel and connected-block ownership still need proof.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 85%. Rated by the weakest part: the slider fix (r99e, build 73) has only been seen in small test windows, not by the owner at 4K.
 
 ## What works
@@ -41,3 +51,6 @@ None are on a fork branch yet; the notes plan visual/interior-exposure.
 - Library (save dark-interior), church (church-candles), sewer (sewer-water), dream house.
 - Must do nothing: graveyard at night, dark alley (without the mod).
 - Slot tests keep the hero light off; the owner's hand run with the lantern out meters brighter.
+
+
+</details>

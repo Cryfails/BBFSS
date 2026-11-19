@@ -54,10 +54,10 @@ struct FlipRequest {
     }
 };
 
-// bbport (r102_camera-mode-3-4): camera mode's freeze (F8). The flip thread waits here after the
+// bbport (r102_camera-mode-3-4): camera mode's freeze (Space in camera mode). The flip thread waits here after the
 // frame was handed on to be presented and before the game hears that it flipped, so the game holds with its
 // picture; the freeze watchdog (BB_FREEZE_REPORT_S) is told of a flip every 10 ms meanwhile. It
-// ends when the flag clears (F8, the settings menu) or after BB_CAMERA_FREEZE_S seconds (1 to
+// ends when the flag clears (the key again, the end of camera mode, the settings menu) or after BB_CAMERA_FREEZE_S seconds (1 to
 // 600, default 60), whichever comes first.
 void HoldFrozen() {
     static const long limit_s = [] {

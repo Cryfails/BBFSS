@@ -28,6 +28,9 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_optiscaler.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+#include "video_core/renderer_vulkan/vk_workflow_probe.h"
+#endif
 #include "bbport_threads.h"
 
 namespace Vulkan {
@@ -187,10 +190,249 @@ Scheduler::~Scheduler() {
             worker->thread.join();
         }
     }
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    NativeWriteSuffix::Recorder::Get().Detach(this);
+#endif
 #if TRACY_GPU_ENABLED
     std::free(profiler_scope);
 #endif
 }
+
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+namespace {
+// Both callers hold Scheduler::submit_mutex around the actual queue call and this observation.
+void NoteNativeSubmit(Scheduler* scheduler, vk::Queue queue, u32 family, vk::Semaphore work_timeline,
+                      u64 tick,
+                      std::span<const vk::CommandBuffer> sparse, SubmitInfo& info, size_t stage_capacity,
+                      const vk::SubmitInfo& submitted, const vk::TimelineSemaphoreSubmitInfo& values,
+                      vk::Fence fence, vk::Result result) {
+    auto& recorder = NativeWriteSuffix::Recorder::Get();
+    const bool armed = recorder.Armed();
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    static u64 next_graphics_sequence{};
+    const auto sequence = ++next_graphics_sequence;
+    if (!armed && !info.observe_post_present_submit) {
+        return;
+    }
+#else
+    constexpr u64 sequence = 0;
+    if (!armed) {
+        return;
+    }
+#endif
+    const size_t count = submitted.pCommandBuffers ?
+        std::min<size_t>(submitted.commandBufferCount, sparse.size()) : 0;
+    const std::span ordered{submitted.pCommandBuffers, count};
+    auto raw = NativeWriteSuffix::ActualQueueSubmitInput(
+        queue, family, fence, result, work_timeline, sequence, submitted,
+        values, info.wait_semas.size(), stage_capacity);
+    raw.metadata_complete &= count == submitted.commandBufferCount;
+    if (armed) {
+        if (!raw.metadata_complete) {
+            recorder.Unordered(scheduler, NativeWriteSuffix::Gap::UnjoinedBuffer);
+        }
+        recorder.Submit(scheduler, tick, ordered, sparse, result == vk::Result::eSuccess, &raw);
+    }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    info.NotifyPostPresentSubmit(scheduler, tick, raw, ordered, sparse);
+#endif
+}
+} // namespace
+
+NativeWriteSuffix::Encoder Scheduler::EncodeNativeWriteSuffix(vk::CommandBuffer cmdbuf) {
+    using namespace NativeWriteSuffix;
+    auto& recorder = Recorder::Get();
+    if (!recorder.Armed()) {
+        return {};
+    }
+    if (const auto* context = worker_segment) {
+        if (context->scheduler == this && cmdbuf == context->buffer) {
+            return recorder.Encode(this, context->tick, context->segment, cmdbuf);
+        }
+    } else if (batch && cmdbuf == current_cmdbuf) {
+        return recorder.Encode(this, batch->native_suffix_tick, current_segment, cmdbuf);
+    }
+    recorder.Unordered(this, Gap::UnjoinedBuffer);
+    return {};
+}
+#endif
+
+#ifdef BB_TEST_SHARED_POST_GRAPH
+NativeWriteSuffix::CaptureId Scheduler::ArmPostNativeOrder(NativeWriteSuffix::PostKey key) {
+    using namespace NativeWriteSuffix;
+    ProducerScope producer{*this, "ArmPostNativeOrder"};
+    if (!batch || open_post_borrow || thread_sink || fork_open || worker_segment ||
+        in_recorded_closure) {
+        return 0;
+    }
+    auto& recorder = Recorder::Get();
+    const auto capture = recorder.Arm(this, Consumer::PostOrder, batch->native_suffix_tick,
+                                      post_raw_tick > work_semaphore.KnownGpuTick(),
+                                      is_rendering || resume_rendering, key);
+    if (capture && (host_copies_done.load(std::memory_order_acquire) != host_copies_issued ||
+                    deferred_signals_done->load(std::memory_order_acquire) !=
+                        deferred_signals_issued.load(std::memory_order_relaxed))) {
+        recorder.Unordered(this, Gap::OrderedHost);
+    }
+    return capture;
+}
+
+NativeWriteSuffix::PostToken Scheduler::ReservePostNativeOperation(
+    NativeWriteSuffix::CaptureId capture, NativeWriteSuffix::PostRole role, u64 operation) {
+    return NativeWriteSuffix::Recorder::Get().ReservePost(this, capture, role, operation);
+}
+
+Scheduler::PostNativeBorrow Scheduler::BorrowPostNativeRoot(NativeWriteSuffix::PostToken token) {
+    using namespace NativeWriteSuffix;
+    ProducerScope producer{*this, "BorrowPostNativeRoot"};
+    const bool scoped = token && batch && !open_post_borrow && !thread_sink && !fork_open &&
+                        !worker_segment &&
+                        !in_recorded_closure && Recorder::Get().OpenPostRoot(this, token);
+    if (scoped) {
+        open_post_borrow = token.capture;
+    }
+    const auto buffer = BorrowCommandBuffer(scoped, __builtin_return_address(0));
+    return {*this, scoped ? token : PostToken{}, buffer};
+}
+
+Scheduler::PostNativeBorrow::PostNativeBorrow(Scheduler& scheduler_, NativeWriteSuffix::PostToken token_,
+                                               vk::CommandBuffer buffer_)
+    : scheduler{scheduler_}, token{token_}, buffer{buffer_}, producer{std::this_thread::get_id()},
+      origin{scheduler.batch ? scheduler.batch->native_suffix_tick : 0,
+             scheduler.post_borrow_epoch, scheduler.current_segment, buffer} {}
+
+Scheduler::PostNativeBorrow::~PostNativeBorrow() {
+    Close(false);
+}
+
+bool Scheduler::PostNativeBorrow::StillCurrent(bool allow_inline_recorded) const {
+    using namespace NativeWriteSuffix;
+    return producer == std::this_thread::get_id() && scheduler.batch &&
+           scheduler.open_post_borrow == token.capture && !thread_sink && !scheduler.fork_open &&
+           !worker_segment && (allow_inline_recorded || !in_recorded_closure) &&
+           origin.Matches({scheduler.batch->native_suffix_tick, scheduler.post_borrow_epoch,
+                           scheduler.current_segment, scheduler.current_cmdbuf});
+}
+
+void Scheduler::PostNativeBorrow::Note() {
+    if (!token) {
+        return;
+    }
+    if (!StillCurrent()) {
+        NativeWriteSuffix::Recorder::Get().ClosePostRoot(&scheduler, token, false);
+        return;
+    }
+    scheduler.NotePostNativeRoot(token, buffer);
+}
+
+bool Scheduler::PostNativeBorrow::NoteOverwriteBarrier(
+    vk::CommandBuffer issued, const vk::ImageMemoryBarrier2& barrier,
+    const NativeWriteSuffix::PostMergeAllocation& backing) {
+    using namespace NativeWriteSuffix;
+    if (producer != std::this_thread::get_id()) {
+        Recorder::Get().Unordered(&scheduler, Gap::UnjoinedBuffer);
+        return false;
+    }
+    if (!token) {
+        return false;
+    }
+    if (overwrite_attempted || overwrite_unclassified || issued != buffer || !StillCurrent(true) ||
+        !barrier.image || barrier.pNext || !backing.allocator || !backing.allocation ||
+        !backing.memory || !backing.bytes || !backing.epoch ||
+        merge_barrier_count == merge_barriers.size()) {
+        overwrite_unclassified = true;
+        return false;
+    }
+    merge_barriers[merge_barrier_count++] = {barrier, backing};
+    return true;
+}
+
+bool Scheduler::PostNativeBorrow::NoteOverwriteRoot(
+    vk::CommandBuffer issued, const NativeWriteSuffix::PostMergeRootProof& proof) {
+    using namespace NativeWriteSuffix;
+    if (producer != std::this_thread::get_id()) {
+        Recorder::Get().Unordered(&scheduler, Gap::UnjoinedBuffer);
+        return false;
+    }
+    if (!token) {
+        return false;
+    }
+    overwrite_unclassified |= std::exchange(overwrite_attempted, true);
+    if (issued != buffer || !StillCurrent()) {
+        overwrite_unclassified = true;
+        Recorder::Get().ClosePostRoot(&scheduler, token, false);
+        return false;
+    }
+    auto evidence = overwrite_unclassified ? PostMergeRootEvidence{} :
+        CheckPostMergeRoot(origin, proof, scheduler.instance.GetGraphicsQueueFamilyIndex(),
+                           std::span{merge_barriers}.first(merge_barrier_count));
+    const auto owns_backing = [allocator = scheduler.instance.GetAllocator()](const PostMergeImage& image) {
+        if (!allocator || image.allocator != allocator) {
+            return false;
+        }
+        VmaAllocationInfo actual{};
+        vmaGetAllocationInfo(allocator, image.allocation, &actual);
+        return actual.deviceMemory == VkDeviceMemory(image.memory) &&
+               actual.offset == image.allocation_offset && actual.size == image.allocation_bytes;
+    };
+    if (evidence && (!owns_backing(proof.rgb) || !owns_backing(proof.destination) ||
+                     !owns_backing(proof.alpha))) {
+        evidence = {};
+    }
+    return scheduler.NotePostNativeRoot(token, issued, &evidence);
+}
+
+void Scheduler::PostNativeBorrow::Close(bool all_raw_uses_classified) {
+    CloseImpl(all_raw_uses_classified, NativeWriteSuffix::PostOverwriteTail::Unknown);
+}
+
+void Scheduler::PostNativeBorrow::CloseAfterOverwrite(NativeWriteSuffix::PostOverwriteTail tail) {
+    using namespace NativeWriteSuffix;
+    const bool explained = overwrite_attempted && !overwrite_unclassified &&
+                           (tail == PostOverwriteTail::NoRawCommands ||
+                            tail == PostOverwriteTail::BreadcrumbOnly);
+    CloseImpl(explained, tail);
+}
+
+void Scheduler::PostNativeBorrow::CloseImpl(bool fully_classified,
+                                           NativeWriteSuffix::PostOverwriteTail tail) {
+    if (!token) {
+        return;
+    }
+    const bool exact = fully_classified && StillCurrent();
+    const auto closed = std::exchange(token, {});
+    const bool joined = NativeWriteSuffix::Recorder::Get().ClosePostRoot(&scheduler, closed, exact, tail);
+    if (producer == std::this_thread::get_id() && scheduler.open_post_borrow == closed.capture) {
+        scheduler.open_post_borrow = 0;
+        if (!joined && scheduler.batch) {
+            scheduler.post_raw_tick = std::max(scheduler.post_raw_tick, scheduler.batch->native_suffix_tick);
+        }
+    }
+}
+
+bool Scheduler::NotePostNativeRoot(NativeWriteSuffix::PostToken token, vk::CommandBuffer buffer,
+                                   const NativeWriteSuffix::PostMergeRootEvidence* overwrite) {
+    auto encoder = EncodeNativeWriteSuffix(buffer);
+    encoder.expected_post = token;
+    return encoder.NotePost(token, overwrite);
+}
+
+bool Scheduler::ReadPostNativeOperation(NativeWriteSuffix::PostToken token,
+                                        NativeWriteSuffix::PostReceipt& receipt) {
+    return NativeWriteSuffix::Recorder::Get().ReadPost(this, token, work_semaphore.KnownGpuTick(),
+                                                       receipt);
+}
+
+bool Scheduler::ConfirmPostProxyLifetime(NativeWriteSuffix::PostToken merge,
+                                         const NativeWriteSuffix::PostProxyLifetimeProof& proof) {
+    return NativeWriteSuffix::Recorder::Get().ConfirmPostProxyLifetime(
+        this, merge, work_semaphore.KnownGpuTick(), proof);
+}
+
+void Scheduler::DisarmPostNativeOrder(NativeWriteSuffix::CaptureId capture) {
+    NativeWriteSuffix::Recorder::Get().Disarm(this, capture);
+}
+#endif
 
 void Scheduler::BeginRendering(const RenderState& new_state) {
     // bbport (r21_draw-sort): ending and beginning render passes leaves every bind as it is.
@@ -257,11 +499,18 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
 
     if (workers.empty()) {
         current_cmdbuf.beginRendering(rendering_info);
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        EncodeNativeWriteSuffix(current_cmdbuf).BeginRendering(rendering_info);
+#endif
         return;
     }
     // The attachment infos live on this stack frame: the recorded closure keeps copies.
-    Record([info = rendering_info, color_attachments, depth_attachment,
-            stencil_attachment](vk::CommandBuffer cmdbuf) mutable {
+    auto begin = [info = rendering_info, color_attachments, depth_attachment,
+                  stencil_attachment](vk::CommandBuffer cmdbuf
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+                                      , NativeWriteSuffix::Encoder& encoder
+#endif
+                                      ) mutable {
         info.pColorAttachments = color_attachments.data();
         if (info.pDepthAttachment) {
             info.pDepthAttachment = &depth_attachment;
@@ -270,16 +519,215 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
             info.pStencilAttachment = &stencil_attachment;
         }
         cmdbuf.beginRendering(info);
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        encoder.BeginRendering(info);
+#endif
+    };
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    RecordNativeWriteSuffix(std::move(begin));
+#else
+    Record(std::move(begin));
+#endif
+}
+
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+void Scheduler::RecordRenderEnd() {
+    RecordNativeWriteSuffix([](vk::CommandBuffer cmdbuf, NativeWriteSuffix::Encoder& encoder) {
+        cmdbuf.endRendering();
+        encoder.Note(NativeWriteSuffix::Kind::RenderEnd);
     });
 }
+#endif
 
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
     is_rendering = false;
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    if (TryPostResidentEnd()) {
+        return;
+    }
+#endif
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    RecordRenderEnd();
+#else
     Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+#endif
 }
+
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+bool Scheduler::PrepareResidentDraw(PostResidentGeometry::Ticket& ticket) {
+    const auto queue = instance.GetGraphicsQueue();
+    const auto allocator = instance.GetAllocator();
+    if (!batch->resident_tick || !ticket.Check(this, queue, allocator)) {
+        return false;
+    }
+    ticket.scheduler = this;
+    ticket.queue = queue;
+    ticket.allocator = allocator;
+    ticket.tick = batch->resident_tick;
+    return true;
+}
+
+bool Scheduler::TryPostResidentEnd() {
+    using namespace PostResidentGeometry;
+    if (thread_sink || !record_chunk) {
+        return false;
+    }
+    ProducerScope producer{*this, "TryPostResidentEnd"};
+    auto& chunk = *record_chunk;
+    auto ticket = chunk.TakeAdjacentResidentDraw();
+    if (!ticket) {
+        return false;
+    }
+    if (!IsRecordingDeferred() || fork_open || !batch || batch->resident_raw ||
+        ticket->tick != batch->resident_tick || ticket->incarnation != chunk.ResidentIncarnation()) {
+        ticket->Refuse(State::Unordered);
+        return false;
+    }
+    if (batch->resident_count == batch->resident.size()) {
+        ticket->Refuse(State::Capacity);
+        return false;
+    }
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    if (!chunk.Push<NativeWriteSuffix::Handling::Described>(
+            [this, owner = &chunk, capture = ticket.get()](vk::CommandBuffer cmd,
+                                                          NativeWriteSuffix::Encoder& encoder) {
+            cmd.endRendering();
+            encoder.Note(NativeWriteSuffix::Kind::RenderEnd);
+            EncodePostResident(*owner, *capture, cmd);
+        })) {
+#else
+    if (!chunk.Push([this, owner = &chunk, capture = ticket.get()](vk::CommandBuffer cmd) {
+            cmd.endRendering();
+            EncodePostResident(*owner, *capture, cmd);
+        })) {
+#endif
+        ticket->Refuse(State::NoAdjacentEnd);
+        return false;
+    }
+    ++r21_serial;
+    batch->resident[batch->resident_count++] = std::move(ticket);
+    return true;
+}
+
+void Scheduler::EncodePostResident(RecordChunk& chunk, PostResidentGeometry::Ticket& ticket,
+                                   vk::CommandBuffer cmd) {
+    using namespace PostResidentGeometry;
+    if (ticket.Get() != State::Issued || !cmd || cmd != ticket.command || !chunk.batch ||
+        chunk.batch->resident_tick != ticket.tick || chunk.ResidentIncarnation() != ticket.incarnation ||
+        !ticket.Check(this, instance.GetGraphicsQueue(), instance.GetAllocator())) {
+        ticket.Refuse(State::NoExactDraw);
+        return;
+    }
+    const auto allocator = instance.GetAllocator();
+    const auto stage = WorkflowProbe::AllocateTransfer(allocator, ticket.transfer_bytes);
+    if (!stage) {
+        ticket.Refuse(State::AllocationFailed);
+        return;
+    }
+    VmaAllocationInfo destination{};
+    vmaGetAllocationInfo(allocator, stage->allocation, &destination);
+    const auto staging_begin = destination.offset;
+    if (!destination.deviceMemory || destination.pMappedData != stage->mapped ||
+        stage->bytes > destination.size ||
+        !Ticket::Contains(0, std::numeric_limits<u64>::max(), staging_begin, destination.size)) {
+        ticket.Refuse(State::AllocationFailed);
+        return;
+    }
+    for (u32 i = 0; i < ticket.count; ++i) {
+        const auto& r = ticket.regions[i];
+        const auto& b = r.source.binding;
+        VmaAllocationInfo backing{};
+        vmaGetAllocationInfo(allocator, b.allocation, &backing);
+        const u64 source_begin = b.memory_offset + r.begin;
+        if (backing.pMappedData || backing.deviceMemory != static_cast<VkDeviceMemory>(b.memory) ||
+            backing.offset != b.memory_offset || backing.size != b.allocation_bytes ||
+            (backing.deviceMemory == destination.deviceMemory &&
+             source_begin < staging_begin + destination.size &&
+             staging_begin < source_begin + r.bytes)) {
+            ticket.Refuse(State::InvalidProof);
+            return;
+        }
+    }
+
+    // Same write-to-copy, copy-to-host, and copy-before-later-write edges as WorkflowCopyIndex.
+    const vk::MemoryBarrier2 before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eHostWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &before});
+    for (u32 i = 0; i < ticket.count; ++i) {
+        const auto& r = ticket.regions[i];
+        const vk::BufferCopy region{.srcOffset = r.begin, .dstOffset = r.destination, .size = r.bytes};
+        cmd.copyBuffer(r.source.binding.buffer, vk::Buffer{stage->buffer}, region);
+    }
+    const std::array after{
+        vk::MemoryBarrier2{.srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                           .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                           .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+                           .dstAccessMask = vk::AccessFlagBits2::eHostRead},
+        vk::MemoryBarrier2{.srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                           .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                           .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                           .dstAccessMask = vk::AccessFlagBits2::eMemoryWrite},
+    };
+    cmd.pipelineBarrier2({.memoryBarrierCount = u32(after.size()), .pMemoryBarriers = after.data()});
+    ticket.segment = chunk.segment;
+    ticket.transfer = stage;
+    ticket.Set(State::Encoded);
+}
+
+void Scheduler::SubmitPostResident(SubmissionBatch& submitted, vk::Result result, u64 signal,
+                                   std::span<const vk::CommandBuffer> commands) {
+    using namespace PostResidentGeometry;
+    if (!submitted.resident_count) {
+        return;
+    }
+    // The async recorder must never acquire the ordinary pending-ops mutex. Its callbacks
+    // run under that mutex and can depend on recorder progress.
+    std::unique_lock lk(resident_pending_ops_mutex);
+    for (u32 i = 0; i < submitted.resident_count; ++i) {
+        auto ticket = std::move(submitted.resident[i]);
+        if (ticket->Get() != State::Encoded) {
+            continue;
+        }
+        if (result != vk::Result::eSuccess) {
+            ticket->transfer.reset();
+            ticket->Refuse(State::UnjoinedSubmit);
+            continue;
+        }
+        const bool joined = ticket->JoinSubmit(result, signal, commands, submitted.segments,
+                                                submitted.resident_raw);
+        if (joined) {
+            ticket->Set(State::Submitted);
+        } else {
+            ticket->Set(State::UnjoinedSubmit);
+        }
+        // A successful queue submit may refer to this staging buffer even if the join fails.
+        resident_pending_ops.emplace([this, ticket = std::move(ticket), joined] {
+            auto stage = std::static_pointer_cast<WorkflowProbe::Transfer>(std::move(ticket->transfer));
+            if (!joined) {
+                ticket->Refuse(State::UnjoinedSubmit);
+                return;
+            }
+            if (vmaInvalidateAllocation(stage->allocator, stage->allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+                ticket->Refuse(State::InvalidateFailed);
+                return;
+            }
+            if (!ticket->Complete(work_semaphore.KnownGpuTick(), {
+                    static_cast<const std::byte*>(stage->mapped), stage->bytes})) {
+                ticket->Refuse(State::UnjoinedSubmit);
+            }
+        }, signal, "post_resident_geometry", false);
+        num_pending_ops.fetch_add(1, std::memory_order_release);
+    }
+    submitted.resident_count = 0;
+}
+#endif
 
 void Scheduler::TraceDirectRecording(void* caller) {
     static const bool enabled = [] {
@@ -577,6 +1025,9 @@ void Scheduler::WaitHostCopies(u32 site) {
 
 void Scheduler::KickRecording(bool force) {
     ProducerScope producer{*this, "KickRecording"};
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    ++post_borrow_epoch;
+#endif
     if (workers.empty()) {
         return;
     }
@@ -606,13 +1057,18 @@ void Scheduler::MaybeSplit() {
         return;
     }
     if (is_rendering) {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        RecordRenderEnd();
+#else
         Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+#endif
         is_rendering = false;
         resume_rendering = true;
     }
     if (async_submit) {
         // Its recording thread ends the segment's command buffer (the pool is that thread's).
-        Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
+        RecordImpl<NativeWriteSuffix::Handling::NoNativeWrites>(
+            [](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
     }
     HandOver();
     ++current_segment;
@@ -645,6 +1101,10 @@ void Scheduler::HandOver() {
     // Entered from inside Record*() on this thread: a fault handler recording mid-command.
     if (const char* inside = producer_scope_where;
         inside && (std::strcmp(inside, "Record") == 0 || std::strcmp(inside, "RecordData") == 0 ||
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+                   std::strcmp(inside, "RecordPostResidentDraw") == 0 ||
+                   std::strcmp(inside, "TryPostResidentEnd") == 0 ||
+#endif
                    std::strcmp(inside, "RecordOrdered") == 0 ||
                    std::strcmp(inside, "RetireChunk") == 0)) {
         ReportProducer("REENTERED recording", BbPlatform::CurrentThreadId(), inside, "HandOver");
@@ -769,6 +1229,11 @@ void Scheduler::SyncRecording() {
 }
 
 void Scheduler::EnterDirectMode() {
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    if (batch) {
+        batch->resident_raw = true;
+    }
+#endif
     // bbport: with submissions going out from the recording threads, the commands recorded
     // here get a segment of their own, from this thread's pool, after the segments handed over:
     // the recording threads go on with those instead of this thread waiting for them (~90 us,
@@ -780,7 +1245,11 @@ void Scheduler::EnterDirectMode() {
     if (own_segment && async_submit && current_segment + 2 < MaxSegments &&
         !BbToggle::Disabled(BbToggle::ThreadedRecording)) {
         if (is_rendering) {
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+            RecordRenderEnd();
+#else
             Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
+#endif
             is_rendering = false;
             resume_rendering = true;
         }
@@ -789,7 +1258,8 @@ void Scheduler::EnterDirectMode() {
             batch->handed[current_segment] == 0 && full_chunks.empty() && CurrentChunk().Empty();
         if (!untouched) {
             // Its recording thread ends the segment's command buffer (the pool is that thread's).
-            Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
+            RecordImpl<NativeWriteSuffix::Handling::NoNativeWrites>(
+                [](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
             HandOver();
             ++current_segment;
         }
@@ -818,6 +1288,9 @@ void Scheduler::EnterDirectMode() {
 void Scheduler::LeaveDirectSegment() {
     if (is_rendering) {
         current_cmdbuf.endRendering();
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        EncodeNativeWriteSuffix(current_cmdbuf).Note(NativeWriteSuffix::Kind::RenderEnd);
+#endif
         is_rendering = false;
         resume_rendering = true;
     }
@@ -922,7 +1395,15 @@ void Scheduler::RecorderThread(std::stop_token stoken, u32 index) {
         if (!cmdbuf) {
             cmdbuf = BeginCommandBuffer(*worker.pool);
         }
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        const NativeWriteSuffix::WorkerSegment context{
+            this, chunk->batch->native_suffix_tick, chunk->segment, cmdbuf};
+        const auto* old_context = std::exchange(NativeWriteSuffix::worker_segment, &context);
+#endif
         chunk->Execute(cmdbuf);
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+        NativeWriteSuffix::worker_segment = old_context;
+#endif
         {
             std::scoped_lock lk{recorder_mutex};
             ++chunk->batch->recorded[chunk->segment];
@@ -1258,15 +1739,44 @@ void Scheduler::PopPendingOperations() {
     // the clock per draw instead was itself a hot spot).
     bool poll = !pending_ops.empty();
     if (poll && !work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        poll = false;
+    }
+    const auto resident_tick = [this] {
+        std::scoped_lock resident_lock(resident_pending_ops_mutex);
+        return resident_pending_ops.empty() ? 0 : resident_pending_ops.front().gpu_tick;
+    }();
+    bool resident_ready = resident_tick && work_semaphore.IsFree(resident_tick);
+    if (!poll && !resident_ready && (!pending_ops.empty() || resident_tick)) {
+#endif
         if ((++pending_polls & 31) != 0 && !BbToggle::Disabled(BbToggle::PendingPollLimit)) {
             poll = false;
         } else {
             work_semaphore.Refresh();
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+            poll = !pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick);
+            resident_ready = resident_tick && work_semaphore.IsFree(resident_tick);
+#else
             poll = work_semaphore.IsFree(pending_ops.front().gpu_tick);
+#endif
         }
     }
     // bbport (r35_pending-ops): nothing the GPU is past and nothing carried: return here, as the
     // old code did (the per-draw cost stays as before).
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    if (resident_ready) {
+        std::unique_lock resident_lock(resident_pending_ops_mutex);
+        while (!resident_pending_ops.empty() &&
+               work_semaphore.IsFree(resident_pending_ops.front().gpu_tick)) {
+            auto op = std::move(resident_pending_ops.front());
+            resident_pending_ops.pop();
+            num_pending_ops.fetch_sub(1, std::memory_order_release);
+            resident_lock.unlock();
+            op.callback();
+            resident_lock.lock();
+        }
+    }
+#endif
     if (!poll && r35_carried.empty()) {
         return;
     }
@@ -1350,6 +1860,12 @@ void Scheduler::AllocateWorkerCommandBuffers() {
         batch->Reset();
         batch->segments[0] = current_cmdbuf;
     }
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    batch->resident_tick = work_semaphore.CurrentTick();
+#endif
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    batch->native_suffix_tick = work_semaphore.CurrentTick();
+#endif
     current_segment = 0;
     segment_bytes = 0;
     active_worker.store(0, std::memory_order_relaxed);
@@ -1456,6 +1972,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    if (!info.before_submit.empty()) {
+        NativeWriteSuffix::Recorder::Get().Unordered(this, NativeWriteSuffix::Gap::SubmitCallback);
+    }
+#endif
     for (auto& operation : info.before_submit) {
         operation();
     }
@@ -1465,13 +1986,25 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         work_semaphore.Refresh();
         diag_dry = work_semaphore.IsFree(signal_value - 1);
     }
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+    const auto queue = instance.GetGraphicsQueue();
+    const auto fence = info.fence;
+    auto submit_result = queue.submit(submit_info, fence);
+    NoteNativeSubmit(this, queue, instance.GetGraphicsQueueFamilyIndex(), timeline, signal_value,
+                     batch->segments, info, wait_stage_masks.size(), submit_info, timeline_si,
+                     fence, submit_result);
+#else
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+#endif
     if (submit_result == vk::Result::eErrorDeviceLost) {
         Breadcrumbs::ReportDeviceLost("submit");
     }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     submitted_tick.store(signal_value, std::memory_order_release);
     submitted_tick.notify_all();
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+    SubmitPostResident(*batch, submit_result, signal_value, {cmdbufs.data(), num_cmdbufs});
+#endif
     if (diag) {
         NoteSubmitDiag(signal_value, diag_reason, diag_dry, diag_waits, diag_flush_ns,
                        diag_since_ns);
@@ -1519,7 +2052,8 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
         direct_mode = false;
         direct_segment = false;
     } else {
-        Record([](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
+        RecordImpl<NativeWriteSuffix::Handling::NoNativeWrites>(
+            [](vk::CommandBuffer cmdbuf) { Check(cmdbuf.end()); });
     }
     // Guest memory copies into staging this submission reads: on the copy threads by then.
     {
@@ -1532,7 +2066,7 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
     // bbport (r27_flush-split): pushing the submit closure (when it runs inline on this thread,
     // its copy wait and queue submit are timed inside)
     BbSpike::SplitScope r27_ordered{BbSpike::SplitRecordOrdered};
-    RecordOrdered([this, submitted = batch, info = std::move(info), signal_value, diag,
+    RecordOrderedImpl([this, submitted = batch, info = std::move(info), signal_value, diag,
                    diag_reason, diag_waits, diag_flush_ns, diag_since_ns]() mutable {
         {
             const BbSpike::SplitScope r27_step{BbSpike::SplitCopyWait}; // r27_flush-split
@@ -1574,20 +2108,45 @@ void Scheduler::SubmitAsync(SubmitInfo& info) {
             work_semaphore.Refresh();
             diag_dry = work_semaphore.IsFree(signal_value - 1);
         }
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        vk::Result resident_result{};
+#endif
         {
             const BbSpike::SplitScope r27_step{BbSpike::SplitQueueSubmit}; // r27_flush-split
             std::scoped_lock lk{submit_mutex};
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+            if (!info.before_submit.empty()) {
+                NativeWriteSuffix::Recorder::Get().Unordered(this,
+                                                            NativeWriteSuffix::Gap::SubmitCallback);
+            }
+#endif
             for (auto& operation : info.before_submit) {
                 operation();
             }
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+            const auto queue = instance.GetGraphicsQueue();
+            const auto fence = info.fence;
+            const auto result = queue.submit(submit_info, fence);
+            NoteNativeSubmit(this, queue, instance.GetGraphicsQueueFamilyIndex(),
+                             work_semaphore.Handle(), signal_value,
+                             submitted->segments, info, wait_stage_masks.size(), submit_info,
+                             timeline_si, fence, result);
+#else
             const auto result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+#endif
             if (result == vk::Result::eErrorDeviceLost) {
                 Breadcrumbs::ReportDeviceLost("submit");
             }
             ASSERT_MSG(result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+            resident_result = result;
+#endif
         }
         submitted_tick.store(signal_value, std::memory_order_release);
         submitted_tick.notify_all();
+#if defined(BB_TEST_POST_RESIDENT_GEOMETRY)
+        SubmitPostResident(*submitted, resident_result, signal_value, {cmdbufs.data(), num_cmdbufs});
+#endif
         if (diag) {
             NoteSubmitDiag(signal_value, diag_reason, diag_dry, diag_waits, diag_flush_ns,
                            diag_since_ns);

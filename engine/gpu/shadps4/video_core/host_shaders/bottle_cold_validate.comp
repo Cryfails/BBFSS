@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 460
+#extension GL_EXT_ray_query : require
+
+layout(local_size_x = 32) in;
+layout(set = 0, binding = 0) uniform accelerationStructureEXT scene;
+layout(std430, set = 0, binding = 1) readonly buffer Proposed { vec4 proposed[]; };
+layout(std430, set = 0, binding = 2) readonly buffer Order { uint order[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Corners { vec4 corners[]; };
+layout(std430, set = 0, binding = 4) buffer Result { uint validated; };
+layout(push_constant) uniform SceneRecord {
+    vec4 row0;
+    vec4 row1;
+    vec4 row2;
+    uint ordinal;
+    uint mask;
+};
+
+const uint TriangleCount = 266u;
+const uint PositionCount = 352u;
+const uint SlotBits = 9u;
+const uint SlotMask = (1u << SlotBits) - 1u;
+
+bool finite3(vec3 p) {
+    return !any(isnan(p)) && !any(isinf(p));
+}
+
+vec3 view_transform(vec4 p) {
+    return vec3(dot(row0, p), dot(row1, p), dot(row2, p));
+}
+
+bool sample_triangle(uint primitive, vec3 center, vec3 normal, float half_ray,
+                     vec3 expected_bary, out vec3 hit, out vec3 bary) {
+    const vec3 origin = view_transform(vec4(center + normal * half_ray, 1.0));
+    const vec3 direction = view_transform(vec4(-normal, 0.0));
+    rayQueryEXT query;
+    rayQueryInitializeEXT(query, scene, gl_RayFlagsNoOpaqueEXT, mask, origin, 0.0,
+                          direction, 2.0 * half_ray);
+    uint candidates = 0u;
+    bool found = false;
+    while (rayQueryProceedEXT(query)) {
+        if (++candidates > 64u) {
+            rayQueryTerminateEXT(query);
+            return false;
+        }
+        if (rayQueryGetIntersectionTypeEXT(query, false) != gl_RayQueryCandidateIntersectionTriangleEXT ||
+            rayQueryGetIntersectionInstanceIdEXT(query, false) != ordinal ||
+            rayQueryGetIntersectionGeometryIndexEXT(query, false) != 0u ||
+            rayQueryGetIntersectionPrimitiveIndexEXT(query, false) != primitive) {
+            continue;
+        }
+        const vec2 yz = rayQueryGetIntersectionBarycentricsEXT(query, false);
+        const float t = rayQueryGetIntersectionTEXT(query, false);
+        bary = vec3(1.0 - yz.x - yz.y, yz);
+        hit = rayQueryGetIntersectionObjectRayOriginEXT(query, false) +
+              t * rayQueryGetIntersectionObjectRayDirectionEXT(query, false);
+        if (!finite3(bary) || !finite3(hit) || any(lessThan(bary, vec3(0.08))) ||
+            any(greaterThan(abs(bary - expected_bary), vec3(0.12))) ||
+            distance(hit, center) > half_ray) {
+            rayQueryTerminateEXT(query);
+            return false;
+        }
+        // The same triangle may be reported more than once by traversal. This
+        // query has one intersection with its plane, so the first exact hit suffices.
+        found = true;
+        rayQueryTerminateEXT(query);
+        break;
+    }
+    return found;
+}
+
+void main() {
+    const uint triangle = gl_GlobalInvocationID.x;
+    if (triangle >= TriangleCount) {
+        return;
+    }
+    const uint first = triangle * 3u;
+    const uint packed = order[first];
+    const uint primitive = packed >> SlotBits;
+    const uvec3 slots = uvec3(packed & SlotMask, order[first + 1u], order[first + 2u]);
+    if (any(greaterThanEqual(slots, uvec3(PositionCount)))) {
+        return;
+    }
+    const vec3 a = proposed[slots.x].xyz;
+    const vec3 b = proposed[slots.y].xyz;
+    const vec3 c = proposed[slots.z].xyz;
+    const vec3 ab = b - a;
+    const vec3 ac = c - a;
+    const vec3 area = cross(ab, ac);
+    const float length_area = length(area);
+    const float longest = max(length(ab), max(length(ac), length(c - b)));
+    if (!finite3(a) || !finite3(b) || !finite3(c) || !(longest > 0.0)) {
+        return;
+    }
+    const float altitude = length_area / longest;
+    if (!(altitude >= 0.001) || isinf(altitude)) {
+        return;
+    }
+    const vec3 normal = area / length_area;
+    const float half_ray = min(0.002, 0.22 * altitude);
+    const vec3 expected[3] = vec3[3](vec3(0.6, 0.2, 0.2), vec3(0.2, 0.6, 0.2),
+                                    vec3(0.2, 0.2, 0.6));
+    vec3 hit[3];
+    vec3 bary[3];
+    for (int i = 0; i < 3; ++i) {
+        const vec3 central = a + expected[i].y * ab + expected[i].z * ac;
+        if (!sample_triangle(primitive, central, normal, half_ray, expected[i], hit[i], bary[i])) {
+            return;
+        }
+    }
+
+    // Each measured hit is one barycentric equation for the resident corners.
+    // Center the data before solving to preserve precision far from world zero.
+    const mat3 barycentric = transpose(mat3(bary[0], bary[1], bary[2]));
+    if (!(determinant(barycentric) > 0.06)) {
+        return;
+    }
+    const mat3 positions = transpose(mat3(vec3(0.0), hit[1] - hit[0], hit[2] - hit[0]));
+    const mat3 solved = transpose(inverse(barycentric) * positions);
+    const vec3 va = solved[0] + hit[0];
+    const vec3 vb = solved[1] + hit[0];
+    const vec3 vc = solved[2] + hit[0];
+    const float tolerance = min(0.0015, 0.12 * altitude);
+    if (!finite3(va) || !finite3(vb) || !finite3(vc) ||
+        distance(va, a) > tolerance || distance(vb, b) > tolerance || distance(vc, c) > tolerance ||
+        dot(cross(vb - va, vc - va), normal) < 0.5 * length_area) {
+        return;
+    }
+    corners[first] = vec4(va, 1.0);
+    corners[first + 1u] = vec4(vb, 1.0);
+    corners[first + 2u] = vec4(vc, 1.0);
+    atomicAdd(validated, 1u);
+}

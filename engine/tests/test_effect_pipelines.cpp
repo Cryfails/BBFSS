@@ -21,7 +21,15 @@
 #include "video_core/host_shaders/blood_sheen_mark_comp.h"     // bbport (r100d_blood-sheen-gbuffer)
 #include "video_core/host_shaders/blood_sheen_show_comp.h"     // bbport (r100d_blood-sheen-gbuffer)
 #include "video_core/host_shaders/blood_sheen_snapshot_comp.h" // bbport (r100_blood-sheen)
+#include "video_core/host_shaders/glass_view_mark_comp.h"     // bbport (r129a_glass-registry)
+#include "video_core/host_shaders/glass_view_paint_comp.h"    // bbport (r129a_glass-registry)
+#include "video_core/host_shaders/glass_view_show_comp.h"     // bbport (r129a_glass-registry)
+#include "video_core/host_shaders/glass_view_snapshot_comp.h" // bbport (r129a_glass-registry)
+#include "video_core/host_shaders/glass_clear_comp.h"         // bbport (r131c_cabinet-glass-clear)
+#include "video_core/host_shaders/sun_term_view_copy_comp.h" // bbport (t129c_sun-term-view)
+#include "video_core/host_shaders/sun_term_view_show_comp.h" // bbport (t129c_sun-term-view)
 #include "video_core/host_shaders/caustics_comp.h" // bbport (r107_caustics)
+#include "video_core/host_shaders/rt_card_alpha_fill_colour_comp.h" // bbport (r131a_foliage-translucency)
 #include "video_core/host_shaders/contact_shadow_comp.h"
 #include "video_core/host_shaders/cloud_shadow_comp.h"      // bbport (r105_cloud-shadows)
 #include "video_core/host_shaders/cloud_shadow_gate_comp.h" // bbport (r105_cloud-shadows)
@@ -29,6 +37,7 @@
 #include "video_core/host_shaders/cloud_layer_march_comp.h"     // bbport (r119_volumetric-clouds)
 #include "video_core/host_shaders/gtao_frag.h"
 #include "video_core/host_shaders/native_motion_blur_frag.h"
+#include "video_core/host_shaders/paint_ink_comp.h"
 #include "video_core/host_shaders/paint_key_comp.h"
 #include "video_core/host_shaders/paint_key_last_comp.h"
 #include "video_core/host_shaders/paint_lock_comp.h"
@@ -81,6 +90,8 @@
 #include "video_core/host_shaders/volumetric_light_integrate_area_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_area_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_integrate_gate_area_noise_comp.h"
+#include "video_core/host_shaders/volumetric_light_integrate_gate_area_dual_noise_comp.h"
+#include "video_core/host_shaders/volumetric_light_repair_gate_area_dual_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_repair_gate_area_noise_comp.h"
 #include "video_core/host_shaders/volumetric_light_tint_comp.h"
 // bbport (r81_sun-fog-no-rt): the march's AREA builds and the area light gate's two passes
@@ -199,30 +210,54 @@ int main() {
           eStorageBuffer},
          32},
         {"blood sheen show", BLOOD_SHEEN_SHOW_COMP, {eStorageImage, eStorageImage}, 32},
-        // bbport (r45_drawn-look): as vk_drawn_look.cpp makes them (DrawnLookParams::Params)
-        {"drawn look prep", PAINT_PREP_COMP, {eSampledImage, eSampledImage, eStorageImage}, 112},
-        {"drawn look stats", PAINT_STATS_COMP, {eSampledImage, eStorageImage, eStorageImage}, 112},
+        // bbport (r129a_glass-registry): as vk_glass_view.cpp makes them (GlassView::Push, 32 bytes)
+        {"glass view snapshot",
+         GLASS_VIEW_SNAPSHOT_COMP,
+         {eSampledImage, eSampledImage, eStorageImage, eStorageImage},
+         32},
+        {"glass view mark",
+         GLASS_VIEW_MARK_COMP,
+         {eSampledImage, eSampledImage, eStorageImage, eStorageImage},
+         32},
+        {"glass view paint", GLASS_VIEW_PAINT_COMP, {eSampledImage, eStorageImage, eStorageImage}, 32},
+        {"glass view show", GLASS_VIEW_SHOW_COMP, {eStorageImage, eSampledImage, eStorageImage}, 32},
+        // bbport (r131c_cabinet-glass-clear): as vk_glass_clear.cpp makes it (GlassClear::Push, 96 bytes)
+        {"glass clear",
+         GLASS_CLEAR_COMP,
+         {eStorageImage, eSampledImage, eSampledImage, eSampledImage, eSampledImage, eStorageBuffer},
+         96},
+        // bbport (t129c_sun-term-view, TOOL): as vk_sun_term_view.cpp makes them (SunTermView::Push, 8 bytes)
+        {"sun term view copy", SUN_TERM_VIEW_COPY_COMP, {eStorageImage, eStorageImage}, 8},
+        {"sun term view show", SUN_TERM_VIEW_SHOW_COMP, {eStorageImage, eStorageImage}, 8},
+        // bbport (r45_drawn-look): as vk_drawn_look.cpp makes them (DrawnLookParams::Params, 128
+        // bytes since r45b; r55_drawn-look-lines: the ink pass)
+        {"drawn look prep", PAINT_PREP_COMP, {eSampledImage, eSampledImage, eStorageImage}, 128},
+        {"drawn look stats", PAINT_STATS_COMP, {eSampledImage, eStorageImage, eStorageImage}, 128},
         {"drawn look mips",
          PAINT_MIPS_COMP,
          {eCombinedImageSampler, eCombinedImageSampler, eStorageImage, eStorageImage},
-         112},
-        {"drawn look key sums", PAINT_KEY_COMP, {eSampledImage, eStorageImage}, 112},
-        {"drawn look key", PAINT_KEY_LAST_COMP, {eSampledImage, eStorageImage}, 112},
+         128},
+        {"drawn look key sums", PAINT_KEY_COMP, {eSampledImage, eStorageImage}, 128},
+        {"drawn look key", PAINT_KEY_LAST_COMP, {eSampledImage, eStorageImage}, 128},
         {"drawn look strokes",
          PAINT_STROKES_COMP,
          {eCombinedImageSampler, eSampledImage, eSampledImage, eSampledImage, eStorageImage,
           eCombinedImageSampler},
-         112},
-        {"drawn look lock means", PAINT_LOCK_FIRST_COMP, {eSampledImage, eStorageImage}, 112},
+         128},
+        {"drawn look lock means", PAINT_LOCK_FIRST_COMP, {eSampledImage, eStorageImage}, 128},
         {"drawn look lock levels",
          PAINT_LOCK_DOWN_COMP,
          {eCombinedImageSampler, eStorageImage},
-         112},
+         128},
         {"drawn look lock",
          PAINT_LOCK_COMP,
          {eCombinedImageSampler, eSampledImage, eSampledImage, eStorageImage,
           eCombinedImageSampler},
-         112},
+         128},
+        {"drawn look ink",
+         PAINT_INK_COMP,
+         {eCombinedImageSampler, eSampledImage, eStorageImage},
+         128},
         // bbport (r97_heat-haze): as vk_heat_haze.cpp makes it (BbHeatHaze::Push, 96 bytes)
         {"heat haze", HEAT_HAZE_COMP,
          {eStorageImage, eStorageImage, eSampledImage, eStorageBuffer}, // r97b: the counters
@@ -235,6 +270,12 @@ int main() {
          {eStorageImage, eSampledImage, eSampledImage, eSampledImage, eStorageBuffer, eSampledImage,
           eSampledImage, eStorageBuffer}, // r107f: the world map
          128},
+        // bbport (r131a_foliage-translucency): the card alpha fill's COLOUR build, as vk_card_alpha.cpp makes it (CARD_FILL_PUSH_BYTES, 16 bytes; the
+        // colour layers are a fifth image). The ray query builds (lamp, sun, glow) need the ray tracing extensions and are not made here.
+        {"card alpha fill (colour)",
+         RT_CARD_ALPHA_FILL_COLOUR_COMP,
+         {eCombinedImageSampler, eStorageImage, eStorageImage, eStorageImage, eStorageImage},
+         16},
         {"ssgi prep", SSGI_PREP_COMP, {eSampledImage, eStorageImage, eSampledImage}, 128},
         {"ssgi gather",
          SSGI_GATHER_COMP,
@@ -259,7 +300,7 @@ int main() {
          CONTACT_SHADOW_COMP,
          {eStorageBuffer, eCombinedImageSampler, eStorageImage, eCombinedImageSampler,
           eStorageBuffer},
-         68},
+         96},
         // bbport (r105_cloud-shadows): CloudShadow's two passes (CloudShadows::Push, 120 bytes)
         {"cloud shadows", CLOUD_SHADOW_COMP, {eStorageBuffer, eCombinedImageSampler, eStorageImage},
          120},
@@ -468,6 +509,19 @@ int main() {
          VOLUMETRIC_LIGHT_REPAIR_AREA_NOISE_COMP,
          {eStorageBuffer, eStorageBuffer, eCombinedImageSampler, eCombinedImageSampler,
           eStorageImage, eStorageImage, eStorageImage},
+         128},
+        // bbport (r94c_fog-noise-dual-gate): as VolumetricLight::NoisePasses makes the dual pair
+        {"volumetric integrate (gate, area gate, dual, fog noise)",
+         VOLUMETRIC_LIGHT_INTEGRATE_GATE_AREA_DUAL_NOISE_COMP,
+         {eStorageBuffer, eStorageBuffer, eCombinedImageSampler, eCombinedImageSampler,
+          eStorageImage, eStorageImage, eCombinedImageSampler, eCombinedImageSampler,
+          eCombinedImageSampler},
+         128},
+        {"volumetric repair (gate, area gate, dual, fog noise)",
+         VOLUMETRIC_LIGHT_REPAIR_GATE_AREA_DUAL_NOISE_COMP,
+         {eStorageBuffer, eStorageBuffer, eCombinedImageSampler, eCombinedImageSampler,
+          eStorageImage, eStorageImage, eStorageImage, eCombinedImageSampler,
+          eCombinedImageSampler, eCombinedImageSampler},
          128},
         {"volumetric integrate (gate, area gate, fog noise)",
          VOLUMETRIC_LIGHT_INTEGRATE_GATE_AREA_NOISE_COMP,

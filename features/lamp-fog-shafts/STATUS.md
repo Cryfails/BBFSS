@@ -1,5 +1,15 @@
 # Lamp and torch fog shafts
 
+## Development snapshot, 2026-11-19
+
+FSH 25%. Feature work is paused.
+
+- Verified scope. The scoped lamp and torch shaft path was visible at 4K.
+- Open scope. Smoothing, stable detail and clean combined cost remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 60%
 
 The glow of every lamp and torch in the fog is cut where the ray traced scene stands between the light and the fog, so walls and pillars make shafts and shadows in the haze. The rating is held down by the look. The owner sees the shafts, but they are faint and a little blocky, and the smoothing fix has not been judged yet.
@@ -49,3 +59,6 @@ No fork branch yet. The branch plan names visual/lamp-fog-shafts. r80 applies al
 - church-candles: 52 lamps. Checks the ray cap and the cost.
 - lamp-test-spot: with ray tracing off it must do nothing.
 - dream-house: another interior with lamps.
+
+
+</details>

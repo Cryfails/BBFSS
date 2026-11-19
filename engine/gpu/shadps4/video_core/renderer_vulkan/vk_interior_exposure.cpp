@@ -69,6 +69,7 @@ struct State {
     float last_open_m = 0.0f; ///< the open distance the last reading was metered with
     bool have_read = false;
     Clock::time_point last_read{}, last_line{};
+    Clock::time_point roof_lift_at{}; // t132e only, records when a valid lift was produced
     u32 metered = 0, read = 0, held = 0, busy = 0, no_camera = 0; ///< since the last line
     bool active = false;   ///< the meter ran at the last call (the setting or a variable said on)
     bool was_off = false;  ///< it was switched off after it had run: the next on says so
@@ -163,6 +164,29 @@ float Percent(float count) {
 }
 } // namespace
 
+bool RoofEvidenceWanted() {
+    static const bool wanted = [] {
+        const char* text = std::getenv("BB_INTERIOR_ROOF_PROBE");
+        return text && text[0] == '1' && text[1] == '\0';
+    }();
+    return wanted;
+}
+
+RoofEvidence ReadRoofEvidence() {
+    if (!g_state || !g_state->active || !g_state->have_read ||
+        !g_state->last.valid || !Policy::Usable(g_state->last_reading)) {
+        return {};
+    }
+    const auto millis = [](Clock::time_point time) {
+        return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            time.time_since_epoch()).count());
+    };
+    const State& s = *g_state;
+    return {true, millis(s.last_read), millis(s.roof_lift_at), millis(Clock::now()),
+            Policy::FarShare(s.last_reading), s.far_eased, Policy::OpenShare(s.last_reading), s.open_eased,
+            s.last.metered, s.last.target, s.last.indoor, s.last.wanted_ev, s.applied_ev};
+}
+
 void Meter(const Instance& instance, Scheduler& scheduler, const CameraMotion& camera,
            vk::ImageView color, vk::ImageView depth, u32 w, u32 h) {
     // bbport (r99c_interior-default): the setting (live) and the environment (read once) at every call.
@@ -251,6 +275,9 @@ void Meter(const Instance& instance, Scheduler& scheduler, const CameraMotion& c
         if (lift.valid) {
             s.applied_ev = Policy::Step(s.applied_ev, lift.wanted_ev, dt);
             s.last = lift;
+            if (RoofEvidenceWanted()) {
+                s.roof_lift_at = now;
+            }
         } else {
             ++s.held;
         }

@@ -1,5 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vk_sewer_display_bridge.h"
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+#include <limits>
+#include "video_core/renderer_vulkan/vk_bottle_raw_search_b177.h"
+#include "video_core/renderer_vulkan/vk_bottle_display_evidence_b182.h"
+#include "video_core/renderer_vulkan/vk_bottle_raw_apply_b180.h"
+#endif
+#include "engine/loading.h"
+#include <bit>
+#include "video_core/renderer_vulkan/vk_bottle_caustic.h"
+#include "video_core/renderer_vulkan/vk_workflow_present.h"
+#include "video_core/renderer_vulkan/vk_point_shadow.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
@@ -32,6 +44,7 @@
 #include "video_core/host_shaders/fsr4_encode_comp.h"
 #include "video_core/host_shaders/fsr4_reactive_comp.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/renderer_vulkan/drawn_look_params.h" // bbport (r55_drawn-look-lines)
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "video_core/renderer_vulkan/vk_frame_generation.h"
@@ -41,8 +54,178 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#include "shader_recompiler/native/gt7_tonemap.h"
+#endif
 
 namespace Vulkan {
+
+struct SewerMotion::VendorCapture {
+    explicit VendorCapture(std::shared_ptr<Checkpoint> sample) : checkpoint(std::move(sample)) {}
+    ~VendorCapture() {
+        if (buffer) vmaDestroyBuffer(allocator, buffer, allocation);
+    }
+
+    const std::shared_ptr<Checkpoint> checkpoint;
+    VmaAllocator allocator{};
+    VmaAllocation allocation{};
+    VkBuffer buffer{};
+    const std::byte* mapped{};
+    const char* refused{};
+    bool copied{}, successful{};
+    u64 tick{};
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    Fsr4Upscaler::Image consumed_color{}, actual_output{};
+#endif
+
+    static constexpr vk::DeviceSize InputBytes = sizeof(Samples);
+    static constexpr vk::DeviceSize OutputBytes = sizeof(Patches);
+    static constexpr vk::DeviceSize Bytes = InputBytes + OutputBytes;
+    static_assert(InputBytes == 24 && OutputBytes == 216 && sizeof(HalfPixel) == 8);
+
+    bool Allocate(VmaAllocator vma) {
+        allocator = vma;
+        const VkBufferCreateInfo ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                    .size = Bytes, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        const VmaAllocationCreateInfo ai{
+            .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+            .usage = VMA_MEMORY_USAGE_AUTO,
+        };
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(allocator, &ci, &ai, &buffer, &allocation, &info) != VK_SUCCESS) return false;
+        mapped = static_cast<const std::byte*>(info.pMappedData);
+        return mapped != nullptr;
+    }
+
+    static void Copy(vk::CommandBuffer cmd, vk::Image image, vk::Buffer destination,
+                     const std::array<vk::BufferImageCopy, 3>& regions) {
+        constexpr auto all = vk::PipelineStageFlagBits2::eAllCommands;
+        constexpr auto all_transfer = vk::PipelineStageFlagBits2::eAllTransfer;
+        constexpr auto rw = vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eMemoryRead;
+        constexpr auto transfer_read = vk::AccessFlagBits2::eTransferRead;
+        const vk::ImageMemoryBarrier2 entering{
+            .srcStageMask = all, .srcAccessMask = rw,
+            .dstStageMask = all_transfer, .dstAccessMask = transfer_read,
+            .oldLayout = vk::ImageLayout::eGeneral, .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image, .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        };
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &entering});
+        cmd.copyImageToBuffer(image, entering.newLayout, destination, regions);
+        auto leaving = entering;
+        leaving.srcStageMask = all_transfer;
+        leaving.srcAccessMask = transfer_read;
+        leaving.dstStageMask = all;
+        leaving.dstAccessMask = rw;
+        leaving.oldLayout = entering.newLayout;
+        leaving.newLayout = entering.oldLayout;
+        cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &leaving});
+    }
+
+    void Read(const Fsr4Upscaler::Frame& frame, bool output) const {
+        std::array<vk::BufferImageCopy, 3> regions{};
+        for (u32 i = 0; i < regions.size(); ++i) {
+            const auto& pixel = checkpoint->warp.px[i];
+            const auto& centre = checkpoint->pose.output[i];
+            const s32 x = output ? static_cast<s32>(centre[0]) - 1 : pixel.x;
+            const s32 y = output ? static_cast<s32>(centre[1]) - 1 : pixel.y;
+            const u32 side = output ? 3 : 1;
+            regions[i] = {
+                .bufferOffset = (output ? InputBytes : 0) + i * side * side * sizeof(HalfPixel),
+                .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .imageOffset = {x, y, 0},
+                .imageExtent = {side, side, 1},
+            };
+        }
+        Copy(frame.cmdbuf, output ? frame.output.image : frame.color.image, vk::Buffer(buffer), regions);
+    }
+
+    void Begin(VmaAllocator vma, const Fsr4Upscaler::Frame& frame, bool is_dlss, u64 at_tick,
+               const vk::ImageCreateInfo& output_info, int model_hint) {
+        tick = at_tick;
+        if (!is_dlss || frame.reset || frame.preset != BbSettings::Performance ||
+            (model_hint != BbSettings::DlssPresetAuto && model_hint != BbSettings::DlssPresetM) ||
+            !frame.color.view || !frame.depth.view || !frame.motion.view ||
+            !frame.output.image || !frame.output.view ||
+            frame.output.image == frame.color.image ||
+            frame.output.format != vk::Format::eR16G16B16A16Sfloat ||
+            output_info.format != frame.output.format || output_info.extent != vk::Extent3D{3840, 2160, 1} ||
+            output_info.mipLevels != 1 || output_info.arrayLayers != 1 ||
+            output_info.samples != vk::SampleCountFlagBits::e1 ||
+            !(output_info.usage & vk::ImageUsageFlagBits::eTransferSrc)) {
+            refused = !is_dlss ? "vendor-fallback" : frame.reset ? "vendor-history-reset" : "actual-vendor-resources";
+            return;
+        }
+        if (!Allocate(vma)) {
+            refused = "vendor-staging-allocation";
+            return;
+        }
+        copied = true;
+        Read(frame, false);
+        const auto raw_image = [](vk::Image image) { return std::bit_cast<u64>(VkImage(image)); };
+        const auto raw_view = [](vk::ImageView view) { return std::bit_cast<u64>(VkImageView(view)); };
+        fmt::print("[sewer-motion] event=vendor-input request={} checkpoint={} frame={} tick={} "
+                   "hdr={}/{}:{:x}/{:x} depth={}/{}:{:x}/{:x} motion={:x}/{:x} "
+                   "output={:x}/{:x} input={}x{} output_size={}x{} "
+                   "reset={} preset={} model_hint={} jitter={:.9g},{:.9g} subresources=mip0-layer0-general\n",
+                   checkpoint->key.request, checkpoint->key.checkpoint, checkpoint->key.frame, tick,
+                   checkpoint->warp.color.id, checkpoint->warp.color.uid, raw_image(frame.color.image),
+                   raw_view(frame.color.view), checkpoint->warp.depth.id, checkpoint->warp.depth.uid,
+                   raw_image(frame.depth.image), raw_view(frame.depth.view), raw_image(frame.motion.image),
+                   raw_view(frame.motion.view), raw_image(frame.output.image), raw_view(frame.output.view),
+                   frame.render_width, frame.render_height, frame.output.width, frame.output.height,
+                   unsigned(frame.reset), frame.preset, model_hint, frame.jitter[0], frame.jitter[1]);
+    }
+
+    void Finish(const Fsr4Upscaler::Frame& frame, bool ok) {
+        if (!copied) return;
+        successful = ok;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (ok && checkpoint->needs_present) {
+            consumed_color = frame.color;
+            actual_output = frame.output;
+        }
+#endif
+        if (ok) Read(frame, true);
+        else refused = "dlss-evaluate-failed";
+        const vk::MemoryBarrier2 memory{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+            .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        };
+        frame.cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &memory});
+    }
+
+    void Report() const {
+        if (!successful) {
+            checkpoint->vendor_error = refused ? refused : "vendor-evaluate-unissued";
+        } else if (vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+            checkpoint->vendor_error = "vendor-host-invalidate";
+        } else {
+            std::memcpy(checkpoint->vendor_input.data(), mapped, InputBytes);
+            std::memcpy(checkpoint->vendor_output.data(), mapped + InputBytes, OutputBytes);
+            checkpoint->vendor_values = true;
+            for (u32 point = 0; point < checkpoint->vendor_input.size(); ++point) {
+                const auto& pixel = checkpoint->warp.px[point];
+                const auto& centre = checkpoint->pose.output[point];
+                const auto& words = checkpoint->vendor_input[point];
+                fmt::print("[sewer-motion] event=vendor-tap request={} checkpoint={} frame={} point={} "
+                           "pixel={},{} half={:04x},{:04x},{:04x},{:04x} q={},{}\n",
+                           checkpoint->key.request, checkpoint->key.checkpoint, checkpoint->key.frame, point,
+                           pixel.x, pixel.y, words[0], words[1], words[2], words[3],
+                           s32(centre[0]), s32(centre[1]));
+                for (u32 i = 0; i < 9; ++i) {
+                    const auto& half = checkpoint->vendor_output[point][i];
+                    fmt::print("[sewer-motion] event=vendor-patch request={} checkpoint={} frame={} "
+                               "point={} index={} half={:04x},{:04x},{:04x},{:04x}\n",
+                               checkpoint->key.request, checkpoint->key.checkpoint, checkpoint->key.frame,
+                               point, i, half[0], half[1], half[2], half[3]);
+                }
+            }
+        }
+    }
+};
 
 namespace {
 
@@ -75,11 +258,30 @@ FfxVkPortableImage Describe(vk::Image image, vk::Format format, u32 width, u32 h
 /// column brighter in some phases (a shimmering line at the right and bottom edges once upscaled,
 /// GitHub issue 43). The row and column before them are copied over them before the upscaler
 /// reads the scene: one edge pixel, and jitter keeps its full detail.
-void ClampSceneEdges(Scheduler& scheduler, vk::Image image, u32 width, u32 height) {
+void ClampSceneEdges(Scheduler& scheduler, vk::Image image, u32 width, u32 height
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                     , const std::shared_ptr<SewerBridge::ProxyAlpha>& observe = {}
+#endif
+                     ) {
     if (width < 2 || height < 2) {
         return;
     }
-    scheduler.Record([image, width, height](vk::CommandBuffer cmdbuf) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (observe) {
+        observe->clamp_expected = true;
+        observe->strips.queued_tick = scheduler.CurrentTick();
+        observe->strips.cookie = PostProxyProof::NextCookie();
+    }
+#endif
+    auto record = [image, width, height
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                   , observe
+#endif
+                   ](vk::CommandBuffer cmdbuf
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                     , NativeWriteSuffix::Encoder* encoder
+#endif
+                   ) {
         const vk::MemoryBarrier2 before{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
@@ -95,7 +297,8 @@ void ClampSceneEdges(Scheduler& scheduler, vk::Image image, u32 width, u32 heigh
             .dstOffset = {0, s32(height - 1), 0},
             .extent = {width, 1, 1},
         };
-        cmdbuf.copyImage(image, vk::ImageLayout::eGeneral, image, vk::ImageLayout::eGeneral, row);
+        constexpr auto layout = vk::ImageLayout::eGeneral;
+        cmdbuf.copyImage(image, layout, image, layout, row);
         const vk::MemoryBarrier2 between{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -110,7 +313,7 @@ void ClampSceneEdges(Scheduler& scheduler, vk::Image image, u32 width, u32 heigh
             .dstOffset = {s32(width - 1), 0, 0},
             .extent = {1, height, 1},
         };
-        cmdbuf.copyImage(image, vk::ImageLayout::eGeneral, image, vk::ImageLayout::eGeneral, column);
+        cmdbuf.copyImage(image, layout, image, layout, column);
         const vk::MemoryBarrier2 after{
             .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
             .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
@@ -118,7 +321,44 @@ void ClampSceneEdges(Scheduler& scheduler, vk::Image image, u32 width, u32 heigh
             .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
         };
         cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
-    });
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (observe) {
+            using namespace NativeWriteSuffix;
+            static std::atomic<u64> issued_strips{};
+            const u64 version = issued_strips.fetch_add(1, std::memory_order_relaxed) + 1;
+            bool noted = false;
+            if (encoder && observe->edge_order) {
+                const auto& binding = observe->source.binding;
+                noted = encoder->NoteProxyEdges(observe->edge_order,
+                    {.proxy = SewerBridge::ScopedProxyImage(binding, 0), .result_version = version,
+                     .owner = {binding.owner, binding.generation}, .source = image, .destination = image,
+                     .source_layout = layout, .destination_layout = layout, .row = row, .column = column,
+                     .before = before, .between = between, .after = after});
+            } else if (encoder) {
+                encoder->Note(Kind::NativeOperation, observe->strips.cookie);
+            }
+            observe->strips.Publish(cmdbuf, image, layout, layout, row, column, before, between, after,
+                                    version, noted);
+        }
+#endif
+    };
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (observe && observe->edge_order) {
+        scheduler.RecordPostNative(observe->edge_order, [record = std::move(record)](
+                                   vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) {
+            record(cmd, &encoder);
+        });
+    } else if (observe && observe->strips.cookie) {
+        scheduler.RecordNativeWriteSuffix([record = std::move(record)](
+                                         vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) {
+            record(cmd, &encoder);
+        });
+    } else {
+        scheduler.Record([record = std::move(record)](vk::CommandBuffer cmd) { record(cmd, nullptr); });
+    }
+#else
+    scheduler.Record(std::move(record));
+#endif
 }
 
 /// bbport: BB_DUMP_TRIGGER=<file> BB_DUMP_DIR=<dir> (default out/dump): creating the file dumps
@@ -331,6 +571,10 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
 }
 
 TemporalUpscaler::~TemporalUpscaler() {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (sewer_bridge && sewer_bridge->post)
+        runtime.DisarmPostImageBarriers(sewer_bridge->post->terminal.runtime_window);
+#endif
     if (resources_ready) scheduler.Finish();
     if (context) {
         scheduler.Finish();
@@ -416,6 +660,29 @@ bool TemporalUpscaler::RasterScaling() const {
 }
 
 bool TemporalUpscaler::OnFrameStart() {
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (bottle_prepared && bottle_prepared->scene.draw_frame != BbStats::frame_number.load(std::memory_order_relaxed)) {
+        auto previous = std::exchange(bottle_prepared, {});
+        std::lock_guard lock(previous->mutex);
+        if (!previous->offered && !previous->completed && !previous->app_checked) {
+            previous->cancelled = true;
+            previous->order->Disarm();
+            fmt::print("[bottle-cut] event=prepared-caller-refused request={} scene={} frame={} why=ordinary-override-missing\n",
+                       previous->scene.key.request, previous->scene.key.scene, previous->scene.draw_frame);
+        }
+    }
+#endif
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (sewer_bridge && sewer_bridge->post &&
+        sewer_bridge->merge.key.frame != BbStats::frame_number.load(std::memory_order_relaxed)) {
+        runtime.DisarmPostImageBarriers(std::exchange(sewer_bridge->post->terminal.runtime_window, 0));
+    }
+    if (sewer_bridge && sewer_bridge->post && !sewer_bridge->offered &&
+        sewer_bridge->merge.key.frame != BbStats::frame_number.load(std::memory_order_relaxed)) {
+        sewer_bridge->Stop("shared-post-display-unissued");
+        if (sewer_bridge->post->order) sewer_bridge->post->order->Disarm();
+    }
+#endif
     if (frame_gen) {
         frame_gen->OnFrameStart();
     }
@@ -716,6 +983,9 @@ bool TemporalUpscaler::EnsureResources(u32 w, u32 h, u32 ow, u32 oh, bool hdr) {
                  vk::ImageUsageFlagBits::eTransferSrc,
         .initialLayout = vk::ImageLayout::eUndefined,
     });
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    ++sewer_output_generation;
+#endif
     output_view = Check(device.createImageViewUnique({
         .image = vk::Image(output_image),
         .viewType = vk::ImageViewType::e2D,
@@ -1067,7 +1337,12 @@ static float ExtraSharpenStrength() {
                           ? 0.0f
                           : 1.0f;
     const float extra = std::clamp(settings.sharpness.load(), 0.0f, 2.0f) - own;
-    return settings.sharpen && extra > 0.0f ? extra : 0.0f;
+    // bbport (r55_drawn-look-lines): this pass sharpens the drawn look's ink lines as it sharpens
+    // any edge; on a frame that recorded them it is lowered, by up to half
+    // (DrawnLookParams::InkSharpen; drawn_look_ink_drawn is 0 on every other frame).
+    const float ink =
+        DrawnLookParams::InkSharpen(settings.drawn_look_ink_drawn.load(std::memory_order_relaxed));
+    return settings.sharpen && extra > 0.0f ? extra * ink : 0.0f;
 }
 
 void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
@@ -1158,6 +1433,9 @@ void TemporalUpscaler::ExtraSharpen(vk::Image target, bool ldr, u32 w, u32 h) {
 }
 
 vk::ImageView TemporalUpscaler::UiStorageView(vk::Image target) {
+    if (SewerBridgeOpen() && target == vk::Image(ui_image)) {
+        sewer_bridge->Stop("ui-storage-writer-unproved");
+    }
     if (!ui_storage_view) {
         // The UI image's own format may be sRGB; FSR 3 writes it through a UNORM view too.
         ui_storage_view = Check(instance.GetDevice().createImageViewUnique({
@@ -1343,7 +1621,7 @@ bool TemporalUpscaler::RecordReactive(vk::ImageView color_view) {
     const vk::PipelineLayout layout = *reactive_pipeline_layout;
     const u32 w = width, h = height;
     // Relative color change times the scale (default 1), zero below the threshold (0.2), at
-    // most the maximum (0.9, never fully reactive) — the defaults of AMD's mask generator.
+    // most the maximum (0.9, never fully reactive) â€” the defaults of AMD's mask generator.
     const auto& settings = BbSettings::Get();
     const std::array<float, 3> params{settings.reactive_scale, settings.reactive_max,
                                       settings.reactive_threshold};
@@ -1416,6 +1694,23 @@ static bool ProxyUpscalerInputs() {
     return env && !BbToggle::Experiment(131072);
 }
 
+#ifdef BB_TEST_SHARED_POST_GRAPH
+static SewerBridge::PhysicalImage PostPhysical(const VideoCore::UniqueImage& owned, u64 generation);
+
+struct PostBorrowTail {
+    Scheduler::PostNativeBorrow* active{};
+    bool overwrite_attempted{};
+    bool breadcrumbs{};
+
+    ~PostBorrowTail() {
+        if (active && overwrite_attempted) {
+            using Tail = NativeWriteSuffix::PostOverwriteTail;
+            active->CloseAfterOverwrite(breadcrumbs ? Tail::BreadcrumbOnly : Tail::NoRawCommands);
+        }
+    }
+};
+#endif
+
 void TemporalUpscaler::Run() {
     BB_SECTION(Upscaler);
     if (auto* profiler = GpuProfiler::Get()) {
@@ -1463,21 +1758,109 @@ void TemporalUpscaler::Run() {
     runtime.FlushBarriers();
     vk::Image input_color = color.GetImage(), input_depth = depth.GetImage();
     vk::ImageView input_color_view = color_view, input_depth_view = depth_view;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    // The selected immutable checkpoint can provisionally own the earlier original proxy read.
+    std::shared_ptr<SewerMotion::Checkpoint> post_candidate;
+    std::shared_ptr<SewerBridge::PostOrder> post_order;
+    SceneTargets::Target selected_proxy{};
+    if (SewerMotion::FinalEnabled()) {
+        const auto frame = BbStats::frame_number.load(std::memory_order_relaxed);
+        post_candidate = SewerMotion::Find(scheduler.GetWorkSemaphore()->Handle(), frame,
+                                            BbEngine::Loading::Generation(), scene_targets.Generation());
+        if (post_candidate && post_candidate->needs_present && !post_candidate->vendor_claimed) {
+            const SewerBridge::Order::PostKey key{post_candidate->key.request,
+                u64(post_candidate->key.checkpoint), post_candidate->key.frame};
+            if (const auto capture = scheduler.ArmPostNativeOrder(key)) {
+                post_order = std::make_shared<SewerBridge::PostOrder>();
+                post_order->owner = &scheduler;
+                post_order->key = key;
+                post_order->capture = capture;
+                post_order->merge = scheduler.ReservePostNativeOperation(
+                    capture, SewerBridge::Order::PostRole::Merge, 1);
+                if (post_order->merge && alpha_from_proxy) {
+                    post_order->proxy_alpha = std::make_shared<SewerBridge::ProxyAlpha>();
+                    auto& alpha = *post_order->proxy_alpha;
+                    alpha.key = {key.request, key.checkpoint, key.frame};
+                    if (jitter[0] != 0.0f || jitter[1] != 0.0f) {
+                        alpha.edge_order = scheduler.ReservePostNativeOperation(capture,
+                            SewerBridge::Order::PostRole::ProxyEdgeClamp, SewerBridge::PostState::ProxyClampOperation);
+                    }
+                }
+            }
+        }
+    }
+#endif
     if (reduced) {
         VideoCore::ImageViewInfo ci;
         ci.format = color.info.pixel_format;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        const auto alpha = post_order ? post_order->proxy_alpha : nullptr;
+        const auto c = alpha ? scene_targets.ReadPostProxy(scene_color, ci, alpha->key, alpha->source)
+                             : scene_targets.Read(scene_color, ci);
+        if (alpha) selected_proxy = c;
+#else
         const auto c = scene_targets.Read(scene_color, ci);
+#endif
         ci.format = depth.info.pixel_format;
         const auto d = scene_targets.Read(camera_motion.Depth(), ci);
         input_color = c.image;
         input_depth = d.image;
         input_color_view = c.view;
         input_depth_view = d.view;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        if (BottleRawSearchRequested() && !BbEngine::Loading::ScreenUp()) {
+            const auto actual = camera_motion.PassMatrices();
+            const auto depth_id = camera_motion.Depth();
+            const auto physical = [](VideoCore::ImageId id, const VideoCore::Image& image) {
+                return BottleColdSource177::Image{id.index, image.image_uid, image.GetImage(),
+                                                   image.backing->image.allocation};
+            };
+            const auto owned = [&](VideoCore::ImageId id, const VideoCore::Image& image,
+                                   const SceneTargets::Target& issued, bool depth_input) {
+                const auto found = scene_targets.InspectSewerProxy(id, image.image_uid, issued.view);
+                const auto aspect = depth_input ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
+                using enum vk::Format;
+                if (!proxy_inputs || !found.valid || found.target.image != issued.image ||
+                    found.target.view != issued.view || found.target.layout != issued.layout ||
+                    issued.layout != vk::ImageLayout::eGeneral || !(found.aspects & aspect) ||
+                    found.extent != vk::Extent3D{1920, 1080, 1} ||
+                    (depth_input ? found.format != eD32Sfloat && found.format != eD32SfloatS8Uint
+                                 : found.format != eR16G16B16A16Sfloat)) {
+                    return BottleColdSource177::OrdinaryView{};
+                }
+                return BottleColdSource177::OrdinaryView{issued.image, issued.view, found.incarnation};
+            };
+            BottleColdSource177::Current().ReadOrdinary(
+                this, BottleCaustic::CutSource::Run(),
+                BbStats::frame_number.load(std::memory_order_relaxed), BbEngine::Loading::Generation(),
+                scene_targets.Generation(), scheduler.GetWorkSemaphore()->Handle(), scheduler.CurrentTick(),
+                actual.valid ? BottleCaustic::CutSource::Camera{actual.view, actual.proj, jitter}
+                             : BottleCaustic::CutSource::Camera{},
+                physical(depth_id, depth), physical(scene_color, color),
+                owned(scene_color, color, c, false), owned(depth_id, depth, d, true));
+        }
+#endif
     }
     if (jitter[0] != 0.0f || jitter[1] != 0.0f) {
-        ClampSceneEdges(scheduler, input_color, w, h);
+        ClampSceneEdges(scheduler, input_color, w, h
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                        , post_order ? post_order->proxy_alpha : nullptr
+#endif
+                        );
     }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    std::unique_ptr<Scheduler::PostNativeBorrow> post_borrow;
+    if (post_order && post_order->merge) {
+        // A non-movable borrow needs to survive the last raw use, including crumb teardown.
+        post_borrow.reset(new Scheduler::PostNativeBorrow(scheduler.BorrowPostNativeRoot(post_order->merge)));
+    }
+    const auto cmdbuf = post_borrow ? post_borrow->Buffer() : scheduler.CommandBuffer();
+    PostBorrowTail post_tail{post_borrow.get(), false, bool(post_borrow) && Breadcrumbs::Enabled()};
+    const auto post_rgb = post_borrow ? PostPhysical(output_image, sewer_output_generation) :
+                                      SewerBridge::PhysicalImage{};
+#else
     const auto cmdbuf = scheduler.CommandBuffer();
+#endif
     const Breadcrumbs::Scope crumb{cmdbuf, scheduler.CrumbStream(), "TAA"};
 
     const auto own_barrier = [&](vk::Image image, vk::ImageLayout old_layout,
@@ -1495,6 +1878,14 @@ void TemporalUpscaler::Run() {
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         };
         cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (post_borrow && post_rgb.Valid() && image == post_rgb.image &&
+            old_layout == vk::ImageLayout::eGeneral && new_layout == vk::ImageLayout::eGeneral &&
+            dst_access == vk::AccessFlagBits2::eShaderRead) {
+            post_borrow->NoteOverwriteBarrier(cmdbuf, barrier, {post_rgb.allocator, post_rgb.allocation,
+                post_rgb.memory, post_rgb.offset, post_rgb.bytes, post_rgb.generation});
+        }
+#endif
     };
     const auto all = vk::PipelineStageFlagBits2::eAllCommands;
     const auto rw = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
@@ -1529,6 +1920,45 @@ void TemporalUpscaler::Run() {
     InteriorExposure::Meter(instance, scheduler, camera_motion, input_color_view, input_depth_view,
                             w, h);
     MarkUpscalerPart(4, "upscaler: evaluate (DLSS, FSR, XeSS or TAA)");
+    std::shared_ptr<SewerMotion::VendorCapture> sewer_observation;
+    if (SewerMotion::Enabled()) {
+        const auto frame = BbStats::frame_number.load(std::memory_order_relaxed);
+        const auto timeline = scheduler.GetWorkSemaphore()->Handle();
+        auto sample = SewerMotion::Find(timeline, frame, BbEngine::Loading::Generation(),
+                                        scene_targets.Generation());
+        if (sample && !sample->vendor_claimed) {
+            const auto& warp = sample->warp;
+            const auto matrices = camera_motion.PassMatrices();
+            const auto target = [&](auto id, const VideoCore::Image& parent, vk::Image image,
+                                    vk::ImageView view, const SewerMotion::Resource& previous,
+                                    vk::ImageAspectFlagBits aspect) {
+                const auto check = scene_targets.InspectSewerProxy(id, parent.image_uid, view);
+                return id.index == previous.id && parent.image_uid == previous.uid && image && view &&
+                       image == previous.image && aspect == previous.aspect && check.target.image == image &&
+                       check.target.view == view && check.valid && check.dirty &&
+                       check.target.layout == vk::ImageLayout::eGeneral &&
+                       check.extent == vk::Extent3D{1920, 1080, 1} && (check.aspects & aspect) &&
+                       (check.target.usage & vk::ImageUsageFlagBits::eSampled) &&
+                       (aspect != vk::ImageAspectFlagBits::eColor ||
+                        (check.target.usage & vk::ImageUsageFlagBits::eTransferSrc));
+            };
+            if (!early_upscale || !reduced || !proxy_inputs || (frame_gen && frame_gen->Capturing()) ||
+                w != 1920 || h != 1080 || ow != 3840 || oh != 2160 ||
+                BbEngine::Loading::ScreenUp() || BbSettings::Get().upscaler != BbSettings::UpscalerDlss ||
+                !UseFsr4() || !matrices.valid || matrices.view != sample->pose.camera.view ||
+                matrices.proj != sample->pose.camera.proj || matrices.inv_view != sample->pose.camera.inv_view ||
+                warp.jitter != jitter || scheduler.CurrentTick() < warp.tick ||
+                !target(scene_color, color, input_color, input_color_view, warp.color,
+                        vk::ImageAspectFlagBits::eColor) ||
+                !target(camera_motion.Depth(), depth, input_depth, input_depth_view, warp.depth,
+                        vk::ImageAspectFlagBits::eDepth)) {
+                sample->VendorRefused("actual-dlss-input-owner-or-scope");
+            } else {
+                sample->vendor_claimed = true;
+                sewer_observation = std::make_shared<SewerMotion::VendorCapture>(std::move(sample));
+            }
+        }
+    }
     bool dispatched = false;
     BbSections::Scope eval_scope{BbSections::UpscalerEval};
     if (BbSettings::Get().upscaler == BbSettings::UpscalerTaa) {
@@ -1537,7 +1967,7 @@ void TemporalUpscaler::Run() {
     } else if (UseFsr4()) {
         dispatched = RecordFsr4(cmdbuf, {input_color, input_color_view, w, h, color.info.pixel_format},
                                 {input_depth, input_depth_view, w, h, depth_format}, w, h, ow, oh,
-                                frame_ms, has_reactive);
+                                frame_ms, has_reactive, sewer_observation.get());
         if (dispatched && has_reactive && BbSettings::IsFsr4(BbSettings::Get().upscaler)) {
             RecordFsr4Reactive(cmdbuf, input_color_view, w, h, ow, oh);
         }
@@ -1655,7 +2085,21 @@ void TemporalUpscaler::Run() {
                     vk::AccessFlagBits2::eShaderRead);
         if (alpha_from_proxy) {
             // The merge writes every pixel of it and reads alpha from the proxy.
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            const auto alpha_read = post_order ? post_order->proxy_alpha : nullptr;
+            if (alpha_read && sewer_observation && sewer_observation->successful &&
+                post_candidate == sewer_observation->checkpoint) {
+                alpha_read->before_merge = scene_targets.CheckPostProxyBacking(alpha_read->source, alpha_read->key,
+                                                                                  selected_proxy);
+            }
+#endif
             scene_targets.NativeOverwritten(color);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            if (alpha_read && alpha_read->before_merge.resident) {
+                alpha_read->after_coherence_drop = scene_targets.CheckPostProxyBacking(
+                    alpha_read->source, alpha_read->key, selected_proxy);
+            }
+#endif
         }
         runtime.Transit(&color, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
@@ -1725,8 +2169,157 @@ void TemporalUpscaler::Run() {
         } merge_params{mode, merge_sharpen, alpha_source};
         cmdbuf.pushConstants(*merge_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                              sizeof(merge_params), &merge_params);
-        cmdbuf.dispatch((ow + 7) / 8, (oh + 7) / 8, 1);
+        const vk::Extent3D groups{(ow + 7) / 8, (oh + 7) / 8, 1};
+        cmdbuf.dispatch(groups.width, groups.height, groups.depth);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        const bool same_post = post_borrow && sewer_observation && sewer_observation->successful &&
+                               post_candidate == sewer_observation->checkpoint;
+        if (same_post) {
+            using namespace NativeWriteSuffix;
+            static std::atomic<u64> issued_merges{};
+            const auto current_write = issued_merges.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto alpha = alpha_source ? scene_targets.InspectSewerProxy(scene_color, color.image_uid,
+                                                                                input_color_view)
+                                            : SceneTargets::SewerProxy{};
+            PostMergeRootProof observed{
+                .origin = post_borrow->Origin(), .pipeline = *merge_pipeline, .layout = *merge_pipeline_layout,
+                .rgb = {post_rgb.image, out_info.imageView, post_rgb.allocator, post_rgb.allocation, post_rgb.memory,
+                    post_rgb.offset, post_rgb.bytes, post_rgb.generation, 0, post_rgb.range,
+                    vk::Extent2D{post_rgb.extent.width, post_rgb.extent.height}, post_rgb.format,
+                    out_info.imageLayout, post_rgb.samples},
+                .destination = {.image = color.GetImage(), .view = scene_info.imageView,
+                    .content_version = current_write, .extent = {ow, oh}, .format = color.info.pixel_format,
+                    .layout = scene_info.imageLayout, .samples = color.backing->image.image_ci.samples},
+                .alpha = {.image = alpha.target.image, .view = alpha.target.view,
+                    .extent = {alpha.extent.width, alpha.extent.height}, .format = alpha.format,
+                    .layout = alpha.target.layout},
+                .groups = groups, .mode = mode, .alpha_source = alpha_source,
+                .program = PostMergeProgram::UpscaleMerge,
+                .predecessor = PostPredecessor::Unknown,
+            };
+            if (const auto& earlier = post_order->proxy_alpha; earlier && earlier->before_merge.resident &&
+                earlier->after_coherence_drop.resident) {
+                const auto& input = sewer_observation->consumed_color;
+                const auto& output = sewer_observation->actual_output;
+                const auto& binding = earlier->source.binding;
+                const auto& owner = binding.proxy;
+                const bool same_color = input.image == binding.image && input.view == binding.view &&
+                    input.width == binding.extent.width && input.height == binding.extent.height &&
+                    input.format == binding.format && input_color_view == proxy_info.imageView;
+                // This is the ordinary NGX resource descriptor's read_only Color operand.
+                earlier->vendor_color_read_only = same_color ? SewerBridge::Graph::Proof::Known
+                                                             : SewerBridge::Graph::Proof::Failed;
+                const PostProxyProof::Backing rgb{post_rgb.image, post_rgb.allocator, post_rgb.allocation,
+                                                       post_rgb.memory, post_rgb.offset, post_rgb.bytes};
+                const bool same_output = output.image == post_rgb.image && output.view == out_info.imageView &&
+                    output.width == post_rgb.extent.width && output.height == post_rgb.extent.height &&
+                    output.format == post_rgb.format && post_rgb.Valid();
+                if (same_output && owner && binding.native) {
+                    earlier->vendor_output_disjoint = PostProxyProof::Distinct(owner, rgb) &&
+                        PostProxyProof::Distinct(binding.native, rgb) ? SewerBridge::Graph::Proof::Known
+                                                                       : SewerBridge::Graph::Proof::Failed;
+                }
+                if (same_color) {
+                    const auto& strips = earlier->strips;
+                    const auto result_version = SewerBridge::IssuedProxyStripShape(*earlier) ? strips.issued_version : 0;
+                    observed.alpha = SewerBridge::ScopedProxyImage(binding, result_version);
+                    observed.prior_proxy = {
+                        .transition = earlier->transition_order, .edges = earlier->edge_order,
+                        .owner = {binding.owner, binding.generation},
+                        .vendor = {.origin = observed.origin, .color = observed.alpha,
+                            .output = same_output ? observed.rgb : PostMergeImage{},
+                            .result = PostProxyVendorResult::SuccessfulDlss,
+                            .color_read_write = false, .output_read_write = same_output},
+                    };
+                }
+            }
+            // Runtime exports later emitted rows. A late copy cannot prove this borrow's alpha
+            // allocation, native predecessor version or the two missing before-dispatch barriers.
+            post_tail.overwrite_attempted = true;
+            post_borrow->NoteOverwriteRoot(cmdbuf, observed);
+            fmt::print("[sewer-motion] event=postgraph-merge-shape request={} frame={} checkpoint={} "
+                       "mode={} alpha={} rgb_owner={} dst_write={} prior_writer=unknown "
+                       "dst_barrier=unknown alpha_same_borrow_barrier=unknown vendor_owner=unknown\n",
+                       post_candidate->key.request, post_candidate->key.frame, post_candidate->key.checkpoint,
+                       mode, alpha_source, post_rgb.Valid(), current_write);
+        }
+#endif
+        if (sewer_observation && sewer_observation->successful) {
+            auto& sample = *sewer_observation->checkpoint;
+            const auto& ci = color.backing->image.image_ci;
+            if (mode == 0 && color.write_seq && ci.format == vk::Format::eR16G16B16A16Sfloat &&
+                ci.extent == vk::Extent3D{3840, 2160, 1} && ci.mipLevels == 1 && ci.arrayLayers == 1 &&
+                ci.samples == vk::SampleCountFlagBits::e1 && !color.binding.needs_rebind &&
+                color.backing->subresource_states.empty() &&
+                color.backing->state.layout == vk::ImageLayout::eGeneral &&
+                texture_cache.IsRegisteredImage(scene_color, color.image_uid)) {
+                sample.merge = {
+                    .key = sample.key,
+                    .destination = {scene_color.index, color.image_uid, color.GetImage(), scene_info.imageView,
+                                    vk::ImageAspectFlagBits::eColor},
+                    .output = vk::Image(output_image), .output_view = out_info.imageView,
+                    .timeline = scheduler.GetWorkSemaphore()->Handle(), .tick = scheduler.CurrentTick(),
+                    .write = color.write_seq, .mode = mode, .alpha = alpha_source,
+                    .sharpen = fold_sharpen ? merge_sharpen : ExtraSharpenStrength(), .folded = fold_sharpen,
+                };
+                sample.has_merge = true;
+                SewerArm(sewer_observation->checkpoint, cmdbuf, scene_color
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                         , same_post ? post_order : nullptr
+#endif
+                         );
+                fmt::print("[sewer-motion] event=merge request={} checkpoint={} frame={} tick={} "
+                           "dst={}/{}:{:x}/{:x} write={} source={:x}/{:x} alpha={} mode={} "
+                           "sharp={:.9g} folded={} presentation=pending\n",
+                           sample.key.request, sample.key.checkpoint, sample.key.frame, sample.merge.tick,
+                           sample.merge.destination.id, sample.merge.destination.uid,
+                           std::bit_cast<u64>(VkImage(sample.merge.destination.image)),
+                           std::bit_cast<u64>(VkImageView(sample.merge.destination.view)), sample.merge.write,
+                           std::bit_cast<u64>(VkImage(sample.merge.output)),
+                           std::bit_cast<u64>(VkImageView(sample.merge.output_view)),
+                           alpha_source, mode, sample.merge.sharpen, unsigned(fold_sharpen));
+            }
+        }
         MarkUpscalerPart(6, "upscaler: after Run (unlabelled work up to the next label)");
+        if (BottleMotion::Run()) {
+            auto& s=BottleMotion::Scene();
+            if (s.mark && !s.bad) {
+                const auto matrices=camera_motion.PassMatrices();
+                const auto tick=scheduler.CurrentTick();
+                if (s.dlss || !s.vendor_ok || !early_upscale || !reduced || !proxy_inputs ||
+                    BbSettings::Get().upscaler!=BbSettings::UpscalerDlss ||
+                    w!=1920 || h!=1080 || ow!=3840 || oh!=2160 || !matrices.valid ||
+                    s.mark.on!=u8(BottleCaustic::On()) || s.arm_generation!=BbLiveKnobs::Generation() ||
+                    s.mark.timeline!=scheduler.GetWorkSemaphore()->Handle() ||
+                    (s.mark.on && (!s.bottle || s.bottle_tick>tick ||
+                     s.generation!=scene_targets.Generation() || s.color_id!=scene_color.index ||
+                     s.depth_id!=camera_motion.Depth().index ||
+                     s.color_uid!=color.image_uid || s.depth_uid!=depth.image_uid ||
+                     s.color!=input_color || s.depth!=input_depth || s.color_view!=input_color_view ||
+                     s.depth_view!=input_depth_view || s.view!=matrices.view ||
+                     s.proj!=matrices.proj || s.jitter!=jitter))) {
+                    BottleMotion::Refuse(s,"actual-dlss-scene-inputs");
+                } else {
+                    s.dlss=true;
+                    s.hdr=color.GetImage();s.hdr_uid=color.image_uid;s.hdr_write=color.write_seq;
+                    s.generation=scene_targets.Generation();
+                    s.view=matrices.view;s.proj=matrices.proj;s.jitter=jitter;
+                }
+            }
+        }
+    }
+    if (sewer_observation) {
+        if (sewer_observation->copied) {
+            scheduler.DeferOperation([scope = std::move(sewer_observation)]() mutable {
+                auto sample = scope->checkpoint;
+                scope->Report();
+                scope.reset();
+                sample->Retire(SewerMotion::Vendor);
+            }, "sewer motion DLSS readback");
+        } else {
+            sewer_observation->checkpoint->VendorRefused(
+                sewer_observation->refused ? sewer_observation->refused : "vendor-copy-unissued");
+        }
     }
 }
 
@@ -1942,12 +2535,1387 @@ bool TemporalUpscaler::LdrFrame(VideoCore::ImageId id) const {
            !FrameCapture::IsDisplayBuffer(image.info.guest_address);
 }
 
+bool TemporalUpscaler::Round2NativeLdr(VideoCore::ImageId frame) const {
+    return !Scaled() && !ui_phase && !display_redirect && !dispatched_last_frame &&
+           BbSettings::Get().frame_gen.load(std::memory_order_relaxed) == BbSettings::FrameGenOff &&
+           (!frame_gen || !frame_gen->Capturing()) && !HdrNative::Wanted() && LdrFrame(frame);
+}
+
 HdrNative::Source TemporalUpscaler::HdrUiImage() {
     // The upscaler's own image, in General layout (written by FSR or the background copy, then
     // the UI draws): the native passes' barriers order their reads against both.
     return {vk::Image(ui_image),
             Mirror(vk::Image(ui_image), ui_views, vk::Format::eR8G8B8A8Unorm, {}), ui_width,
             ui_height};
+}
+
+SewerBridge::Native TemporalUpscaler::SewerNative(VideoCore::ImageId id, vk::Format format,
+                                                  vk::ImageView view) {
+    using namespace SewerBridge;
+    const auto* image = id ? texture_cache.TryGetImage(id, 0) : nullptr;
+    if (!image || !image->backing || !image->GetImage() || image->binding.needs_rebind ||
+        !texture_cache.IsRegisteredImage(id, image->image_uid) || !image->SafeToDownload() ||
+        scene_targets.NativeStale(*image) || image->info.pixel_format != format ||
+        image->aspect_mask != Color || image->info.resources != VideoCore::SubresourceExtent{1, 1} ||
+        !image->guest_begin || image->guest_begin >= image->guest_end ||
+        image->track_addr != image->guest_begin || image->track_addr_end != image->guest_end ||
+        !image->backing->image.allocation || !image->backing->subresource_states.empty()) return {};
+    const auto& ci = image->backing->image.image_ci;
+    if (ci.imageType != vk::ImageType::e2D || ci.format != format ||
+        ci.extent != vk::Extent3D{3840, 2160, 1} || ci.mipLevels != 1 || ci.arrayLayers != 1 ||
+        ci.samples != vk::SampleCountFlagBits::e1 || image->info.num_samples != 1) return {};
+    if (view) {
+        unsigned joined = 0;
+        for (const auto key : image->backing->image_view_ids) {
+            const auto& candidate = texture_cache.GetImageView(key);
+            const auto& range = candidate.info.range;
+            joined += candidate.image_view.get() == view && candidate.info.format == format &&
+                      !candidate.info.is_storage && range.base.level == 0 && range.base.layer == 0 &&
+                      range.extent == VideoCore::SubresourceExtent{1, 1};
+        }
+        if (joined != 1) return {};
+    }
+    bool exclusive = true;
+    texture_cache.ForEachImageInRegion(image->guest_begin, image->guest_end - image->guest_begin,
+        [&](VideoCore::ImageId other, VideoCore::Image&) { exclusive &= id == other; });
+    if (!exclusive) return {};
+    return {{id.index, image->image_uid, image->GetImage(), view, Color}, image->write_seq,
+            image->guest_begin, image->guest_end, image->backing, image->backing->image.allocation
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            , format
+#endif
+            };
+}
+
+static bool SewerSameCamera(const SewerBridge::Trace& tap, const CameraMotion::Matrices& camera,
+                            std::array<float, 2> jitter) {
+    const auto& original = tap.checkpoint->pose.camera;
+    return camera.valid && camera.view == original.view && camera.inv_view == original.inv_view &&
+           camera.proj == original.proj && tap.checkpoint->warp.jitter == jitter;
+}
+
+void TemporalUpscaler::SewerArm(const std::shared_ptr<SewerMotion::Checkpoint>& sample,
+                                 vk::CommandBuffer cmdbuf, VideoCore::ImageId id
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                                 , std::shared_ptr<SewerBridge::PostOrder> order
+#endif
+                                 ) {
+    using namespace SewerBridge;
+    if (!sample->needs_present) return;
+    if (sewer_bridge && sewer_bridge->Open()) {
+        sewer_bridge->Stop("unretired-display-scope");
+        sample->FinishPresentation(false, "previous-display-scope-active");
+        return;
+    }
+    const auto hdr = SewerNative(id, vk::Format::eR16G16B16A16Sfloat, {});
+    if (!hdr.res.image || !SewerPresent::SameBacking(hdr.res, sample->merge.destination) ||
+        hdr.write != sample->merge.write || !cmdbuf || !sample->merge.timeline) {
+        sample->FinishPresentation(false, "native-hdr-merge-owner");
+        return;
+    }
+    SewerPresent::Regions regions{};
+    const auto push = [&](SewerPresent::Role role, vk::Offset2D p) {
+        regions.points[regions.count++] = {role, p};
+    };
+    const auto point = [](SewerMotion::Vec2 p) { return vk::Offset2D{s32(p[0]), s32(p[1])}; };
+    for (u32 i = 0; i < 3; ++i) push(SewerPresent::Role(i), point(sample->pose.output[i]));
+    if (sample->key.checkpoint == 'A') {
+        sewer_a_request = sample->key.request;
+        sewer_a_points = {regions.points[0].centre, regions.points[1].centre};
+    } else if (sewer_a_request == sample->key.request) {
+        push(SewerPresent::Role::Vacated0, sewer_a_points[0]);
+        push(SewerPresent::Role::Vacated1, sewer_a_points[1]);
+    }
+    const auto a = OpaquePoint(sample->pose.camera, {17.314748f, -28.674114f, 101.997937f});
+    const auto b = OpaquePoint(sample->pose.camera, {14.954797f, -28.333264f, 103.857976f});
+    if (!a || !b) {
+        sample->FinishPresentation(false, "opaque-landmark-projection");
+        return;
+    }
+    push(SewerPresent::Role::Opaque0, *a);
+    push(SewerPresent::Role::Opaque1, *b);
+    if (!regions.Valid(sample->key.checkpoint)) {
+        sample->FinishPresentation(false, "invalid-final-region-set");
+        return;
+    }
+    sewer_bridge = std::make_shared<Trace>(sample, cmdbuf, hdr, regions);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    auto& trace = *sewer_bridge;
+    auto post = std::make_unique<PostState>();
+    Graph::Scope scope{};
+    scope.key = {sample->key.request, sample->key.scene, sample->key.loading, sample->key.generation,
+                 std::bit_cast<u64>(instance.GetGraphicsQueue()), std::bit_cast<u64>(sample->merge.timeline),
+                 sample->key.frame, Graph::Client::Sewer, sample->key.enabled ? Graph::Arm::On : Graph::Arm::Off,
+                 sample->key.checkpoint};
+    scope.width = SewerPresent::Extent.width;
+    scope.height = SewerPresent::Extent.height;
+    scope.count = regions.count;
+    constexpr std::array roles{Graph::ProbeRole::Wet0, Graph::ProbeRole::Wet1, Graph::ProbeRole::Dry,
+        Graph::ProbeRole::Vacated0, Graph::ProbeRole::Vacated1, Graph::ProbeRole::Opaque0, Graph::ProbeRole::Opaque1};
+    for (u32 i = 0; i < regions.count; ++i) {
+        const auto region = regions.points[i];
+        scope.probes[i] = {roles[unsigned(region.role)], u32(region.centre.x - SewerPresent::Side / 2),
+            u32(region.centre.y - SewerPresent::Side / 2), SewerPresent::Side, SewerPresent::Side};
+    }
+    if (!post->packet.Begin(scope, +[](void*, const BottleMotion203::TerminalReceipt& receipt) {
+        fmt::print("[sewer-motion] event=postgraph request={} frame={} checkpoint={} entries={} "
+                   "omitted_events={} omitted_inputs={} foreign={} fence={} ready={}\n",
+                   receipt.scope.key.request, receipt.scope.key.frame, receipt.scope.key.checkpoint,
+                   receipt.entries.size(), receipt.omitted_events, receipt.omitted_inputs,
+                   receipt.foreign_events, unsigned(receipt.fence), unsigned(receipt.ready));
+        for (const auto& row : receipt.entries) {
+            fmt::print("[sewer-motion] event=postgraph-entry request={} ordinal={} kind={} step={} "
+                       "shader={:08x} permutation={:x} backing={:x} view={:x} format={} writer={} "
+                       "command={:x} tick={} inputs={} known={:x} failed={:x} unknown={:x}\n",
+                       receipt.scope.key.request, row.event.order, unsigned(row.event.kind),
+                       unsigned(row.event.step), row.event.shader, row.event.permutation,
+                       row.event.output.backing, row.event.output.view, unsigned(row.event.output.format),
+                       row.event.output.content, row.event.actual.command, row.event.actual.tick, row.input_count,
+                       row.facts.known, row.facts.failed, row.facts.unknown);
+        }
+    }, nullptr)) {
+        trace.Stop("postgraph-scope-unavailable");
+        return;
+    }
+    post->merge = {reinterpret_cast<u64>(hdr.allocation), std::bit_cast<u64>(sample->merge.destination.view),
+                   hdr.res.uid, hdr.res.uid, sample->merge.write, {0, 1, 0, 1, 1}, Graph::Format::Rgba16Float};
+    post->merge_command = std::bit_cast<u64>(cmdbuf);
+    post->order = std::move(order);
+    if (post->order) {
+        post->terminal.runtime_window = runtime.ArmPostImageBarriers({
+            scope.key.request, u64(scope.key.checkpoint), scope.key.frame});
+    }
+    if (!post->order) {
+        fmt::print("[sewer-motion] event=postgraph-order-refused request={} checkpoint={} frame={} "
+                   "reason=early-scheduler-owner-unavailable\n",
+                   scope.key.request, scope.key.checkpoint, scope.key.frame);
+    }
+    trace.post = std::move(post);
+#endif
+}
+
+#ifdef BB_TEST_SHARED_POST_GRAPH
+static SewerBridge::PhysicalImage PostPhysical(const VideoCore::UniqueImage& owned, u64 generation) {
+    const auto& ci = owned.image_ci;
+    if (!owned || !owned.allocator || !owned.allocation || !generation || ci.imageType != vk::ImageType::e2D ||
+        ci.mipLevels != 1 || ci.arrayLayers != 1 || ci.extent.depth != 1) return {};
+    VmaAllocationInfo range{};
+    vmaGetAllocationInfo(owned.allocator, owned.allocation, &range);
+    return {vk::Image(owned), owned.allocator, owned.allocation, vk::DeviceMemory(range.deviceMemory),
+            range.offset, range.size, generation, ci.format, ci.extent, ci.samples,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}};
+}
+
+bool TemporalUpscaler::SewerPostDisplayPending() const {
+    return SewerBridgeOpen() && sewer_bridge->post &&
+           sewer_bridge->planned == SewerBridge::Planned::DisplayExpected;
+}
+
+static bool PostProgram(u64 ps) {
+    return ps == 0xccbf44a6 || ps == 0xed4c7668 || ps == 0x8c08444c ||
+           Shader::Native::IsKnownComposite(ps);
+}
+
+std::shared_ptr<SewerBridge::PostDraw> TemporalUpscaler::SewerBeginPostDraw(
+    u64 scene, u64 ps, VideoCore::ImageId target, const void* buffer_cache) {
+    using namespace SewerBridge;
+    if (!SewerBridgeOpen() || !sewer_bridge->post) return {};
+    auto& trace = *sewer_bridge;
+    auto& post = *trace.post;
+    if (post.ui_tick) return {};
+    const bool candidate = PostProgram(ps);
+    const auto* image = target ? texture_cache.TryGetImage(target, 0) : nullptr;
+    const bool possible_writer = image && image->info.size.width == 3840 && image->info.size.height == 2160 &&
+        (image->info.pixel_format == vk::Format::eR16G16B16A16Sfloat ||
+         image->info.pixel_format == vk::Format::eR8G8B8A8Unorm);
+    if (!candidate && !possible_writer) return {};
+    if (post.count == post.draws.size()) {
+        ++post.omitted;
+        return {};
+    }
+    if (candidate && !post.geometry) post.geometry = PostGeometry::Capture::Create(buffer_cache);
+    auto draw = std::make_shared<PostDraw>();
+    draw->geometry_key = {trace.merge.key.request, scene, post.count + 1, std::bit_cast<u64>(trace.merge.timeline),
+                          BbStats::frame_number.load(std::memory_order_relaxed)};
+    if (candidate) draw->geometry = post.geometry;
+    draw->color_id = target;
+    draw->ps = ps;
+    if (post.order) {
+        draw->native_order = scheduler.ReservePostNativeOperation(
+            post.order->capture.load(std::memory_order_acquire), Order::PostRole::Draw, post.count + 2);
+    }
+    post.draws[post.count++] = draw;
+    return draw;
+}
+
+void TemporalUpscaler::SewerPostBindings(SewerBridge::PostDraw& draw, std::span<const VideoCore::ImageId> images) {
+    for (u32 i = 0; i < draw.slots.count; ++i) {
+        const auto& slot = draw.slots.images[i];
+        if (!slot.exact || !slot.view) continue;
+        for (const auto id : images) {
+            const auto* image = id ? texture_cache.TryGetImage(id, 0) : nullptr;
+            if (!image) continue;
+            if (draw.slot_images[i].res.id == id.index) continue; // same exact image in one draw can repeat
+            const auto source = SewerNative(id, image->info.pixel_format, slot.view);
+            if (!source.res.image) continue;
+            if (draw.slot_images[i].res.image) {
+                draw.slot_images[i] = {};
+                draw.slots.images[i].exact = false;
+                break;
+            }
+            draw.slot_images[i] = source;
+        }
+    }
+}
+
+void TemporalUpscaler::SewerPostFinal(SewerBridge::PostDraw& draw, const SewerBridge::DrawFacts& facts) {
+    const auto& root = *sewer_bridge;
+    draw.tick = scheduler.CurrentTick();
+    if (draw.geometry_key.request != root.merge.key.request ||
+        draw.geometry_key.frame != root.merge.key.frame ||
+        draw.geometry_key.timeline != std::bit_cast<u64>(root.merge.timeline)) return;
+    draw.camera = SewerSameCamera(root, camera_motion.PassMatrices(), jitter);
+    draw.original = facts.original && draw.color_id == facts.color_id && draw.ps == facts.ps;
+    draw.full_write = facts.full_write;
+    draw.attachment = facts.attachment;
+    draw.scissor = facts.scissor;
+    draw.output = facts.output;
+    draw.output_layout = facts.layout;
+    if (const auto* image = facts.color_id ? texture_cache.TryGetImage(facts.color_id, 0) : nullptr) {
+        draw.output_format = image->info.pixel_format;
+        draw.destination = SewerNative(facts.color_id, image->info.pixel_format, facts.output);
+    }
+}
+
+static BottleAncestry::ImageVersion PostImage(const SewerBridge::Native& image, vk::Format format, u64 write) {
+    if (!image.res.view || !image.allocation || !write) return {};
+    return {reinterpret_cast<u64>(image.allocation), std::bit_cast<u64>(image.res.view), image.res.uid,
+            image.res.uid, write, {0, 1, 0, 1, 1}, BottleMotion203::Format(format)};
+}
+
+static bool SewerPostOrderReceipt(Scheduler& scheduler, const SewerBridge::PostOrder* scope,
+                                  NativeWriteSuffix::PostToken token, BottleAncestry::IssueOrder& actual,
+                                  u64* completed_tick = nullptr) {
+    using namespace SewerBridge;
+    Order::PostReceipt receipt{};
+    const bool found = scope && token && scheduler.ReadPostNativeOperation(token, receipt);
+    const bool matched = found && MatchedPostSubmission(receipt, scope->key, token, actual);
+    const bool fenced = matched && receipt.phase == Order::PostPhase::Retired;
+    if (completed_tick && fenced) *completed_tick = receipt.completed_tick;
+    if (matched) {
+        actual.submission = receipt.submission.tick;
+        actual.incarnation = receipt.where.tick;
+        actual.segment = receipt.where.submitted_index;
+        actual.ordinal = u32(receipt.where.encoding);
+        actual.submitted = Graph::Proof::Known;
+    }
+    // A scheduler position does not attest which barriers protect a particular image version.
+    if (scope) {
+        fmt::print("[sewer-motion] event=postgraph-order request={} checkpoint={} frame={} "
+                   "operation={} role={} phase={} joined={} matched={} gaps={:x} command={:x} tick={} "
+                   "submission={} segment={} ordinal={} queue={:x} timeline={:x} fence={:x} "
+                   "fence_tick={} waits={} signals={} overwrite={} prior_proxy_phase={} resource_dependencies=unknown\n",
+                   scope->key.request, scope->key.checkpoint, scope->key.frame, token.operation,
+                   unsigned(token.role), unsigned(receipt.phase), receipt.stream_joined, matched,
+                   receipt.gaps, matched ? actual.command : 0, matched ? actual.tick : 0, actual.submission,
+                   actual.segment, actual.ordinal, std::bit_cast<u64>(receipt.submission.queue),
+                   std::bit_cast<u64>(receipt.submission.timeline), std::bit_cast<u64>(receipt.submission.fence),
+                   receipt.completed_tick, receipt.submission.wait_count, receipt.submission.signal_count,
+                   bool(receipt.overwrite), unsigned(receipt.proxy.phase));
+    }
+    return fenced;
+}
+
+static void LogPostLocalBarrier(u64 request, const SewerBridge::TerminalState& facts, SewerBridge::LocalEdge role) {
+    using namespace SewerBridge;
+    const auto& emission = facts.Barrier(role);
+    const auto& image = role == LocalEdge::DisplayDiscard ? facts.display : facts.ui;
+    const auto shape = BarrierShape(role, emission, image);
+    const auto state = emission.state.load(std::memory_order_acquire);
+    if (state != EdgeState::Issued) {
+        fmt::print("[sewer-motion] event=postgraph-local-barrier request={} role={} shape={} state={}\n",
+                   request, unsigned(role), unsigned(shape), unsigned(state));
+        return;
+    }
+    const auto& b = emission.barrier;
+    fmt::print("[sewer-motion] event=postgraph-local-barrier request={} role={} shape={} state={} "
+               "cmd={:x} image={:x} allocation={:x} memory={:x} offset={} bytes={} "
+               "old={} new={} src_stage={:x} dst_stage={:x} src_access={:x} dst_access={:x} "
+               "src_family={} dst_family={} aspect={} mip={} levels={} layer={} layers={}\n",
+               request, unsigned(role), unsigned(shape), unsigned(state),
+               std::bit_cast<u64>(emission.command), std::bit_cast<u64>(b.image), reinterpret_cast<u64>(image.allocation),
+               std::bit_cast<u64>(image.memory), image.offset, image.bytes, u32(b.oldLayout), u32(b.newLayout),
+               u64(VkPipelineStageFlags2(b.srcStageMask)), u64(VkPipelineStageFlags2(b.dstStageMask)),
+               u64(VkAccessFlags2(b.srcAccessMask)), u64(VkAccessFlags2(b.dstAccessMask)),
+               b.srcQueueFamilyIndex, b.dstQueueFamilyIndex, u32(VkImageAspectFlags(b.subresourceRange.aspectMask)),
+               b.subresourceRange.baseMipLevel, b.subresourceRange.levelCount,
+               b.subresourceRange.baseArrayLayer, b.subresourceRange.layerCount);
+}
+
+static bool SewerRetirePost(Scheduler& scheduler, SewerBridge::Trace& trace, u64 fence_tick) {
+    using namespace BottleAncestry;
+    namespace Geometry = VideoCore::PostGeometry;
+    auto& post = *trace.post;
+    auto& graph = post.packet.trace;
+    const auto scope = graph.Registration();
+    // Exact submitted positions may be available even when there are native or resource gaps.
+    Event merge{.output = post.merge, .order = 1, .kind = Kind::Merge, .issued = Proof::Known,
+                .pipeline = Proof::Known, .boundary = Proof::Known};
+    merge.scope = scope.key;
+    merge.actual = {.queue = scope.key.queue, .timeline = scope.key.timeline, .tick = trace.merge.tick,
+                    .command = post.merge_command};
+    if (post.order) SewerPostOrderReceipt(scheduler, post.order.get(), post.order->merge, merge.actual);
+    if (post.order && post.order->proxy_alpha) {
+        using namespace SewerBridge;
+        const auto& alpha = *post.order->proxy_alpha;
+        const auto& binding = alpha.source.binding;
+        const auto read = alpha.source.Emission(alpha.key, binding.image, binding.view);
+        const bool same_read = read && read->order.queue == scope.key.queue &&
+            read->order.scheduler == reinterpret_cast<u64>(&scheduler) &&
+            read->order.timeline == scope.key.timeline && read->order.queued_tick <= trace.merge.tick;
+        fmt::print("[sewer-motion] event=postgraph-alpha-source request={} frame={} checkpoint={} "
+                   "image={:x} view={:x} allocation={:x} native_alloc={:x} incarnation={} "
+                   "read_emitted={} read_cmd={:x} queued_tick={} cookie={:x} note={} "
+                   "before_resident={} after_resident={} coherence_same={} native_requested_same={} "
+                   "dlss_color={}:{} upstream_vendor=unknown earlier_submitted=unknown\n",
+                   scope.key.request, scope.key.frame, scope.key.checkpoint, std::bit_cast<u64>(binding.image),
+                   std::bit_cast<u64>(binding.view), reinterpret_cast<u64>(binding.proxy.allocation),
+                   reinterpret_cast<u64>(binding.native.allocation), binding.incarnation, same_read,
+                   same_read ? std::bit_cast<u64>(read->command) : 0, same_read ? read->order.queued_tick : 0,
+                   same_read ? read->order.cookie : 0, same_read && read->encoder_note,
+                   alpha.before_merge.resident, alpha.after_coherence_drop.resident,
+                   alpha.after_coherence_drop.coherence_same, alpha.after_coherence_drop.native_serial_same,
+                   unsigned(alpha.vendor_color_read_only), unsigned(alpha.vendor_output_disjoint));
+        const auto& stripes = alpha.strips;
+        const bool staged = IssuedProxyStripShape(alpha);
+        IssueOrder strip_order{.queue = scope.key.queue, .timeline = scope.key.timeline,
+            .tick = stripes.queued_tick, .command = staged ? std::bit_cast<u64>(stripes.command) : 0};
+        const auto strip_fenced = SewerPostOrderReceipt(scheduler, post.order.get(), alpha.edge_order, strip_order);
+        if (staged) {
+            fmt::print("[sewer-motion] event=postgraph-alpha-strips request={} frame={} checkpoint={} "
+                       "cmd={:x} tick={} cookie={:x} note={} version={} layout={}->{} "
+                       "rowsrc={},{} rowdst={},{} rowsize={}x{} colsrc={},{} coldst={},{} colsize={}x{} "
+                       "src_stage={:x} dst_stage={:x} src_access={:x} dst_access={:x} "
+                       "prior_version=unknown submitted={} retired={}\n",
+                       scope.key.request, scope.key.frame, scope.key.checkpoint, std::bit_cast<u64>(stripes.command),
+                       stripes.queued_tick, stripes.cookie, stripes.encoder_note, stripes.issued_version,
+                       u32(stripes.src_layout), u32(stripes.dst_layout), stripes.row.srcOffset.x, stripes.row.srcOffset.y,
+                       stripes.row.dstOffset.x, stripes.row.dstOffset.y, stripes.row.extent.width, stripes.row.extent.height,
+                       stripes.column.srcOffset.x, stripes.column.srcOffset.y, stripes.column.dstOffset.x,
+                       stripes.column.dstOffset.y, stripes.column.extent.width, stripes.column.extent.height,
+                       u64(VkPipelineStageFlags2(stripes.after.srcStageMask)), u64(VkPipelineStageFlags2(stripes.after.dstStageMask)),
+                       u64(VkAccessFlags2(stripes.after.srcAccessMask)), u64(VkAccessFlags2(stripes.after.dstAccessMask)),
+                       unsigned(strip_order.submitted), strip_fenced);
+        } else {
+            fmt::print("[sewer-motion] event=postgraph-alpha-strips request={} frame={} checkpoint={} "
+                       "expected={} issued={} repeated={} shape=unknown\n",
+                       scope.key.request, scope.key.frame, scope.key.checkpoint, alpha.clamp_expected,
+                       stripes.issued.load(std::memory_order_acquire),
+                       stripes.repeated.load(std::memory_order_acquire));
+        }
+        for (u32 i = 0; i < trace.regions.count; ++i) {
+            const auto& point = trace.regions.points[i];
+            const auto result = staged && alpha.before_merge.resident && alpha.after_coherence_drop.resident
+                ? DirectMergeAlphaFootprint(alpha, trace.merge.alpha, point.centre) : AlphaFootprint{};
+            fmt::print("[sewer-motion] event=postgraph-alpha-footprint request={} frame={} checkpoint={} "
+                       "role={} mode={} center={},{} proxy_bounds={},{},{},{} outside={} downstream=unknown\n",
+                       scope.key.request, scope.key.frame, scope.key.checkpoint, unsigned(point.role), trace.merge.alpha,
+                       point.centre.x, point.centre.y, result.first.x, result.first.y, result.last.x, result.last.y,
+                       unsigned(result.outside));
+        }
+    }
+    for (u32 i = 0; i < scope.count; ++i) merge.written[i] = Proof::Known;
+    graph.Record(merge);
+    for (u32 i = 0; i < post.count; ++i) {
+        const auto& draw = *post.draws[i];
+        const u64 command = draw.encoded.load(std::memory_order_acquire);
+        Event event{.output = PostImage(draw.destination, draw.output_format, draw.destination.write),
+            .order = i + 2, .kind = Kind::Raster, .issued = command ? Proof::Known : Proof::Unknown,
+            .pipeline = draw.original ? Proof::Known : Proof::Unknown,
+            .boundary = draw.camera && draw.geometry_key.scene == scope.key.scene &&
+                        draw.geometry_key.frame == scope.key.frame ? Proof::Known : Proof::Unknown,
+            .prior = draw.blends ? Prior::Blend : Prior::Unknown};
+        event.scope = scope.key;
+        event.actual = {.queue = scope.key.queue, .timeline = scope.key.timeline, .tick = draw.tick, .command = command};
+        SewerPostOrderReceipt(scheduler, post.order.get(), draw.native_order, event.actual);
+        if (command && draw.original && draw.scissor_count == 1 && !draw.clear &&
+            !draw.storage_or_attachment_scope_unknown && draw.destination.res.image) {
+            const auto& rect = draw.scissor;
+            for (u32 point = 0; point < scope.count; ++point) {
+                const auto& roi = scope.probes[point];
+                if (s64(rect.offset.x) >= s64(roi.x) + roi.width ||
+                    s64(rect.offset.y) >= s64(roi.y) + roi.height ||
+                    s64(rect.offset.x) + rect.extent.width <= roi.x ||
+                    s64(rect.offset.y) + rect.extent.height <= roi.y) event.untouched[point] = Proof::Known;
+            }
+        }
+        std::array<BottleMotion203::Reader, MaxInputs> readers{};
+        for (u32 n = 0; n < draw.slots.count; ++n) {
+            const auto& slot = draw.slots.images[n];
+            const auto& raw = draw.slot_images[n];
+            const auto image = PostImage(raw, raw.format, raw.write);
+            // The exact owner snapshot is retained even if its producer view/recipe does not join.
+            readers[n] = {.image = image, .bind_generation = slot.bind_generation, .set = slot.set,
+                .binding = slot.binding, .element = slot.element, .layout = slot.layout, .sampler = slot.sampler,
+                .handle = slot.handle, .stage = slot.stage,
+                .owner = Proof::Unknown}; // Pre-rebase observation has no immutable final set receipt yet.
+            fmt::print("[sewer-motion] event=postgraph-bind request={} ordinal={} stage={} set={} binding={} "
+                       "element={} layout={} image={:x} view={:x} format={} uid={} allocation={:x} write_intent={}\n",
+                       scope.key.request, event.order, unsigned(slot.stage), slot.set, slot.binding, slot.element,
+                       u32(slot.layout), std::bit_cast<u64>(raw.res.image), std::bit_cast<u64>(slot.view),
+                       u32(raw.format), raw.res.uid, reinterpret_cast<u64>(raw.allocation), raw.write);
+        }
+        BottleMotion203::RecordEffective(graph, event,
+            {.shader = u32(draw.ps), .permutation = draw.ps_permutation, .pipeline = draw.pipeline,
+             .resolved = draw.original && command ? Proof::Known : Proof::Unknown},
+             draw.slots, std::span{readers}.first(draw.slots.count));
+        u32 geometry_done = 0;
+        if (draw.geometry) {
+            for (u32 i = 0; i < draw.bytes.size(); ++i) {
+                const auto& row = draw.bytes[i];
+                const auto completed = row.ticket && row.state == Geometry::State::Complete ?
+                    draw.geometry->Read(row.ticket, row.binding) : Geometry::Result{row.state};
+                std::array<char, 2 * Geometry::VertexBytes> bytes{};
+                static constexpr char Hex[] = "0123456789abcdef";
+                for (u32 n = 0; n < completed.bytes.size(); ++n) {
+                    const u8 value = completed.bytes[n];
+                    bytes[2 * n] = Hex[value >> 4];
+                    bytes[2 * n + 1] = Hex[value & 15];
+                }
+                geometry_done += completed.state == Geometry::State::Complete;
+                fmt::print("[sewer-motion] event=postgraph-geometry request={} ordinal={} slot={} native_slot={} "
+                           "state={} route={} reservation={} buffer={:x} offset={} index_type={} "
+                           "member={} member_bytes={} adjust={} desc_buffer={:x} desc_range={} desc_offset={} "
+                           "guest={:x} allocation={:x} cache_generation={} bytes={}\n",
+                           scope.key.request, event.order, i, row.native_slot,
+                           unsigned(completed.state), unsigned(completed.route),
+                           row.ticket.serial, row.binding.backing.handle, row.binding.offset,
+                           u32(draw.index_type), row.member, row.member_bytes, row.adjust,
+                           std::bit_cast<u64>(row.descriptor.buffer), row.descriptor.range, row.descriptor.offset,
+                           row.binding.guest, row.binding.backing.allocation, row.binding.backing.cache_generation,
+                           std::string_view(bytes.data(), completed.bytes.size() * 2));
+            }
+            for (u32 i = 0; i < std::min<std::size_t>(draw.attribute_count, draw.attributes.size()); ++i) {
+                const auto& a = draw.attributes[i];
+                fmt::print("[sewer-motion] event=postgraph-vertex request={} ordinal={} location={} binding={} "
+                           "format={} attribute_offset={}\n", scope.key.request, event.order, a.location,
+                           a.binding, u32(a.format), a.offset);
+            }
+            for (u32 i = 0; i < std::min<std::size_t>(draw.binding_count, draw.bindings.size()); ++i) {
+                const auto& b = draw.bindings[i];
+                fmt::print("[sewer-motion] event=postgraph-vertex-binding request={} ordinal={} binding={} "
+                           "stride={} rate={} divisor={}\n", scope.key.request, event.order,
+                           b.binding, b.stride, u32(b.inputRate), b.divisor);
+            }
+        }
+        for (u32 n = 0; n < draw.sampler_count; ++n) {
+            const auto& s = draw.samplers[n];
+            fmt::print("[sewer-motion] event=postgraph-sampler request={} ordinal={} binding={} sampler={:x} "
+                       "sharp={:08x},{:08x},{:08x},{:08x} lod_bias={:.9g}\n", scope.key.request, event.order,
+                       s.binding, std::bit_cast<u64>(s.handle), s.sharp[0], s.sharp[1], s.sharp[2], s.sharp[3], s.lod_bias);
+        }
+        fmt::print("[sewer-motion] event=postgraph-draw request={} ordinal={} vs={:x} vp={:x} ps={:x} "
+                   "original={} raster_scope={} camera={} geometry={} streams={} descriptors={} storage_unknown={}\n",
+                   scope.key.request, event.order, draw.vs, draw.vs_permutation, draw.ps,
+                   draw.original, draw.full_write, draw.camera, geometry_done, draw.binding_count,
+                   draw.snapshots_complete, draw.storage_or_attachment_scope_unknown);
+        fmt::print("[sewer-motion] event=postgraph-raster request={} ordinal={} size={}x{} scissors={} "
+                   "scissor={},{},{},{} viewports={} viewport={:.9g},{:.9g},{:.9g},{:.9g},{:.9g},{:.9g} "
+                   "indices={} count={} instances={} first_vertex={} first_instance={} primitive={} restart={} "
+                   "depth={} stencil={} blend={} logic={} mask={} clear={} omitted_samplers={} "
+                   "attachment_layers={} attachments={} load_request={} store=unknown resolve=unknown\n",
+                   scope.key.request, event.order, draw.width, draw.height, draw.scissor_count,
+                   draw.scissor.offset.x, draw.scissor.offset.y, draw.scissor.extent.width, draw.scissor.extent.height,
+                   draw.viewport_count, draw.viewport.x, draw.viewport.y, draw.viewport.width, draw.viewport.height,
+                   draw.viewport.minDepth, draw.viewport.maxDepth, draw.indexed, draw.count, draw.instances,
+                   draw.first_vertex, draw.first_instance, draw.topology, draw.primitive_restart, draw.depth_test,
+                   draw.stencil_test, draw.blends, draw.logic_op, draw.write_mask, draw.clear, draw.omitted_samplers,
+                   draw.attachment.layers, draw.attachment.color_count,
+                   draw.attachment.clear ? "clear" : "load");
+    }
+    const auto ui = post.ui_encoded.load(std::memory_order_acquire);
+    Event copy{.output = post.ui_version, .order = post.count + 2u, .kind = Kind::Ui,
+               .issued = ui ? Proof::Known : Proof::Unknown};
+    copy.scope = scope.key;
+    copy.actual = {.queue = scope.key.queue, .timeline = scope.key.timeline, .tick = post.ui_tick, .command = ui};
+    const bool ui_fenced = SewerPostOrderReceipt(scheduler, post.order.get(), post.ui_order, copy.actual);
+    // An observed 1:1 transfer has an exact source range but no VkImageView. Preserve its
+    // transfer identity separately from any sampled or producing view.
+    const auto& ui_source = post.ui_source;
+    const auto& terminal = post.terminal;
+    const bool same_closure = terminal.Barrier(SewerBridge::LocalEdge::UiDiscard).state.load(std::memory_order_acquire)
+            == SewerBridge::EdgeState::Issued &&
+        terminal.Barrier(SewerBridge::LocalEdge::UiAttachment).state.load(std::memory_order_acquire)
+            == SewerBridge::EdgeState::Issued &&
+        std::bit_cast<u64>(terminal.Barrier(SewerBridge::LocalEdge::UiDiscard).command) == ui &&
+        std::bit_cast<u64>(terminal.Barrier(SewerBridge::LocalEdge::UiAttachment).command) == ui;
+    const auto local_ui = same_closure
+        ? All(BarrierShape(SewerBridge::LocalEdge::UiDiscard, terminal.Barrier(SewerBridge::LocalEdge::UiDiscard), terminal.ui),
+              BarrierShape(SewerBridge::LocalEdge::UiAttachment, terminal.Barrier(SewerBridge::LocalEdge::UiAttachment), terminal.ui))
+        : Proof::Unknown;
+    auto ui_output = post.ui_version;
+    if (ui_fenced && local_ui == Proof::Known)
+        ui_output.content = terminal.blit_write.load(std::memory_order_acquire);
+    copy.output = ui_output;
+    LogPostLocalBarrier(scope.key.request, terminal, SewerBridge::LocalEdge::UiDiscard);
+    LogPostLocalBarrier(scope.key.request, terminal, SewerBridge::LocalEdge::UiAttachment);
+    // The native source has no VkImageView in BlitImage. Its current issued writer must come from
+    // the graph and certified Runtime edge, independently of the requested cache write ordinal.
+    const ImageVersion source{reinterpret_cast<u64>(ui_source.allocation), BottleMotion203::Transfer(ui_source.res.image),
+        ui_source.res.uid, ui_source.res.uid, 0, {0, 1, 0, 1, 1}, Format::Rgba8Unorm};
+    fmt::print("[sewer-motion] event=postgraph-ui-edge request={} frame={} checkpoint={} source={:x} "
+               "source_alloc={:x} source_uid={} source_requested={} source_writer=unknown ui_write={} "
+               "source_runtime={} separation={} local_order={} fence={}\n",
+               scope.key.request, scope.key.frame, scope.key.checkpoint, std::bit_cast<u64>(post.blit_source),
+               reinterpret_cast<u64>(terminal.source.allocation), terminal.source.generation, ui_source.write,
+               ui_output.content, unsigned(terminal.source_runtime),
+               unsigned(PhysicalSeparation(terminal.source, terminal.ui)), unsigned(local_ui), ui_fenced);
+    BottleMotion203::RecordUi(graph, copy, {
+        .source = source, .source_image = post.blit_source, .destination_image = post.ui_image,
+        .source_layout = post.blit_source_layout, .destination_layout = vk::ImageLayout::eTransferDstOptimal,
+        .source_extent = post.blit_source_extent, .destination_extent = post.ui_extent, .region = post.blit,
+        .filter = vk::Filter::eLinear, .source_owner = terminal.source_runtime,
+        .destination_owner = ui_output.Valid() ? Proof::Known : Proof::Unknown,
+        .ordinary_scope = post.ui_ordinary ? Proof::Known : Proof::Unknown,
+        .after_writers = post.ui_after_writer ? Proof::Unknown : Proof::Known,
+    });
+    if (post.omitted) {
+        fmt::print("[sewer-motion] event=postgraph-draw-cap request={} omitted={}\n", scope.key.request, post.omitted);
+    }
+    return post.packet.Retire(scope.key, ui_output, ui_fenced ? Proof::Known : Proof::Unknown,
+                              scope.key.timeline, fence_tick) && !post.omitted;
+}
+
+// Render and app-present owners finish independently. Never promote an encoded handle
+// to submitted order or let a raw contender retire a different checkpoint.
+static void SewerCompletePost(SewerBridge::Trace& trace) {
+    auto& post = *trace.post;
+    auto result = post.TakeCompletion();
+    if (!result) return;
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+    if (result->frame && result->display) {
+        fmt::print("[sewer-motion] event=postgraph-present-resource request={} frame={} ready={} lineage={}\n",
+            trace.merge.key.request, trace.merge.key.frame,
+            SewerPresent::JoinsResources(*result->frame, *result->display), result->display->lineage);
+    }
+#endif
+    const bool fenced = !result->refusal && result->frame && result->display &&
+        SewerPresent::PublishFinal(std::move(*result->frame), *result->display);
+    if (post.order) post.order->Disarm();
+    trace.checkpoint->FinishPresentation(fenced,
+        fenced ? nullptr : result->refusal ? result->refusal : "shared-post-present-resource-unproved");
+}
+
+void TemporalUpscaler::SewerPostEndDisplay(const SewerBridge::Draw& draw) {
+    using namespace SewerBridge;
+    auto& post = *draw.trace->post;
+    if (post.display_retirement_scheduled) return;
+    post.display_retirement_scheduled = true;
+    auto& terminal = post.terminal;
+    if (terminal.runtime_window) {
+        // The Runtime session belongs to this original producer. Copy the emitted rows here.
+        PostImageBarriers::Report report{};
+        const auto& key = draw.trace->merge.key;
+        const auto& scope = post.packet.trace.Registration().key;
+        if (runtime.ReadPostImageBarriers(terminal.runtime_window, report) &&
+            report.window == terminal.runtime_window && report.count <= report.rows.size() &&
+            report.key == PostImageBarriers::Key{key.request, u64(key.checkpoint), key.frame}) {
+            const PostImageBarriers::Row* selected = nullptr;
+            u32 matches = 0;
+            for (const auto& row : std::span{report.rows}.first(report.count)) {
+                if (!NativeUiSourceRow(row, terminal.source, scope.queue, reinterpret_cast<u64>(&scheduler),
+                                       draw.trace->merge.tick, post.ui_tick)) continue;
+                ++matches;
+                selected = &row;
+            }
+            if (selected && matches == 1 && !report.pending && !report.overflow && !report.mismatch) {
+                terminal.runtime_emission = Graph::Proof::Known;
+            } else if (report.overflow || report.mismatch) {
+                terminal.runtime_emission = Graph::Proof::Failed;
+            }
+            fmt::print("[sewer-motion] event=postgraph-runtime-ui-source request={} frame={} checkpoint={} "
+                       "window={} rows={} pending={} overflow={} mismatch={} matches={} emission={} "
+                       "cookie={:x} command={:x} queued_tick={} note={} issued_writer=unknown dependency=unknown\n",
+                       key.request, key.frame, key.checkpoint, report.window, report.count, report.pending,
+                       report.overflow, report.mismatch, matches, unsigned(terminal.runtime_emission),
+                       selected ? selected->cookie : 0, selected ? selected->command : 0,
+                       selected ? selected->queued_tick : 0, selected && selected->encoder_note);
+        }
+        runtime.DisarmPostImageBarriers(std::exchange(terminal.runtime_window, 0));
+    }
+    scheduler.DeferOperation([active = draw.trace, token = draw.native_order, owner = &scheduler] {
+        auto& post = *active->post;
+        const auto& scope = post.packet.trace.Registration();
+        const u64 command = post.display_encoded.load(std::memory_order_acquire);
+        Graph::IssueOrder actual{.queue = scope.key.queue, .timeline = scope.key.timeline,
+                                 .tick = post.display_tick.load(std::memory_order_relaxed), .command = command};
+        u64 completed_tick = 0;
+        const bool fenced = SewerPostOrderReceipt(*owner, post.order.get(), token, actual, &completed_tick);
+        const auto& facts = post.terminal;
+        fmt::print("[sewer-motion] event=postgraph-display-edge request={} frame={} checkpoint={} "
+                   "source_view={:x} source_format={} output_view={:x} output_format={} output_alloc={:x} "
+                   "generation={} write={} slot={} footprint={} native_order={} local_order={} committed={} "
+                   "app_dependency={} separation={} ui_issued={}/{} load_clear={} layers={} attachments={}\n",
+                   scope.key.request, scope.key.frame, scope.key.checkpoint, std::bit_cast<u64>(facts.draw.source_view),
+                   u32(facts.draw.source_format), std::bit_cast<u64>(facts.draw.color.view), u32(facts.display.format),
+                   reinterpret_cast<u64>(facts.display.allocation), facts.issued_candidate.generation,
+                   facts.issued_candidate.write, unsigned(facts.draw.requested_slot), unsigned(facts.draw.footprint),
+                   fenced, unsigned(facts.separate_local_order), unsigned(facts.descriptor_committed),
+                   unsigned(facts.app_dependency), unsigned(PhysicalSeparation(facts.ui, facts.display)),
+                   active->ui_encoded.load(std::memory_order_acquire), active->ui_expected,
+                   facts.draw.color.clear, facts.draw.color.layers, facts.draw.color.color_count);
+        LogPostLocalBarrier(scope.key.request, facts, LocalEdge::DisplayDiscard);
+        LogPostLocalBarrier(scope.key.request, facts, LocalEdge::UiSample);
+        for (u32 i = 0; i < facts.draw.slots.count; ++i) {
+            const auto& slot = facts.draw.slots.images[i];
+            const auto& map = facts.draw.source_mapping;
+            fmt::print("[sewer-motion] event=postgraph-display-bind request={} stage={} set={} slot={} element={} "
+                       "type={} layout={} view={:x} descriptor={:x} sampler={:x} "
+                       "pipeline={:x} pipeline_layout={:x} shader={:x} permutation={:x} swizzle={},{},{},{}\n",
+                       scope.key.request, unsigned(slot.stage), slot.set, slot.binding, slot.element, u32(slot.type),
+                       u32(slot.layout), std::bit_cast<u64>(slot.view), std::bit_cast<u64>(slot.handle),
+                       std::bit_cast<u64>(slot.sampler), std::bit_cast<u64>(facts.draw.pipeline),
+                       std::bit_cast<u64>(facts.draw.layout), facts.draw.shader, facts.draw.permutation,
+                       u32(map.r), u32(map.g), u32(map.b), u32(map.a));
+        }
+        {
+            std::lock_guard lock(post.retirement_mutex);
+            const auto& issued = facts.issued_candidate;
+            if (fenced && actual.tick == issued.display.draw_tick && issued.attachment == facts.draw.color.view &&
+                SewerPresent::SameMerge(issued.merge, active->merge)) {
+                post.render = SewerPresent::RenderRetirement{
+                    .merge = issued.merge, .display = issued.display, .display_attachment = issued.attachment,
+                    .display_generation = issued.generation, .display_write = issued.write,
+                    .display_allocation = issued.allocation,
+                    .command = std::bit_cast<vk::CommandBuffer>(actual.command),
+                    .submission = actual.submission, .incarnation = actual.incarnation,
+                    .ordinal = actual.ordinal, .segment = actual.segment, .submitted_tick = actual.tick,
+                    .completed_tick = completed_tick, .submitted = true, .fenced = true,
+                    .regions = active->regions,
+                };
+            }
+            post.renderer_checked = true;
+        }
+        SewerCompletePost(*active);
+    }, "shared post display order");
+}
+#endif
+
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+static void FinishBottlePrepared(SewerBridge::BottleDisplay& pending) {
+    const auto completion = pending.TakeCompletion();
+    if (!completion) return;
+    const auto& frame = completion->frame;
+    const auto& position = completion->position;
+    const bool present_joined = frame && completion->fenced && frame->ResourcesJoined() &&
+        frame->resources.display_order.where.StreamKey() == position.StreamKey() &&
+        frame->resources.display_order.where.segment == position.segment &&
+        frame->resources.display_order.where.buffer == position.buffer;
+    const auto& scene = pending.scene;
+    fmt::print("[bottle-cut] event={} request={} scene={} frame={} raw_fenced={} "
+               "present_serial={} renderer_submitted={} renderer_fenced={} resources={} "
+               "app_refusal={} first_lineage_refusal={}\n",
+               pending.raw ? "raw-search-caller-retired" : "prepared-caller-retired",
+               scene.key.request, scene.key.scene, scene.draw_frame, bool(frame),
+               frame ? frame->attempt.serial : 0, completion->submitted, completion->fenced, present_joined,
+               completion->refusal ? completion->refusal : "none",
+               pending.raw ? "raw-search-only" : "starting-proxy-writer-unproved");
+    pending.order->Disarm();
+}
+
+static const std::optional<BottleRawSearch177::Options>& BottleRawOptions() {
+    static const auto options = [] {
+        const auto* text = std::getenv("BB_BOTTLE_RAW_SEARCH");
+        return text ? BottleRawSearch177::Parse(text, BottleCaustic::CutSource::Run()) : std::nullopt;
+    }();
+    return options;
+}
+
+BottleRawApply180::Selection BottleRawApply180::Selected(u32 request) {
+    const auto& options = BottleRawOptions();
+    if (!options || options->request != request) return {};
+    return {request, options->mode == BottleCutPresent::Mode::Cut ? Mode::Cut : Mode::AllOff};
+}
+
+bool TemporalUpscaler::BottleRawSearchRequested() const {
+    return !bottle_raw_closed && BottleRawOptions().has_value() && !BottleMotion::Run();
+}
+
+void TemporalUpscaler::BottleCloseRawSearch() {
+    if (bottle_raw_closed || !bottle_raw_end) return;
+    bottle_raw_closed = true;
+    BottleCutPresent::CloseWindow(BottleCaustic::CutSource::Run(), bottle_raw_end);
+}
+
+static void ReportBottleApplySelection(u32 request, u32 frame, const BottleColdSource177::Closed* closed,
+                                       const BottleRawApply180::Readiness& observed, const char* result) {
+    fmt::print("[bottle-raw-apply] event=selection request={} scene={} frame={} outcome={} epoch={} "
+               "first_frame={} deadline={} expected={} seen={} recorded={} opportunity={} phase_tick={} "
+               "topology_ordinal={}\n",
+               request, closed ? closed->source.key.scene : 0, frame, result, closed ? closed->first_epoch : 0,
+               observed.first_frame, observed.deadline, observed.expected, observed.seen, observed.recorded,
+               observed.opportunity, observed.phase_tick, observed.topology_ordinal);
+}
+
+void TemporalUpscaler::BottleObserveRawSearch(const BottleColdSource177::Closed* closed) {
+    using namespace BottleCutPresent;
+    if (!BottleRawSearchRequested()) return;
+    const auto frame = BbStats::frame_number.load(std::memory_order_relaxed);
+    if (!frame || frame == bottle_raw_boundary_frame) return;
+    if (bottle_raw_end && !bottle_raw_remaining) {
+        BottleCloseRawSearch();
+        return;
+    }
+    bottle_raw_boundary_frame = frame;
+    if (bottle_raw_end) --bottle_raw_remaining;
+
+    const auto& options = *BottleRawOptions();
+    constexpr std::array search{BottleMotion::Receiver, BottleMotion::Opaque};
+    const auto candidate = closed ? BottleRawSearch177::Project(*closed, options, search) : std::nullopt;
+    const bool source_valid = candidate && candidate->scene.draw_frame == frame &&
+        candidate->native_timeline == scheduler.GetWorkSemaphore()->Handle();
+    const bool display_scope = source_valid && ui_phase && !SewerBridgeOpen();
+    using BottleRawApply180::Decision;
+    BottleRawApply180::Readiness application{};
+    const bool selecting = !bottle_raw_end && options.mode == Mode::Cut;
+    if (selecting) {
+        application = BottleRawApply180::CurrentBudget().Probe(frame, source_valid ? closed : nullptr);
+        const char* terminal = nullptr;
+        switch (application.decision) {
+        case Decision::NoWork: terminal = "no-work"; break;
+        case Decision::ScopeUnknown: terminal = "scope-unknown"; break;
+        case Decision::QueueUnjoined: terminal = "queue-unjoined"; break;
+        case Decision::Overflow: terminal = "active-cap"; break;
+        case Decision::Ready:
+            if (!display_scope && frame >= application.deadline) terminal = "display-scope-unavailable";
+            break;
+        case Decision::Awaiting: break;
+        }
+        if (terminal) {
+            ReportBottleApplySelection(options.request, frame, source_valid ? closed : nullptr, application, terminal);
+            BottleRawApply180::CurrentBudget().StopSeeking();
+            bottle_raw_closed = true;
+            return;
+        }
+    }
+    if (!display_scope) {
+        if (!std::exchange(bottle_raw_source_refused, true)) {
+            fmt::print("[bottle-cut] event=raw-search-source-refused request={} frame={} reason={}\n",
+                       options.request, frame, closed && closed->raw_refusal ? closed->raw_refusal : "current-source-or-ui-scope");
+        }
+        return;
+    }
+    if (selecting && application.decision != Decision::Ready) return;
+    const auto& raw = *candidate;
+    const auto ordinal = raw.scene.key.scene;
+    if (!bottle_raw_end) {
+        if ((options.mode == Mode::Cut && raw.scene.state != State::On) ||
+            ordinal > std::numeric_limits<u64>::max() - options.span ||
+            !BeginRawSearchWindow(options.request, options.mode, ordinal)) return;
+        if (selecting) ReportBottleApplySelection(options.request, frame, closed, application, "recorded");
+        bottle_raw_end = ordinal + options.span - 1;
+        bottle_raw_remaining = options.span - 1;
+        BottleRawApply180::CurrentBudget().Open(BottleRawApply180::Selected(options.request),
+                                               closed->frame, raw.scene.key, bottle_raw_end);
+    }
+    if (ordinal > bottle_raw_end) {
+        BottleCloseRawSearch();
+        return;
+    }
+    if (EnrolRawSearch(raw)) {
+        fmt::print("[bottle-raw-apply] event=coverage request={} scene={} frame={} expected={} epoch={}\n",
+                   options.request, ordinal, frame, closed->source.last_sequence, raw.scene.last_epoch);
+        if (BottleBeginPrepared(raw.scene, options.mode, {}, &raw) && !bottle_raw_remaining)
+            bottle_prepared->raw_close_after_offer = bottle_raw_end;
+    }
+}
+
+bool TemporalUpscaler::BottleBeginPrepared(const BottleCutPresent::Scene& scene, BottleCutPresent::Mode mode,
+                                            const BottleCutPresent::Regions& regions) {
+    return BottleBeginPrepared(scene, mode, regions, nullptr);
+}
+
+bool TemporalUpscaler::BottleBeginPrepared(const BottleCutPresent::Scene& scene, BottleCutPresent::Mode mode,
+                                            const BottleCutPresent::Regions& regions,
+                                            const BottleCutPresent::RawSearch* raw) {
+    using namespace NativeWriteSuffix;
+    const auto& options = BottleRawOptions();
+    const bool coordinates = raw ? options && options->request == scene.key.request && options->mode == mode &&
+        raw->scene == scene && raw->Valid() && !regions.count : regions.Valid(scene.state, mode);
+    if (!scene.Known() || scene.key.request != BottleCaustic::CutSource::Run() ||
+        !coordinates || BottleMotion::Run() || SewerBridgeOpen() ||
+        !scene.draw_frame || scene.draw_frame != BbStats::frame_number.load(std::memory_order_relaxed) ||
+        scene.key.load != BbEngine::Loading::Generation() || scene.key.target_generation != scene_targets.Generation() ||
+        BbEngine::Loading::ScreenUp() || (bottle_prepared && bottle_prepared->scene.draw_frame == scene.draw_frame)) return false;
+    const auto key = BottleCutPresent::ResourceKey(scene);
+    auto order = std::make_shared<SewerBridge::PostOrder>();
+    order->owner = &scheduler;
+    order->key = key;
+    order->capture = scheduler.ArmPostNativeOrder(key);
+    auto selected = std::make_shared<SewerBridge::BottleDisplay>();
+    selected->scene = scene;
+    selected->regions = regions;
+    if (raw) selected->raw = *raw;
+    selected->order = std::move(order);
+    bottle_prepared = std::move(selected);
+    return true;
+}
+
+bool TemporalUpscaler::BottlePreparedPending() const {
+    return bottle_prepared && bottle_prepared->address && !SewerBridgeOpen() &&
+           bottle_prepared->scene.draw_frame == BbStats::frame_number.load(std::memory_order_relaxed);
+}
+
+std::shared_ptr<SewerBridge::BottleDisplay> TemporalUpscaler::BottlePlanPrepared(
+    const SewerBridge::DrawFacts& draw, const BottleDisplay182::Draw* actual,
+    std::shared_ptr<SewerBridge::BottleDisplay>& observed) {
+    using namespace SewerBridge;
+    if (!BottlePreparedPending()) return {};
+    const auto selected = bottle_prepared;
+    const auto* guest = draw.color_id ? texture_cache.TryGetImage(draw.color_id, 0) : nullptr;
+    if (!guest || guest->info.guest_address != selected->address) return {};
+    std::lock_guard owner(display_mutex);
+    const auto found = displays.find(selected->address);
+    const auto& key = selected->scene.key;
+    const auto fail = [&](const char* why) -> std::shared_ptr<BottleDisplay> {
+        selected->Cancel();
+        fmt::print("[bottle-cut] event=prepared-caller-refused request={} scene={} frame={} why={}\n",
+                   key.request, key.scene, selected->scene.draw_frame, why);
+        return {};
+    };
+    const bool report_scope = selected->raw && !std::exchange(selected->draw_scope_reported, true);
+    const bool found_display = found != displays.end();
+    const auto* actual_epoch = found_display ? found->second.bottle_epoch.get() : nullptr;
+    const bool epoch_matches = actual_epoch == selected.get();
+    const bool display_valid = found_display && found->second.valid;
+    const auto load = BbEngine::Loading::Generation();
+    const auto targets = scene_targets.Generation();
+    const bool basic_refusal = !found_display || !epoch_matches || !display_valid ||
+        selected->write || !selected->attachment || selected->attachment != draw.output ||
+        !draw.original || !draw.full_write || draw.scene != key.object_frame + 1 ||
+        key.load != load || key.target_generation != targets ||
+        draw.attachment.extent != BottleCutPresent::Extent || draw.layout != vk::ImageLayout::eGeneral ||
+        draw.attachment.layers != 1 || draw.attachment.color_count != 1 || draw.attachment.clear;
+    const bool target_valid = selected->target.Valid();
+    const bool inspect_target = found_display && (report_scope || (!basic_refusal && target_valid));
+    const auto current_target = inspect_target ? PostPhysical(found->second.image, selected->target.generation)
+                                               : PhysicalImage{};
+    const bool target_matches = inspect_target && selected->target == current_target;
+    const bool inspect_ui = report_scope || (!basic_refusal && target_valid && target_matches);
+    const auto current_ui = inspect_ui ? PostPhysical(ui_image, bottle_ui_generation) : PhysicalImage{};
+    const bool ui_matches = inspect_ui && selected->ui == current_ui;
+    const auto separation = PhysicalSeparation(selected->target, selected->ui);
+    const bool attachment_failed = basic_refusal || !target_valid || !target_matches || !ui_matches ||
+        separation != Graph::Proof::Known;
+    if (report_scope) {
+        const auto attachment_mask = BottleRejections({
+            !found_display, !epoch_matches, !display_valid, selected->write != 0, !selected->attachment,
+            selected->attachment != draw.output, !draw.original, !draw.full_write,
+            draw.scene != key.object_frame + 1, key.load != load, key.target_generation != targets,
+            draw.attachment.extent != BottleCutPresent::Extent, draw.layout != vk::ImageLayout::eGeneral,
+            draw.attachment.layers != 1, draw.attachment.color_count != 1, draw.attachment.clear,
+            !target_valid, !target_matches, !ui_matches, separation != Graph::Proof::Known});
+        const auto& slot = draw.display_slots.images.front();
+        const auto& r = draw.scissor;
+        const auto& shape = draw.bottle_scope;
+        const auto& v = shape.viewport;
+        const bool ui_slot = slot.view &&
+            std::ranges::any_of(ui_views, [&](const auto& view) { return *view.view == slot.view; });
+        const auto physical = [](const PhysicalImage& image) {
+            return fmt::format("{:x}/{:x}/{:x}/{:x}/{}/{}/{}/{}/{}x{}x{}",
+                std::bit_cast<u64>(image.image), reinterpret_cast<u64>(image.allocator),
+                reinterpret_cast<u64>(image.allocation), std::bit_cast<u64>(image.memory),
+                image.offset, image.bytes, image.generation, u32(image.format),
+                image.extent.width, image.extent.height, image.extent.depth);
+        };
+        fmt::print("[bottle-cut] event=prepared-draw-scope request={} scene={} frame={} epoch={} "
+                   "address={:x} color={} tick={} timeline={:x} "
+                   "attachment_mask={:x} original_mask={:x} full_mask={:x} "
+                   "display_found={} display_epoch={} display_valid={} writer={} actual_epoch={}/{} "
+                   "selected_view={:x} output={:x} "
+                   "load={}/{} targets={}/{} object={}/{} rt={} primary={} "
+                   "attachment={}x{}/{}/{}/{} layout={} scissor={}/{}/{}x{}/{} "
+                   "viewport={}/{}/{}/{}/{}/{}/{} elements={} instances={} write_mask={:x} logic_op={} "
+                   "target_inspected={} ui_inspected={} target_valid={} physical_separation={} "
+                   "target={}/actual:{} ui={}/actual:{} pipeline={:x} pipeline_layout={:x} ps={:x} permutation={:x} "
+                   "slot_count={} slot_omitted={} slot_view={:x} slot_exact={} slot_stage={} slot_set={} "
+                   "slot_binding={} slot_element={} slot_layout={} slot_type={} slot_handle={:x} slot_sampler={:x} "
+                   "slot_generation={} ui_slot={} descriptor_commit=unknown coverage=unknown\n",
+                   key.request, key.scene, selected->scene.draw_frame, selected->scene.last_epoch,
+                   selected->address, draw.color_id.index, scheduler.CurrentTick(),
+                   std::bit_cast<u64>(scheduler.GetWorkSemaphore()->Handle()),
+                   attachment_mask, shape.original_mask, shape.full_mask,
+                   found_display, epoch_matches, display_valid, selected->write,
+                   actual_epoch ? actual_epoch->target.generation : 0, actual_epoch ? actual_epoch->write : 0,
+                   std::bit_cast<u64>(selected->attachment), std::bit_cast<u64>(draw.output),
+                   key.load, load, key.target_generation, targets, key.object_frame, draw.scene,
+                   key.rt_frame, key.primary_pass, draw.attachment.extent.width, draw.attachment.extent.height,
+                   draw.attachment.layers, draw.attachment.color_count, draw.attachment.clear, u32(draw.layout),
+                   r.offset.x, r.offset.y, r.extent.width, r.extent.height, shape.scissor_count,
+                   v.x, v.y, v.width, v.height, v.minDepth, v.maxDepth, shape.viewport_count, shape.index_count,
+                   shape.instances, shape.color_mask, shape.logic_op, inspect_target, inspect_ui, target_valid,
+                   u32(separation), physical(selected->target), physical(current_target), physical(selected->ui),
+                   physical(current_ui), std::bit_cast<u64>(draw.pipeline), std::bit_cast<u64>(draw.pipeline_layout),
+                   draw.ps, draw.fragment_permutation, draw.display_slots.count, draw.display_slots.omitted,
+                   std::bit_cast<u64>(slot.view), slot.exact, u32(slot.stage), slot.set, slot.binding,
+                   slot.element, u32(slot.layout), u32(slot.type), std::bit_cast<u64>(slot.handle),
+                   std::bit_cast<u64>(slot.sampler), slot.bind_generation, ui_slot);
+    }
+    if (report_scope && actual) {
+        const auto& lut = actual->lut;
+        const auto& sampler = actual->sampler;
+        const auto& clip = actual->viewport_push;
+        const auto& first = draw.display_slots.images[0];
+        const auto& second = draw.display_slots.images[1];
+        const bool ui = draw.display_slots.count && first.exact && first.binding == 0 && first.view &&
+            std::ranges::any_of(ui_views, [&](const auto& view) { return *view.view == first.view; });
+        const auto distinct = [&](const PhysicalImage& target) {
+            return actual->slot1_matches && target.Valid() &&
+               BottleDisplay182::Disjoint(lut, target.image, reinterpret_cast<u64>(target.allocator),
+                   reinterpret_cast<u64>(target.allocation), std::bit_cast<u64>(target.memory),
+                   target.offset, target.bytes);
+        };
+        const auto stage = [](const BottleDisplay182::Module& m) {
+            return fmt::format("{:x}/{:x}/{:x}/{:x}/{}/{}", std::bit_cast<u64>(m.handle), m.guest,
+                               m.permutation, m.digest, m.bytes, m.route ? m.route : "unknown");
+        };
+        const auto& modules = actual->program.stages;
+        const auto sequence = !actual->indexed && actual->elements == 3 &&
+            actual->first_vertex <= std::numeric_limits<u32>::max() - 2
+            ? fmt::format("{}/{}/{}", actual->first_vertex, actual->first_vertex + 1, actual->first_vertex + 2)
+            : "unknown";
+        fmt::print("[bottle-cut] event=prepared-original-operands request={} scene={} frame={} epoch={} "
+                   "output={:x} primitive={} indexed={} elements={} instances={} first_vertex={} first_instance={} "
+                   "index_buffer={:x} index_offset={} index_type={} index_bytes={} index_sequence={} "
+                   "attributes={} vertex_buffers={} "
+                   "restart={} cull={} front={} polygon={} samples={} depth_clip={} depth_clamp={} "
+                   "scene_push={:x} viewport_push={}/{}/{}/{} vs={:x} vs_permutation={:x} ps_permutation={:x} "
+                   "modules={},{},{},{} "
+                   "ui_exact={} ui_view={:x} lut_view={:x} lut_layout={} lut_known={} lut_slot={} "
+                   "lut_parent={:x}/{}/{} lut_memory={:x}/{:x}/{:x}/{}/{} lut_format={} "
+                   "lut_shape={}/{}/{}/{}/{}/{}/{}/{} lut_incarnation=unknown lut_write_hint={} disjoint_ui={} disjoint_display={} "
+                   "sampler={:x} sampler_known={} sampler_slot={} sampler_words={:x}/{:x}/{:x}/{:x} sampler_bias={} "
+                   "binder_shape={} descriptor_commit=unknown footprint=unknown\n",
+                   key.request, key.scene, selected->scene.draw_frame, selected->scene.last_epoch,
+                   std::bit_cast<u64>(draw.output), actual->primitive, actual->indexed, actual->elements,
+                   actual->instances, actual->first_vertex, actual->first_instance, std::bit_cast<u64>(actual->index),
+                   actual->index_offset, u32(actual->index_type), actual->indexed ? "unavailable" : "implicit",
+                   sequence, actual->attributes, actual->vertex_buffers, actual->restart,
+                   actual->cull, actual->front_face,
+                   actual->polygon, actual->samples, actual->depth_clip, actual->depth_clamp, actual->scene_size,
+                   clip[0], clip[1], clip[2], clip[3], actual->vs, actual->vs_permutation, actual->ps_permutation,
+                   stage(modules[0]), stage(modules[1]), stage(modules[2]), stage(modules[3]), ui,
+                   std::bit_cast<u64>(first.view), std::bit_cast<u64>(second.view), u32(second.layout), lut.known,
+                   actual->slot1_matches, std::bit_cast<u64>(lut.image), lut.uid, lut.id, lut.allocator,
+                   lut.allocation, lut.memory, lut.offset, lut.bytes, u32(lut.format), lut.type, lut.width,
+                   lut.levels, lut.layers, lut.base_level, lut.base_layer, lut.view_levels, lut.view_layers, lut.write_hint,
+                   distinct(current_ui), distinct(current_target), std::bit_cast<u64>(sampler.handle), sampler.known,
+                   actual->sampler_matches, sampler.words[0], sampler.words[1], sampler.words[2], sampler.words[3],
+                   sampler.lod_bias, actual->binder_shape);
+        if (attachment_failed && draw.original && draw.output && selected->attachment == draw.output && epoch_matches)
+            observed = selected;
+    }
+    if (attachment_failed) return fail("ordinary-display-attachment");
+    if (draw.display_slots.omitted || draw.display_slots.count != 1) return fail("ordinary-display-slot");
+    const auto& slot = draw.display_slots.images.front();
+    if (!slot.exact || slot.stage != Graph::BindStage::Fragment || slot.set != 0 || slot.element ||
+        slot.layout != vk::ImageLayout::eGeneral || slot.type == vk::DescriptorType::eStorageImage ||
+        std::ranges::none_of(ui_views, [&](const auto& item) { return *item.view == slot.view; }))
+        return fail("ordinary-display-ui-binding");
+    auto& scheduler_order = *selected->order;
+    if (const auto capture = scheduler_order.capture.load(std::memory_order_acquire)) {
+        selected->display_order = scheduler.ReservePostNativeOperation(
+            capture, Order::PostRole::Display, PostState::DisplayOperation);
+    }
+    selected->requested_slot = slot;
+    selected->pipeline = draw.pipeline;
+    selected->pipeline_layout = draw.pipeline_layout;
+    selected->shader = draw.ps;
+    selected->permutation = draw.fragment_permutation;
+    selected->display = {selected->address, selected->target.image, selected->target.format, BottleCutPresent::Extent,
+                         scheduler.GetWorkSemaphore()->Handle(), scheduler.CurrentTick()};
+    selected->write = ++bottle_display_write;
+    return selected;
+}
+
+void TemporalUpscaler::BottleEndPrepared(const std::shared_ptr<SewerBridge::BottleDisplay>& selected) {
+    scheduler.DeferOperation([selected, owner = &scheduler, queue = instance.GetGraphicsQueue()] {
+        using namespace SewerBridge;
+        Order::PostReceipt receipt{};
+        const Graph::IssueOrder actual{
+            .queue = std::bit_cast<u64>(queue), .timeline = std::bit_cast<u64>(selected->display.draw_timeline),
+            .tick = selected->display.draw_tick, .command = selected->encoded.load(std::memory_order_acquire)};
+        const bool submitted = selected->display_order && owner->ReadPostNativeOperation(selected->display_order, receipt) &&
+                               MatchedPostSubmission(receipt, selected->order->key, selected->display_order, actual);
+        {
+            std::lock_guard lock(selected->mutex);
+            selected->renderer_checked = true;
+            selected->renderer_submitted = submitted;
+            selected->renderer_fenced = submitted && receipt.phase == Order::PostPhase::Retired;
+            if (submitted) selected->renderer_position = receipt.where;
+        }
+        const auto& slot = selected->requested_slot;
+        fmt::print("[bottle-cut] event=prepared-renderer-display request={} scene={} frame={} "
+                   "command={:x} tick={} view={:x} allocation={:x} writer={} "
+                   "input={:x} slot={} layout={} set={:x} pipeline={:x} pipeline_layout={:x} "
+                   "shader={:x} permutation={:x} native_submitted={} descriptor_commit=unknown coverage=unknown\n",
+                   selected->scene.key.request, selected->scene.key.scene, selected->scene.draw_frame,
+                   actual.command, actual.tick, std::bit_cast<u64>(selected->attachment),
+                   reinterpret_cast<u64>(selected->target.allocation), selected->write, std::bit_cast<u64>(slot.view),
+                   slot.binding, u32(slot.layout), std::bit_cast<u64>(slot.handle), std::bit_cast<u64>(selected->pipeline),
+                   std::bit_cast<u64>(selected->pipeline_layout), selected->shader, selected->permutation, submitted);
+        FinishBottlePrepared(*selected);
+    }, "bottle prepared renderer order");
+}
+
+void TemporalUpscaler::BottleOfferPrepared(const std::shared_ptr<SewerBridge::BottleDisplay>& selected) {
+    using namespace BottleCutPresent;
+    bool offer = false;
+    {
+        std::lock_guard lock(selected->mutex);
+        if (selected->offered || selected->cancelled || !selected->write ||
+            selected->scene.draw_frame != BbStats::frame_number.load(std::memory_order_relaxed) ||
+            selected->scene.key.load != BbEngine::Loading::Generation() ||
+            selected->scene.key.target_generation != scene_targets.Generation() || BbEngine::Loading::ScreenUp() ||
+            selected->display.draw_timeline != scheduler.GetWorkSemaphore()->Handle() || SewerBridgeOpen()) return;
+        offer = selected->encoded.load(std::memory_order_acquire) != 0;
+        if (offer) selected->offered = true;
+        else {
+            selected->cancelled = true;
+            selected->app_checked = true;
+            selected->app_refusal = "ordinary-display-unencoded-at-override";
+        }
+    }
+    if (!offer) {
+        if (selected->raw)
+            fmt::print("[bottle-cut] event=prepared-offer-scope request={} scene={} frame={} epoch={} "
+                       "outcome=unencoded-at-override\n", selected->scene.key.request, selected->scene.key.scene,
+                       selected->scene.draw_frame, selected->scene.last_epoch);
+        FinishBottlePrepared(*selected);
+        return;
+    }
+    using namespace NativeWriteSuffix;
+    if (selected->display_order) {
+        const auto capture = selected->order->capture.load(std::memory_order_acquire);
+        selected->barrier_order = scheduler.ReservePostNativeOperation(capture, PostRole::PrepareBarrier,
+            SewerBridge::PostState::PrepareBarrierOperation);
+        selected->postprocess_order = scheduler.ReservePostNativeOperation(capture, PostRole::PreparePostprocess,
+            SewerBridge::PostState::PreparePostprocessOperation);
+    }
+    const bool full_order = selected->display_order && selected->barrier_order && selected->postprocess_order;
+    const bool offered = OfferResourceDisplay(
+        {.scene = selected->scene, .display = selected->display, .display_attachment = selected->attachment,
+         .display_generation = selected->target.generation, .display_write = selected->write, .regions = selected->regions,
+         .consume_epoch = [selected](const Scene& scene, const Override& actual, u64 generation, u64 write) {
+             return selected->Consume(scene, actual, generation, write);
+         }, .raw = selected->raw},
+        {.display_allocation = reinterpret_cast<u64>(selected->target.allocation),
+         .display_order = full_order ? selected->display_order : PostToken{},
+         .prepare_barrier_order = full_order ? selected->barrier_order : PostToken{},
+         .prepare_postprocess_order = full_order ? selected->postprocess_order : PostToken{},
+         .complete = [selected](Result result, std::optional<RawFenced> frame) {
+             {
+                 std::lock_guard lock(selected->mutex);
+                 if (selected->app_checked) return;
+                 selected->app_checked = true;
+                 if (frame && selected->Matches(result, *frame)) selected->frame = std::move(frame);
+                 else selected->app_refusal = result.reason ? result.reason : "ordinary-present-unjoined";
+             }
+             FinishBottlePrepared(*selected);
+         }});
+    if (selected->raw)
+        fmt::print("[bottle-cut] event=prepared-offer-scope request={} scene={} frame={} epoch={} "
+                   "outcome={} native_order={}\n", selected->scene.key.request, selected->scene.key.scene,
+                   selected->scene.draw_frame, selected->scene.last_epoch,
+                   offered ? "offer-enrolled" : "offer-refused", full_order);
+    // The offer already owns its immutable final epoch. The existing window keeps pending
+    // and active records alive under its mutex through actual application fence retirement.
+    if (selected->raw_close_after_offer)
+        CloseWindow(selected->scene.key.request, selected->raw_close_after_offer);
+    if (!offered) {
+        {
+            std::lock_guard lock(selected->mutex);
+            if (!selected->app_checked) {
+                selected->app_checked = true;
+                selected->app_refusal = "prepared-resource-offer-unavailable";
+            }
+        }
+        FinishBottlePrepared(*selected);
+    }
+}
+#endif
+
+SewerBridge::Draw TemporalUpscaler::SewerPlanDraw(const SewerBridge::DrawFacts& draw) {
+    using namespace SewerBridge;
+    const auto active = sewer_bridge;
+    if (!active || !active->Open()) return {};
+    auto& trace = *active;
+    const auto& key = trace.merge.key;
+    const auto tick = scheduler.CurrentTick();
+    const auto fail = [&](const char* why) -> Draw { trace.Stop(why); return {}; };
+    const bool tick_matches =
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        trace.post ? tick >= trace.merge.tick :
+#endif
+        tick == trace.merge.tick;
+    if (BbStats::frame_number.load(std::memory_order_relaxed) != key.frame ||
+        BbEngine::Loading::Generation() != key.loading ||
+        scene_targets.Generation() != key.generation ||
+        scheduler.GetWorkSemaphore()->Handle() != trace.merge.timeline || !tick_matches) {
+        return fail("display-render-epoch");
+    }
+    if (trace.redirect) {
+        const bool target = std::exchange(trace.redirect, {}) == draw.output;
+        if (!target || draw.scene != key.scene || !draw.original || !draw.disjoint_capable ||
+            !Outside(draw.scissor, trace.regions) || trace.planned != Planned::UiCopy ||
+            trace.ui != vk::Image(ui_image) || trace.ui_allocation != ui_image.allocation ||
+            trace.ui_generation != sewer_ui_generation) {
+            return fail("unproved-ui-attachment-write");
+        }
+        ++trace.ui_expected;
+        return {active, Step::DisjointUi, tick};
+    }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (!trace.post && draw.ps == TonemapHash) {
+#else
+    if (draw.ps == TonemapHash) {
+#endif
+        if (trace.planned != Planned::Merge || draw.scene != key.scene || !draw.original ||
+            !draw.full_write || !SewerSameCamera(trace, camera_motion.PassMatrices(), jitter)) {
+            return fail("original-tonemap-scope");
+        }
+        u32 joined = 0;
+        Native source{};
+        for (const auto id : draw.images) {
+            if (id.index != trace.hdr.res.id) continue;
+            for (const auto& input : draw.inputs) {
+                if (!input.imageView || (input.imageLayout != vk::ImageLayout::eGeneral &&
+                                         input.imageLayout != vk::ImageLayout::eShaderReadOnlyOptimal)) continue;
+                const auto sampled = SewerNative(id, vk::Format::eR16G16B16A16Sfloat, input.imageView);
+                if (sampled.res.image && SameNative(sampled, trace.hdr)) {
+                    source = sampled;
+                    ++joined;
+                }
+            }
+        }
+        const auto ldr = SewerNative(draw.color_id, vk::Format::eR8G8B8A8Unorm, draw.output);
+        if (joined != 1 || !source.res.view || !ldr.res.image || !ldr.write || !Separate(source, ldr)) {
+            return fail("actual-tonemap-bindings-or-write");
+        }
+        trace.ldr = ldr;
+        trace.hdr_sample = source.res.view;
+        trace.tonemap_tick = tick;
+        trace.planned = Planned::Tonemap;
+        return {active, Step::Tonemap, tick};
+    }
+
+    if (trace.planned != Planned::DisplayExpected) return {};
+    const auto* guest = draw.color_id ? texture_cache.TryGetImage(draw.color_id, 0) : nullptr;
+    if (!guest || guest->info.guest_address != trace.display_address) return {};
+    std::scoped_lock lock{display_mutex};
+    const auto found = displays.find(trace.display_address);
+    if (found == displays.end() || !found->second.valid || !display_redirect ||
+        found->second.sewer_target != draw.output || !found->second.sewer_generation ||
+        draw.scene != key.scene + 1 || !draw.original || !draw.full_write ||
+        draw.layout != vk::ImageLayout::eGeneral || trace.ui != vk::Image(ui_image) ||
+        trace.ui_allocation != ui_image.allocation || trace.ui_generation != sewer_ui_generation) {
+        return fail("actual-display-draw-or-target");
+    }
+    u32 sampled = 0, ui = 0;
+    for (const auto& input : draw.inputs) {
+        if (!input.imageView) continue;
+        ++sampled;
+        if (input.imageLayout == vk::ImageLayout::eGeneral &&
+            std::ranges::any_of(ui_views, [&](const auto& it) { return *it.view == input.imageView; }))
+            ++ui;
+    }
+    auto& display = found->second;
+    const auto& ci = display.image.image_ci;
+    if (sampled != 1 || ui != 1 || display.width != 3840 || display.height != 2160 ||
+        ci.extent != vk::Extent3D{3840, 2160, 1} || ci.samples != vk::SampleCountFlagBits::e1 ||
+        ci.mipLevels != 1 || ci.arrayLayers != 1 || !SewerPresent::DisplayColor(display.format)) {
+        return fail("actual-display-sampled-ui");
+    }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (trace.post) {
+        auto& terminal = trace.post->terminal;
+        const auto physical_display = PostPhysical(display.image, display.sewer_generation);
+        const auto physical_ui = PostPhysical(ui_image, sewer_ui_generation);
+        if ((terminal.display.Valid() && terminal.display != physical_display) ||
+            (terminal.ui.Valid() && terminal.ui != physical_ui) ||
+            PhysicalSeparation(physical_ui, physical_display) == Graph::Proof::Failed) {
+            return fail("shared-post-display-backing");
+        }
+        auto& selected = terminal.draw;
+        selected.color = draw.attachment;
+        selected.slots = draw.display_slots;
+        selected.pipeline = draw.pipeline;
+        selected.layout = draw.pipeline_layout;
+        selected.shader = draw.ps;
+        selected.permutation = draw.fragment_permutation;
+        selected.scene = draw.scene;
+        selected.ordinary = draw.original;
+        for (const auto& input : draw.inputs) {
+            const auto view = std::ranges::find_if(ui_views, [&](const auto& it) {
+                return input.imageView && *it.view == input.imageView;
+            });
+            if (view != ui_views.end()) {
+                selected.source_view = input.imageView;
+                selected.source_format = view->format;
+                selected.source_mapping = view->mapping;
+            }
+        }
+        if (!selected.slots.omitted && selected.slots.count == 1) {
+            const auto& slot = selected.slots.images.front();
+            selected.requested_slot = slot.stage != Graph::BindStage::Unknown && slot.view
+                ? (slot.exact && slot.stage == Graph::BindStage::Fragment && slot.view == selected.source_view &&
+                   slot.layout == vk::ImageLayout::eGeneral && slot.set == 0 && slot.element == 0 &&
+                   slot.type != vk::DescriptorType::eStorageImage ? Graph::Proof::Known : Graph::Proof::Failed)
+                : Graph::Proof::Unknown;
+        }
+        // Full viewport, scissor and write mask are range constraints. Triangle coverage is separate.
+        selected.footprint = draw.full_write ? Graph::Proof::Unknown : Graph::Proof::Failed;
+        if (selected.requested_slot == Graph::Proof::Failed) return fail("shared-post-display-slot");
+    }
+#endif
+    display.sewer_epoch = std::make_shared<Epoch>(
+        SewerPresent::Override{trace.display_address, vk::Image(display.image), display.format,
+                               SewerPresent::Extent, trace.merge.timeline, tick},
+        display.sewer_generation, ++sewer_display_write, draw.output, active
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        , reinterpret_cast<u64>(display.image.allocation)
+#endif
+        );
+    trace.planned = Planned::Display;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (trace.post) {
+        const auto& epoch = *display.sewer_epoch;
+        trace.post->terminal.issued_candidate = {trace.merge, epoch.display, epoch.attachment,
+                                                 epoch.generation, epoch.write, epoch.allocation};
+    }
+    if (trace.post && trace.post->order) {
+        trace.post->display_order = scheduler.ReservePostNativeOperation(
+            trace.post->order->capture.load(std::memory_order_acquire), Order::PostRole::Display,
+            PostState::DisplayOperation);
+        return {active, Step::Display, tick, trace.post->display_order};
+    }
+#endif
+    return {active, Step::Display, tick};
+}
+
+void TemporalUpscaler::SewerOffer(const std::shared_ptr<SewerBridge::Epoch>& epoch) {
+    if (!epoch || !epoch->trace->Open()) return;
+    auto& trace = *epoch->trace;
+    const auto& key = trace.merge.key;
+    if (trace.planned != SewerBridge::Planned::Display ||
+        BbStats::frame_number.load(std::memory_order_relaxed) != key.frame ||
+        BbEngine::Loading::ScreenUp() || BbEngine::Loading::Generation() != key.loading ||
+        scene_targets.Generation() != key.generation ||
+        scheduler.GetWorkSemaphore()->Handle() != trace.merge.timeline) {
+        trace.Stop("prepare-override-scope");
+        return;
+    }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (trace.post) {
+        if (!trace.post->display_encoded.load(std::memory_order_acquire) ||
+            trace.post->display_tick.load(std::memory_order_relaxed) != epoch->display.draw_tick) {
+            trace.Stop("shared-post-display-not-encoded");
+            return;
+        }
+        trace.offered = true;
+        const auto sample = trace.checkpoint;
+        sample->present_claimed.store(true, std::memory_order_release);
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+        NativeWriteSuffix::PostToken prepare_barrier{}, prepare_postprocess{};
+        if (trace.post->order && trace.post->display_order) {
+            const auto capture = trace.post->order->capture.load(std::memory_order_acquire);
+            prepare_barrier = scheduler.ReservePostNativeOperation(capture,
+                NativeWriteSuffix::PostRole::PrepareBarrier, SewerBridge::PostState::PrepareBarrierOperation);
+            prepare_postprocess = scheduler.ReservePostNativeOperation(capture,
+                NativeWriteSuffix::PostRole::PreparePostprocess, SewerBridge::PostState::PreparePostprocessOperation);
+        }
+#endif
+        const bool accepted = SewerPresent::OfferDisplayCandidate({
+            .merge = trace.merge, .display = epoch->display, .display_attachment = epoch->attachment,
+            .display_generation = epoch->generation, .display_write = epoch->write,
+            .display_allocation = epoch->allocation, .regions = trace.regions,
+            .consume_epoch = [epoch](const SewerPresent::Override& actual, u64 generation, u64 write) {
+                return epoch->Consume(actual, generation, write);
+            },
+            .complete = [active = epoch->trace, candidate = trace.post->terminal.issued_candidate](
+                            SewerPresent::Result result, std::optional<SewerPresent::FencedFrame> frame) {
+                auto& post = *active->post;
+                {
+                    std::lock_guard lock(post.retirement_mutex);
+                    if (post.presentation_received) return;
+                    post.presentation_received = true;
+                    if (frame && SewerBridge::MatchesAppFrame(result, *frame, candidate, active->regions))
+                        post.raw_frame = std::move(frame);
+                    else
+                        post.application_refusal = result.reason ? result.reason : "shared-post-present-unproved";
+                }
+                SewerCompletePost(*active);
+            },
+#ifdef BB_TEST_POST_PRESENT_RESOURCES
+            .display_order = trace.post->display_order,
+            .prepare_barrier_order = prepare_barrier,
+            .prepare_postprocess_order = prepare_postprocess,
+#endif
+        });
+        if (!accepted) {
+            {
+                std::lock_guard lock(trace.post->retirement_mutex);
+                if (!trace.post->presentation_received) {
+                    trace.post->presentation_received = true;
+                    trace.post->application_refusal = "display-candidate-unavailable";
+                }
+            }
+            SewerCompletePost(trace);
+        }
+        return;
+    }
+#endif
+    if (const auto why = trace.EncoderFailure()) {
+        trace.Stop(why);
+        return;
+    }
+    auto hdr = trace.hdr.res;
+    hdr.view = trace.hdr_sample;
+    trace.offered = true;
+    trace.checkpoint->present_claimed.store(true, std::memory_order_release);
+    const auto sample = trace.checkpoint;
+    SewerPresent::OfferIssuedDisplay({
+        .merge = trace.merge, .tonemap_input = hdr, .tonemap_output = trace.ldr.res,
+        .tonemap_input_write = trace.hdr.write, .tonemap_output_write = trace.ldr.write,
+        .tonemap_tick = trace.tonemap_tick,
+        .display = epoch->display, .display_attachment = epoch->attachment,
+        .display_generation = epoch->generation, .display_write = epoch->write,
+        .regions = trace.regions,
+        .consume_epoch = [epoch](const SewerPresent::Override& source, u64 generation, u64 write) {
+            return epoch->Consume(source, generation, write);
+        },
+        .complete = [sample](const SewerPresent::Result& result) {
+            sample->FinishPresentation(result.fenced, result.reason, false);
+        },
+    });
+}
+
+bool TemporalUpscaler::SewerBridgeOpen() const {
+    return sewer_bridge && sewer_bridge->Open();
+}
+
+void TemporalUpscaler::SewerIndirectDisplayOrUi(VideoCore::ImageId color) {
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (BottlePreparedPending()) {
+        const auto* output = color ? texture_cache.TryGetImage(color, 0) : nullptr;
+        if (output && output->info.guest_address == bottle_prepared->address) bottle_prepared->Cancel();
+    }
+#endif
+    if (!SewerBridgeOpen()) return;
+    const auto* output = color ? texture_cache.TryGetImage(color, 0) : nullptr;
+    if (sewer_bridge->redirect || (output && output->info.guest_address == sewer_bridge->display_address)) {
+        sewer_bridge->Stop("indirect-final-ui-or-display-writer");
+    }
 }
 
 void TemporalUpscaler::OnDisplayPass(VAddr address, VideoCore::ImageId frame) {
@@ -1996,6 +3964,70 @@ void TemporalUpscaler::OnDisplayPass(VAddr address, VideoCore::ImageId frame) {
         }
     }
     hdr_native.OnDisplayPass(address, source);
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (bottle_prepared && !bottle_prepared->address && address && ui_phase && !SewerBridgeOpen() &&
+        bottle_prepared->scene.draw_frame == BbStats::frame_number.load(std::memory_order_relaxed) &&
+        bottle_prepared->scene.key.load == BbEngine::Loading::Generation() &&
+        bottle_prepared->scene.key.target_generation == scene_targets.Generation()) {
+        bottle_prepared->address = address;
+        bottle_prepared->ui = PostPhysical(ui_image, bottle_ui_generation);
+    } else if (const auto request = BottleCaustic::CutSource::Run(); request && address &&
+               (!bottle_prepared || bottle_prepared->scene.key.request != request ||
+                bottle_prepared->scene.draw_frame != BbStats::frame_number.load(std::memory_order_relaxed))) {
+        const u32 frame = BbStats::frame_number.load(std::memory_order_relaxed);
+        if (frame && !std::exchange(bottle_source_refusal_reported, true)) {
+            fmt::print("[bottle-cut] event=prepared-caller-refused request={} frame={} why=ordinary-scene-not-enrolled\n",
+                       request, frame);
+        }
+    }
+#endif
+    if (SewerBridgeOpen()) {
+        auto& trace = *sewer_bridge;
+        const auto tick = scheduler.CurrentTick();
+        const bool tick_matches =
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            trace.post ? trace.post->ui_tick && tick >= trace.post->ui_tick :
+#endif
+            tick == trace.merge.tick;
+        if (trace.planned == SewerBridge::Planned::UiCopy && ui_phase && !trace.redirect && address &&
+            trace.ui == vk::Image(ui_image) && trace.ui_allocation == ui_image.allocation &&
+            trace.ui_generation == sewer_ui_generation && tick_matches &&
+            SewerSameCamera(trace, camera_motion.PassMatrices(), jitter)) {
+            trace.display_address = address;
+            trace.planned = SewerBridge::Planned::DisplayExpected;
+        } else {
+            trace.Stop("ordinary-display-finishing-scope");
+        }
+    }
+    if (BottleMotion::Run()) {
+        auto& s=BottleMotion::Scene();
+        motion_finish={};
+        motion_finish_ui=vk::Image{};
+        if (s.mark && !s.bad) {
+            if (!s.dlss || !s.tone || !s.ui || !ui_phase || s.ui_image!=vk::Image(ui_image) ||
+                s.mark.on!=u8(BottleCaustic::On()) || s.arm_generation!=BbLiveKnobs::Generation() ||
+                !BottleMotion::MarkerClear(s)) {
+                BottleMotion::Refuse(s,"finishing-ui-identity");
+            } else {
+                motion_finish=s.mark;
+                motion_finish.address=address;
+                motion_finish_ui=s.ui_image;
+                using BottleMotion::P;
+                std::printf("[bottle-motion-t198] event=scene run=%u id=%u arm=%u scene=%llu qpc_ns=%llu "
+                            "on=%u input=1920x1080 proxy=%llu\n",u32(s.mark.run),u32(s.mark.id),
+                            s.mark.arm,P(s.mark.scene),P(s.mark.scene_ns),u32(s.mark.on),P(s.generation));
+                for (u32 i=0;i<3;++i) {
+                    const auto* r=s.view.data()+i*4;
+                    std::printf("[bottle-motion-t198] event=view id=%u row=%u values=(%.9g,%.9g,%.9g,%.9g)\n",
+                                u32(s.mark.id),i,r[0],r[1],r[2],r[3]);
+                }
+                std::printf("[bottle-motion-t198] event=projection id=%u values=(%.9g,%.9g,%.9g,%.9g) "
+                            "jitter=(%.9g,%.9g)\n",u32(s.mark.id),s.proj[0],s.proj[1],s.proj[2],s.proj[3],
+                            s.jitter[0],s.jitter[1]);
+            }
+        }
+        BottleMotion::ClearScene(s);
+    }
     hdr_ui_target = {};
 }
 
@@ -2045,6 +4077,17 @@ void TemporalUpscaler::EnsureUiResources(u32 w, u32 h, vk::Format color, vk::For
     ui_width = w;
     ui_height = h;
     if (new_color) {
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        ++bottle_ui_generation;
+#endif
+        if (SewerMotion::FinalEnabled()) ++sewer_ui_generation;
+        if (SewerBridgeOpen() && sewer_bridge->planned != SewerBridge::Planned::Tonemap
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            && !sewer_bridge->post
+#endif
+        ) {
+            sewer_bridge->Stop("ui-backing-recreated");
+        }
         ui_views.clear();
         ui_view.reset();
         ui_storage_view.reset();
@@ -2236,8 +4279,91 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .dstOffsets = std::array{vk::Offset3D{x0, y0, 0}, vk::Offset3D{x1, y1, 1}},
     };
-    scheduler.Record([source, source_layout, ui = vk::Image(ui_image), bars,
-                      region](vk::CommandBuffer cmd) {
+    SewerBridge::Draw sewer_copy;
+    if (SewerBridgeOpen()) {
+        using namespace SewerBridge;
+        auto& trace = *sewer_bridge;
+        const auto stamp = SewerNative(color_id, vk::Format::eR8G8B8A8Unorm, {});
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (trace.post && trace.post->ui_tick) {
+            trace.Stop("shared-post-ui-copy-repeated");
+        } else if (trace.post) {
+            auto& post = *trace.post;
+            post.ui_source = stamp;
+            if (const auto* actual = stamp.res.image == source ?
+                    texture_cache.TryGetImage(color_id, stamp.res.uid) : nullptr;
+                actual && actual->backing == stamp.backing && actual->GetImage() == source) {
+                post.terminal.source = PostPhysical(actual->backing->image, stamp.res.uid);
+            }
+            post.terminal.ui = PostPhysical(ui_image, sewer_ui_generation);
+            // Transfer ranges have no bound view. Keep a distinct canonical transfer identity.
+            if (stamp.res.image) post.ui_source.res.view = vk::ImageView{};
+            post.blit_source = source;
+            post.blit_source_layout = source_layout;
+            post.blit = region;
+            post.blit_source_extent = vk::Extent2D{source_width, source_height};
+            post.ui_extent = vk::Extent2D{ui_width, ui_height};
+            post.ui_image = vk::Image(ui_image);
+            post.ui_tick = scheduler.CurrentTick();
+            post.ui_ordinary = post.ui_tick >= trace.merge.tick && scheduler.GetWorkSemaphore()->Handle() == trace.merge.timeline &&
+                early_upscale && world && dispatched_last_frame && !bars && source == stamp.res.image &&
+                source_layout == vk::ImageLayout::eTransferSrcOptimal &&
+                SewerSameCamera(trace, camera_motion.PassMatrices(), jitter) &&
+                post.ui_extent == SewerPresent::Extent && post.blit_source_extent == post.ui_extent && stamp.allocation &&
+                ui_image && ui_image.allocation && stamp.allocation != ui_image.allocation &&
+                PhysicalSeparation(post.terminal.source, post.terminal.ui) != Graph::Proof::Failed;
+            post.ui_after_writer = bool(after_upscale);
+            if (post.ui_ordinary && !post.ui_after_writer && !trace.redirect && trace.planned == Planned::Merge) {
+                trace.planned = Planned::UiCopy;
+                trace.ui = post.ui_image;
+                trace.ui_allocation = ui_image.allocation;
+                trace.ui_generation = sewer_ui_generation;
+                post.ui_version = {reinterpret_cast<u64>(ui_image.allocation), BottleMotion203::Transfer(post.ui_image),
+                    sewer_ui_generation, sewer_ui_generation, 0, {0, 1, 0, 1, 1},
+                    BottleMotion203::Format(ui_format)};
+                sewer_copy = {sewer_bridge, Step::UiCopy, post.ui_tick};
+            }
+        } else
+#endif
+        if (trace.planned != Planned::Tonemap || !early_upscale || !world || !dispatched_last_frame ||
+            !SewerSameCamera(trace, camera_motion.PassMatrices(), jitter) ||
+            !SameNative(trace.ldr, stamp) || source != stamp.res.image ||
+            source_layout != vk::ImageLayout::eTransferSrcOptimal ||
+            bars || source_width != 3840 || source_height != 2160 ||
+            ui_width != 3840 || ui_height != 2160 || !ui_image || !ui_image.allocation ||
+            source == vk::Image(ui_image) || stamp.allocation == ui_image.allocation ||
+            scheduler.CurrentTick() != trace.merge.tick ||
+            scheduler.GetWorkSemaphore()->Handle() != trace.merge.timeline) {
+            trace.Stop("ordinary-ui-copy-source-or-route");
+        } else if (after_upscale) {
+            trace.Stop("ui-compositor-writer-uncertified");
+        } else {
+            trace.planned = Planned::UiCopy;
+            trace.ui = vk::Image(ui_image);
+            trace.ui_allocation = ui_image.allocation;
+            trace.ui_generation = sewer_ui_generation;
+            sewer_copy = {sewer_bridge, Step::UiCopy, scheduler.CurrentTick()};
+        }
+    }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    const auto post_copy = SewerBridgeOpen() && sewer_bridge->post ? sewer_bridge : nullptr;
+    if (post_copy && post_copy->post->order) {
+        auto& post = *post_copy->post;
+        post.ui_order = scheduler.ReservePostNativeOperation(
+            post.order->capture.load(std::memory_order_acquire), SewerBridge::Order::PostRole::UiBlit,
+            SewerBridge::PostState::UiOperation);
+    }
+    const auto post_token = post_copy ? post_copy->post->ui_order : NativeWriteSuffix::PostToken{};
+#endif
+    auto record_ui_copy = [source, source_layout, ui = vk::Image(ui_image), bars, region, sewer_copy
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                           , post_copy, post_token
+#endif
+                           ](vk::CommandBuffer cmd
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                             , NativeWriteSuffix::Encoder* encoder
+#endif
+                           ) {
         vk::ImageMemoryBarrier2 barrier{
             .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
             .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
@@ -2249,6 +4375,9 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         };
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (post_copy) post_copy->post->terminal.Barrier(SewerBridge::LocalEdge::UiDiscard).Observe(cmd, barrier);
+#endif
         if (bars) {
             const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
             cmd.clearColorImage(ui, vk::ImageLayout::eTransferDstOptimal,
@@ -2263,6 +4392,14 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         }
         cmd.blitImage(source, source_layout, ui, vk::ImageLayout::eTransferDstOptimal, region,
                       vk::Filter::eLinear);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (encoder) encoder->NotePost(post_token);
+        if (post_copy) {
+            static std::atomic<u64> issued_blits{};
+            post_copy->post->terminal.blit_write.store(issued_blits.fetch_add(1, std::memory_order_relaxed) + 1,
+                                                       std::memory_order_release);
+        }
+#endif
         barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
         barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
         barrier.dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
@@ -2271,7 +4408,38 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         barrier.oldLayout = vk::ImageLayout::eTransferDstOptimal;
         barrier.newLayout = vk::ImageLayout::eGeneral;
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
-    });
+        sewer_copy.Encoded(cmd);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (post_copy) {
+            post_copy->post->terminal.Barrier(SewerBridge::LocalEdge::UiAttachment).Observe(cmd, barrier);
+            post_copy->post->ui_encoded.store(std::bit_cast<u64>(cmd), std::memory_order_release);
+        }
+#endif
+    };
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    if (post_token) {
+        scheduler.RecordPostNative(post_token,
+            [record = std::move(record_ui_copy)](vk::CommandBuffer cmd, NativeWriteSuffix::Encoder& encoder) {
+                record(cmd, &encoder);
+            });
+    } else {
+        scheduler.Record([record = std::move(record_ui_copy)](vk::CommandBuffer cmd) { record(cmd, nullptr); });
+    }
+    if (post_copy) {
+        const u64 fence = scheduler.CurrentTick();
+        scheduler.DeferOperation([trace = post_copy, fence, owner = &scheduler] {
+            const bool ready = SewerRetirePost(*owner, *trace, fence);
+            {
+                std::lock_guard lock(trace->post->retirement_mutex);
+                trace->post->graph_retired = true;
+                trace->post->graph_ready = ready;
+            }
+            SewerCompletePost(*trace);
+        }, "shared post graph");
+    }
+#else
+    scheduler.Record(std::move(record_ui_copy));
+#endif
     // bbport (r98b_particles-reduced-scene): with the upscale before the game's post (Run, at
     // the trigger dispatch) RunScaled never runs: the output-size frame before the UI is this
     // copy of the game's finished frame. Only for a frame of the world Run upscaled this frame.
@@ -2327,6 +4495,20 @@ void TemporalUpscaler::RunUiOnly(VideoCore::ImageId color_id, VideoCore::ImageId
         reset = true; // returning to 3D must not reuse history from before a menu/loading screen
     }
     done_this_frame = ui_phase = true;
+    if (BottleMotion::Run()) {
+        auto& s=BottleMotion::Scene();
+        if (s.mark && !s.bad) {
+            if (!early_upscale || !world || !dispatched_last_frame || !s.dlss || !s.tone || s.ui ||
+                s.ldr_id!=color_id.index || s.ldr_uid!=color.image_uid || s.ldr_write!=color.write_seq ||
+                source!=color.GetImage() || source_width!=3840 || source_height!=2160 || bars ||
+                ui_width!=3840 || ui_height!=2160 || !ui_image) {
+                BottleMotion::Refuse(s,"ui-source-not-proved-world-tonemap");
+            } else {
+                s.ui=true;
+                s.ui_image=vk::Image(ui_image);
+            }
+        }
+    }
     ui_color = color_id;
     ui_depth = depth_id;
 }
@@ -2725,11 +4907,56 @@ vk::ImageView TemporalUpscaler::Mirror(vk::Image image, std::vector<MirrorView>&
     return handle;
 }
 
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+enum class BottleRedirect : u8 { Fallback = 1, Reserved = 2, Repeated = 4, UiUnavailable = 8 };
+
+static void ReportBottleRedirect(SewerBridge::BottleDisplay& selected, BottleRedirect status,
+                                 const char* result, bool display_valid, const TemporalUpscaler::Target& target,
+                                 vk::Image image, vk::Format format, u64 tick) {
+    const auto bit = u8(status);
+    if (selected.redirect_scope_reported & bit) return;
+    selected.redirect_scope_reported |= bit;
+    fmt::print("[bottle-cut] event=prepared-redirect-scope request={} scene={} frame={} epoch={} address={:x} "
+               "outcome={} tick={} display_valid={} image={:x} format={} view={:x} layout={} extent={}x{} "
+               "reserved_view={:x} generation={} writer={}\n",
+               selected.scene.key.request, selected.scene.key.scene, selected.scene.draw_frame,
+               selected.scene.last_epoch, selected.address, result, tick, display_valid, std::bit_cast<u64>(image),
+               u32(format), std::bit_cast<u64>(target.view), u32(target.layout), target.width, target.height,
+               std::bit_cast<u64>(selected.attachment), selected.target.generation, selected.write);
+}
+
+static TemporalUpscaler::Display::BottleScope ReportBottleOverride(
+    SewerBridge::BottleDisplay& selected, const char* result, bool display_valid,
+    vk::Image image, vk::Format format, u64 tick, VAddr address, u32 frame, u64 load, u64 targets) {
+    if (!selected.raw) return {};
+    const bool same_scope = selected.address == address && selected.scene.draw_frame == frame &&
+        selected.scene.key.load == load && selected.scene.key.target_generation == targets;
+    const u8 bit = same_scope ? 1 : 2;
+    if (selected.override_scope_reported & bit) return {};
+    selected.override_scope_reported |= bit;
+    fmt::print("[bottle-cut] event=prepared-override-scope request={} scene={} frame={} epoch={} "
+               "address={:x} actual_address={:x} actual_frame={} actual_load={} actual_targets={} "
+               "scope_match={} outcome={} tick={} display_valid={} image={:x} format={} view={:x} "
+               "generation={} writer={} encoded={:x}\n",
+               selected.scene.key.request, selected.scene.key.scene, selected.scene.draw_frame,
+               selected.scene.last_epoch, selected.address, address, frame, load, targets, same_scope, result,
+               tick, display_valid, std::bit_cast<u64>(image), u32(format), std::bit_cast<u64>(selected.attachment),
+               selected.target.generation, selected.write, selected.encoded.load(std::memory_order_acquire));
+    if (!same_scope) return {};
+    return {selected.scene.key.request, selected.scene.draw_frame, selected.scene.key.scene,
+            selected.scene.last_epoch, selected.address};
+}
+#endif
+
 bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
                                      const VideoCore::ImageViewInfo& view_info, Target& target) {
     if (ui_phase && color == ui_color) {
         target = {Mirror(vk::Image(ui_image), ui_views, view_info.format, {}),
                   vk::ImageLayout::eGeneral, ui_width, ui_height, true};
+        if (SewerBridgeOpen()) {
+            if (sewer_bridge->redirect) sewer_bridge->Stop("missing-issued-ui-before-next-redirect");
+            else sewer_bridge->redirect = target.view;
+        }
         return true;
     }
     const auto& image = texture_cache.GetImage(color);
@@ -2740,8 +4967,32 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
     }
     std::scoped_lock lock{display_mutex};
     auto& display = displays[address];
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    auto* observed_bottle = BottlePreparedPending() && bottle_prepared->address == address &&
+                            bottle_prepared->raw ? bottle_prepared.get() : nullptr;
+    if (display.bottle_epoch) {
+        display.bottle_epoch->Cancel();
+        display.bottle_epoch.reset();
+    }
+#endif
+    if (display.sewer_epoch) {
+        display.sewer_epoch->Cancel();
+        display.sewer_epoch->trace->Stop("display-written-or-rebound-after-sample");
+        display.sewer_epoch.reset();
+    }
+    display.sewer_target = vk::ImageView{};
+    if (BottleMotion::Run()) {
+        if (display.motion && motion_finish && display.motion.id==motion_finish.id) motion_finish={};
+        display.motion={};
+        display.motion_target=vk::ImageView{};
+    }
     if (!display_redirect) {
         display.valid = false; // not upscaled: the presenter shows the guest buffer
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        if (observed_bottle)
+            ReportBottleRedirect(*observed_bottle, BottleRedirect::Fallback, "guest-fallback", display.valid,
+                                 {}, vk::Image(display.image), display.format, scheduler.CurrentTick());
+#endif
         return false;
     }
     if (!display.image || display.format != image.info.pixel_format ||
@@ -2768,6 +5019,7 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
             .initialLayout = vk::ImageLayout::eUndefined,
         });
         display.views.clear();
+        display.sewer_generation = 0;
     }
     scheduler.EndRendering();
     const vk::ImageMemoryBarrier2 b{
@@ -2780,12 +5032,100 @@ bool TemporalUpscaler::RedirectColor(VideoCore::ImageId color,
         .image = vk::Image(display.image),
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     };
-    scheduler.Record([b](vk::CommandBuffer cmd) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    const auto post = SewerPostDisplayPending() && sewer_bridge->display_address == address ? sewer_bridge : nullptr;
+    if (post) {
+        if (!display.sewer_generation) display.sewer_generation = ++sewer_display_generation;
+        auto& physical = post->post->terminal.display;
+        const auto current = PostPhysical(display.image, display.sewer_generation);
+        if (physical.image && physical != current)
+            post->post->terminal.Barrier(SewerBridge::LocalEdge::DisplayDiscard).state.store(
+                SewerBridge::EdgeState::Repeated, std::memory_order_release);
+        if (!physical.image) physical = current;
+    }
+#endif
+    scheduler.Record([b
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                      , post
+#endif
+                      ](vk::CommandBuffer cmd) {
         cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (post) post->post->terminal.Barrier(SewerBridge::LocalEdge::DisplayDiscard).Observe(cmd, b);
+#endif
     });
     display.valid = true;
     target = {Mirror(vk::Image(display.image), display.views, view_info.format, {}),
               vk::ImageLayout::eGeneral, ui_width, ui_height};
+    if (BottleMotion::Run()) display.motion_target=target.view;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (BottlePreparedPending() && bottle_prepared->address == address && bottle_prepared->ui.Valid()) {
+        // Every original redirect of this candidate gets its own epoch, including same-image writes.
+        if (bottle_prepared->attachment) {
+            bottle_prepared->Cancel();
+            if (observed_bottle)
+                ReportBottleRedirect(*observed_bottle, BottleRedirect::Repeated, "repeated-cancelled", display.valid,
+                                     target, vk::Image(display.image), display.format, scheduler.CurrentTick());
+        } else {
+            bottle_prepared->attachment = target.view;
+            bottle_prepared->target = PostPhysical(display.image, ++bottle_display_generation);
+            display.bottle_epoch = bottle_prepared;
+            if (observed_bottle)
+                ReportBottleRedirect(*observed_bottle, BottleRedirect::Reserved, "epoch-reserved", display.valid,
+                                     target, vk::Image(display.image), display.format, scheduler.CurrentTick());
+        }
+    } else if (observed_bottle) {
+        ReportBottleRedirect(*observed_bottle, BottleRedirect::UiUnavailable, "ui-owner-unavailable", display.valid,
+                             target, vk::Image(display.image), display.format, scheduler.CurrentTick());
+    }
+#endif
+    if (SewerBridgeOpen() && sewer_bridge->display_address == address) {
+        if (!display.sewer_generation) display.sewer_generation = ++sewer_display_generation;
+        display.sewer_target = target.view;
+    }
+    return true;
+}
+
+void TemporalUpscaler::MotionIssuedDisplay(VAddr address,vk::ImageView target,
+                                           std::span<const vk::DescriptorImageInfo> inputs,bool issued) {
+    std::scoped_lock lock{display_mutex};
+    const auto got=displays.find(address);
+    if (got==displays.end()) {
+        if (motion_finish.address==address) motion_finish={};
+        return;
+    }
+    auto& display=got->second;
+    // A second draw to this attachment cannot inherit the previous accepted producer.
+    display.motion={};
+    if (!motion_finish || motion_finish.address!=address) return;
+    const auto pending=std::exchange(motion_finish,{});
+    u32 sampled=0,ui=0;
+    for (const auto& in:inputs) {
+        if (!in.imageView) continue;
+        ++sampled;
+        if (in.imageLayout==vk::ImageLayout::eGeneral &&
+            std::ranges::any_of(ui_views,[&](const auto& item){return *item.view==in.imageView;})) ++ui;
+    }
+    if (!issued || !display.valid || !display_redirect || !target || target!=display.motion_target ||
+        display.width!=3840 || display.height!=2160 || vk::Image(ui_image)!=motion_finish_ui ||
+        sampled!=1 || ui!=1 || pending.timeline!=scheduler.GetWorkSemaphore()->Handle()) {
+        std::printf("[bottle-motion-t198] event=refused id=%u why=actual-display-draw sampled=%u ui=%u\n",
+                    u32(pending.id),sampled,ui);
+        return;
+    }
+    display.motion=pending;
+    display.motion.image=vk::Image(display.image);
+    display.motion.draw_tick=scheduler.CurrentTick();
+    display.motion.draw_ns=WorkflowPresent::Now();
+    display.motion.write=++motion_display_write;
+}
+
+bool TemporalUpscaler::MotionConsume(const BottleMotion::Mark& mark) {
+    std::scoped_lock lock{display_mutex};
+    const auto found=displays.find(mark.address);
+    if (found==displays.end() || !found->second.valid ||
+        !BottleMotion::Same(mark,found->second.motion) || vk::Image(found->second.image)!=mark.image) return false;
+    found->second.motion={};
     return true;
 }
 
@@ -2816,8 +5156,20 @@ bool TemporalUpscaler::RedirectSampled(VideoCore::ImageId image,
             .image = vk::Image(ui_image),
             .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
         };
-        scheduler.Record([b](vk::CommandBuffer cmd) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        const auto post = SewerPostDisplayPending() && sewer_bridge->ui == b.image &&
+            sewer_bridge->ui_allocation == ui_image.allocation &&
+            sewer_bridge->ui_generation == sewer_ui_generation ? sewer_bridge : nullptr;
+#endif
+        scheduler.Record([b
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                          , post
+#endif
+                          ](vk::CommandBuffer cmd) {
             cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+#ifdef BB_TEST_SHARED_POST_GRAPH
+            if (post) post->post->terminal.Barrier(SewerBridge::LocalEdge::UiSample).Observe(cmd, b);
+#endif
         });
     }
     view = Mirror(vk::Image(ui_image), ui_views, info.format, info.mapping);
@@ -2829,9 +5181,43 @@ bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display, vk::Form
     std::scoped_lock lock{display_mutex};
     const auto it = displays.find(address);
     if (it == displays.end() || !it->second.valid) {
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+        if (it != displays.end() && it->second.bottle_epoch)
+            display.bottle_scope = ReportBottleOverride(*it->second.bottle_epoch, "guest-fallback", false,
+                vk::Image(it->second.image), it->second.format, scheduler.CurrentTick(), address,
+                BbStats::frame_number.load(std::memory_order_relaxed), BbEngine::Loading::Generation(),
+                scene_targets.Generation());
+#endif
+        if (SewerBridgeOpen()) sewer_bridge->Stop("ordinary-display-override-fallback");
         return false;
     }
     display = {vk::Image(it->second.image), it->second.format, it->second.width, it->second.height};
+    if (BottleMotion::Run()) display.motion=it->second.motion;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_POST_PRESENT_RESOURCES) && defined(BB_TEST_SHARED_POST_GRAPH)
+    if (const auto& bottle = it->second.bottle_epoch; bottle && bottle->target.Valid()) {
+        const bool same = PostPhysical(it->second.image, bottle->target.generation) == bottle->target;
+        display.bottle_scope = ReportBottleOverride(*bottle, same ? "override-bound" : "epoch-rebound", true,
+            display.image, display.format, scheduler.CurrentTick(), address,
+            BbStats::frame_number.load(std::memory_order_relaxed), BbEngine::Loading::Generation(),
+            scene_targets.Generation());
+        if (same && bottle->raw) display.bottle_backing_flags = it->second.image.image_ci.flags;
+        if (same)
+            BottleOfferPrepared(bottle);
+        else
+            bottle->Cancel();
+    }
+#endif
+    if (it->second.sewer_epoch) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        auto& epoch = *it->second.sewer_epoch;
+        if (epoch.trace->post && epoch.trace->post->terminal.display.Valid() &&
+            PostPhysical(it->second.image, it->second.sewer_generation) != epoch.trace->post->terminal.display) {
+            epoch.Cancel();
+            epoch.trace->Stop("shared-post-override-backing");
+        } else
+#endif
+        SewerOffer(it->second.sewer_epoch);
+    } else if (SewerBridgeOpen()) sewer_bridge->Stop("display-override-without-issued-source");
     // Diagnostic capture of the actual completed display buffer, including native UI.
     // BB_PRESENT_DUMP_COUNT=N: the trigger dumps N consecutive frames (temporal stability).
     static const char* dump = std::getenv("BB_PRESENT_DUMP_TRIGGER");
@@ -2852,6 +5238,7 @@ bool TemporalUpscaler::DisplayOverride(VAddr address, Display& display, vk::Form
         // format (R8G8B8A8, ConvertPixelFormat), which named these BGRA bytes "rgba".
         const bool bgra = view_format == vk::Format::eB8G8R8A8Unorm ||
                           view_format == vk::Format::eB8G8R8A8Srgb;
+        PointShadow::NoteColourProbeCapture(address, dump_index, true);
         DumpImages(instance, scheduler, scheduler.CommandBuffer(), dump_index++,
                    {{display.image, display.width, display.height, 4, "present",
                      bgra ? "bgra" : "rgba"}});
@@ -2877,7 +5264,8 @@ bool TemporalUpscaler::PresentDumpDue() {
     return true;
 }
 
-void TemporalUpscaler::DumpPresented(vk::Image image, u32 width, u32 height, vk::Format format) {
+void TemporalUpscaler::DumpPresented(vk::Image image, u32 width, u32 height, vk::Format format, VAddr address) {
+    PointShadow::NoteColourProbeCapture(address, present_dump_index, false);
     scheduler.EndRendering();
     const bool bgra = format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
     DumpImages(instance, scheduler, scheduler.CommandBuffer(), present_dump_index++,
@@ -2928,7 +5316,8 @@ bool TemporalUpscaler::Fsr4TooSlow(float frame_ms) {
 
 bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image color,
                                   Fsr4Upscaler::Image depth, u32 w, u32 h, u32 ow, u32 oh,
-                                  float frame_ms, bool reactive) {
+                                  float frame_ms, bool reactive,
+                                  SewerMotion::VendorCapture* sewer_observation) {
     const auto& settings = BbSettings::Get();
     // Same jitter convention as FSR 3; the menu (or toggle 1 << 26) flips it for tests.
     const float sign =
@@ -2963,7 +5352,20 @@ bool TemporalUpscaler::RecordFsr4(vk::CommandBuffer cmdbuf, Fsr4Upscaler::Image 
                                               vk::Format::eR8Unorm}
                         : Fsr4Upscaler::Image{},
     };
+    if (sewer_observation) {
+        sewer_observation->Begin(instance.GetAllocator(), frame, use_dlss, scheduler.CurrentTick(),
+                                 output_image.image_ci, settings.dlss_preset.load(std::memory_order_relaxed));
+    }
     const bool ok = use_dlss ? dlss->Record(frame) : use_xess ? xess->Record(frame) : fsr4->Record(frame);
+    if (sewer_observation) sewer_observation->Finish(frame, use_dlss && ok);
+    if (BottleMotion::Run() && BottleMotion::Scene().mark) {
+        auto& s=BottleMotion::Scene();
+        if (s.vendor_ok || !use_dlss || !ok) {
+            BottleMotion::Refuse(s,"actual-dlss-dispatch-failed-fallback-or-duplicate");
+        } else {
+            s.vendor_ok=true;
+        }
+    }
     if (ok && !vendor && Fsr4TooSlow(frame_ms)) {
         static const std::string slow =
             "too slow on this GPU (under 20 FPS for 5 s); you can select it again to retry";

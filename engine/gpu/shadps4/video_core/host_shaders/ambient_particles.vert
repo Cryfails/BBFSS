@@ -34,6 +34,8 @@ layout(std140, binding = 2) uniform Lamps {
     vec4 lamp_place[AP_MAX_LAMPS];  // world xyz (m), reach (m)
     vec4 lamp_colour[AP_MAX_LAMPS]; // rgb as the lamp pass drew it (at most 4), w: weight 0..1
     vec4 flame_seed[AP_MAX_FLAMES]; // x: seed (24 bits over 2^24), y: share of its slots burning
+    vec4 moth_info[AP_MAX_LAMPS];   // r98e_moths-at-lamps: x moths round the lamp, y seed, z loop
+                                    // scale, w calm (1: sheltered)
 };
 
 layout(push_constant) uniform Push {
@@ -162,6 +164,37 @@ bool flame_ember(int f, int slot, out vec3 world, out float life_fade, out float
     return true;
 }
 
+// bbport (r98e_moths-at-lamps): moth `k` of the lamp in block slot `lamp` now: round the lamp in a tilted
+// loop (a steady turn either way, with surges), its radius breathing, a jitter, and a lean downwind
+// (the embers' drift without its vertical part, 0 in sheltered air); `flap`: the wing beat's
+// brightness, 0.55 to 1. Everything from the lamp's seed and the moth's number.
+vec3 moth_world(int lamp, int k, out float flap) {
+    const vec4 info = moth_info[lamp];
+    const uint key = uint(info.y * 16777216.0);
+    const vec3 u = ap_unit(ap_hash(uvec3(key, uint(k), 0x2c1b3c6du)));
+    const vec3 w = ap_unit(ap_hash(uvec3(key, uint(k), 0x7f4a7c15u)));
+    const vec3 v = ap_unit(ap_hash(uvec3(key, uint(k), 0x1b873593u)));
+    const float tt = camera.w * (1.0 - AP_MOTH_CALM * info.w);
+    const float orbit = mix(AP_MOTH_ORBIT_MIN, AP_MOTH_ORBIT_MAX, u.x) * info.z;
+    const float turn = (u.y < 0.5 ? -1.0 : 1.0) * mix(AP_MOTH_TURN_MIN, AP_MOTH_TURN_MAX, u.z);
+    const float a = turn * tt + AP_MOTH_SURGE * sin(tt * 2.3 + 6.2831853 * w.x) + 6.2831853 * w.y;
+    const float r = orbit * (0.8 + 0.2 * sin(tt * 1.3 + 6.2831853 * v.x));
+    const float psi = 6.2831853 * w.z;
+    const float tilt = 3.1415927 * (0.1 + 0.8 * v.y);
+    const float st = sin(tilt), ct = cos(tilt);
+    const vec3 ex = vec3(cos(psi), 0.0, sin(psi));
+    const vec3 ey = vec3(-sin(psi) * ct, st, cos(psi) * ct);
+    vec3 offset = r * (cos(a) * ex + sin(a) * ey);
+    offset += (AP_MOTH_JITTER * (1.0 - AP_MOTH_CALM * info.w)) *
+              vec3(sin(tt * 7.3 + 6.2831853 * u.y) * sin(tt * 2.9 + 6.2831853 * u.z),
+                   sin(tt * 8.7 + 6.2831853 * v.y) * sin(tt * 3.3 + 6.2831853 * v.z),
+                   sin(tt * 6.1 + 6.2831853 * w.x) * sin(tt * 2.1 + 6.2831853 * u.x));
+    vec3 lean = vec3(lamp_wind.x, 0.0, lamp_wind.z) * AP_MOTH_LEAN;
+    lean *= min(1.0, AP_MOTH_LEAN_MAX / max(length(lean), 1e-4));
+    flap = 0.55 + 0.45 * (0.5 + 0.5 * sin(camera.w * (22.0 + 12.0 * v.z) + 6.2831853 * v.y));
+    return lamp_place[lamp].xyz + vec3(0.0, 0.05 * orbit, 0.0) + offset + lean;
+}
+
 void main() {
     const vec2 corner = CORNERS[gl_VertexIndex % 6];
     gl_Position = vec4(-4.0, -4.0, 0.0, 1.0);
@@ -180,9 +213,31 @@ void main() {
     float seed;
     bool ember;
     bool thrown = false; // an ember a flame threw (the instances after the lattice's)
+    bool moth = false;   // r98e_moths-at-lamps: a moth round a lamp (the instances after the flames')
+    int moth_lamp = 0;   // its lamp's slot in the block
+    float moth_flap = 1.0;
     vec3 place = vec3(0.5);
     vec3 phase = vec3(0.0);
-    if (gl_InstanceIndex >= AP_LATTICE) {
+    if (gl_InstanceIndex >= AP_LATTICE + AP_MAX_FLAMES * AP_FLAME_SLOTS) {
+        // bbport (r98e_moths-at-lamps): moth k of the lamp in block slot lamp; the instances
+        // are only drawn when the CPU says moths fly (else this branch is never reached).
+        const int index = gl_InstanceIndex - AP_LATTICE - AP_MAX_FLAMES * AP_FLAME_SLOTS;
+        const int lamp = index / AP_MOTH_SLOTS;
+        const int k = index % AP_MOTH_SLOTS;
+        if (lamp >= min(int(lamp_info.x), AP_MAX_LAMPS)) {
+            return;
+        }
+        const float shown = clamp(moth_info[lamp].x - float(k), 0.0, 1.0);
+        if (shown <= 0.0) {
+            return;
+        }
+        world = moth_world(lamp, k, moth_flap);
+        life_fade = shown;
+        seed = moth_info[lamp].y;
+        ember = false;
+        moth = true;
+        moth_lamp = lamp;
+    } else if (gl_InstanceIndex >= AP_LATTICE) {
         const int slot = gl_InstanceIndex - AP_LATTICE;
         if (!flame_ember(slot / AP_FLAME_SLOTS, slot % AP_FLAME_SLOTS, world, life_fade, heat,
                          seed)) {
@@ -232,10 +287,12 @@ void main() {
         return;
     }
     const vec3 rel = world - camera.xyz;
-    // An ember a flame threw is seen further (AP_SPARK_FAR0/1), heights counted as they are.
-    const float reach = thrown ? length(rel) : length(vec3(rel.x, rel.y * AP_FAR_Y, rel.z));
-    const float far0 = thrown ? AP_SPARK_FAR0 : AP_FAR0;
-    const float far1 = thrown ? AP_SPARK_FAR1 : AP_FAR1;
+    // An ember a flame threw is seen further (AP_SPARK_FAR0/1), heights counted as they are; a
+    // moth (r98e_moths-at-lamps) by AP_MOTH_FAR0/1, heights as they are.
+    const float reach = (thrown || moth) ? length(rel)
+                                         : length(vec3(rel.x, rel.y * AP_FAR_Y, rel.z));
+    const float far0 = thrown ? AP_SPARK_FAR0 : (moth ? AP_MOTH_FAR0 : AP_FAR0);
+    const float far1 = thrown ? AP_SPARK_FAR1 : (moth ? AP_MOTH_FAR1 : AP_FAR1);
     const float fade = life_fade * smoothstep(AP_NEAR0, AP_NEAR1, z) *
                        (1.0 - smoothstep(far0, far1, reach));
     if (fade <= 0.0) {
@@ -257,7 +314,7 @@ void main() {
     // Size: a mote smaller than AP_MIN_PX is drawn at that size with its light scaled down by the
     // area, so far motes get fainter instead of flickering.
     const float radius_px =
-        (thrown ? AP_SPARK_RADIUS : ember ? AP_EMBER_RADIUS : AP_MOTE_RADIUS) * look.z *
+        (thrown ? AP_SPARK_RADIUS : moth ? AP_MOTH_RADIUS : ember ? AP_EMBER_RADIUS : AP_MOTE_RADIUS) * look.z *
         abs(proj.y) * 0.5 * out_size.y / z;
     const float most = max(AP_MAX_PX_FLOOR, AP_MAX_PX_4K * out_size.y / 2160.0) * look.z;
     const float drawn = clamp(radius_px, AP_MIN_PX * look.z, most);
@@ -284,7 +341,23 @@ void main() {
     const vec3 hue = mix(vec3(luma), light, 0.7);
     vec3 colour;
     float peak;
-    if (thrown) {
+    if (moth) {
+        // bbport (r98e_moths-at-lamps): lit by its lamp (the colour as the lamp pass drew it, the
+        // curve and halo of the dust's light, the same tone curve), pale and warm, with the wing
+        // beat; a little of the picture's light around it so it does not go black in the glow.
+        const vec4 lamp = lamp_place[moth_lamp];
+        const float dist = distance(world, lamp.xyz);
+        const float x = max(1.0 - dist / lamp.w, 0.0);
+        const float halo = 1.0 / (1.0 + dist * dist * (1.0 / (AP_LAMP_HALO * AP_LAMP_HALO)));
+        const vec3 lit = lamp_colour[moth_lamp].rgb * (x * x * halo * AP_LAMP_EXPOSURE * lamp_info.z);
+        const float strongest = max(lit.r, max(lit.g, lit.b));
+        vec3 body = vec3(0.0);
+        if (strongest > 1e-6) {
+            body = pow(lit * ((1.0 - exp(-strongest)) / strongest), vec3(1.0 / 2.2));
+        }
+        colour = min((body * vec3(1.0, 0.95, 0.85) + 0.25 * hue) * moth_flap, vec3(AP_MAX_LIT));
+        peak = AP_MOTE_PEAK;
+    } else if (thrown) {
         // bbport (r98c_particles-visible): it glows by itself, orange cooling to red as it rises,
         // and flickers.
         const float flicker = 0.7 + 0.3 * sin(t * (7.0 + 6.0 * seed) + 6.2831853 * seed);

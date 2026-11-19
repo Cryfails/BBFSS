@@ -217,9 +217,21 @@ struct PostKnob {
     return PostOnce().on;
 }
 
+// bbport (r112v_lantern-hangs): BB_WIND_HANG_LANTERN (read once; default on, exactly 0 = r112s/r112t's post rule and r112u's guard): only the lantern of
+// a post stream leans (bbport_wind_lantern.h). Asked only with the post rule. The shaders carry it: LanternBinaryAdd goes into the sway binary version.
+inline constexpr std::uint32_t LanternBinaryAdd = 3000;
+
+[[nodiscard]] inline bool LanternAsked() {
+    static const bool asked = [] {
+        const char* const text = std::getenv("BB_WIND_HANG_LANTERN");
+        return PostOn() && !(text != nullptr && text[0] == '0' && text[1] == '\0');
+    }();
+    return asked;
+}
+
 /// Added to the sway shader binary version: 0 off (the shaders are as before), PostBinaryAdd with the post rule in them.
 [[nodiscard]] inline std::uint32_t PostBinaryOffset() {
-    return PostOn() ? PostBinaryAdd : 0u;
+    return PostOn() ? PostBinaryAdd + (LanternAsked() ? LanternBinaryAdd : 0u) : 0u; // bbport (r112v_lantern-hangs): 3000 more with the lantern rule
 }
 
 /// Is a position stream of `size` bytes and `stride` bytes a vertex a post's (its vertex count one the knob names)?
@@ -253,7 +265,8 @@ struct PostKnob {
         version -= ProofBinaryAdd;
     }
     // bbport (r112s_hang-bracket-move): and the post rule's add (52000 since r112t, under the proof's 200000; every other sum is under 20000)
-    return PostOn() && version >= PostBinaryAdd ? version - PostBinaryAdd : version;
+    const std::uint32_t post_add = PostBinaryAdd + (LanternAsked() ? LanternBinaryAdd : 0u); // bbport (r112v_lantern-hangs)
+    return PostOn() && version >= post_add ? version - post_add : version;
 }
 
 /// Bytes of the sway words ObjectMotion makes when the plant sway is on: r89's region, and with

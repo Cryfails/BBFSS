@@ -239,7 +239,7 @@ def validate_patch_requirements(names, game):
                              'debug menu off (debug_menu in lantern.ini)')
 
 
-DEFAULT_OFF=('effect_chromatic_aberration','effect_dof','effect_motion_blur','effect_game_aa')
+DEFAULT_OFF=('effect_chromatic_aberration','effect_motion_blur','effect_game_aa')  # DoF on: Froyok bloom needs it
 def effect_patches(settings):
     names=[]
     for key,(off,on) in EFFECTS.items():

@@ -47,7 +47,8 @@ struct Effect {
 };
 inline constexpr Effect Effects[] = {
     {"effect_chromatic_aberration", "Chromatic aberration", "Хроматическая аберрация", false},
-    {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", false},
+    // On by default: Froyok bloom builds its pyramid at DoF's recombination (vk_froyok_bloom.h).
+    {"effect_dof", "Depth of field (DoF)", "Глубина резкости (DoF)", true},
     {"effect_motion_blur", "Motion blur", "Размытие в движении", false},
     {"effect_ssao", "Ambient occlusion (SSAO)", "Затенение SSAO", true},
     {"effect_game_aa", "Game's own anti-aliasing", "Собственное сглаживание игры", false},
@@ -59,7 +60,7 @@ inline constexpr Effect Effects[] = {
     {"effect_gtao", "Ground-truth ambient occlusion (GTAO, experimental)", "Затенение GTAO (эксперимент)", true},
     {"effect_modern_ssr", "Improved reflections", "Улучшенные отражения", true},
     {"effect_pom_cavity", "Deeper parallax surfaces", "Глубокие параллакс-поверхности", true},
-    {"effect_contact_shadows", "Contact shadows", "Контактные тени", false},
+    {"effect_contact_shadows", "Bend Studio Screenspace Shadows", "Экранные тени Bend Studio", false},
     {"effect_pcss", "Soft sun shadows (PCSS)", "Мягкие тени солнца (PCSS)", false},
     {"effect_gi", "Indirect lighting (GI)", "Непрямое освещение (GI)", true},
     {"effect_volumetric_light", "Volumetric sunlight", "Объёмный солнечный свет", true},
@@ -126,12 +127,13 @@ inline constexpr float WetGroundMin = 0.0f, WetGroundMax = 1.0f, WetGroundDefaul
 inline constexpr float DofIntensityMin = 0.0f, DofIntensityMax = 3.0f;
 // bbport (r45_drawn-look): the drawn look's keys (graphics_drawn_look_*) that do not run 0..1.
 inline constexpr float DrawnLookStrengthDefault = 0.6f;
-inline constexpr float DrawnLookStrokeSizeMin = 0.6f, DrawnLookStrokeSizeMax = 1.4f;
-inline constexpr float DrawnLookTextureMax = 1.2f;
+inline constexpr float DrawnLookStrokeSizeMin = 0.6f, DrawnLookStrokeSizeMax = 1.4f,
+                       DrawnLookStrokeSizeDefault = 1.0f; // bbport (r55_drawn-look-lines)
+inline constexpr float DrawnLookTextureMax = 1.2f, DrawnLookTextureDefault = 1.0f; // (r55)
 inline constexpr float DrawnLookOutlinesDefault = 0.35f, DrawnLookCharactersDefault = 0.5f;
 inline constexpr float DrawnLookShadowSoftMin = 0.05f, DrawnLookShadowSoftMax = 0.3f,
                        DrawnLookShadowSoftDefault = 0.12f;
-inline constexpr int DrawnLookDebugMax = 4; // DrawnLookParams::ViewMax (drawn_look_params.h)
+inline constexpr float DrawnLookInkWorldDefault = 0.35f; // bbport (r55_drawn-look-lines)
 inline constexpr float LocalLightIntensityMin = 0.0f, LocalLightIntensityMax = 4.0f;
 // Source size of local lights under inverse-square falloff, as a fraction of the light radius.
 inline constexpr float LocalLightCoreMin = 0.0f, LocalLightCoreMax = 0.35f, LocalLightCoreDefault = 0.05f;
@@ -139,12 +141,33 @@ inline constexpr float LocalLightCoreMin = 0.0f, LocalLightCoreMax = 0.35f, Loca
 // exposure lift (live; 0 = off; a set BB_INTERIOR_EXPOSURE or BB_INTERIOR_EXPOSURE_MAX_EV wins). Tied to
 // BbInteriorExposure by static_asserts in vk_interior_exposure.cpp.
 inline constexpr float InteriorBrightnessMin = 0.0f, InteriorBrightnessMax = 3.0f, InteriorBrightnessDefault = 0.75f;
+// bbport (r128d_lrt-sheen-interior): the blood sheen's strength (lantern.ini key graphics_blood_sheen; 0 = off, the
+// default; read once at the game's start; a set and not empty BB_BLOOD_SHEEN wins). Tied to BloodSheenRules by
+// static_asserts in vk_blood_sheen.cpp.
+inline constexpr float BloodSheenMin = 0.0f, BloodSheenMax = 4.0f, BloodSheenDefault = 0.0f;
 // bbport (r109a_strength-settings-engine): the halation's and the lamp flicker's strengths (live;
 // a set BB_HALATION, BB_LAMP_FLICKER or BB_LAMP_FLICKER_ON_GAME wins). Tied to HalationParams and
 // LampFlicker by static_asserts in vk_halation.cpp and vk_rasterizer_effects.cpp.
 inline constexpr float HalationStrengthMin = 0.0f, HalationStrengthMax = 2.0f, HalationStrengthDefault = 1.0f;
 inline constexpr float LampFlickerStrengthMin = 0.0f, LampFlickerStrengthMax = 1.0f;
 inline constexpr float LampFlickerSteadyDefault = 1.0f, LampFlickerOnGameDefault = 0.0f;
+// bbport (r128b_lrt-caustics-water): the water caustics' strengths (live; 0 = off, the default; a set
+// BB_CAUSTICS (sun and moon) or BB_CAUSTICS_LAMPS (lamps) wins). Tied to BbCaustics::MaxStrength by a
+// static_assert in vk_caustics.cpp.
+inline constexpr float WaterCausticsStrengthMin = 0.0f, WaterCausticsStrengthMax = 4.0f,
+                       WaterCausticsStrengthDefault = 0.0f;
+// bbport (r130b_water-moves): the moving water's strength (graphics_water_motion_strength): 0 off, up to the caustics' maximum.
+inline constexpr float WaterMotionStrengthMin = 0.0f, WaterMotionStrengthMax = 4.0f, WaterMotionStrengthDefault = 0.0f;
+// bbport (r131b_lrt-settings): the ray traced foliage shadows (graphics_rt_foliage_shadows: 0 off, 1 the lamps, 2 the lamps and the sun
+// and moon; restart; a set BB_RT_CARD_ALPHA, BB_RT_CARD_LAMPS or BB_RT_CARD_SUN wins for its own part) and the blood sheen's colour
+// (graphics_blood_sheen_tint: 0 grey test, 1 red, 2 clear film; live; a set BB_BLOOD_SHEEN_TINT wins). The colour is tied to
+// BloodSheenRules by a static_assert in vk_blood_sheen.cpp.
+inline constexpr int RtFoliageOff = 0, RtFoliageLamps = 1, RtFoliageLampsSun = 2, RtFoliageDefault = 0;
+inline constexpr int BloodSheenTintMin = 0, BloodSheenTintMax = 2, BloodSheenTintDefault = 1;
+// bbport (r131a_foliage-translucency): the foliage translucency (graphics_foliage_translucency: 0 off, 1 light through leaves, 2 back-lit glow, 3 both;
+// restart; a set BB_FOLIAGE_TRANSLUCENCY, BB_FOLIAGE_LIGHT_THROUGH or BB_FOLIAGE_GLOW wins for its part). Tied to foliage_translucency.h by static_asserts
+// in vk_foliage_glow.cpp.
+inline constexpr int FoliageTranslucencyOff = 0, FoliageTranslucencyBoth = 3, FoliageTranslucencyDefault = 0;
 // bbport (r97e_heat-haze-option): the heat haze's strength (live; 0 = off, the default; a set
 // BB_HEAT_HAZE wins). Tied to BbHeatHaze by static_asserts in vk_heat_haze.cpp.
 inline constexpr float HeatHazeStrengthMin = 0.0f, HeatHazeStrengthMax = 2.0f, HeatHazeStrengthDefault = 0.0f;
@@ -392,12 +415,14 @@ struct Values {
     // renderer leaves out the game's HUD and menus, from the first UI draw onto the finished frame
     // to the display pass (Rasterizer::CleanShotEarly, UiComposition::CleanShotSkip); loading
     // screens keep theirs. The overlay then shows only what takes input (BbOverlay::Visible).
-    // Set at the start by BB_CLEAN_SHOT=1 (Load), toggled in play by camera mode's F3 or
-    // L3 + D-pad Left, ended by opening the settings menu: no ini key, never saved.
+    // Set at the start by BB_CLEAN_SHOT=1 (Load), toggled in camera mode by its H key (Triangle on a
+    // pad), ended by ending camera mode (when H set it) or by opening the settings menu: no ini key,
+    // never saved.
     std::atomic<bool> clean_shot{false};
-    // bbport (r102_camera-mode-3-4): camera mode's freeze (F8 in play, BbOverlay ToggleFreeze): the
-    // game's flip waits while it is set (lantern_video_out.cpp HoldFrozen). Runtime only: no ini
-    // key, false at every start, never saved; the settings menu and BB_CAMERA_FREEZE_S end it.
+    // bbport (r102_camera-mode-3-4): camera mode's freeze (Space in camera mode, Square on a pad,
+    // BbOverlay ToggleFreeze): the game's flip waits while it is set (lantern_video_out.cpp
+    // HoldFrozen). Runtime only: no ini key, false at every start, never saved; the key again, the
+    // end of camera mode, the settings menu and BB_CAMERA_FREEZE_S end it.
     std::atomic<bool> camera_freeze{false};
     std::atomic<bool> voice_enabled{true}, voice_push_to_talk{true}, voice_mic_muted{false};
     std::atomic<int> voice_talk_key{25};
@@ -475,35 +500,46 @@ struct Values {
     std::atomic<bool> graphics_rt_sun_half{false};               // BB_RT_SUN_HALF
     std::atomic<bool> graphics_rt_far_refit{false};              // BB_RT_REFIT_EVERY=8
     // bbport (r45_drawn-look): the drawn look, an optional hand-painted look (renderer_vulkan/
-    // vk_drawn_look.h). All live. While the switch is off or the strength is 0 nothing of it
-    // runs. The renderer reads the switch, strength, stroke_size, texture, characters and debug
-    // so far; the others are parsed, clamped and saved for the parts of the look that are not
-    // built yet (ink lines, painted shadow edges).
+    // vk_drawn_look.h). All live. While the switch is off, or the strength and ink_world are both
+    // 0, nothing of it runs. The renderer reads the switch, strength, stroke_size, texture,
+    // characters and (r55_drawn-look-lines) ink_world; outlines is handed to the ink pass, which
+    // does not read it yet; the others are parsed, clamped and saved for the parts of the look
+    // that are not built yet (painted shadow edges). The test views are BB_DRAWN_LOOK_VIEW only
+    // (r55: graphics_drawn_look_debug is no key; a line of it in the ini is kept, not read).
     std::atomic<bool> graphics_drawn_look{false};
-    std::atomic<float> graphics_drawn_look_strength{DrawnLookStrengthDefault}; // 0..1; 0: no pass
-    std::atomic<float> graphics_drawn_look_stroke_size{1.0f};  // 0.6..1.4, a factor on the strokes' size
-    std::atomic<float> graphics_drawn_look_texture{1.0f};      // 0..1.2, the brush's marks in a stroke
+    std::atomic<float> graphics_drawn_look_strength{DrawnLookStrengthDefault}; // 0..1; 0: no strokes
+    std::atomic<float> graphics_drawn_look_stroke_size{DrawnLookStrokeSizeDefault}; // 0.6..1.4, a factor on the strokes' size
+    std::atomic<float> graphics_drawn_look_texture{DrawnLookTextureDefault}; // 0..1.2, the brush's marks in a stroke
     std::atomic<float> graphics_drawn_look_outlines{DrawnLookOutlinesDefault}; // 0..1, ink on characters
     std::atomic<float> graphics_drawn_look_shadow_edges{1.0f}; // 0..1; 0: the game's shadows as they are
-    std::atomic<float> graphics_drawn_look_ink_world{0.0f};    // 0..1, ink on the world
+    std::atomic<float> graphics_drawn_look_ink_world{DrawnLookInkWorldDefault}; // 0..1, ink lines; 0: none
     std::atomic<float> graphics_drawn_look_characters{DrawnLookCharactersDefault}; // 0..1, the strength on characters
     std::atomic<float> graphics_drawn_look_shadow_soft{DrawnLookShadowSoftDefault}; // 0.05..0.3
     std::atomic<int> graphics_drawn_look_quality{1};           // 0 low, 1 high
-    // 0 the look; 1, 2, 4 the test view: every stroke in a flat colour of its own (sizes as the
-    // look mixes them, all fine, all bold); 3 is kept for the ink lines' view.
-    std::atomic<int> graphics_drawn_look_debug{0};
     // Why the drawn look cannot run, for the menu; null while it can. Set by the renderer.
     std::atomic<const char*> drawn_look_problem{nullptr};
+    // bbport (r55_drawn-look-lines): the weight of the ink lines this frame recorded
+    // (DrawnLookParams::MakeInk's strength), 0 on a frame without them. Set by the renderer, not
+    // a key; the upscaler's extra sharpening reads it (DrawnLookParams::InkSharpen).
+    std::atomic<float> drawn_look_ink_drawn{0.0f};
     // bbport (r109a_strength-settings-engine): live, the renderer reads them every frame; a set
     // BB_HALATION, BB_LAMP_FLICKER or BB_LAMP_FLICKER_ON_GAME wins over its key.
     std::atomic<float> graphics_halation_strength{HalationStrengthDefault}; // 0..2; 0: nothing drawn
     std::atomic<float> graphics_lamp_flicker_strength{LampFlickerSteadyDefault}; // 0..1, flame lamps the game keeps steady
     std::atomic<float> graphics_lamp_flicker_on_game_strength{LampFlickerOnGameDefault}; // 0..1, flame lamps the game changes; 0: left alone
+    std::atomic<float> graphics_water_caustics_sun_strength{WaterCausticsStrengthDefault};   // 0..4, bbport (r128b): sun and moon; 0: off
+    std::atomic<float> graphics_water_caustics_lamps_strength{WaterCausticsStrengthDefault}; // 0..4, bbport (r128b): lamps; 0: off
+    std::atomic<float> graphics_water_motion_strength{WaterMotionStrengthDefault}; // 0..4, bbport (r130b): moving water; 0: off
     // bbport (r97e_heat-haze-option): live; 0..2, 0 (the default): off, nothing is made or drawn
     std::atomic<float> graphics_heat_haze_strength{HeatHazeStrengthDefault};
     // bbport (r99c_interior-default): live, the renderer reads it at every frame; a set BB_INTERIOR_EXPOSURE
     // or BB_INTERIOR_EXPOSURE_MAX_EV wins over it.
     std::atomic<float> graphics_interior_brightness{InteriorBrightnessDefault}; // 0..3 stops; 0: off
+    // bbport (r128d_lrt-sheen-interior): read once, when BloodSheen::Wanted first runs; 0..4, 0 (the default): off
+    std::atomic<float> graphics_blood_sheen{BloodSheenDefault};
+    std::atomic<int> graphics_rt_foliage_shadows{RtFoliageDefault}; // 0 off, 1 lamps, 2 lamps and sun, bbport (r131b): restart
+    std::atomic<int> graphics_blood_sheen_tint{BloodSheenTintDefault}; // 0 grey test, 1 red, 2 clear film, bbport (r131b): live
+    std::atomic<int> graphics_foliage_translucency{FoliageTranslucencyDefault}; // 0 off, 1 light through leaves, 2 glow, 3 both, bbport (r131a): restart
     std::atomic<bool> engine_previous_paths{false}; // bbport (r39_master-debug): PreviousPathsMask, live
     std::atomic<bool> debug_switches[DebugSwitchCount]{}; // bbport (r39_master-debug): debug_* keys, restart
     std::atomic<int> look_choice{0};
@@ -565,6 +601,9 @@ struct Values {
     int startup_shadow_resolution = 1;
     int startup_local_shadow_resolution = 0;
     int startup_sun_far_shadows = SunFarGame; // bbport (r15_far-shadow-setting): what the hook uses
+    int startup_rt_foliage_shadows = RtFoliageDefault; // bbport (r131b_lrt-settings): what the render code uses
+    float startup_blood_sheen = BloodSheenDefault;     // bbport (r131b): for the menu's restart note
+    int startup_foliage_translucency = FoliageTranslucencyDefault; // bbport (r131a_foliage-translucency): what the render code uses
     bool startup_effects[EffectCount]{};
     int startup_model_lod = -2;
     int startup_output_res = OutputDefault;

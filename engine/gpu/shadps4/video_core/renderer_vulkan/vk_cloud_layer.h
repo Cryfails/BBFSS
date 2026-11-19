@@ -158,6 +158,7 @@ private:
     float told_speed = -1.0f, told_contrast = -1.0f; ///< bbport (r119e): the live speed and contrast said last (below 0: none yet)
     float told_cover = -1.0f, told_tint = -1.0f;     ///< bbport (r119g): the live cover and tint said last (below 0: none yet)
     std::array<float, 3> told_paint{-1.0f, -1.0f, -1.0f}; ///< bbport (r119i): the live painted fade, horizon and glow cap said last (below 0: none yet)
+    int told_soften = -1;                            ///< bbport (r119j): the live banding fix bits said last (-1: none yet)
     int told_smear = -1;                             ///< bbport (r119g): the live smear fix said last (-1: none yet)
     bool frozen = false, told_frozen = false;        ///< bbport (r119h): BB_VOLUMETRIC_CLOUDS_FREEZE now and said last
     u32 mark_told = 0, mark_skip = 0, mark_left = 0, mark_age = 0; ///< bbport (r119h): BB_VOLUMETRIC_CLOUDS_MARK said last, frames to skip / to sum, frame ends since
@@ -169,6 +170,7 @@ private:
         u32 frames = 0;     ///< frame ends
         u32 reached = 0;    ///< frames that reached the place before the upscaler
         u32 drawn = 0;      ///< frames with the passes recorded
+        u32 smoothed = 0;   ///< bbport (r119j): of them, with any banding fix bit on (BB_VOLUMETRIC_CLOUDS_SMOOTH not 0)
         u32 no_camera = 0;  ///< reached, but no camera or a menu's preview
         u32 no_scene = 0;   ///< reached, but the scene colour or depth was not usable
         u32 no_memory = 0;  ///< reached, but no room for the march image

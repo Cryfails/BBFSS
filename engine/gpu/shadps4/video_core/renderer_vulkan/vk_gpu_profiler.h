@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -57,6 +58,10 @@ public:
     void Resume(u64 key) {
         WriteTimestamp(key);
     }
+    enum class Round2Copy { Index, Frame, Count };
+    /// Reserve both marks and return the previous label to resume after the copy.
+    [[nodiscard]] std::optional<u64> BeginRound2Copy(Round2Copy copy);
+
     /// bbport r8: at the end of a submission: the GPU's time until the next submission starts
     /// (MarkSubmissionStart). Collect charges it to a row per reason of submission `next_tick`
     /// (the one that ends the gap) and whether the GPU had finished this one when it was queued.
@@ -140,6 +145,15 @@ private:
     /// submission not sent yet, during loads): not written again until they are read.
     std::array<bool, NumSlices> held{};
     u64 skipped_frames = 0;
+    static constexpr std::array<u64, size_t(Round2Copy::Count)> Round2CopyKeys{
+        0x5232494e44584350ull, 0x52324652414d4350ull,
+    };
+    static constexpr std::array<const char*, Round2CopyKeys.size()> Round2CopyNames{
+        "indexcopy", "framecopy",
+    };
+    std::array<u64, Round2CopyKeys.size()> round2_rejected_pairs{};
+    bool round2_copy_active = false;
+    u64 round2_window = 0;
     std::unordered_map<u64, std::string> described;
     struct Total {
         double ms = 0;

@@ -1,5 +1,15 @@
 # Lamp flicker and colour temperature
 
+## Development snapshot, 2026-11-19
+
+FCT 50%. Feature work is paused.
+
+- Verified scope. Steady lamps flicker. Existing game flicker remains separately controlled.
+- Open scope. Combined colour judgement remains open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 45%
 
 Flicker is built and has settings. Colour temperature by lamp kind (r123) has a model and a draft header only, and no patch script. The rating is held down by that missing half.
@@ -45,3 +55,6 @@ No fork branch yet. The branch plan names visual/lamp-flicker.
 - lamp-test-spot: the torch and the glass street lamps.
 - dark-alley: steady street lamps, the best place to see steady flicker.
 - dream-house: lamps the game flickers must stay as the game made them at on-game strength 0.
+
+
+</details>

@@ -205,20 +205,22 @@ private:
     // bbport (r94_fog-noise): BB_FOG_NOISE above 0 only (vk_volumetric_fog_noise.cpp): whether the
     // march takes the noise (after SetFogNoise; not a march the gate view draws; the NOISE builds
     // of its (gated, area) pair made at the pair's first march, a failure said once), the build it
-    // then binds, its push words after Params, the builds (index: bit 0 gated, 1 area, 2 repair),
+    // then binds, its push words after Params, the builds (index: bit 0 gated, 1 area, 2 repair,
+    // 3 dual: r94c),
     // and the state: the next Integrate's input, the drift, the pairs tried and failed, and the
     // counts of the 600-march line
-    bool FogNoiseMarch(bool viewing, bool gated, bool area);
-    bool NoisePasses(bool gated, bool area);
-    const Pass& NoisePass(bool gated, bool area, bool repairing) const;
+    bool FogNoiseMarch(bool viewing, bool gated, bool area, bool dual = false);
+    bool NoisePasses(bool gated, bool area, bool dual = false);
+    const Pass& NoisePass(bool gated, bool area, bool repairing, bool dual = false) const;
     VolumetricFogNoise::Tail FogNoiseTail() const;
-    std::array<Pass, 8> noise_passes;
+    std::array<Pass, 16> noise_passes; // bbport (r94c): 16, bit 3 the dual gate
     struct FogNoise {
         bool on = false, drifting = false;
-        std::array<bool, 4> tried{}, failed{};
+        std::array<bool, 16> tried{}, failed{}; // bbport (r94c): by pair, bit 3 dual
         std::array<float, 12> view_to_world{};
         VolumetricFogNoise::Drift drift;
         u64 marches = 0, gated = 0, area = 0, drifted = 0, even = 0, no_camera = 0;
+        u64 dual = 0; // bbport (r94c_fog-noise-dual-gate): marches with the dual gate
     } fog_noise;
 
     const Instance& instance;

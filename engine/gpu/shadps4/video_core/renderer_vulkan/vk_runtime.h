@@ -11,6 +11,9 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#include "video_core/renderer_vulkan/vk_post_image_barriers.h"
+#endif
 
 namespace VideoCore {
 class BlitHelper;
@@ -164,6 +167,12 @@ public:
     void NoteAliasedAccess(const VideoCore::Buffer* handle, u64 offset, u64 size);
 
     void FlushBarriers();
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    // Call from the existing renderer producer. Read from the ordinary terminal handoff.
+    u64 ArmPostImageBarriers(const PostImageBarriers::Key& key);
+    bool ReadPostImageBarriers(u64 window, PostImageBarriers::Report& report) const;
+    void DisarmPostImageBarriers(u64 window);
+#endif
     /// bbport (r22_barriers): a barrier of an image the texture cache does not track (a scene
     /// proxy), recorded by the next FlushBarriers in its call.
     void QueueImageBarrier(const vk::ImageMemoryBarrier2& barrier) {
@@ -192,6 +201,10 @@ private:
     StagingBufferPool staging_pool;
     BarrierTracker barrier_tracker;
     VideoCore::Image::Barriers image_barriers;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    std::shared_ptr<PostImageBarriers::Session> post_image_barriers;
+    u64 post_image_barrier_window{};
+#endif
     vk::MemoryBarrier2 memory_barrier{};
     // bbport: ranges inserted into barrier_tracker since its last Clear(); re-inserting a
     // contained range is a no-op, and draws re-bind the same ranges constantly.

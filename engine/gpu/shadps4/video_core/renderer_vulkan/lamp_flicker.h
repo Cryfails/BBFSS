@@ -62,6 +62,7 @@
 #include <vector>
 
 #include "strength_knob.h" // bbport (r109a_strength-settings-engine)
+#include "lamp_temperature.h" // bbport (r123_lamp-colour-temperature)
 
 namespace LampFlicker {
 
@@ -96,6 +97,9 @@ inline constexpr std::array<float, 3> TempK{-0.6f, 0.35f, 1.1f};
 inline constexpr std::array<double, 3> WaveHz{0.37, 1.13, 2.71};
 inline constexpr std::array<float, 3> WaveWeight{0.45f, 0.35f, 0.20f};
 static_assert(WaveWeight[0] + WaveWeight[1] + WaveWeight[2] <= 1.0f + 1e-6f);
+// bbport (r123_lamp-colour-temperature): the luminance weights of lamp_temperature.h are lampWeight's too
+static_assert(LampTemperature::Luma[0] == Luma[0] && LampTemperature::Luma[1] == Luma[1] &&
+              LampTemperature::Luma[2] == Luma[2] && LampTemperature::KindCount == 4);
 
 struct Params {
     bool on = false;
@@ -103,6 +107,7 @@ struct Params {
     float temp = 0.0f;     ///< BB_LAMP_FLICKER_TEMP, 0..1
     bool show = false;     ///< BB_LAMP_FLICKER_SHOW=1
     float on_game = 0.0f;  ///< r109a: lamps the game changes itself, 0..1; 0: left alone
+    float spread_k = LampTemperature::DefaultSpread; ///< r123: K of each lamp's own difference
     /// The swing and colour shift a pass uses.
     [[nodiscard]] float Amplitude() const {
         return Amplitude(strength);
@@ -164,6 +169,8 @@ inline Strengths Resolve(const StrengthKnob::Env& steady_env, const StrengthKnob
 namespace Detail {
 inline std::atomic<bool> on{false}; ///< Strengths::On() of the frame that runs
 inline Strengths now{};             ///< written by Update, read by FrameEnd (the frame end only)
+/// r123: BB_LAMP_TEMPERATURE's setting of the frame that runs (Update).
+inline LampTemperature::Setting temperature{};
 } // namespace Detail
 
 /// Each frame end, before anything asks On() for the next frame: that frame's strengths, from the
@@ -174,7 +181,9 @@ inline bool Update(float steady_setting, float on_game_setting) {
     static const StrengthKnob::Env on_game_env =
         StrengthKnob::ReadEnv(std::getenv("BB_LAMP_FLICKER_ON_GAME"), MaxStrength);
     Detail::now = Resolve(steady_env, on_game_env, steady_setting, on_game_setting);
-    const bool on = Detail::now.On();
+    // bbport (r123_lamp-colour-temperature): BB_LAMP_TEMPERATURE above 0 also needs the light draws looked at
+    Detail::temperature = LampTemperature::Read();
+    const bool on = Detail::now.On() || Detail::temperature.On();
     Detail::on.store(on, std::memory_order_relaxed);
     return on;
 }
@@ -268,6 +277,19 @@ public:
         }
     }
 
+    /// bbport (r123): the lamp colour temperature's setting of the frame that starts (FrameEnd, from
+    /// Update); the strength the lamps use follows it over RampSeconds (EndFrame).
+    /// `resumed`: the frame end before was off (no lamp looked at), so the strength starts again at 0.
+    void SetTemperature(const LampTemperature::Setting& setting, bool resumed = false) {
+        std::scoped_lock lock{mutex};
+        temperature_target = setting.strength;
+        params.spread_k = setting.spread;
+        temperature_show = setting.show; // bbport (r123b)
+        if (resumed) {
+            temperature_now = 0.0f;
+        }
+    }
+
     /// A light draw's `count` records (16 words each) at `in`: the records with each flickering
     /// lamp's colour scaled, or null when no word of them would change. `key`: the draw's records
     /// in guest memory, for Fog. inv_view: the camera, view to world, 12 floats in rows of four;
@@ -353,6 +375,13 @@ public:
                 continue;
             }
             ++window.states[std::size_t(lamp.state)];
+            if (lamp.kelvin > 0.0f) { // bbport (r123): the lamps tinted this frame, by kind
+                const std::size_t k = std::size_t(lamp.kind);
+                ++window.kind_lamps[k];
+                window.kind_kelvin[k] += double(lamp.kelvin);
+                window.kind_least[k] = std::min(window.kind_least[k], lamp.kelvin);
+                window.kind_most[k] = std::max(window.kind_most[k], lamp.kelvin);
+            }
             if (lamp.state == State::Flickers) {
                 window.least = std::min(window.least, lamp.factor);
                 window.most = std::max(window.most, lamp.factor);
@@ -383,9 +412,38 @@ public:
                   double(window.least <= window.most ? window.least : 1.0f),
                   double(window.least <= window.most ? window.most : 1.0f),
                   double(window.step));
+            if (temperature_target > 0.0f || temperature_now > 0.0f) {
+                // bbport (r123_lamp-colour-temperature): the lamps by kind and the kelvin they got
+                std::array<double, LampTemperature::KindCount> per_frame{}, mean{}, least{}, most{};
+                for (std::size_t k = 0; k < LampTemperature::KindCount; ++k) {
+                    const double n = double(window.kind_lamps[k]);
+                    per_frame[k] = n / f;
+                    mean[k] = n > 0.0 ? window.kind_kelvin[k] / n : 0.0;
+                    least[k] = n > 0.0 ? double(window.kind_least[k]) : 0.0;
+                    most[k] = n > 0.0 ? double(window.kind_most[k]) : 0.0;
+                }
+                print("Lamp temperature (r123): over %u frames, strength %.2f (asked %.2f), spread %.0f K; "
+                      "a frame, lamps tinted (kelvin mean, least to most): %.1f %s (%.0f K, %.0f to %.0f), "
+                      "%.1f %s (%.0f K, %.0f to %.0f), %.1f %s (%.0f K, %.0f to %.0f), %.1f %s (%.0f K, "
+                      "%.0f to %.0f); %.1f distinct records not flame-coloured (left alone), %.1f flame "
+                      "lamps not followed (left alone)\n",
+                      window.frames, double(temperature_now), double(temperature_target),
+                      double(params.spread_k), per_frame[0], LampTemperature::KindNames[0], mean[0],
+                      least[0], most[0], per_frame[1], LampTemperature::KindNames[1], mean[1], least[1],
+                      most[1], per_frame[2], LampTemperature::KindNames[2], mean[2], least[2], most[2],
+                      per_frame[3], LampTemperature::KindNames[3], mean[3], least[3], most[3],
+                      double(window.not_flame) / f, double(window.untracked) / f);
+            }
             window = {};
         }
         ++frame;
+        {   // bbport (r123): the strength the lamps use follows its target over RampSeconds
+            const float step =
+                float(std::clamp(seconds - now, 0.0, 0.1) / LampTemperature::RampSeconds);
+            temperature_now = temperature_target > temperature_now
+                                  ? std::min(temperature_target, temperature_now + step)
+                                  : std::max(temperature_target, temperature_now - step);
+        }
         now = seconds;
         frame_unique = frame_not_flame = frame_untracked = 0;
         frame_blind = false;
@@ -414,6 +472,8 @@ private:
         double seen_at = 0.0, changed_at = 0.0, born_at = 0.0;
         float amount = 0.0f;
         float game_amount = 0.0f; ///< r109a: the share of the on-game flicker
+        float kelvin = 0.0f; ///< r123: the kelvin the lamp got this frame (0: not tinted)
+        LampTemperature::Kind kind = LampTemperature::Kind::Fire; ///< r123: what it was counted as
         float factor = 1.0f;
         float away = 0.0f;
         float luma = 0.0f;
@@ -432,6 +492,11 @@ private:
         std::uint64_t unique = 0, not_flame = 0, untracked = 0;
         std::array<std::uint64_t, 3> states{};
         float least = 2.0f, most = 0.0f, step = 0.0f;
+        // bbport (r123): lamps tinted in the frames since the last line, by LampTemperature::Kind
+        std::array<std::uint64_t, LampTemperature::KindCount> kind_lamps{};
+        std::array<double, LampTemperature::KindCount> kind_kelvin{};
+        std::array<float, LampTemperature::KindCount> kind_least{1e9f, 1e9f, 1e9f, 1e9f};
+        std::array<float, LampTemperature::KindCount> kind_most{};
     };
 
     static float F(std::uint32_t word) {
@@ -548,13 +613,27 @@ private:
         lamp.reach = reach;
         lamp.away = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
         lamp.luma = Luma[0] * colour[0] + Luma[1] * colour[1] + Luma[2] * colour[2];
-        if (!(swing > 0.0f) || lamp.factor == 1.0f) {
+        // bbport (r123_lamp-colour-temperature): BB_LAMP_TEMPERATURE tints the colour by the lamp's kind
+        // before the flicker scales it; both keep the game's luminance. Off: `base` is `colour`.
+        std::array<float, 3> base = colour;
+        lamp.kelvin = 0.0f;
+        if (temperature_now > 0.0f) {
+            const LampTemperature::Tinted tint = LampTemperature::Tint(
+                colour, reach, 2.0f * Unit(Hash(lamp.seed ^ 0x7E3A1C55u)) - 1.0f, temperature_now,
+                params.spread_k, temperature_show);
+            base = tint.colour;
+            lamp.kelvin = tint.kelvin;
+            lamp.kind = tint.kind;
+        }
+        const bool flickers = swing > 0.0f && lamp.factor != 1.0f;
+        if (!flickers && !(temperature_now > 0.0f)) {
             return false;
         }
-        const auto gains = Gains(lamp.factor, params.Temp(), colour);
+        const auto gains = flickers ? Gains(lamp.factor, params.Temp(), base)
+                                    : std::array<float, 3>{1.0f, 1.0f, 1.0f};
         bool changes = false;
         for (std::size_t c = 0; c < 3; ++c) {
-            out[c] = std::bit_cast<std::uint32_t>(colour[c] * gains[c]);
+            out[c] = std::bit_cast<std::uint32_t>(base[c] * gains[c]);
             changes = changes || out[c] != record[4 + c];
         }
         return changes;
@@ -652,6 +731,9 @@ private:
     std::vector<std::uint32_t> scratch;
     const void* last_key = nullptr;
     bool too_large = false; ///< Skip::Large happened: off for the session
+    float temperature_target = 0.0f; ///< r123: the strength asked for (SetTemperature)
+    float temperature_now = 0.0f;    ///< r123: the strength the lamps use (follows the target)
+    bool temperature_show = false;   ///< r123b: BB_LAMP_TEMPERATURE_SHOW=1, the tint's test view
     bool lines_printed = false; ///< the first periodic line went out
     std::uint64_t frame = 1;
     double now = 0.0;
@@ -694,6 +776,31 @@ void FrameEnd(Print&& print) {
               p.show ? ", BB_LAMP_FLICKER_SHOW=1: exaggerated, lamps listed every 120 frames" : "",
               s.On() ? "" : "; both 0: off, nothing of it runs");
     }
+    // bbport (r123_lamp-colour-temperature): the setting's line when it is above 0, and again after a
+    // change or when it goes back to 0 (at most once every LineFrames frames)
+    static StrengthKnob::Line temperature_line;
+    static bool temperature_said = false;
+    const LampTemperature::Setting& temperature = Detail::temperature;
+    if ((temperature.On() || temperature_said) &&
+        temperature_line.Due(LineFrames, StrengthKnob::Value{temperature.strength, false},
+                             StrengthKnob::Value{temperature.spread, temperature.show})) {
+        // (r123b: from_env of the second value carries the show flag, so a change of the view prints too)
+        temperature_said = true;
+        print("Lamp temperature (r123): BB_LAMP_TEMPERATURE strength %.2f, spread %.0f K "
+              "(BB_LAMP_TEMPERATURE_SPREAD)%s: flame lamps tinted by kind (blue / red of the colour and the "
+              "reach: candles, torches and fires about %.0f K, wall lanterns between, street lamps about "
+              "%.0f K), each with its own offset within the spread, at the luminance the game made them; the "
+              "strength follows a change over %.0f s\n",
+              double(temperature.strength), double(temperature.spread),
+              temperature.On() ? "" : "; 0: off, the game's colours", double(LampTemperature::KFire),
+              double(LampTemperature::KPale), LampTemperature::RampSeconds);
+        if (temperature.show) { // bbport (r123b)
+            print("Lamp temperature (r123b): BB_LAMP_TEMPERATURE_SHOW=1: the tint is exaggerated %.0f times "
+                  "(a test view; the luminance is still the game's); the reference that changes nothing is "
+                  "%.0f K\n",
+                  double(LampTemperature::ShowScale), double(LampTemperature::KRef));
+        }
+    }
     if (!On()) {
         ran = false;
         return;
@@ -702,6 +809,7 @@ void FrameEnd(Print&& print) {
     static const Clock::time_point start = Clock::now();
     Tracker& tracker = Get();
     tracker.SetStrengths(s.steady.value, s.on_game.value, !ran);
+    tracker.SetTemperature(temperature, !ran); // bbport (r123_lamp-colour-temperature)
     ran = true;
     tracker.EndFrame(std::chrono::duration<double>(Clock::now() - start).count(), print);
 }

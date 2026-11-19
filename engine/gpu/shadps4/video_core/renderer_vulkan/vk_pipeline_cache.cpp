@@ -13,6 +13,7 @@
 #include "engine/gx_records.h"
 #include "bbport_sections.h"
 #include "common/hash.h"
+#include "common/serdes.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -31,12 +32,18 @@
 #include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r54_leaf-stage2): CardAlphaOn
 #include "shader_recompiler/native/capture.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/renderer_vulkan/foliage_translucency.h"
+#include "video_core/renderer_vulkan/vk_foliage_mask.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/cache_file.h"
 #include "video_core/renderer_vulkan/pipeline_cache_blob.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_effect_shaders.h"
+#include "video_core/renderer_vulkan/vk_reflection_fragment_discard.h"
+#include "video_core/renderer_vulkan/vk_reflection_first_hit.h"
+#include "video_core/renderer_vulkan/ivy_material_probe.h"
+#include "video_core/renderer_vulkan/vk_workflow_capture_proof.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/rt_glass.h" // bbport (r83_glass-water-stage1)
 #include "video_core/renderer_vulkan/rt_glass_probe.h" // bbport (r83b_glass-pane-probe)
@@ -46,7 +53,122 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+#include "video_core/renderer_vulkan/vk_bottle_raw_search_b177.h"
+#endif
+
 namespace Vulkan {
+
+namespace ReflectionDiscard {
+namespace {
+struct Entry {
+    Module module{};
+    bool ambiguous{};
+};
+
+struct Bank {
+    std::mutex mutex;
+    std::array<std::array<Entry, 48>, RoleCount> roles{};
+    u64 generation{};
+};
+
+std::atomic_bool replaced{};
+
+Bank& State() {
+    // The cache may be destroyed at shutdown after ordinary static destructors.
+    static auto* const bank = new Bank;
+    return *bank;
+}
+
+bool Open() {
+    return On() && !replaced.load(std::memory_order_acquire);
+}
+} // namespace
+
+void Observe(const PipelineCache* cache, u64 guest, u64 stage, size_t permutation,
+             vk::ShaderModule handle, Route route, std::span<const u32> code,
+             std::optional<bool> warm_raw_discard) {
+    const u32 role = GuestRole(guest);
+    if (role >= RoleCount || !cache || !stage || !handle || !Open()) return;
+    auto& bank = State();
+    const u64 bits = std::bit_cast<u64>(handle);
+    std::scoped_lock lock{bank.mutex};
+    if (!Open()) return;
+    for (auto& group : bank.roles) {
+        const auto same_handle = std::ranges::find_if(group, [&](const Entry& entry) {
+            return entry.module.id.cache == cache && entry.module.id.handle == bits;
+        });
+        if (same_handle != group.end()) {
+            // A real second create returned the same handle. Warm reuse never observes a create.
+            same_handle->ambiguous = true;
+            return;
+        }
+    }
+    auto& entries = bank.roles[role];
+    const auto slot = std::ranges::find_if(entries, [](const Entry& entry) {
+        return !entry.module.id.cache;
+    });
+    if (slot == entries.end()) return;
+    const auto opcodes = Scan(code);
+    slot->module = {.id = {cache, guest, stage, bits, ++bank.generation},
+                    .permutation = permutation, .bytes = code.size_bytes(),
+                    .effective_xxh3 = opcodes.valid ? XXH3_64bits(code.data(), code.size_bytes()) : 0,
+                    .opcodes = opcodes, .route = route, .warm_raw_discard = warm_raw_discard};
+}
+
+std::optional<Module> Find(const PipelineCache* cache, u64 guest, u64 stage, vk::ShaderModule handle) {
+    const u32 role = GuestRole(guest);
+    if (role >= RoleCount || !cache || !stage || !handle || !Open()) return {};
+    auto& bank = State();
+    const u64 bits = std::bit_cast<u64>(handle);
+    std::scoped_lock lock{bank.mutex};
+    if (!Open()) return {};
+    for (const auto& entry : bank.roles[role]) {
+        const auto& id = entry.module.id;
+        if (!entry.ambiguous && id.cache == cache && id.stage == stage && id.handle == bits)
+            return entry.module;
+    }
+    return {};
+}
+
+bool Revalidate(const Signature& signature) {
+    const u32 role = GuestRole(signature.guest);
+    if (role >= RoleCount || !Open()) return false;
+    auto& bank = State();
+    std::scoped_lock lock{bank.mutex};
+    return Open() && std::ranges::any_of(bank.roles[role], [&](const Entry& entry) {
+        return !entry.ambiguous && Live(signature, entry.module.id, false);
+    });
+}
+
+void Clear(const PipelineCache* cache) {
+    if (!On()) return;
+    auto& bank = State();
+    std::scoped_lock lock{bank.mutex};
+    for (auto& role : bank.roles) {
+        for (auto& entry : role) {
+            if (entry.module.id.cache == cache) entry = {};
+        }
+    }
+}
+
+void Replaced() {
+    replaced.store(true, std::memory_order_release);
+}
+
+const char* Name(Route route) {
+    switch (route) {
+    case Route::ColdOriginal: return "cold-original";
+    case Route::ColdHostPatch: return "cold-host-patch";
+    case Route::ColdUserPatch: return "cold-user-patch";
+    case Route::ColdReplacement: return "cold-replacement";
+    case Route::WarmOriginal: return "warm-original";
+    case Route::WarmHostPatch: return "warm-host-patch";
+    case Route::WarmReplacement: return "warm-replacement";
+    }
+    return "unknown";
+}
+} // namespace ReflectionDiscard
 
 namespace {
 struct CacheRegistry {
@@ -148,6 +270,8 @@ void PipelineCache::SaveNativeCache() {
 }
 
 PipelineCache::~PipelineCache() {
+    stock_fragments = {};
+    ReflectionDiscard::Clear(this);
     std::scoped_lock lock{Registry().mutex};
     std::erase(Registry().caches, this);
     Sync();
@@ -281,6 +405,11 @@ static bool SwayWanted(const PipelineSelection& sel) {
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(PipelineSelection& sel, HwStage stage,
                                                              SwStage l_stage) {
     auto& info = sel.runtime_infos[u32(l_stage)];
+    if (stage == HwStage::Fragment && sel.graphics_key.foliage_mask) {
+        // The second target pass has since pruned the key. Retain the original PS inputs.
+        info.hw.fs.foliage_mask = true;
+        return info;
+    }
     const auto& regs = (*sel.regs);
     const auto BuildCommon = [&](const auto& program) {
         info.props.num_user_data = program.settings.num_user_regs;
@@ -728,7 +857,13 @@ void PipelineCache::NoteGxRecords() {
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params,
                                                            const PreparedDraw* prepared,
-                                                           u64 gx_record) {
+                                                           u64 gx_record,
+                                                           bool request_foliage_mask) {
+    // Prepared and GX memo records have no receiver/epoch authorization.
+    if (request_foliage_mask) {
+        prepared = nullptr;
+        gx_record = 0;
+    }
     used_prepared = nullptr;
     gx_unfilled = 0;
     const bool gx_use = BbEngine::GxRecords::Used() && gx_record && gx_pipelines.contains(gx_record);
@@ -740,7 +875,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
     }
     const GraphicsPipeline* gx_expected = nullptr;
-    if (BbEngine::GxRecords::On()) {
+    if (!request_foliage_mask && BbEngine::GxRecords::On()) {
         if (!gx_record) {
             ++gx_none;
         } else if (const auto memo = gx_pipelines.find(gx_record); memo != gx_pipelines.end()) {
@@ -759,7 +894,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     gx_unfilled = 0;
     BbSections::ScopeA key_scope{BbSections::AKey};
     sel.draw_indirect_params = params;
-    if (!RefreshGraphicsKey(sel)) {
+    if (!RefreshGraphicsKey(sel, request_foliage_mask)) {
         return nullptr;
     }
     const auto remember = [&](const GraphicsPipeline* pipeline) {
@@ -789,7 +924,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         std::scoped_lock cache_lock{native_cache_mutex};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, sel.graphics_key, *pipeline_cache, sel.infos,
-            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false);
+            sel.runtime_infos, sel.fetch_shader, sel.modules, sdata, false, CaptureProof(sel), this);
 
         RegisterPipelineData(sel.graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -833,7 +968,181 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
+namespace {
+constexpr u32 BoundaryFragment = u32(Shader::SwStage::Fragment);
+
+FoliageBoundary::Prep DescribeFoliagePrep(const GraphicsPipeline& original) {
+    const auto* ps = original.GetStages()[BoundaryFragment];
+    const auto* mask = original.FoliageVariant();
+    return {.pipeline = reinterpret_cast<uintptr_t>(&original),
+            .stage = original.GetGraphicsKey().stage_hashes[BoundaryFragment],
+            .masked = mask ? mask->GetGraphicsKey().stage_hashes[BoundaryFragment] : 0,
+            .ps = ps ? ps->pgm_hash : 0};
+}
+
+struct BoundaryPreparation;
+thread_local BoundaryPreparation* active_foliage_prep{};
+
+struct BoundaryPreparation {
+    FoliageBoundary::Probe& probe;
+    FoliageBoundary::Prep prep;
+    FoliageBoundary::Compile compile{};
+    BoundaryPreparation* previous;
+
+    BoundaryPreparation(FoliageBoundary::Probe& probe_, const GraphicsPipeline& pipeline)
+        : probe{probe_}, prep{DescribeFoliagePrep(pipeline)},
+          previous{std::exchange(active_foliage_prep, this)} {}
+    ~BoundaryPreparation() {
+        active_foliage_prep = previous;
+        probe.Prepared(prep);
+    }
+};
+
+FoliageBoundary::Patch BoundaryPatch(const EffectShaders::PatchReport& r) {
+    const auto& o = r.options;
+    return {u32(r.branch), r.unified, r.standard_falloff, r.special_falloff, r.phong, r.blinn,
+            r.env, r.filtered, r.sharpness,
+            u32(o.local_ggx) | (u32(o.specular_aa) << 1) | (u32(o.env_tails) << 2) |
+                (u32(o.unify_local_light) << 3) | (u32(o.inverse_square) << 4),
+            std::bit_cast<u32>(o.sharpness), std::bit_cast<u32>(o.local_light_intensity),
+            std::bit_cast<u32>(o.local_light_core)};
+}
+
+std::vector<u8> BoundaryStageBytes(const Shader::StageSpecialization& spec) {
+    // Serialize the same already-resolved fields used by shader metadata. This never walks SRT.
+    if (spec.fetch_shader_data ||
+        spec.vs_attribs.size() + spec.buffers.size() + spec.images.size() + spec.fmasks.size() +
+            spec.samplers.size() > Shader::StageSpecialization::MaxStageResources) {
+        return {};
+    }
+    Serialization::Archive archive;
+    spec.Serialize(archive);
+    return archive.TakeOff();
+}
+} // namespace
+
+void PipelineCache::NoteFoliageNotRequested(const GraphicsPipeline& original) {
+    if (!foliage_boundary.Active() || std::popcount(original.GetGraphicsKey().mrt_mask) < 5) return;
+    auto prep = DescribeFoliagePrep(original);
+    prep.result = "not-requested-gx";
+    foliage_boundary.Prepared(prep);
+}
+
+void PipelineCache::PrepareFoliageVariant(const GraphicsPipeline& original, DrawIndirectParams params) {
+    std::optional<BoundaryPreparation> capture;
+    if (foliage_boundary.Active() && std::popcount(original.GetGraphicsKey().mrt_mask) >= 5) {
+        capture.emplace(foliage_boundary, original);
+    }
+    auto expected = original.GetGraphicsKey();
+    if (original.FoliageVariant() || std::popcount(expected.mrt_mask & 0x3fu) < 5) {
+        if (capture) capture->prep.result = original.FoliageVariant() ? "already-linked" : "low-color-mrt-count";
+        return;
+    }
+    const auto* candidate = GetGraphicsPipeline(params, nullptr, 0, true);
+    if (!candidate || !candidate->GetGraphicsKey().foliage_mask) {
+        if (capture && !capture->prep.result) {
+            capture->prep.result = candidate ? "mask-not-enabled-or-stage-not-requested" : "candidate-pipeline-missing";
+        }
+        return;
+    }
+    constexpr u32 ps = u32(SwStage::Fragment);
+    if (expected.stage_hashes[ps] != foliage_guest_fragment) {
+        if (capture) capture->prep.result = "original-stage-key-mismatch";
+        return;
+    }
+    expected.foliage_mask = true;
+    expected.stage_hashes[ps] = candidate->GetGraphicsKey().stage_hashes[ps];
+    if (expected == candidate->GetGraphicsKey()) {
+        original.SetFoliageVariant(candidate);
+        if (capture) capture->prep.result = "linked";
+    } else if (capture) {
+        capture->prep.result = "pipeline-key-mismatch";
+    }
+}
+
+bool PipelineCache::FoliageMaskAvailable() {
+    if (!foliage_mask_available) {
+        foliage_mask_available = FoliageMask::Requested() && FoliageTranslucency::Glow() &&
+                                 !EmulatorSettings.IsPatchShaders() && FoliageMask::Supported(instance);
+    }
+    return *foliage_mask_available;
+}
+
+bool PipelineCache::AddFoliageMaskStage(PipelineSelection& sel) {
+    constexpr u32 ps = u32(SwStage::Fragment);
+    constexpr u32 location = Shader::FoliageMaskOutput::Location;
+    const auto& regs = *sel.regs;
+    auto& key = sel.graphics_key;
+    const auto* frag = sel.infos[ps];
+    auto* trace = active_foliage_prep;
+    if (!frag) {
+        if (trace) trace->prep.result = "no-fragment";
+        return false;
+    }
+    const auto& fs = sel.runtime_infos[ps].hw.fs;
+    const FoliageMaskRules::Slot6 slot{
+        .has_fragment = true,
+        .guest_export = bool(frag->mrt_mask & (1u << location)),
+        .guest_store = frag->stores.GetAny(Shader::IR::Attribute::RenderTarget6),
+        .guest_shader_channels = key.cb_shader_mask.GetMask(location) != 0,
+        .host_location = bool(key.mrt_mask & (1u << location)),
+        .host_write = bool(key.write_masks[location]),
+        .host_samples = key.color_samples[location] != 0,
+        .dual_source = fs.dual_source_blending,
+    };
+    // Prepared guest targets and complete receiver semantics are checked by the ordered
+    // renderer. This gate uses only the unmodified pipeline/register facts.
+    if (!slot.Available() || frag->uses_tone_curve || frag->uses_froyok_bloom ||
+        key.logic_op != AmdGpu::ColorControl::LogicOp::Copy || fs.num_samples != 1 ||
+        key.num_samples != 1 || key.depth_samples != 1 ||
+        !regs.depth_buffer.DepthValid() || std::popcount(key.mrt_mask & 0x3fu) < 5 ||
+        regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) {
+        if (trace) {
+            trace->prep.result = "precompile-eligibility";
+            trace->prep.eligibility =
+                u32(slot.guest_export) | (u32(slot.guest_store) << 1) |
+                (u32(slot.guest_shader_channels) << 2) | (u32(slot.host_location) << 3) |
+                (u32(slot.host_write) << 4) | (u32(slot.host_samples) << 5) |
+                (u32(slot.dual_source) << 6) | (u32(frag->uses_tone_curve) << 7) |
+                (u32(frag->uses_froyok_bloom) << 8) |
+                (u32(key.logic_op != AmdGpu::ColorControl::LogicOp::Copy) << 9) |
+                (u32(fs.num_samples != 1 || key.num_samples != 1 || key.depth_samples != 1) << 10) |
+                (u32(!regs.depth_buffer.DepthValid()) << 11) |
+                (u32(std::popcount(key.mrt_mask & 0x3fu) < 5) << 12) |
+                (u32(regs.stage_enable.raw != AmdGpu::ShaderStageEnable::VgtStages::Vs) << 13);
+        }
+        return false;
+    }
+    for (u32 i = 0; i < Shader::FoliageMaskOutput::Location; ++i) {
+        if (key.color_samples[i] > 1 ||
+            (key.write_masks[i] && regs.color_buffers[i].NumSamples() != 1)) {
+            if (trace) {
+                trace->prep.result = "color-target-samples";
+                trace->prep.eligibility = i;
+            }
+            return false;
+        }
+    }
+    foliage_guest_fragment = key.stage_hashes[ps];
+    const auto guest_fragment = sel.runtime_infos[ps];
+    key.foliage_mask = true;
+    Shader::Backend::Bindings binding{}; // Fragment is the first stage in RefreshGraphicsStages.
+    const auto params = AmdGpu::GetParams(regs.ps_program);
+    const auto [info, module, fetch, hash] =
+        GetProgram(sel, HwStage::Fragment, SwStage::Fragment, params, binding);
+    if (!module) {
+        if (trace && !trace->prep.result) trace->prep.result = "masked-module-unavailable";
+        key.foliage_mask = false;
+        sel.runtime_infos[ps] = guest_fragment;
+        return false;
+    }
+    sel.infos[ps] = info;
+    sel.modules[ps] = module;
+    key.stage_hashes[ps] = hash;
+    return true;
+}
+
+bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel, bool request_foliage_mask) {
     std::memset(&sel.graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = (*sel.regs);
     auto& key = sel.graphics_key;
@@ -1075,6 +1384,14 @@ bool PipelineCache::RefreshGraphicsKey(PipelineSelection& sel) {
         }
     }
 
+    if (request_foliage_mask) {
+        if (FoliageMaskAvailable()) {
+            AddFoliageMaskStage(sel); // an unsupported draw retains the original pipeline
+        } else if (active_foliage_prep) {
+            active_foliage_prep->prep.result =
+                EmulatorSettings.IsPatchShaders() ? "user-patches-enabled" : "mask-unavailable";
+        }
+    }
     return true;
 }
 
@@ -1211,19 +1528,116 @@ bool PipelineCache::RefreshComputeKey() {
     return true;
 }
 
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+bool PipelineCache::BottleDisplayEvidenceEnabled() const {
+    static const bool armed = [] {
+        const auto* text = std::getenv("BB_BOTTLE_RAW_SEARCH");
+        return text && BottleRawSearch177::Parse(text, BottleCaustic::CutSource::Run()).has_value();
+    }();
+    return armed && CaptureProofUnchanged();
+}
+
+void PipelineCache::RecordBottleDisplayModule(const Shader::Info& info, u64 permutation, vk::ShaderModule module,
+                                              std::span<const u32> code, const char* route) {
+    using namespace BottleDisplay182;
+    if (!((info.pgm_hash == Vertex && info.sw_stage == SwStage::Vertex) ||
+          (info.pgm_hash == Fragment && info.sw_stage == SwStage::Fragment)) ||
+        !BottleDisplayEvidenceEnabled()) return;
+    const auto actual = Effective(module, info.pgm_hash, permutation, code, route);
+    if (!actual) return;
+    if (!bottle_display_modules) bottle_display_modules = std::make_unique<Modules>();
+    bottle_display_modules->Remember(actual);
+}
+
+BottleDisplay182::Module PipelineCache::FindBottleDisplayModule(
+    vk::ShaderModule handle, u64 guest, u64 permutation) const {
+    return bottle_display_modules && CaptureProofUnchanged()
+        ? bottle_display_modules->Find(handle, guest, permutation) : BottleDisplay182::Module{};
+}
+
+#endif
+
+void PipelineCache::RecordStockFragment(const ReflectionDiscard::StockFragment& role,
+                                        const Shader::Info& info, bool mask, vk::ShaderModule module,
+                                        ReflectionDiscard::Route route, std::span<const u32> code) {
+    using namespace ReflectionDiscard;
+    if (mask || info.hw_stage != HwStage::Fragment || info.sw_stage != SwStage::Fragment ||
+        !module || !CaptureProofUnchanged() || !ReflectionFirstHit::On() ||
+        !ReflectionFirstHit::PlacedOn()) {
+        return;
+    }
+    // Only creation writes this slot. A second creation poisons this role even if
+    // its first handle is reused.
+    auto& record = stock_fragments[StockFragmentIndex(role.role)];
+    if (record.module) {
+        record.poisoned = true;
+        return;
+    }
+    const auto opcodes = Scan(code);
+    const bool hash_clear_candidate = opcodes.valid && !opcodes.kill && !opcodes.terminate &&
+        !opcodes.demote && StockHostPatch(route) && code.size_bytes() == role.effective_bytes;
+    const u64 digest = hash_clear_candidate ? XXH3_64bits(code.data(), code.size_bytes()) : 0;
+    record = {module, role.fragment_stage, Classify(role, opcodes, route, code.size_bytes(), digest)};
+}
+
+ReflectionDiscard::Verdict PipelineCache::ResolveStockFragment(
+    const ReflectionDiscard::StockFragment& role, vk::ShaderModule fragment) const {
+    using namespace ReflectionDiscard;
+    const auto& record = stock_fragments[StockFragmentIndex(role.role)];
+    return fragment && record.stage == role.fragment_stage && record.module == fragment &&
+        StockFragmentUsable(role.role, record.verdict) ? record.verdict : Verdict::Unknown;
+}
+
+bool PipelineCache::StockFragmentUsable(ReflectionDiscard::StockRole role,
+                                        ReflectionDiscard::Verdict verdict) const {
+    using namespace ReflectionDiscard;
+    if (role == StockRole::None || verdict == Verdict::Unknown || !CaptureProofUnchanged()) {
+        return false;
+    }
+    const auto& record = stock_fragments[StockFragmentIndex(role)];
+    return !record.poisoned && record.module && record.verdict == verdict;
+}
+
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
-    LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
-             perm_idx != 0 ? "(permutation)" : "");
-    DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    const bool mask = info.hw_stage == HwStage::Fragment && runtime_info.hw.fs.foliage_mask;
+    const auto cache_hash = GraphicsProgramHash(info.pgm_hash, mask);
+    LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}{}", info.hw_stage, info.pgm_hash,
+             perm_idx != 0 ? "(permutation)" : "", mask ? " (foliage mask)" : "");
+    DumpShader(code, cache_hash, info.hw_stage, perm_idx, "bin");
     CompileTimer timer;
 
     const auto runtime_before = runtime_info; // the compile changes it (clip distance emulation)
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
-    Shader::Native::Capture(info, runtime_before, code, profile);
-    Shader::Native::StoreState(info, runtime_before, code, perm_idx);
+    if (!mask) {
+        Shader::Native::Capture(info, runtime_before, code, profile);
+        Shader::Native::StoreState(info, runtime_before, code, perm_idx);
+    }
+    auto* trace = mask && active_foliage_prep ? &active_foliage_prep->compile : nullptr;
+    if (trace) {
+        const auto digest = [](std::span<const u32> words) {
+            const auto bytes = std::span(reinterpret_cast<const u8*>(words.data()), words.size_bytes());
+            return FoliageBoundary::Probe::Digest(bytes);
+        };
+        trace->code_words = u32(code.size());
+        trace->userdata_words = u32(info.user_data.size());
+        trace->flattened_words = u32(info.flattened_ud_buf.size());
+        // Read only this existing compile's inputs. Decline hashes beyond the diagnostic bound.
+        constexpr size_t WordsCap = 64 * 1024;
+        if (code.size() <= WordsCap) trace->code = digest(code);
+        trace->userdata = digest(info.user_data);
+        if (info.flattened_ud_buf.size() <= WordsCap) trace->flattened = digest(info.flattened_ud_buf);
+    }
     const auto binding_before = binding;
+    if (mask && (info.uses_tone_curve || info.uses_froyok_bloom ||
+                 !EffectShaders::Replacement(info, profile, binding_before).empty())) {
+        if (trace) {
+            trace->reason = info.uses_tone_curve ? "tone-curve" :
+                            info.uses_froyok_bloom ? "bloom" : "replacement";
+        }
+        return {};
+    }
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     // bbport (r54_leaf-stage2, r62c_leaf-stage3-fix): a capture vertex shader with the card UVs
     // (CaptureUv, BB_RT_CARD_ALPHA on, a pixel shader that discards) is the lifter's too: its
@@ -1255,30 +1669,117 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     if ((BbWindTwigs::ProofOn() || BbWindHang::KnobOnce().on) && info.hw_stage == HwStage::Vertex) { // bbport (r89l_twigs-palette-move, TOOL)
         BbWindTwigs::NoteShaderPath(info.pgm_hash, bbport_lifted);
     }
-    DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
+    DumpShader(spv, cache_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
 
-    auto patch = GetShaderPatch(info.pgm_hash, info.hw_stage, perm_idx, "spv");
+    std::optional<std::vector<u32>> masked_effect_patch;
+    // Check host fragment modifiers against the unextended program. Checksum-based
+    // modifiers might otherwise silently miss the mask variant and alter color/coverage.
+    if (mask) {
+        if (trace) trace->masked_lifted = bbport_lifted;
+        auto guest_runtime = runtime_info;
+        guest_runtime.hw.fs.foliage_mask = false;
+        auto guest_binding = binding_before;
+        auto guest_spv = Shader::Backend::SPIRV::EmitSPIRV(profile, guest_runtime, ir_program, guest_binding);
+        if (Lifter::GetMode() != Lifter::Mode::Off && !EffectShaders::KeepRecompiled(info)) {
+            auto original = Lifter::Lift(Lifter::MakeInput(info, guest_runtime, profile, binding_before, code));
+            const bool original_lifted = original.ok() && original.uses_tone_curve == info.uses_tone_curve;
+            if (trace) trace->original_lifted = original_lifted;
+            if (original_lifted != bbport_lifted) {
+                if (trace) trace->reason = "emitter-mismatch";
+                return {};
+            }
+            if (original_lifted) {
+                guest_spv = std::move(original.spirv);
+            }
+        }
+        if (info.pgm_hash == EffectShaders::FoliageComposedHash) {
+            EffectShaders::PatchReport original_report, masked_report;
+            const auto original_patch = EffectShaders::Patched(info, guest_spv, &original_report);
+            masked_effect_patch = EffectShaders::Patched(info, spv, &masked_report);
+            if (trace) {
+                trace->original_report = trace->masked_report = true;
+                trace->original_patch = BoundaryPatch(original_report);
+                trace->masked_patch = BoundaryPatch(masked_report);
+            }
+            if ((original_patch || masked_effect_patch) &&
+                (!original_patch || !masked_effect_patch ||
+                 !EffectShaders::CanComposeFoliagePatch(original_report, masked_report))) {
+                if (trace) trace->reason = "host-patch-report-mismatch";
+                return {};
+            }
+        } else {
+            EffectShaders::PatchReport report;
+            const auto patch = EffectShaders::Patched(info, guest_spv, trace ? &report : nullptr);
+            if (trace) {
+                trace->original_report = true;
+                trace->original_patch = BoundaryPatch(report);
+            }
+            if (patch) {
+                if (trace) trace->reason = "host-patch-veto";
+                return {};
+            }
+        }
+    }
+    auto patch = mask ? std::nullopt : GetShaderPatch(info.pgm_hash, info.hw_stage, perm_idx, "spv");
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
-    const auto effect_shader = EffectShaders::Replacement(info, profile, binding_before);
-    const auto effect_patch = effect_shader.empty() ? EffectShaders::Patched(info, spv) : std::nullopt;
+    const auto effect_shader = mask ? std::span<const u32>{}
+                                    : EffectShaders::Replacement(info, profile, binding_before);
+    const auto effect_patch =
+        !mask && effect_shader.empty() ? EffectShaders::Patched(info, spv) : std::nullopt;
+    const bool note_discard = !mask && info.hw_stage == HwStage::Fragment &&
+        info.sw_stage == SwStage::Fragment && ReflectionDiscard::GuestRole(info.pgm_hash) <
+            ReflectionDiscard::RoleCount && ReflectionDiscard::On() && CaptureProofUnchanged();
+    using DiscardRoute = ReflectionDiscard::Route;
+    const auto compile_effective = [&](std::span<const u32> code, const char* route,
+                                       DiscardRoute discard_route) {
+        const auto shader = CompileSPV(code, instance.GetDevice());
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+        if (!mask) RecordBottleDisplayModule(info, HashCombine(cache_hash, perm_idx), shader, code, route);
+#endif
+        if (const auto* role = ReflectionDiscard::StockFragmentForCreation(
+                info.pgm_hash, HashCombine(cache_hash, perm_idx), perm_idx)) {
+            RecordStockFragment(*role, info, mask, shader, discard_route, code);
+        }
+        if (note_discard) {
+            ReflectionDiscard::Observe(this, info.pgm_hash, HashCombine(cache_hash, perm_idx), perm_idx,
+                                       shader, discard_route, code);
+        }
+        if (!mask && info.sw_stage == SwStage::Fragment &&
+            info.pgm_hash == IvyMaterialProbe::Fragment && IvyMaterialProbe::Wanted()) {
+            IvyMaterialProbe::Modules().Remember(
+                HashCombine(cache_hash, perm_idx), std::bit_cast<u64>(shader), route,
+                bbport_lifted ? "lifter" : "recompiler", IvyMaterialProbe::Words(spv),
+                IvyMaterialProbe::Words(code), IvyMaterialProbe::ObjectBytes(profile),
+                IvyMaterialProbe::ObjectBytes(runtime_before));
+        }
+        return shader;
+    };
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
-        module = CompileSPV(*patch, instance.GetDevice());
+        module = compile_effective(*patch, "cold-user-patch", DiscardRoute::ColdUserPatch);
     } else if (!effect_shader.empty()) {
-        module = CompileSPV(effect_shader, instance.GetDevice());
+        module = compile_effective(effect_shader, "cold-replacement", DiscardRoute::ColdReplacement);
+    } else if (masked_effect_patch) {
+        module = CompileSPV(*masked_effect_patch, instance.GetDevice());
     } else if (effect_patch) {
         CaptureSpecularModule(info.pgm_hash, perm_idx, *effect_patch);
-        module = CompileSPV(*effect_patch, instance.GetDevice());
+        module = compile_effective(*effect_patch, "cold-host-patch", DiscardRoute::ColdHostPatch);
     } else {
         CaptureSpecularModule(info.pgm_hash, perm_idx, spv);
-        module = CompileSPV(spv, instance.GetDevice());
+        module = compile_effective(spv, "cold-original", DiscardRoute::ColdOriginal);
+        if (info.hw_stage == HwStage::Vertex && info.sw_stage == SwStage::Vertex &&
+            (runtime_before.hw.vs.motion_vectors & Shader::MotionVectors::VertexCapture)) {
+            ObserveCaptureModule(module, info, runtime_before.hw.vs.motion_vectors,
+                                 HashCombine(cache_hash, perm_idx), spv, bbport_lifted, false);
+        }
     }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    if (trace) trace->reason = module ? "module-created" : "module-unavailable";
+    RegisterShaderBinary(std::move(spv), cache_hash, perm_idx);
 
-    const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
+    const auto name = GetShaderName(info.hw_stage, cache_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
     if (EmulatorSettings.IsShaderCollect()) {
         DebugState.CollectShader(name, info.sw_stage, module, spv, code,
@@ -1292,6 +1793,14 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
     auto runtime_info = BuildRuntimeInfo(sel, hw_stage, sw_stage);
+    const bool mask = hw_stage == HwStage::Fragment && runtime_info.hw.fs.foliage_mask;
+    const auto cache_hash = GraphicsProgramHash(params.hash, mask);
+    const auto walker_faults = mask ? Shader::Info::srt_walk_faults : 0;
+    // An empty module for a known masked specialization records a deliberate refusal.
+    // A fault during an SRT read may be transient, so never remember that outcome.
+    const auto can_remember_refusal = [&] {
+        return mask && Shader::Info::srt_walk_faults == walker_faults;
+    };
     if (sel.worker) {
         // bbport: draw-preparation worker: look up only, with the worker's own Info copy.
         auto& worker = *sel.worker;
@@ -1338,22 +1847,52 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                                HashCombine(params.hash, perm_idx));
     }
 
-    auto it_pgm = program_cache.find(params.hash); // this thread is the only writer
+    const auto observe = [&](const Shader::StageSpecialization& spec, u64 stage, const char* result,
+                             bool compiled, bool cached_refusal = false) {
+        if (!foliage_boundary.Active() || sw_stage != SwStage::Fragment ||
+            (!mask && !active_foliage_prep && std::popcount(sel.graphics_key.mrt_mask) < 5)) {
+            return;
+        }
+        const FoliageBoundary::Compile* compile = nullptr;
+        if (mask && active_foliage_prep) {
+            auto& trace = *active_foliage_prep;
+            trace.prep.masked = stage;
+            trace.prep.result = result;
+            if (compiled) {
+                trace.compile.stage = stage;
+                compile = &trace.compile;
+            }
+        }
+        foliage_boundary.Specialization(stage, params.hash, mask, result, compile, cached_refusal,
+                                       [&] { return BoundaryStageBytes(spec); });
+    };
+
+    auto it_pgm = program_cache.find(cache_hash); // this thread is the only writer
     if (it_pgm == program_cache.end()) {
         auto new_program = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto start = binding;
         const auto module =
             CompileModule(new_program->info, runtime_info, params.code, 0, binding);
         auto spec = Shader::StageSpecialization(new_program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(cache_hash, 0);
+        if (!module && !can_remember_refusal()) {
+            observe(spec, perm_hash, "compile-not-cached-srt-or-module-fault", true);
+            return {};
+        }
+        observe(spec, perm_hash, module ? "compiled" : "compiled-refusal", true);
 
-        RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
+        if (module) {
+            RegisterShaderMeta(new_program->info, spec.fetch_shader_data, spec, perm_hash, 0);
+        }
         new_program->AddPermut(module, std::move(spec));
         new_program->info_template = std::make_unique<Shader::Info>(new_program->info);
         Program* program = new_program.get();
         {
             std::unique_lock lk{programs_mutex};
-            program_cache.emplace(params.hash, std::move(new_program));
+            program_cache.emplace(cache_hash, std::move(new_program));
+        }
+        if (!module) {
+            return {};
         }
         return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
                                perm_hash);
@@ -1369,11 +1908,11 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
-    if (Shader::Native::CaptureEnabled()) Shader::Native::Capture(info, runtime_info, params.code, profile);
+    if (!mask && Shader::Native::CaptureEnabled()) Shader::Native::Capture(info, runtime_info, params.code, profile);
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
     size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
+    u64 perm_hash = HashCombine(cache_hash, perm_idx);
 
     vk::ShaderModule module{};
 
@@ -1384,20 +1923,37 @@ PipelineCache::Result PipelineCache::GetProgram(PipelineSelection& sel, HwStage 
                   : std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it != program->modules.end()) {
         program->last_used = std::distance(program->modules.begin(), it);
-        if (!std::atomic_ref<bool>(it->state_stored).load(std::memory_order_relaxed) && Shader::Native::StatesEnabled()) { Shader::Native::StoreState(info, runtime_info, params.code, program->last_used); std::atomic_ref<bool>(it->state_stored).store(true, std::memory_order_relaxed); }
+        const auto loaded_hash = HashCombine(cache_hash, program->last_used);
+        if (!it->module) {
+            observe(it->spec, loaded_hash, "cached-refusal", false, true);
+            return {};
+        }
+        observe(it->spec, loaded_hash, "cached-module", false);
+        if (!mask && !std::atomic_ref<bool>(it->state_stored).load(std::memory_order_relaxed) && Shader::Native::StatesEnabled()) { Shader::Native::StoreState(info, runtime_info, params.code, program->last_used); std::atomic_ref<bool>(it->state_stored).store(true, std::memory_order_relaxed); }
     }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        if (!module && !can_remember_refusal()) {
+            observe(spec, perm_hash, "compile-not-cached-srt-or-module-fault", true);
+            return {};
+        }
+        observe(spec, perm_hash, module ? "compiled" : "compiled-refusal", true);
 
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        if (module) {
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        }
         std::unique_lock lk{programs_mutex};
         program->AddPermut(module, std::move(spec));
+        if (!module) {
+            program->last_used = perm_idx;
+            return {};
+        }
     } else {
         info.AddBindings(binding);
         module = it->module;
         perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+        perm_hash = HashCombine(cache_hash, perm_idx);
     }
     return std::make_tuple(&program->info, module,
                            program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
@@ -1410,6 +1966,21 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         for (auto& m : program->modules) {
             if (m.module == module) {
                 const auto& d = instance.GetDevice();
+                // The replacement may be a vertex or a fragment module. Until a later process
+                // reestablishes exact shader ownership, allow no active capture certificate.
+                workflow_capture_replacement_unknown.store(true, std::memory_order_release);
+                const bool trace_discard = ReflectionDiscard::On();
+                if (trace_discard) ReflectionDiscard::Replaced();
+                const bool stock_fragments_live = std::ranges::any_of(
+                    stock_fragments, [](const auto& record) { return bool(record.module); });
+                if (trace_discard || stock_fragments_live) {
+                    for (const auto& [_, pipeline] : graphics_pipelines) {
+                        if (!pipeline) continue;
+                        // Warm pipelines need not appear in module_related_pipelines.
+                        if (stock_fragments_live) pipeline->WaitForStockFragmentCreation();
+                        if (trace_discard) pipeline->WaitForReflectionDiscardCreation(this, module);
+                    }
+                }
                 d.destroyShaderModule(m.module);
                 m.module = CompileSPV(spv_code, d);
                 new_module = m.module;
@@ -1429,6 +2000,15 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
         }
     }
     return new_module;
+}
+
+PipelineCache::CaptureRoute PipelineCache::CaptureProof(const PipelineSelection& selection) const {
+    using WorkflowCapture::Route;
+    if (!CaptureProofUnchanged() || workflow_capture_modules.empty()) return Route::Unknown;
+    const auto found = workflow_capture_modules.find(selection.modules[u32(SwStage::Vertex)]);
+    if (found == workflow_capture_modules.end() || found->second.mode != selection.graphics_key.motion_vectors)
+        return Route::Unknown;
+    return found->second.route;
 }
 
 std::string PipelineCache::GetShaderName(Shader::HwStage stage, u64 hash,

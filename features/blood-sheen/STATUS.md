@@ -1,5 +1,15 @@
 # Blood sheen: wet film on blood pools
 
+## Development snapshot, 2026-11-19
+
+LRT T07. Feature work is paused.
+
+- Verified scope. The sampled graveyard pool and dry-room control passed.
+- Open scope. The boot/rim fix still needs the actual held-pass and original snapshot/restore join.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 60%. Rated by the weakest part: only the graveyard pool is covered, and the bright blotch fix is not built. Waits for the owner verdict.
 
 ## What works
@@ -41,3 +51,6 @@ None are on a fork branch yet; the notes plan visual/blood-sheen.
 ## Test places
 - Graveyard standing on the blood pool (save graveyard-blood): look at the pool by the hunter's feet, at strength 1 and 2, also off.
 - Dream house: must do nothing.
+
+
+</details>

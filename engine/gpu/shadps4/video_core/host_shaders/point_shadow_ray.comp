@@ -3,6 +3,9 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_ray_query : require
+#if defined(GLASS) || defined(T191)
+#extension GL_GOOGLE_include_directive : require
+#endif
 #ifdef CARDS
 // bbport (r63_leaf-stage4): BB_RT_CARD_LAMPS=1 (with BB_RT_CARD_ALPHA=2) only: the builds made with
 // CARDS (point_shadow_ray_cards_comp and its half, centred and half centred forms; the builds
@@ -16,6 +19,15 @@
 #define CARD_BINDING_POOL 1
 #define CARD_BINDING_LAYER_INFO 2
 #define CARD_BINDING_ALPHA 3
+#ifdef FOLIAGE
+// bbport (r131a_foliage-translucency) FEATURE: the FOLIAGE builds (CARDS=1 COLOUR=1 FOLIAGE=1, made only with the light through leaves on for the
+// lamps; the builds without it are the pass as before, word for word). A kept leaf texel passes a share of the lamp's light (cardTraceShadow with
+// CARD_TRANSMIT, rt_cards.glsl) and the lamp's colour takes the leaf's hue: lampVisibility returns the luma of what got through and ray_hue, the hue,
+// as r130c's glass does (the same colour sums). The colour layers are binding 5 of set 1. Specialization constants 16 to 19: T, the hue mix, the
+// floor, and whether the lamps keep their own hue as well (BB_LAMP_SHADOW_COLOUR=1).
+#define CARD_TRANSMIT
+#define CARD_BINDING_COLOUR 5
+#endif
 #define CARD_TRACE_SHADOW
 #include "rt_cards.glsl"
 layout(set = 1, binding = 4, std430) buffer CardLampCounts {
@@ -86,6 +98,15 @@ bool card_split_off = false;
 // ratio), a pass that is not split adds 4 to the ratio it stores in half_answers. 0: no mark (r62n); 1: the three other pixels of a marked block trace their
 // own rays; 2: also those of the blocks beside a marked one; 3: measure only (marks made and counted, every block shares as before).
 layout(constant_id = 15) const uint CARD_BLOCKS = 0u;
+#ifdef FOLIAGE
+layout(constant_id = 16) const float FOLIAGE_PASS = 0.25;
+layout(constant_id = 17) const float FOLIAGE_TINT = 1.0;
+layout(constant_id = 18) const float FOLIAGE_FLOOR = 0.02;
+layout(constant_id = 19) const uint FOLIAGE_HUE = 0u;
+vec3 ray_trans = vec3(1.0); // the product of the leaves the last ray passed (1: none, or the ray was not cast)
+const uint FOLIAGE_FLAG_ON = 256u; // word 16 of a pass's data, bit 8 (foliage_translucency.h LampFlagOn): the light through leaves is on (live knob)
+bool t_fol_on = true;
+#endif
 bool cardMet() {
     return (card_what & 15u) != 0u; // bits 0-3: a ray tested cards (free, opaque, kept, cap); bit 4 (cards without data) does not mark
 }
@@ -94,7 +115,14 @@ bool card_blocks_split = false; // set by main: this dispatch is the trace of a 
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
+#if defined(T131E) || defined(T191)
+layout(scalar, set = 0, binding = 0) buffer Data { uint d[]; } data;
+#else
 layout(scalar, set = 0, binding = 0) readonly buffer Data { uint d[]; } data;
+#endif
+#ifdef T191
+#include "lamp_actual_blocker_layout.h"
+#endif
 layout(set = 0, binding = 1) uniform sampler2D depth_tex;
 layout(set = 0, binding = 2, r11f_g11f_b10f) uniform image2D cur0;
 // snap0, snap1: the light targets as they were before the lamps were drawn; with MODE_APART the
@@ -212,6 +240,15 @@ const float LAMP_CLEARANCE = 0.18; // bbport (r90_lamp-clearance-default): 0.35 
 const uint MAX_GROUP_TILES = 256u;
 
 shared mat4 shared_inverse;
+// bbport (r128a_lrt-moving-shadows): BB_LAMP_SHADOW_JITTER=1 (lamp_jitter.h): HISTORY_JITTER, set in the history block's word 0
+// by vk_point_shadow.cpp only on a pass that averages, says words 34 to 37 hold this frame's jitter and the last frame's
+// (render pixels, x right, y down: Rasterizer's viewport shift, TemporalUpscaler::Jitter). The scene depth was rasterised
+// through that shifted viewport, so the point a depth texel holds lies at uv - jit_uv, not at the pixel's centre (as in
+// camera_motion.comp); a history texel holds the sample that lay at its centre - the last frame's jitter, so a reprojected
+// place is looked up at + jit_prev_px. Both stay 0 without the flag: `uv - 0` and `+ 0` are exact.
+const uint HISTORY_JITTER = 32u;
+vec2 jit_uv = vec2(0.0);
+vec2 jit_prev_px = vec2(0.0);
 shared uint group_tiles[MAX_GROUP_TILES];
 shared uint group_count;
 
@@ -321,13 +358,128 @@ float vsum_top = -1.0;       // the pick: the strongest lamp's part of vsum (bel
 vec3 colour_rc = vec3(1.0);  // the pixel's ratio in each channel (this frame's, then averaged)
 vec3 colour_tap = vec3(0.0); // the colour history at the taps of the last look-up
 vec3 colour_a = vec3(0.0), colour_f = vec3(0.0), colour_held = vec3(0.0);
+#ifdef GLASS
+// bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT=1 only (the GLASS builds: COLOUR=1 GLASS=1, four tracing forms of the COLOUR
+// builds; every other build is as before, byte for byte). A lamp ray that is free of solid geometry asks one more query for the
+// glass records on its way (instance mask 0x10, NoOpaque: every candidate is looked at, none is confirmed): each registry entry
+// it meets (instanceCustomIndex with GLASS_INDEX_BIT) multiplies the product by its tint word once, at most GLASS_RAY_CAP
+// candidates. lampVisibility then returns the luma of the product as the visibility (dimming in the grey ratio and in every
+// guard) and ray_hue = product / luma rides in the colour sums (top_hue, sec_hue for the picked lamps), so colourScale keeps the
+// grey luma and gives the tint's hue. g_glass: the pass's scene holds glass records (word 16 bit 0, written after the 16 tuning
+// words); g_hue: the lamps keep their own hue (BB_LAMP_SHADOW_COLOUR=1; clear: colourOf is 1). Weaker "rest" lamps stay grey.
+#include "glass_light_layout.h"
+bool g_glass = false, g_hue = false, g_cast = false;
+uint g_words = 0u;
+vec3 ray_hue = vec3(1.0), top_hue = vec3(1.0), sec_hue = vec3(1.0);
+vec3 g_org = vec3(0.0), g_dir = vec3(0.0, 0.0, 1.0);
+float g_tmin = 0.0, g_tmax = 0.0;
+
+vec3 glassCross(vec3 o, float tmin, vec3 dir, float tmax) {
+    vec3 product = vec3(1.0);
+    uint seen_lo = 0u, seen_hi = 0u, looked = 0u;
+    rayQueryEXT glass;
+    rayQueryInitializeEXT(glass, scene, gl_RayFlagsNoOpaqueEXT, GLASS_LIGHT_MASK, o, max(tmin, float(GLASS_LIGHT_TMIN)), dir, tmax);
+    while (rayQueryProceedEXT(glass)) {
+        if (rayQueryGetIntersectionTypeEXT(glass, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+            continue;
+        }
+        const uint index = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(glass, false));
+        if ((index & GLASS_INDEX_BIT) != 0u) {
+            const uint entry = index & GLASS_ENTRY_MASK;
+            const uint bit = 1u << (entry & 31u);
+            const bool seen = ((entry < 32u ? seen_lo : seen_hi) & bit) != 0u;
+            if (!seen) {
+                seen_lo |= entry < 32u ? bit : 0u;
+                seen_hi |= entry < 32u ? 0u : bit;
+                const uint w = data.d[g_words + entry];
+                product *= vec3(float(w & 255u), float((w >> 8u) & 255u), float((w >> 16u) & 255u)) * (1.0 / 255.0);
+            }
+        }
+        if (++looked >= GLASS_RAY_CAP) {
+            rayQueryTerminateEXT(glass);
+        }
+    }
+    return product;
+}
+#define GLASS_HUE(h) * h
+#elif defined(FOLIAGE)
+// bbport (r131a_foliage-translucency): the hue of what a lamp's ray let through, for the colour sums (as r130c's glass: top_hue and sec_hue are the
+// picked lamps'; the weaker lamps stay grey)
+vec3 ray_hue = vec3(1.0), top_hue = vec3(1.0), sec_hue = vec3(1.0);
+#define GLASS_HUE(h) * h
+#else
+#define GLASS_HUE(h)
+#endif
 
 // A lamp's colour over its luma (the luma lampWeight takes): its weight times this is its weight in
 // each channel, whose luma is the weight. Called only for a lamp with weight (luma above 0).
 vec3 colourOf(vec3 col) {
     const float l = dot(col, vec3(0.299, 0.587, 0.114));
+#ifdef GLASS
+    if (!g_hue) { // bbport (r130c_glass-lamp-light): the lamps keep no hue of their own: only glass changes it
+        return vec3(1.0);
+    }
+#endif
+#ifdef FOLIAGE
+    if (FOLIAGE_HUE == 0u) { // bbport (r131a_foliage-translucency): the lamps keep no hue of their own: only the leaves change it
+        return vec3(1.0);
+    }
+#endif
     return l > 0.0 ? col / l : vec3(1.0);
 }
+
+#ifdef GLASS
+// bbport (r130g_glass-light-forward): the glass query of a lamp ray, with a counter. glassCrossC is r130c's glassCross (which stays)
+// plus: the glass records the ray meets are counted. g_asked: queries asked. g_met: met a glass record. g_tint: the product it gave
+// was below 1 in some channel. g_beyond: met one farther than old_end (the end of the old solid ray: what r130c searched; the
+// glass inside its blind end is what r130g adds). g_entries: the registry entries met, a mask of entries 0 to 31. g_near_t: the
+// nearest hit of the last query along its ray (-1: none). g_last: the view position of the last lamp whose query met glass and w,
+// its nearest pane's distance from the lamp's centre (w < 0: none yet). The half resolution passes add these to half_counts words
+// GLASS_RAY_FIRST and on (HalfCount); the other builds keep them and do nothing with them.
+#include "glass_light_forward_layout.h"
+uint g_asked = 0u, g_met = 0u, g_tint = 0u, g_beyond = 0u, g_entries = 0u;
+float g_near_t = -1.0;
+vec4 g_last = vec4(0.0, 0.0, 0.0, -1.0);
+
+vec3 glassCrossC(vec3 o, float tmin, vec3 dir, float tmax, float old_end) {
+    vec3 product = vec3(1.0);
+    uint seen_lo = 0u, seen_hi = 0u, looked = 0u;
+    bool hit_any = false, beyond = false;
+    g_near_t = -1.0;
+    rayQueryEXT glass;
+    rayQueryInitializeEXT(glass, scene, gl_RayFlagsNoOpaqueEXT, GLASS_LIGHT_MASK, o, max(tmin, float(GLASS_LIGHT_TMIN)), dir, tmax);
+    while (rayQueryProceedEXT(glass)) {
+        if (rayQueryGetIntersectionTypeEXT(glass, false) != gl_RayQueryCandidateIntersectionTriangleEXT) {
+            continue;
+        }
+        const uint index = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(glass, false));
+        if ((index & GLASS_INDEX_BIT) != 0u) {
+            const uint entry = index & GLASS_ENTRY_MASK;
+            const float t = rayQueryGetIntersectionTEXT(glass, false);
+            g_near_t = g_near_t < 0.0 ? t : min(g_near_t, t);
+            hit_any = true;
+            beyond = beyond || t > old_end;
+            g_entries |= entry < 32u ? 1u << entry : 0u;
+            const uint bit = 1u << (entry & 31u);
+            const bool seen = ((entry < 32u ? seen_lo : seen_hi) & bit) != 0u;
+            if (!seen) {
+                seen_lo |= entry < 32u ? bit : 0u;
+                seen_hi |= entry < 32u ? 0u : bit;
+                const uint w = data.d[g_words + entry];
+                product *= vec3(float(w & 255u), float((w >> 8u) & 255u), float((w >> 16u) & 255u)) * (1.0 / 255.0);
+            }
+        }
+        if (++looked >= GLASS_RAY_CAP) {
+            rayQueryTerminateEXT(glass);
+        }
+    }
+    ++g_asked;
+    g_met += hit_any ? 1u : 0u;
+    g_beyond += beyond ? 1u : 0u;
+    g_tint += any(lessThan(product, vec3(0.999))) ? 1u : 0u;
+    return product;
+}
+#endif
 
 vec3 colourLoad(ivec2 p, int row) {
     return imageLoad(colour_image, p + ivec2(0, row)).rgb;
@@ -347,6 +499,10 @@ void colourStore(ivec2 p, int row, vec3 c) {
 // No light, or an rc that passes nothing of it: the grey ratio. (lamp_shadow_tune.h LampColourScale
 // is the same in C++, for the test.)
 vec3 colourScale(vec3 rc, float ratio, vec3 light) {
+    // bbport (r131d_lamp-colour-blob): An averaged history ratio can round above 1. With grey
+    // rc, top can equal that ratio, so the rescale can divide by zero and yield NaN channels.
+    // With the ratio clamped, top > 1 guarantees a positive denominator and a share in [0, 1).
+    ratio = clamp(ratio, 0.0, 1.0);
     const vec3 lw = light * vec3(0.299, 0.587, 0.114);
     const float whole = lw.r + lw.g + lw.b;
     const float got = dot(lw, rc);
@@ -376,6 +532,17 @@ void loadTune() {
     t_window = (f & (1u << 21u)) != 0u;      // bbport (r57_lamp-window)
 #ifdef COLOUR
     t_colour = (f & (1u << 25u)) != 0u;      // bbport (r92_lamp-shadow-colour)
+#ifdef FOLIAGE
+    t_fol_on = (data.d[at + 16u] & FOLIAGE_FLAG_ON) != 0u; // bbport (r131a_foliage-translucency): the host's word 16 (PointShadow::Flush)
+#endif
+#ifdef GLASS
+    { // bbport (r130c_glass-lamp-light): the flag word after the 16 tuning words, then the 64 tint words
+        const uint glass_flags = data.d[at + 16u];
+        g_glass = (glass_flags & GLASS_FLAG_ACTIVE) != 0u;
+        g_hue = (glass_flags & GLASS_FLAG_LAMP_HUE) != 0u;
+        g_words = at + 17u;
+    }
+#endif
 #endif
 #ifdef CENTRED
     t_centred = (f & (1u << 22u)) != 0u;     // bbport (r60_lamp-centred-window)
@@ -450,6 +617,7 @@ float lampWeight(vec3 to_light, float t2, vec3 col, vec3 n) {
 }
 
 vec3 viewPosAt(vec2 uv, float depth) {
+    uv -= jit_uv; // bbport (r128a_lrt-moving-shadows): where the depth value really lies (0 unless HISTORY_JITTER)
     vec4 v = shared_inverse * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
     return v.xyz / v.w;
 }
@@ -526,6 +694,24 @@ void cardCount(uint index, uint n) {
         atomicAdd(card_counts[index], n);
     }
 }
+#ifdef FOLIAGE
+// bbport (r131a_foliage-translucency): what the last ray did with the leaves, counted like cardCount: rays, rays that passed a leaf, leaves passed,
+// rays that ended at the floor, leaves passed without colour
+void foliageNote() {
+    cardCount(CARD_LAMP_FOLIAGE_FIRST, 1u);
+    if (card_pass_n != 0u) {
+        cardCount(CARD_LAMP_FOLIAGE_FIRST + 1u, 1u);
+        cardCount(CARD_LAMP_FOLIAGE_FIRST + 2u, card_pass_n);
+    }
+    if (card_pass_floor_n != 0u) {
+        cardCount(CARD_LAMP_FOLIAGE_FIRST + 3u, card_pass_floor_n);
+    }
+    if (card_pass_grey != 0u) {
+        cardCount(CARD_LAMP_FOLIAGE_FIRST + 4u, card_pass_grey);
+    }
+    card_pass_grey = 0u;
+}
+#endif
 
 // bbport (r62i_cutout-uv-proof): the proof of the chain "card hit -> pool record UV -> layer texel", for the pixels whose
 // G-buffer surface is a card. A camera ray (origin 0, the TLAS's view space) to the pixel's point P meets every candidate
@@ -815,12 +1001,106 @@ void proofCount(uint index) {
 // along the way to the target the hit lies, 0 to 1 (a hit, not always the nearest: the ray stops
 // at its first). (Before: visibility(), 1 free and 0 blocked, with LAMP_CLEARANCE; with the
 // repair off t_clear is that constant and the query is the same.)
+#ifdef T191
+uint t191_pixel = 0u;
+uint t191_vote = 0u;
+uint t191_count = 0u;
+
+void t191Vec(uint at, vec3 v) {
+    data.d[at] = floatBitsToUint(v.x);
+    data.d[at + 1u] = floatBitsToUint(v.y);
+    data.d[at + 2u] = floatBitsToUint(v.z);
+}
+
+bool t191Held(uint at) {
+    if (t191_pixel == 0u || data.d[LAB_BASE + 5u] == 0u) {
+        return false;
+    }
+    for (uint i = 0u; i < 7u; ++i) {
+        if (data.d[at + i] != data.d[LAB_BASE + 6u + i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void t191Begin(uint role, uint at, float represented, float own) {
+    if (t191_pixel == 0u) {
+        return;
+    }
+    const uint index = t191_count++;
+    t191_vote = 0u;
+    if (index >= LAB_VOTES) {
+        return;
+    }
+    t191_vote = t191_pixel + LAB_TRACE + LAB_OUTPUT + LAB_VOTE * index;
+    data.d[t191_vote + 1u] = role;
+    data.d[t191_vote + 2u] = at;
+    data.d[t191_vote + 3u] = floatBitsToUint(represented);
+    data.d[t191_vote + 4u] = floatBitsToUint(own);
+    data.d[t191_vote + 23u] = t_disc_each && t_radius > 0.0 ? data.d[at + 10u] : 0u;
+    for (uint i = 0u; i < 7u; ++i) {
+        data.d[t191_vote + 24u + i] = data.d[at + i];
+    }
+    data.d[t191_vote + 31u] = data.d[at + 15u];
+}
+
+void t191Segment(uint status, vec3 from, vec3 target, vec3 dir, float tmin, float tmax) {
+    if (t191_vote == 0u) {
+        return;
+    }
+    data.d[t191_vote] = status;
+    t191Vec(t191_vote + 5u, from);
+    t191Vec(t191_vote + 8u, target);
+    t191Vec(t191_vote + 11u, dir);
+    data.d[t191_vote + 14u] = floatBitsToUint(tmin);
+    data.d[t191_vote + 15u] = floatBitsToUint(tmax);
+    data.d[t191_vote + 22u] = floatBitsToUint(status < 3u ? 1.0 : 0.0);
+}
+
+void t191Output(uint status, vec3 P, float depth, float raw, float ratio, float frames,
+                float fade, float scale, uint history, vec3 s0, vec3 d0, vec3 s1, vec3 d1,
+                vec3 out0, vec3 out1) {
+    if (t191_pixel == 0u) {
+        return;
+    }
+    const uint at = t191_pixel + LAB_TRACE;
+    data.d[at] = data.d[LAB_BASE];
+    data.d[at + 1u] = status;
+    t191Vec(at + 2u, P);
+    data.d[at + 5u] = floatBitsToUint(depth);
+    data.d[at + 6u] = floatBitsToUint(raw);
+    data.d[at + 7u] = floatBitsToUint(ratio);
+    data.d[at + 8u] = floatBitsToUint(frames);
+    data.d[at + 9u] = floatBitsToUint(fade);
+    data.d[at + 10u] = floatBitsToUint(strength);
+    data.d[at + 11u] = floatBitsToUint(scale);
+    t191Vec(at + 12u, s0);
+    t191Vec(at + 15u, d0);
+    t191Vec(at + 18u, s1);
+    t191Vec(at + 21u, d1);
+    t191Vec(at + 24u, out0);
+    t191Vec(at + 27u, out1);
+    data.d[at + 30u] = history;
+}
+#endif
+
+
 float ray(vec3 origin, float reach, vec3 target) {
     const vec3 ray_to = target - origin;
     const float ray_len = length(ray_to);
     const float tmax = ray_len - (ray_clear > 0.0 ? ray_clear : t_clear); // bbport (r91): the lamp's own
+#ifdef GLASS
+    g_cast = false; // bbport (r130c_glass-lamp-light): set where the plain ray is cast
+#endif
+#ifdef FOLIAGE
+    ray_trans = vec3(1.0); // bbport (r131a_foliage-translucency)
+#endif
     ray_left = -1.0;
     if (!(tmax > reach)) {
+#ifdef T191
+        t191Segment(1u, origin, target, vec3(0.0), reach * 0.5, tmax);
+#endif
         return -1.0;
     }
     ++rays_cast;
@@ -890,6 +1170,14 @@ float ray(vec3 origin, float reach, vec3 target) {
         card_rescued = 0u;
         card_lod16 = 0u;
         card_skip_from = CARD_HOUSING > 0.0 ? card_len - CARD_HOUSING : 1e30; // bbport (r62n_cutout-skinned-blocker) FEATURE
+#ifdef FOLIAGE
+        card_pass_share = t_fol_on ? FOLIAGE_PASS : 0.0; // bbport (r131a_foliage-translucency): 0 when switched off live (the leaves block as before)
+        card_pass_tint = FOLIAGE_TINT;
+        card_pass_floor = FOLIAGE_FLOOR;
+        card_pass = vec3(1.0);
+        card_pass_n = 0u;
+        card_pass_floor_n = 0u;
+#endif
         const CardRay card_hit = cardTraceShadow(scene, gl_RayFlagsTerminateOnFirstHitEXT, CARD_LAMP_MASK, origin,
                                                  card_tmin, card_to / card_len, card_tmax, t_card_cap, width0,
                                                  -width0 / card_len);
@@ -908,6 +1196,10 @@ float ray(vec3 origin, float reach, vec3 target) {
         card_housing_skips = 0u;
         card_skip_from = 1e30;
         ray_card_kept = card_hit.how == CARD_RAY_KEPT;
+#ifdef FOLIAGE
+        ray_trans = card_hit.t < 0.0 ? card_pass : vec3(1.0); // bbport (r131a_foliage-translucency): a free ray carries what the leaves passed
+        foliageNote();
+#endif
         if (ray_card_kept && card_hit.t >= 0.0) { // bbport (r62m_cutout-name-blocker) TOOL
             blockerFromRay(origin + card_to / card_len * card_hit.t);
         }
@@ -928,6 +1220,14 @@ float ray(vec3 origin, float reach, vec3 target) {
     card_dilate = CARD_GATHER != 0u;
     card_wrap_clamped = CARD_WRAP_CLAMPED != 0u;
     card_skip_from = CARD_HOUSING > 0.0 ? ray_len - CARD_HOUSING : 1e30; // bbport (r62n_cutout-skinned-blocker) FEATURE
+#ifdef FOLIAGE
+    card_pass_share = t_fol_on ? FOLIAGE_PASS : 0.0; // bbport (r131a_foliage-translucency): 0 when switched off live (the leaves block as before)
+    card_pass_tint = FOLIAGE_TINT;
+    card_pass_floor = FOLIAGE_FLOOR;
+    card_pass = vec3(1.0);
+    card_pass_n = 0u;
+    card_pass_floor_n = 0u;
+#endif
     const CardRay hit = cardTraceShadow(scene, gl_RayFlagsTerminateOnFirstHitEXT, 0x04u | CARD_LAMP_MASK,
                                         origin, reach * 0.5, ray_to / ray_len, tmax, t_card_cap, width0,
                                         -width0 / ray_len);
@@ -941,6 +1241,10 @@ float ray(vec3 origin, float reach, vec3 target) {
     card_housing_skips = 0u;
     card_skip_from = 1e30;
     ray_card_kept = hit.how == CARD_RAY_KEPT;
+#ifdef FOLIAGE
+    ray_trans = hit.t < 0.0 ? card_pass : vec3(1.0); // bbport (r131a_foliage-translucency)
+    foliageNote();
+#endif
     if (ray_card_kept && hit.t >= 0.0) { // bbport (r62m_cutout-name-blocker) TOOL
         blockerFromRay(origin + ray_to / ray_len * hit.t);
     }
@@ -953,15 +1257,41 @@ float ray(vec3 origin, float reach, vec3 target) {
     }
     ray_went = hit.t;
 #else
+#ifdef GLASS
+    g_org = origin; // bbport (r130c_glass-lamp-light): the same ray, for the glass query lampVisibility asks when it is free
+    g_dir = ray_to / ray_len;
+    g_tmin = reach * 0.5;
+    g_tmax = tmax;
+    g_cast = true;
+#endif
     rayQueryEXT query;
     // 0x04: everything but cut-out cards (vk_rt_shadow.cpp LampMask).
     rayQueryInitializeEXT(query, scene, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsOpaqueEXT, 0x04u,
                           origin, reach * 0.5, ray_to / ray_len, tmax);
     rayQueryProceedEXT(query);
     if (rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+#ifdef T191
+        t191Segment(2u, origin, target, ray_to / ray_len, reach * 0.5, tmax);
+#endif
         return -1.0;
     }
     ray_went = rayQueryGetIntersectionTEXT(query, true);
+#endif
+#ifdef T191
+    if (t191_vote != 0u) {
+        const bool triangle =
+            rayQueryGetIntersectionTypeEXT(query, true) == gl_RayQueryCommittedIntersectionTriangleEXT;
+        t191Segment(triangle ? 3u : 4u, origin, target, ray_to / ray_len, reach * 0.5, tmax);
+        if (triangle) {
+            const vec2 bary = rayQueryGetIntersectionBarycentricsEXT(query, true);
+            data.d[t191_vote + 16u] = uint(rayQueryGetIntersectionInstanceIdEXT(query, true));
+            data.d[t191_vote + 17u] = uint(rayQueryGetIntersectionGeometryIndexEXT(query, true));
+            data.d[t191_vote + 18u] = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+            data.d[t191_vote + 19u] = floatBitsToUint(bary.x);
+            data.d[t191_vote + 20u] = floatBitsToUint(bary.y);
+            data.d[t191_vote + 21u] = floatBitsToUint(ray_went);
+        }
+    }
 #endif
     ray_left = ray_len - ray_went;
     return ray_went / ray_len;
@@ -1053,6 +1383,12 @@ uint lampRecord() {
 //    behind the surface keeps the part of its disc that looks over the edge (the soft rim of
 //    the lit side of a body).
 float lampVisibility(vec3 P, vec3 n, vec3 origin, float reach, vec3 L, vec2 xi) {
+#ifdef GLASS
+    ray_hue = vec3(1.0); // bbport (r130c_glass-lamp-light)
+#endif
+#ifdef FOLIAGE
+    ray_hue = vec3(1.0); // bbport (r131a_foliage-translucency)
+#endif
     vec3 from = origin;
     if (t_self > 0.0 && n != vec3(0.0)) {
         const float g = 1.0 - clamp(dot(n, normalize(L - P)), 0.0, 1.0);
@@ -1129,7 +1465,56 @@ float lampVisibility(vec3 P, vec3 n, vec3 origin, float reach, vec3 L, vec2 xi) 
     // ray to the same point where the disc is not larger than CARD_DISC); 0: r62g's single ray there
     card_sharp = card_sharp || (CARD_DISC < 0.5 && CARD_TMIN > 0.0);
 #endif
+#ifdef GLASS
+    // bbport (r130g_glass-light-forward): with the glass flag the lamp's glass query aims at the lamp's CENTRE from the ray's start
+    // to GLASS_LAMP_CLEAR short of it, after a free solid ray, and also when the solid ray was not cast (inside its blind end or
+    // reach, where it is free): only registered glass records (mask 0x10) are read, so the blind end adds no blocker. The tint is
+    // per lamp (its centre), not per point of its disc. r130c's lines below are reached only without the glass flag.
+    if (g_glass) {
+        if (ray(from, reach, target) >= 0.0) {
+            return 0.0;
+        }
+        const vec3 to_c = L - from;
+        const float len_c = length(to_c);
+        const float g_lo = max(reach * 0.5, float(GLASS_LIGHT_TMIN));
+        const float g_hi = len_c - float(GLASS_LAMP_CLEAR);
+        if (g_hi > g_lo) {
+            const vec3 through = glassCrossC(from, g_lo, to_c / len_c, g_hi, g_cast ? g_tmax : 0.0);
+            if (g_near_t >= 0.0) {
+                g_last = vec4(L, len_c - g_near_t);
+            }
+            const float grey = dot(through, vec3(0.299, 0.587, 0.114));
+            ray_hue = grey > 1e-4 ? through / grey : vec3(1.0);
+            return min(grey, 1.0);
+        }
+        return 1.0;
+    }
+#endif
+#ifdef GLASS
+    // bbport (r130c_glass-lamp-light): a blocked ray is 0; a free one crossed the glass records on its way (glassCross): the luma
+    // of what they let through, and its hue for the colour sums
+    if (ray(from, reach, target) >= 0.0) {
+        return 0.0;
+    }
+    if (g_glass && g_cast) {
+        const vec3 through = glassCross(g_org, g_tmin, g_dir, g_tmax);
+        const float grey = dot(through, vec3(0.299, 0.587, 0.114));
+        ray_hue = grey > 1e-4 ? through / grey : vec3(1.0);
+        return min(grey, 1.0);
+    }
+    return 1.0;
+#elif defined(FOLIAGE)
+    // bbport (r131a_foliage-translucency): a blocked ray is 0; a free one passed the leaves on its way: the luma of what they let through and its
+    // hue for the colour sums (1 and white where it met none: the same answer as the build without FOLIAGE)
+    if (ray(from, reach, target) >= 0.0) {
+        return 0.0;
+    }
+    const float through = dot(ray_trans, vec3(0.299, 0.587, 0.114));
+    ray_hue = through > 1e-4 ? ray_trans / through : vec3(1.0);
+    return min(through, 1.0);
+#else
     return ray(from, reach, target) < 0.0 ? 1.0 : 0.0;
+#endif // GLASS (r130c lampVisibility)
 }
 
 bool inside(uint tile, ivec2 lo, ivec2 hi) {
@@ -1199,7 +1584,7 @@ bool blendHistory(vec3 P, uint history_at, vec3 moved, out float ratio, out floa
         return false;
     }
     const vec2 ndc = clip.xy / clip.w;
-    const vec2 was = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+    const vec2 was = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size + jit_prev_px; // bbport (r128a_lrt-moving-shadows)
     if (any(lessThan(was, vec2(0.0))) || any(greaterThanEqual(was, size))) {
         return false;
     }
@@ -1278,7 +1663,7 @@ void historyAt(vec3 P, uint history_at, vec3 moved, out vec3 sum, out float foun
         return;
     }
     const vec2 ndc = clip.xy / clip.w;
-    const vec2 was = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size;
+    const vec2 was = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * size + jit_prev_px; // bbport (r128a_lrt-moving-shadows)
     if (any(lessThan(was, vec2(0.0))) || any(greaterThanEqual(was, size))) {
         return;
     }
@@ -1653,6 +2038,9 @@ uint HalfAnswer(ivec2 px, float z, vec3 n, out float v) {
 const uint HALF_SLOTS = 15u; // bbport (r101_lamp-moving-edge): 13 unused, 14 HALF_YOUNG (13 slots before)
 shared uint half_n[HALF_SLOTS];
 shared uint half_done;
+#ifdef GLASS
+shared uint glass_n[GLASS_RAY_SLOTS]; // bbport (r130g_glass-light-forward): the workgroup's glass counters (see HalfCount)
+#endif
 
 // Every invocation of a workgroup that got past its tile list calls this once; the last one
 // adds the workgroup's counts to half_counts.
@@ -1663,6 +2051,32 @@ void HalfCount(bool first, uint slot, uint why) {
     if (slot != 0u) {
         atomicAdd(half_n[slot], 1u);
     }
+#ifdef GLASS
+    // bbport (r130g_glass-light-forward): this invocation's glass counters into the workgroup's (the last one flushes them below)
+    if (g_asked != 0u) {
+        atomicAdd(glass_n[0], g_asked);
+        if (g_met != 0u) {
+            atomicAdd(glass_n[1], g_met);
+        }
+        if (g_tint != 0u) {
+            atomicAdd(glass_n[2], g_tint);
+        }
+        if (g_beyond != 0u) {
+            atomicAdd(glass_n[3], g_beyond);
+        }
+        if (g_entries != 0u) {
+            atomicOr(glass_n[4], g_entries);
+        }
+    }
+    if (g_last.w >= 0.0) { // the workgroup keeps the lamp whose pane lies nearest its centre (a race may mix it with another's)
+        const uint mm = uint(g_last.w * 1000.0);
+        if (atomicMin(glass_n[8], mm) > mm) {
+            atomicExchange(glass_n[5], floatBitsToUint(g_last.x));
+            atomicExchange(glass_n[6], floatBitsToUint(g_last.y));
+            atomicExchange(glass_n[7], floatBitsToUint(g_last.z));
+        }
+    }
+#endif
     if (half_rays != 0u) {
         atomicAdd(half_n[first ? 2u : 6u], half_rays);
     }
@@ -1680,10 +2094,120 @@ void HalfCount(bool first, uint slot, uint why) {
             atomicAdd(half_counts.n[i], v);
         }
     }
+#ifdef GLASS
+    // bbport (r130g_glass-light-forward): the workgroup's glass counters into half_counts (words GLASS_RAY_FIRST and on: sums, the
+    // entries' OR, then the lamp's position and its pane's distance as the last workgroup wrote them)
+    for (uint i = 0u; i < 5u; ++i) {
+        const uint v = atomicAdd(glass_n[i], 0u);
+        if (v != 0u) {
+            if (i == 4u) {
+                atomicOr(half_counts.n[GLASS_RAY_FIRST + i], v);
+            } else {
+                atomicAdd(half_counts.n[GLASS_RAY_FIRST + i], v);
+            }
+        }
+    }
+    const uint near_mm = atomicAdd(glass_n[8], 0u);
+    if (near_mm != 0xFFFFFFFFu) {
+        atomicExchange(half_counts.n[GLASS_RAY_FIRST + 8u], near_mm);
+        for (uint i = 5u; i < 8u; ++i) {
+            atomicExchange(half_counts.n[GLASS_RAY_FIRST + i], atomicAdd(glass_n[i], 0u));
+        }
+    }
+#endif
     if (!first && atomicAdd(half_n[4], 0u) + atomicAdd(half_n[5], 0u) + atomicAdd(half_n[7], 0u) != 0u) {
         atomicAdd(half_counts.n[8], 1u);
         if (atomicAdd(half_n[6], 0u) == 0u) {
             atomicAdd(half_counts.n[9], 1u);
+        }
+    }
+}
+#endif
+
+#ifdef T131E
+// The debug variants use the tail of binding 0. The light words keep their original indices.
+const uint PROBE_SAMPLE_WORDS = 32u;
+const uint PROBE_BUCKETS = 64u;
+const uint PROBE_FIELDS = 14u;
+const uint PROBE_WORDS = 2u * PROBE_SAMPLE_WORDS + 3u * PROBE_BUCKETS * PROBE_FIELDS;
+
+bool probeNonfinite(vec3 v) {
+    return any(equal(floatBitsToUint(v) & uvec3(0x7f800000u), uvec3(0x7f800000u)));
+}
+
+uint probeFiniteMax(vec3 v) {
+    const uvec3 bits = floatBitsToUint(v) & uvec3(0x7fffffffu);
+    const uvec3 finite = mix(bits, uvec3(0u), greaterThanEqual(bits, uvec3(0x7f800000u)));
+    return max(max(finite.x, finite.y), finite.z);
+}
+
+void probeColourOutput(ivec2 px, uint stage, float ratio, vec3 rc, vec3 scale,
+                       vec3 s0, vec3 d0, vec3 s1, vec3 d1, vec3 out0, vec3 out1) {
+    const uvec2 group = gl_WorkGroupID.xy;
+    const uint group_hash = group.x * 23u + group.y * 41u;
+    const uint base = uint(data.d.length()) - PROBE_WORDS;
+    const uint lane = gl_LocalInvocationIndex;
+    const uint bucket = (group_hash + lane) & (PROBE_BUCKETS - 1u);
+    const uint at = base + 2u * PROBE_SAMPLE_WORDS + (stage * PROBE_BUCKETS + bucket) * PROBE_FIELDS;
+    const bool scale_bad = probeNonfinite(scale);
+    const bool scale_range = !scale_bad && (any(lessThan(scale, vec3(0.0))) || any(greaterThan(scale, vec3(1.0))));
+    const bool inputs_bad = probeNonfinite(vec3(ratio)) || probeNonfinite(rc) ||
+                            probeNonfinite(s0) || probeNonfinite(d0) ||
+                            probeNonfinite(s1) || probeNonfinite(d1);
+    const bool output_bad = probeNonfinite(out0) || probeNonfinite(out1);
+    // R11G11B10 unsigned float: flag a finite component beyond the largest representable value.
+    const uvec3 max_bits = floatBitsToUint(vec3(65024.0, 65024.0, 64512.0));
+    const uvec3 o0 = floatBitsToUint(out0), o1 = floatBitsToUint(out1);
+    const bool format_risk =
+        any(greaterThan(mix(uvec3(0u), o0, lessThan(o0, uvec3(0x7f800000u))), max_bits)) ||
+        any(greaterThan(mix(uvec3(0u), o1, lessThan(o1, uvec3(0x7f800000u))), max_bits));
+    const bool ratio_gt_one = ratio > 1.0;
+    const uint flags = (scale_bad ? (ratio_gt_one ? 1u : 2u) : 0u) |
+                       (scale_range ? 4u : 0u) | (inputs_bad ? 8u : 0u) |
+                       (output_bad ? 16u : 0u) | (format_risk ? 32u : 0u);
+
+    // Rotate the coverage lane with the shader's noise frame. Always pick a fill lane that
+    // is different from the even/even first-half pixels.
+    uint pick = (group_hash + frame_index) & 63u;
+    if (stage == 2u && (pick & 9u) == 0u) {
+        pick |= 1u;
+    }
+    if (lane == pick) {
+        atomicAdd(data.d[at], 1u);
+        atomicMax(data.d[at + 9u], probeFiniteMax(vec3(ratio)));
+        atomicMax(data.d[at + 10u], probeFiniteMax(rc));
+        atomicMax(data.d[at + 11u], probeFiniteMax(scale));
+        atomicMax(data.d[at + 12u], probeFiniteMax(out0));
+        atomicMax(data.d[at + 13u], probeFiniteMax(out1));
+    }
+    if (flags == 0u) {
+        return;
+    }
+    for (uint i = 0u; i < 6u; ++i) {
+        if ((flags & (1u << i)) != 0u) {
+            atomicAdd(data.d[at + 1u + i], 1u);
+        }
+    }
+
+    // Prefer a sample of a harder fault over a finite scale outside [0, 1]. Only the first
+    // event of each kind in a bucket attempts the global claim.
+    const bool hard = (flags & ~4u) != 0u;
+    const uint sample_base = base + (hard ? PROBE_SAMPLE_WORDS : 0u);
+    if (atomicAdd(data.d[at + (hard ? 8u : 7u)], 1u) == 0u &&
+        atomicCompSwap(data.d[sample_base], 0u, 1u) == 0u) {
+        data.d[sample_base + 1u] = uint(px.x);
+        data.d[sample_base + 2u] = uint(px.y);
+        data.d[sample_base + 3u] = uint(size.x);
+        data.d[sample_base + 4u] = uint(size.y);
+        data.d[sample_base + 5u] = stage;
+        data.d[sample_base + 6u] = flags;
+        data.d[sample_base + 7u] = floatBitsToUint(ratio);
+        const vec3 values[8] = vec3[8](rc, scale, s0, d0, s1, d1, out0, out1);
+        for (uint i = 0u; i < 8u; ++i) {
+            const uvec3 bits = floatBitsToUint(values[i]);
+            data.d[sample_base + 8u + 3u * i] = bits.x;
+            data.d[sample_base + 9u + 3u * i] = bits.y;
+            data.d[sample_base + 10u + 3u * i] = bits.z;
         }
     }
 }
@@ -1699,6 +2223,11 @@ void main() {
             half_n[i] = 0u;
         }
         half_done = 0u;
+#ifdef GLASS
+        for (uint i = 0u; i < GLASS_RAY_SLOTS; ++i) { // bbport (r130g_glass-light-forward): word 8 is a minimum
+            glass_n[i] = i == 8u ? 0xFFFFFFFFu : 0u;
+        }
+#endif
         if ((mode & (MODE_HALF_FILL | MODE_HALF_COUNT)) == (MODE_HALF_FILL | MODE_HALF_COUNT) &&
             gl_WorkGroupID.xy == uvec2(rect.xy) >> 3u) {
             atomicAdd(half_counts.n[0], 1u); // one counted pass (its first workgroup)
@@ -1712,6 +2241,16 @@ void main() {
     const int span = first ? 16 : 8;
     const ivec2 group_lo = ivec2(gl_WorkGroupID.xy) * span;
     const ivec2 group_hi = group_lo + span;
+#ifdef T191
+    if (first) {
+        const uvec2 p = gl_GlobalInvocationID.xy * 2u;
+        if (p == uvec2(data.d[LAB_BASE + 1u], data.d[LAB_BASE + 2u])) {
+            t191_pixel = LAB_BASE + LAB_HEADER;
+        } else if (p == uvec2(data.d[LAB_BASE + 3u], data.d[LAB_BASE + 4u])) {
+            t191_pixel = LAB_BASE + LAB_HEADER + LAB_PIXEL;
+        }
+    }
+#endif
 #else
     const ivec2 group_lo = ivec2(gl_WorkGroupID.xy) * 8;
     const ivec2 group_hi = group_lo + 8;
@@ -1769,6 +2308,12 @@ void main() {
     }
     barrier();
     const uint listed = group_count;
+#ifdef T191
+    if (t191_pixel != 0u && !resolve_mode) {
+        data.d[t191_pixel] = data.d[LAB_BASE];
+        data.d[t191_pixel + 2u] = listed == 0u ? 8u : 0u;
+    }
+#endif
     if (listed == 0u) {
 #ifdef HALF
 #ifdef CENTRED
@@ -1802,6 +2347,10 @@ void main() {
 #endif
     const uint history_at = floatBitsToUint(length_m);
     const uint history_flags = history_at != 0u ? data.d[history_at] : 0u;
+    if ((history_flags & HISTORY_JITTER) != 0u) { // bbport (r128a_lrt-moving-shadows): BB_LAMP_SHADOW_JITTER (before any viewPosAt)
+        jit_uv = vec2(word(history_at + 34u), word(history_at + 35u)) / size;
+        jit_prev_px = vec2(word(history_at + 36u), word(history_at + 37u));
+    }
 #ifdef COLOUR
     // bbport (r92_lamp-shadow-colour): the colour image's parts for this pass (colour_image)
     colour_cur_row = (history_flags & HISTORY_COLOUR_ONE) != 0u ? int(size.y) : 0;
@@ -1921,8 +2470,14 @@ void main() {
     const vec2 uv = (vec2(px) + 0.5) / size;
     vec3 P = vec3(0.0);
     float fade = 0.0;
+#ifdef T191
+    float t191_depth = 0.0;
+#endif
     if (live) {
         const float depth = textureLod(depth_tex, uv, 0.0).x;
+#ifdef T191
+        t191_depth = depth;
+#endif
         live = depth < 1.0 && depth > 0.0;
         if (live) {
             P = viewPosAt(uv, depth);
@@ -1951,6 +2506,12 @@ void main() {
     vec3 top_l = vec3(0.0);
     float rest_w = 0.0;
     vec3 rest_l = vec3(0.0);
+#ifdef T191
+    uint t191_rest_at = 0u;
+    float t191_rest_own = 0.0;
+    uint t191_listed = 0u, t191_in_range = 0u, t191_weighted = 0u;
+    float t191_held_weight = 0.0;
+#endif
     float vsum = 0.0;
     vec3 n = vec3(0.0);
     float reach = 0.0;
@@ -1989,6 +2550,10 @@ void main() {
         for (uint k = 0u; k < lights; ++k) {
             const uint at = lights_at + k * 16u;
             const float inv_r2 = word(at + 3u);
+            #ifdef T191
+            const bool t191_held = t191Held(at);
+            if (t191_held) { ++t191_listed; }
+            #endif
             if (!(inv_r2 > 0.0)) {
                 continue;
             }
@@ -1998,12 +2563,23 @@ void main() {
             if (t2 >= 1.0) {
                 continue;
             }
+            #ifdef T191
+            if (t191_held) { ++t191_in_range; }
+            #endif
             const vec3 col = vec3(word(at + 4u), word(at + 5u), word(at + 6u));
             const float w = lampWeight(to_light, t2, col, n); // bbport (r41_lamp-shadows)
             if (!(w > 1e-5)) {
                 continue;
             }
             wsum += w;
+#ifdef T191
+            if (t191_held) {
+                ++t191_weighted;
+                t191_held_weight += w;
+            }
+            const uint t191_old_top = top_at;
+            uint t191_cand_at = at;
+#endif
 #ifdef COLOUR
             if (t_colour) { // bbport (r92_lamp-shadow-colour): its weight in each channel
                 wsum_c += w * colourOf(col);
@@ -2029,6 +2605,9 @@ void main() {
             float cand_w = w;
             vec3 cand_l = L;
             if (w > top_w) {
+#ifdef T191
+                t191_cand_at = t191_old_top;
+#endif
                 cand_w = top_w;
                 cand_l = top_l;
                 top_w = w;
@@ -2055,6 +2634,10 @@ void main() {
                 const float u = float((mixed >> 22u) ^ mixed) * (1.0 / 4294967296.0);
                 if (u * rest_w < cand_w) {
                     rest_l = cand_l;
+#ifdef T191
+                    t191_rest_at = t191_cand_at;
+                    t191_rest_own = cand_w;
+#endif
                     pick_rest = pick_cand; // bbport (r91_lamp-radius-per-lamp)
                 }
             }
@@ -2131,6 +2714,12 @@ void main() {
     if (!live) {
         if (lit) {
             // Lamp light that gets no shadow (sky, too far, too weak, no lamp in reach).
+#ifdef T191
+            if (!resolve) {
+                t191Output(2u, P, t191_depth, 1.0, 1.0, 0.0, fade, 1.0, history_flags,
+                           s0, d0, s1, d1, s0 + d0, s1 + d1);
+            }
+#endif
             imageStore(cur0, px, vec4(s0 + d0, 1.0));
             imageStore(cur1, px, vec4(s1 + d1, 1.0));
             imageStore(snap0, px, vec4(0.0));
@@ -2210,11 +2799,14 @@ void main() {
                         if (!(w > 1e-5)) {
                             continue;
                         }
+#ifdef T191
+                        t191Begin(1u, at, w, w);
+#endif
                         vsum += w * lampVisibility(P, n, origin, reach, L,
                                                    fract(xi + float(traced++) * vec2(0.5545497, 0.3085170)));
 #ifdef COLOUR
                         if (t_colour) { // bbport (r92_lamp-shadow-colour): this lamp's part of vsum, in its colour
-                            vsum_c += colourOf(col) * (vsum - vsum_seen);
+                            vsum_c += colourOf(col) GLASS_HUE(ray_hue) * (vsum - vsum_seen);
                             vsum_seen = vsum;
                         }
 #endif
@@ -2232,6 +2824,9 @@ void main() {
         } else {
             // bbport (r42_lamp-soft): one ray for the strongest lamp and one for the picked one
             // (which stands for all the others), each to its own point of the lamp's disc
+#ifdef T191
+            t191Begin(2u, top_at, top_w, top_w);
+#endif
             vsum = top_w * lampVisibility(P, n, origin, reach, top_l, xi);
             top_went = ray_went;
             top_left = ray_left;
@@ -2241,8 +2836,17 @@ void main() {
 #endif
 #ifdef COLOUR
             vsum_top = vsum; // bbport (r92_lamp-shadow-colour): the strongest lamp's part
+#ifdef FOLIAGE
+            top_hue = ray_hue; // bbport (r131a_foliage-translucency): the hue of what the strongest lamp's ray let through
+#endif
+#ifdef GLASS
+            top_hue = ray_hue; // bbport (r130c_glass-lamp-light): the hue of what the strongest lamp's ray let through
+#endif
 #endif
             if (rest_w > 0.0) {
+#ifdef T191
+                t191Begin(3u, t191_rest_at, rest_w, t191_rest_own);
+#endif
                 vsum += rest_w * lampVisibility(P, n, origin, reach, rest_l,
                                                 fract(xi + vec2(0.5545497, 0.3085170)));
             }
@@ -2253,11 +2857,20 @@ void main() {
             if (lay_sec_w > 0.0) {
                 const uint rest_at = pick_rest;
                 pick_rest = lay_sec_at;
+#ifdef T191
+                t191Begin(4u, lay_sec_at, lay_sec_w, lay_sec_w);
+#endif
                 lay_sec_part = lay_sec_w * lampVisibility(P, n, origin, reach, lay_sec_l,
                                                           fract(xi + (rest_w > 0.0 ? 2.0 : 1.0) *
                                                                          vec2(0.5545497, 0.3085170)));
                 pick_rest = rest_at;
+#ifdef GLASS
+                sec_hue = ray_hue; // bbport (r130c_glass-lamp-light): the second strongest lamp's
+#endif
                 vsum += lay_sec_part;
+#ifdef FOLIAGE
+                sec_hue = ray_hue; // bbport (r131a_foliage-translucency): the second strongest lamp's
+#endif
             }
         }
         ratio = clamp(vsum / wsum, 0.0, 1.0);
@@ -2277,7 +2890,7 @@ void main() {
             // pixel every lamp lights at 1). A channel without weight: the grey ratio.
             if (vsum_top >= 0.0) {
                 const vec3 top_c = colourOf(vec3(word(top_at + 4u), word(top_at + 5u), word(top_at + 6u)));
-                vsum_c = top_c * vsum_top;
+                vsum_c = top_c GLASS_HUE(top_hue) * vsum_top;
                 if (0.0 < rest_w) {
                     vsum_c += max(wsum_c - top_w * top_c, vec3(0.0)) * ((vsum - vsum_top) / rest_w);
                 }
@@ -2292,7 +2905,7 @@ void main() {
         if (t_colour && lay_sec_part >= 0.0 && vsum_top >= 0.0) {
             const vec3 top_c = colourOf(vec3(word(top_at + 4u), word(top_at + 5u), word(top_at + 6u)));
             const vec3 sec_c = colourOf(vec3(word(lay_sec_at + 4u), word(lay_sec_at + 5u), word(lay_sec_at + 6u)));
-            vsum_c = top_c * vsum_top + sec_c * lay_sec_part;
+            vsum_c = top_c GLASS_HUE(top_hue) * vsum_top + sec_c GLASS_HUE(sec_hue) * lay_sec_part;
             if (0.0 < rest_w) {
                 vsum_c += max(wsum_c - top_w * top_c - lay_sec_w * sec_c, vec3(0.0)) *
                           ((vsum - vsum_top - lay_sec_part) / rest_w);
@@ -2380,6 +2993,34 @@ void main() {
     //    BB_LAMP_SHADOW_FOLLOW_SOFT=0). In the second half-resolution pass the window also holds
     //    the first pass's answers at the pixels (2x, 2y) (value 1's could not reach them).
     const float answer = ratio; // what this frame's rays said (view 1)
+#ifdef T191
+    if (t191_pixel != 0u && !resolve) {
+        const uint at = t191_pixel;
+        data.d[at + 1u] = t191_count;
+        data.d[at + 2u] = (live ? 1u : 0u) | (lit ? 2u : 0u) |
+                          (group_trace != 0u ? 4u : 0u) | (half_why << 8u);
+        data.d[at + 3u] = rays_cast;
+        t191Vec(at + 4u, P);
+        data.d[at + 7u] = floatBitsToUint(t191_depth);
+        t191Vec(at + 8u, n);
+        data.d[at + 11u] = floatBitsToUint(wsum);
+        data.d[at + 12u] = floatBitsToUint(vsum);
+        data.d[at + 13u] = floatBitsToUint(answer);
+        data.d[at + 14u] = history_flags;
+        data.d[at + 15u] = t191_listed;
+        data.d[at + 16u] = t191_in_range;
+        data.d[at + 17u] = t191_weighted;
+        data.d[at + 18u] = floatBitsToUint(t191_held_weight);
+        t191Vec(at + 19u, vec3(jit_uv * size, 0.0));
+        data.d[at + 21u] = uint(size.x);
+        data.d[at + 22u] = uint(size.y);
+        data.d[at + 23u] = uint(px.x);
+        data.d[at + 24u] = uint(px.y);
+        data.d[at + 25u] = mode & 0xffu;
+        data.d[at + 26u] = frame_index;
+    }
+#endif
+
     float frames = 0.0;         // the frames of history in the ratio (view 5)
     vec3 looked = vec3(0.0, 0.0, 1.0); // view 6
     if (blend) {
@@ -2880,8 +3521,24 @@ void main() {
     const vec3 scale_c = t_colour ? mix(vec3(1.0), colourScale(colour_rc, ratio, d0 + d1), strength * fade)
                                   : vec3(scale);
     vec3 out0 = s0 + d0 * scale_c, out1 = s1 + d1 * scale_c;
+#ifdef T131E
+    if (t_colour && t_view == 0u) {
+#ifdef HALF
+        const uint probe_stage = first ? 1u : 2u;
+#else
+        const uint probe_stage = 0u;
+#endif
+        probeColourOutput(px, probe_stage, ratio, colour_rc, scale_c, s0, d0, s1, d1, out0, out1);
+    }
+#endif
 #else
     vec3 out0 = s0 + d0 * scale, out1 = s1 + d1 * scale;
+#ifdef T191
+    if (resolve) {
+        t191Output(1u, P, t191_depth, answer, ratio, frames, fade, scale, history_flags,
+                   s0, d0, s1, d1, out0, out1);
+    }
+#endif
 #endif
     if (t_view != 0u) {
         // bbport (r41_lamp-shadows): BB_LAMP_SHADOW_VIEW, on pixels the pass shadows, in place of
@@ -2971,6 +3628,17 @@ void main() {
                     : (card_what & (1u << CARD_RAY_FREE)) != 0u   ? vec3(0.0, 1.0, 0.0)
                     : (card_what & (1u << CARD_RAY_OPAQUE)) != 0u ? vec3(0.0, 0.0, 1.0)
                                                                   : vec3(1.0, 0.0, 1.0);
+        }
+#endif
+#ifdef COLOUR
+        // bbport (r131d_lamp-colour-blob): View 4: non-finite scale is magenta if ratio > 1, cyan otherwise
+        // (including NaN ratio); finite scale with ratio > 1 is red. Check scale exponent bits.
+        if (t_view == 4u && t_colour) {
+            if (any(equal(floatBitsToUint(scale_c) & uvec3(0x7F800000u), uvec3(0x7F800000u)))) {
+                shown = ratio > 1.0 ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0);
+            } else if (ratio > 1.0) {
+                shown = vec3(1.0, 0.0, 0.0);
+            }
         }
 #endif
         out0 = shown * t_gain;

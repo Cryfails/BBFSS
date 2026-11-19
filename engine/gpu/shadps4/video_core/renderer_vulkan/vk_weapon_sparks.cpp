@@ -35,6 +35,7 @@
 
 #include "../bbgpu.h"
 #include "bbport_toggles.h"
+#include "bbport_wind_felt_shelter.h" // bbport (r97g_shelter-haze-sparks)
 #include "input/pad.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -443,7 +444,9 @@ void Rasterizer::WeaponSparksAfterDraw(const GraphicsPipeline* pipeline, bool is
         if (const BbWind::Snapshot w = wind.Get(); w.on) {
             const CameraMotion::Matrices cam = camera_motion->CameraMatrices();
             if (cam.valid) {
-                const std::array<float, 3> v = BbWind::Felt(BbWind::Follower::Sparks, w, cam.inv_view);
+                // bbport (r97g_shelter-haze-sparks): in sheltered air (indoors) the copies fall without a sideways push
+                const std::array<float, 3> v = BbWindFelt::Felt(BbWind::Follower::Sparks, w, cam.inv_view,
+                                                                wind_shelter ? wind_shelter->CameraOpen() : 1.0f);
                 breeze = BbWind::ScreenVelocity(cam.view, cam.proj, v, SparksWindDepth,
                                                 std::abs(viewports[0].width), height);
                 breeze[0] *= SparksWindFollow;

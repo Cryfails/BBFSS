@@ -17,6 +17,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef BB_TEST_SHARED_POST_GRAPH
+#include <vk_mem_alloc.h>
+#endif
 
 namespace Vulkan {
 SceneTargets::SceneTargets(const Instance& i, Scheduler& s, Runtime& r,
@@ -207,7 +210,11 @@ void SceneTargets::NativeAccess(VideoCore::Image& image, vk::AccessFlags2 access
 }
 void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLayout layout,
                                vk::PipelineStageFlags2 stages, vk::AccessFlags2 access,
-                               bool discard) {
+                               bool discard
+#ifdef BB_TEST_SHARED_POST_GRAPH
+                               , std::shared_ptr<const PostProxyProof::Trace>* post_trace
+#endif
+                               ) {
     scheduler.EndRendering();
     const vk::ImageMemoryBarrier2 barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
@@ -229,6 +236,34 @@ void SceneTargets::Transition(Entry& e, vk::ImageAspectFlags aspect, vk::ImageLa
         if (BbStats::enabled) {
             r22_counts.proxy_issued.fetch_add(1, std::memory_order_relaxed);
         }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        if (post_trace) {
+            if (const auto cookie = PostProxyProof::NextCookie()) {
+                auto trace = std::make_shared<PostProxyProof::Trace>(PostProxyProof::Order{
+                    reinterpret_cast<u64>(&scheduler), std::bit_cast<u64>(instance.GetGraphicsQueue()),
+                    std::bit_cast<u64>(scheduler.GetWorkSemaphore()->Handle()), scheduler.CurrentTick(),
+                    cookie, instance.GetGraphicsQueueFamilyIndex()});
+                *post_trace = trace;
+#ifdef BB_HAS_NATIVE_SCHEDULER_RECORDER
+                scheduler.RecordNativeWriteSuffix([barrier, trace](vk::CommandBuffer cmd,
+                                                      NativeWriteSuffix::Encoder& encoder) {
+                    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+                    if (trace->Commit(cmd, barrier, true)) {
+                        encoder.Note(NativeWriteSuffix::Kind::NativeOperation, trace->order.cookie);
+                    } else {
+                        encoder.Note(NativeWriteSuffix::Kind::UnknownRecord);
+                    }
+                });
+#else
+                scheduler.Record([barrier, trace](vk::CommandBuffer cmd) {
+                    cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+                    trace->Commit(cmd, barrier, false);
+                });
+#endif
+                return;
+            }
+        }
+#endif
         scheduler.Record([barrier](vk::CommandBuffer cmd) {
             cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
         });
@@ -546,6 +581,30 @@ vk::Pipeline SceneTargets::ResamplePipeline(vk::Format format, bool stencil) {
 // unresolved until something needs it. Only for a proxy that is dirty: its native image would be
 // exactly its upscale. After a fill (the native image written at full size, CopiedToProxy) the
 // proxy is a reduction of it, and copying the native image keeps the detail.
+SceneTargets::SewerProxy SceneTargets::InspectSewerProxy(VideoCore::ImageId id, u64 uid,
+                                                         vk::ImageView view) const {
+    const auto it = entries.find(Key(uid, 0));
+    if (!Reduced() || it == entries.end()) return {};
+    const auto& e = *it->second;
+    const auto* parent = lookup(id, uid);
+    if (!parent || parent->image_uid != uid || parent->binding.needs_rebind ||
+        !parent->backing || e.source != id || e.uid != uid || e.level != 0 || !e.image.image ||
+        parent->info.resources != VideoCore::SubresourceExtent{1, 1}) return {};
+    const auto& ci = e.image.image_ci;
+    if (ci.imageType != vk::ImageType::e2D || ci.mipLevels != 1 || ci.arrayLayers != 1 ||
+        ci.samples != vk::SampleCountFlagBits::e1 || ci.extent.depth != 1) return {};
+    if (view && !std::ranges::any_of(e.views, [view](const auto& pair) {
+            return *pair.second == view && pair.first.range.base.level == 0 &&
+                   pair.first.range.base.layer == 0;
+        })) return {};
+    SewerProxy result{{e.image, view, e.layout, ci.usage}, ci.extent, ci.format,
+                      parent->aspect_mask, e.state.valid, e.state.dirty};
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    result.incarnation = e.post_proxy_incarnation;
+#endif
+    return result;
+}
+
 bool SceneTargets::CanCopyDepthProxyToColor(const VideoCore::Image& depth,
                                             const VideoCore::Image& dst) {
     if (copying || !Reduced() || !depth.scene_proxy || !depth.info.props.is_depth ||
@@ -580,7 +639,8 @@ bool SceneTargets::CanCopyDepthProxyToColor(const VideoCore::Image& depth,
     }
     return bool(DepthToColorPipeline());
 }
-bool SceneTargets::CopyDepthProxyToColor(VideoCore::Image& depth, VideoCore::Image& dst) {
+bool SceneTargets::CopyDepthProxyToColor(VideoCore::Image& depth, VideoCore::Image& dst,
+                                          SewerCopyViews* sewer_views) {
     if (!CanCopyDepthProxyToColor(depth, dst)) {
         return false;
     }
@@ -614,6 +674,7 @@ bool SceneTargets::CopyDepthProxyToColor(VideoCore::Image& depth, VideoCore::Ima
         .format = vk::Format::eR32Sfloat,
         .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
     }));
+    if (sewer_views) *sewer_views = {depth_view, target_view};
     scheduler.DeferOperation([device, depth_view, target_view] {
         device.destroyImageView(depth_view);
         device.destroyImageView(target_view);
@@ -1279,6 +1340,9 @@ SceneTargets::Entry& SceneTargets::Get(VideoCore::ImageId id, u32 level, const c
         ci.extent = vk::Extent3D{proxy.width, proxy.height, 1};
         ci.mipLevels = 1;
         entry->image.Create(ci);
+#ifdef BB_TEST_SHARED_POST_GRAPH
+        entry->post_proxy_incarnation = PostProxyProof::NextIncarnation();
+#endif
         tracked.insert(original.image_uid);
     }
     recent[recent_next++ % recent.size()] = {key, entry.get()};
@@ -1354,9 +1418,80 @@ std::optional<SceneTargets::Target> SceneTargets::SampleProxy(
     const auto layout = PrepareSample(image, level);
     return Target{e.image, View(e, image, info), layout, e.image.image_ci.usage};
 }
+#ifdef BB_TEST_SHARED_POST_GRAPH
+namespace {
+PostProxyProof::Backing OwnPostBacking(const VideoCore::UniqueImage& owned) {
+    constexpr auto ambiguous = vk::ImageCreateFlagBits::eSparseBinding |
+        vk::ImageCreateFlagBits::eSparseResidency | vk::ImageCreateFlagBits::eSparseAliased |
+        vk::ImageCreateFlagBits::eAlias | vk::ImageCreateFlagBits::eDisjoint;
+    if (!owned.image || !owned.allocator || !owned.allocation || owned.image_ci.pNext ||
+        (owned.image_ci.flags & ambiguous)) return {};
+    VmaAllocationInfo memory{};
+    vmaGetAllocationInfo(owned.allocator, owned.allocation, &memory);
+    return {owned.image, owned.allocator, owned.allocation, memory.deviceMemory, memory.offset, memory.size};
+}
+} // namespace
+
+PostProxyProof::Binding SceneTargets::SnapshotPostProxy(const Entry& e,
+        const VideoCore::Image& original, Target selected, const PostProxyProof::Key& key) const {
+    if (!key || !Reduced() || copying || !original.backing || original.binding.needs_rebind ||
+        original.image_uid != e.uid || e.level != 0 || selected.image != e.image.image ||
+        selected.layout != e.layout || !selected.view || original.info.props.is_depth ||
+        original.aspect_mask != vk::ImageAspectFlagBits::eColor) return {};
+    const auto owned_view = std::ranges::find_if(e.views, [&](const auto& pair) {
+        const auto& info = pair.first;
+        return *pair.second == selected.view && info.format == vk::Format::eR16G16B16A16Sfloat &&
+            !info.range.base.level && !info.range.base.layer && info.range.extent.levels == 1 &&
+            info.range.extent.layers == 1 && info.mapping == vk::ComponentMapping{};
+    });
+    const auto& ci = e.image.image_ci;
+    const auto& native_ci = original.backing->image.image_ci;
+    if (owned_view == e.views.end() || ci.imageType != vk::ImageType::e2D || ci.mipLevels != 1 ||
+        ci.arrayLayers != 1 || ci.extent.depth != 1 || ci.format != owned_view->first.format ||
+        !(ci.usage & vk::ImageUsageFlagBits::eSampled) ||
+        native_ci.imageType != vk::ImageType::e2D || native_ci.format != ci.format ||
+        native_ci.samples != ci.samples || native_ci.mipLevels != 1 || native_ci.arrayLayers != 1 ||
+        ci.extent.width >= native_ci.extent.width || ci.extent.height >= native_ci.extent.height) return {};
+    return {.key = key, .owner = reinterpret_cast<u64>(this), .generation = generation,
+        .incarnation = e.post_proxy_incarnation, .uid = e.uid, .native_serial = original.write_seq,
+        .proxy = OwnPostBacking(e.image), .native = OwnPostBacking(original.backing->image),
+        .image = selected.image, .view = selected.view, .layout = selected.layout,
+        .extent = {ci.extent.width, ci.extent.height}, .format = ci.format, .samples = ci.samples,
+        .range = PostProxyProof::Color0, .valid = e.state.valid, .dirty = e.state.dirty};
+}
+
+PostProxyProof::BackingCheck SceneTargets::CheckPostProxyBacking(const PostProxyProof::Lease& lease,
+        const PostProxyProof::Key& key, Target selected) const {
+    const auto& prior = lease.binding;
+    if (!prior.IsOwned() || prior.key != key || prior.owner != reinterpret_cast<u64>(this) ||
+        prior.generation != generation) return {};
+    const auto it = entries.find(Key(prior.uid, 0));
+    if (it == entries.end()) return {};
+    const auto& e = *it->second;
+    const auto* original = lookup(e.source, e.uid);
+    if (!original) return {};
+    return PostProxyProof::Recheck(prior, SnapshotPostProxy(e, *original, selected, key));
+}
+#endif
+
 SceneTargets::Target SceneTargets::Read(VideoCore::ImageId id,
                                        const VideoCore::ImageViewInfo& info,
                                        vk::PipelineStageFlags2 stages, vk::AccessFlags2 access) {
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    return ReadImpl(id, info, stages, access, {}, nullptr);
+}
+
+SceneTargets::Target SceneTargets::ReadPostProxy(VideoCore::ImageId id,
+        const VideoCore::ImageViewInfo& info, const PostProxyProof::Key& key,
+        PostProxyProof::Lease& lease, vk::PipelineStageFlags2 stages, vk::AccessFlags2 access) {
+    lease = {};
+    return ReadImpl(id, info, stages, access, key, &lease);
+}
+
+SceneTargets::Target SceneTargets::ReadImpl(VideoCore::ImageId id,
+        const VideoCore::ImageViewInfo& info, vk::PipelineStageFlags2 stages, vk::AccessFlags2 access,
+        const PostProxyProof::Key& key, PostProxyProof::Lease* lease) {
+#endif
     auto& original = *lookup(id, 0);
     // bbport (r22_barriers): ReadNext's request, taken before Get (a fill there records
     // Transitions of its own).
@@ -1364,8 +1499,17 @@ SceneTargets::Target SceneTargets::Read(VideoCore::ImageId id,
     r22_read_next = false;
     auto& e = Get(id, 0, "proxy read (engine effect or upscaler input)");
     r22_site = r22_next ? R22EffectRead : R22None;
+#ifdef BB_TEST_SHARED_POST_GRAPH
+    const bool observe = lease && key && e.state.valid && e.state.dirty && (access & R22Reads) == access;
+    Transition(e, original.aspect_mask, vk::ImageLayout::eGeneral, stages, access, false,
+               observe ? &lease->trace : nullptr);
+    const Target target{e.image, View(e, original, info), e.layout, e.image.image_ci.usage};
+    if (lease) lease->binding = SnapshotPostProxy(e, original, target, key);
+    return target;
+#else
     Transition(e, original.aspect_mask, vk::ImageLayout::eGeneral, stages, access);
     return {e.image, View(e, original, info), e.layout, e.image.image_ci.usage};
+#endif
 }
 SceneTargets::Target SceneTargets::ReadNext(VideoCore::ImageId id,
                                            const VideoCore::ImageViewInfo& info) {

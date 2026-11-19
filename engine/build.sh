@@ -218,6 +218,8 @@ if [[ ${1:-} == --test ]]; then
     out/settings-test
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_motion_history.cpp -o out/motion-history-test
     out/motion-history-test
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_drawn_look_rules.cpp -o out/drawn-look-rules-test
+    out/drawn-look-rules-test
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_card_uv.cpp -o out/rt-card-uv-test
     out/rt-card-uv-test
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_rt_card_layers.cpp -o out/rt-card-layers-test
@@ -245,6 +247,18 @@ if [[ ${1:-} == --test ]]; then
     # bbport (r86b_glass-visible): the glass glint's knobs, lamps, gate and numbers
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_glass_glint.cpp -o out/glass-glint-test
     out/glass-glint-test
+    # bbport (r129a_glass-registry): the glass registry's table text, lookup and view knob
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_glass_registry.cpp -o out/glass-registry-test
+    # bbport (r130g_glass-light-forward): the forward glass light's steady rule and shared numbers
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_glass_light_forward.cpp -o out/glass-light-forward-test
+    out/glass-light-forward-test
+    # bbport (r131a_foliage-translucency): the foliage translucency's knob rules, leaf pass and card ray rule
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_foliage_translucency.cpp -o out/foliage-translucency-test
+    out/foliage-translucency-test
+    out/glass-registry-test
+    # bbport (r130c_glass-lamp-light): lamp light through glass: tint words, strengths, custom index, the s token
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_glass_light.cpp -o out/glass-light-test
+    out/glass-light-test
     # bbport (r107_caustics): the water caustics' knob, push words, drift and pattern
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_caustics.cpp -o out/caustics-test
     out/caustics-test
@@ -306,18 +320,30 @@ if [[ ${1:-} == --test ]]; then
     # bbport (r112q_hang-bracket-route): the route lines, BB_WIND_HANG_FORCE, BB_WIND_HANG_BOX_RETRY and the judge's DueSoft
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_hang_route.cpp -o out/wind-hang-route-test
     out/wind-hang-route-test
+    # bbport (r112v_lantern-hangs): the lantern rule's plan, weight, keys and guard
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_lantern.cpp -o out/wind-lantern-test
+    out/wind-lantern-test
     # bbport (r82_wind-stage1): the shared wind state, the fog noise and the march step
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind.cpp -o out/wind-test
     out/wind-test
     # bbport (r117_wind-shelter): the wind shelter field's knob, layout, reader and model
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_shelter.cpp -o out/wind-shelter-test
     out/wind-shelter-test
+    # bbport (r97g_shelter-haze-sparks): the wind the haze and the sparks feel in sheltered air
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_felt_shelter.cpp -o out/wind-felt-shelter-test
+    out/wind-felt-shelter-test
     # bbport (r122_game-wind-drive): the game-wind cut's knob, level, bit and counters
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_game.cpp -o out/wind-game-test
     out/wind-game-test
+    # bbport (r122b_game-particles-follow-wind): the game-particle lean's knob text, lean, word, counters and module patch
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_wind_game_particles.cpp -o out/wind-game-particles-test
+    out/wind-game-particles-test
     # bbport (r96_lamp-flicker-colour): the lamp flicker's knobs, wave, colour gains and tracker
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_lamp_flicker.cpp -o out/lamp-flicker-test
     out/lamp-flicker-test
+    # bbport (r123_lamp-colour-temperature): the lamp colour temperature's knobs, kinds, tint and tracker
+    "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror "${threads[@]}" -I. tests/test_lamp_temperature.cpp -o out/lamp-temperature-test
+    out/lamp-temperature-test
     # bbport (r95_halation): the halation's knobs and push words
     "${CXX:-clang++}" -std=c++20 -O1 -UNDEBUG -Wall -Wextra -Werror -I. tests/test_halation.cpp -o out/halation-test
     out/halation-test

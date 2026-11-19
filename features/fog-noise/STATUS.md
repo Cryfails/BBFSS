@@ -1,5 +1,15 @@
 # Fog noise (uneven, drifting density in the sun fog)
 
+## Development snapshot, 2026-11-19
+
+FGN 35%. Feature work is paused.
+
+- Verified scope. The graveyard fog banks show measurable off/on variation.
+- Open scope. Normal 4K acceptance and combined timing remain open.
+
+<details>
+<summary>Historical status and patch notes</summary>
+
 Completion: about 50%. Rated by the weakest part: the owner has not yet seen it work. It acts but is subtle in stills, and the drift could not be shown in a 5 second clip.
 
 ## What works
@@ -33,3 +43,6 @@ Not on a fork branch yet.
 - graveyard-blood: banks against even fog, level and looking up.
 - Do-nothing place: library (dark-interior).
 - Use a clip. Stills hide it.
+
+
+</details>

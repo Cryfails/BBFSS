@@ -3,17 +3,22 @@
 
 #pragma once
 
+#include "video_core/renderer_vulkan/foliage_boundary_probe.h"
+
 #include <unordered_map>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <variant>
 #include <boost/container/static_vector.hpp>
 #include <tsl/robin_map.h>
+#include "common/hash.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_reflection_fragment_discard.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 template <>
@@ -28,6 +33,13 @@ class Liverpool;
 }
 
 namespace Vulkan {
+
+// The mask variant has its own program/record namespace, so disabled runs keep the
+// original permutation indices and never overwrite a masked binary at an ordinary index.
+inline u64 GraphicsProgramHash(u64 hash, bool foliage_mask) {
+    return foliage_mask ? HashCombine(hash, 0x72313332616d6173ULL) : hash;
+}
+
 /// True for the game's SSAO pixel shader while GTAO stands in for it (BB_GTAO).
 bool IsGtaoReplacement(u64 pgm_hash, Shader::HwStage stage);
 bool IsSsrReplacement(u64 pgm_hash, Shader::HwStage stage);
@@ -158,12 +170,17 @@ public:
     void SetPositionCapture(bool enabled) { position_capture = enabled; }
 
     bool LoadComputePipeline(Serialization::Archive& ar);
-    bool LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy);
+    bool LoadGraphicsPipeline(Serialization::Archive& ar, u32 version);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage, u64 expected_hash);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {},
                                                 const PreparedDraw* prepared = nullptr,
-                                                u64 gx_record = 0);
+                                                u64 gx_record = 0,
+                                                bool request_foliage_mask = false);
+
+    void PrepareFoliageVariant(const GraphicsPipeline& original, DrawIndirectParams params = {});
+    FoliageBoundary::Probe& BoundaryProbe() { return foliage_boundary; }
+    void NoteFoliageNotRequested(const GraphicsPipeline& original);
 
     /// bbport: worker side of draw preparation: selects the pipeline key for `sel.regs` without
     /// creating anything. False when a program or permutation does not exist yet.
@@ -188,8 +205,23 @@ public:
     Result GetProgram(PipelineSelection& sel, Shader::HwStage stage, Shader::SwStage l_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
+    ReflectionDiscard::Verdict ResolveStockFragment(const ReflectionDiscard::StockFragment& role,
+                                                     vk::ShaderModule fragment) const;
+    bool StockFragmentUsable(ReflectionDiscard::StockRole role,
+                             ReflectionDiscard::Verdict verdict) const;
+
+    // If exposed again, replacement must run on the serialized draw/cache owner after draining
+    // draw preparation, so an in-flight DrawRecord cannot retain an erased pipeline.
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
+    bool CaptureProofUnchanged() const {
+        return !workflow_capture_replacement_unknown.load(std::memory_order_acquire);
+    }
+
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    BottleDisplay182::Module FindBottleDisplayModule(vk::ShaderModule handle, u64 guest, u64 permutation) const;
+    bool BottleDisplayEvidenceEnabled() const;
+#endif
 
     static std::string GetShaderName(Shader::HwStage stage, u64 hash,
                                      std::optional<size_t> perm = {});
@@ -206,7 +238,11 @@ private:
     static std::mutex progress_mutex;
     static PrecacheProgress precache_progress;
 
-    bool RefreshGraphicsKey(PipelineSelection& sel);
+    bool RefreshGraphicsKey(PipelineSelection& sel, bool request_foliage_mask = false);
+    bool FoliageMaskAvailable();
+    std::optional<bool> foliage_mask_available;
+    u64 foliage_guest_fragment{};
+    bool AddFoliageMaskStage(PipelineSelection& sel);
     bool RefreshGraphicsStages(PipelineSelection& sel);
     bool RefreshComputeKey();
 
@@ -217,6 +253,40 @@ private:
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
+    using CaptureRoute = WorkflowCapture::Route;
+    CaptureRoute CaptureProof(const PipelineSelection& selection) const;
+    void ObserveCaptureModule(vk::ShaderModule module, const Shader::Info& info, u32 mode,
+                              u64 perm_hash, std::span<const u32> code, bool lifted, bool warm);
+    struct CaptureModule {
+        CaptureRoute route{};
+        u32 mode = 0;
+    };
+    // Only the normal cache owner writes these. Pipelines take a value while being created.
+    tsl::robin_map<vk::ShaderModule, CaptureModule> workflow_capture_modules;
+    u32 workflow_capture_scanned_words = 0;
+    u32 workflow_capture_module_attempts = 0;
+#if defined(BB_TEST_BOTTLE_CUT_SOURCE) && defined(BB_TEST_SHARED_POST_GRAPH) && defined(BB_TEST_POST_PRESENT_RESOURCES)
+    void RecordBottleDisplayModule(const Shader::Info& info, u64 permutation, vk::ShaderModule module,
+                                   std::span<const u32> code, const char* route);
+    std::unique_ptr<BottleDisplay182::Modules> bottle_display_modules;
+#endif
+    void RecordStockFragment(const ReflectionDiscard::StockFragment& role, const Shader::Info& info,
+                             bool mask, vk::ShaderModule module, ReflectionDiscard::Route route,
+                             std::span<const u32> code);
+
+    struct StockFragmentRecord {
+        vk::ShaderModule module{};
+        u64 stage{};
+        ReflectionDiscard::Verdict verdict{};
+        bool poisoned{};
+    };
+
+    static constexpr size_t StockFragmentIndex(ReflectionDiscard::StockRole role) {
+        return static_cast<size_t>(role) - 1;
+    }
+    std::array<StockFragmentRecord, 2> stock_fragments;
+
+    std::atomic_bool workflow_capture_replacement_unknown{false};
     const Shader::RuntimeInfo& BuildRuntimeInfo(PipelineSelection& sel, Shader::HwStage stage,
                                                 Shader::SwStage l_stage);
 
@@ -232,6 +302,7 @@ private:
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
+    FoliageBoundary::Probe foliage_boundary;
     Shader::Pools pools;
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     /// bbport: exclusive for program/permutation insertions, shared for worker lookups.

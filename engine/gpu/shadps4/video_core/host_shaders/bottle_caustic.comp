@@ -1,0 +1,344 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform accelerationStructureEXT scene;
+layout(binding = 1, std430) readonly buffer Corners { vec4 xyz[]; } bottle;
+
+struct Lamp { vec4 position_radius; vec4 color; };
+struct Record { vec4 position_normal; vec3 flux; uint next; };
+layout(binding = 2, std430) buffer Scratch {
+    Lamp lights[64];
+    vec4 center_active;
+    vec4 source_radius;
+    vec4 color;
+    vec4 aperture_u;
+    vec4 aperture_v;
+    vec4 resolution;
+    uvec4 commands[2];
+    uint heads[4096];
+    Record hits[1024];
+} data;
+
+layout(binding = 3, rgba16f) uniform image2D color_img;
+layout(binding = 4) uniform texture2D depth_tex;
+layout(binding = 5) uniform texture2D normal_tex;
+layout(binding = 6) uniform texture2D albedo_tex;
+
+layout(push_constant) uniform Push {
+    vec4 view0;
+    vec4 view1;
+    vec4 view2;
+    vec4 proj;
+    vec2 jitter;
+    uvec2 size;
+    uint ordinal;
+    uint lamp_count;
+    uint phase;
+    float ior;
+    float emitter_clearance;
+} pc;
+
+const float Pi = 3.1415926536;
+const float Epsilon = 0.00025;
+const float Travel = 0.45;
+const float Kernel = 0.018;
+const uint CameraMask = 2u;
+const uint LampMask = 4u;
+const ivec2 InvalidPixel = ivec2(-1);
+const uvec2 ranges[5] = uvec2[](uvec2(9932, 9983), uvec2(10240, 10347), uvec2(37872, 37879),
+                                  uvec2(41856, 41887), uvec2(48759, 48824));
+
+struct Hit { uint instance_id; uint primitive; float t; };
+
+bool finite3(vec3 v) {
+    return !any(isnan(v)) && !any(isinf(v));
+}
+vec3 rotate(vec3 v) {
+    return vec3(dot(pc.view0.xyz, v), dot(pc.view1.xyz, v), dot(pc.view2.xyz, v));
+}
+vec3 unrotate(vec3 v) {
+    return pc.view0.xyz * v.x + pc.view1.xyz * v.y + pc.view2.xyz * v.z;
+}
+vec3 view(vec3 p) {
+    return rotate(p) + vec3(pc.view0.w, pc.view1.w, pc.view2.w);
+}
+vec3 world(vec3 p) {
+    return unrotate(p - vec3(pc.view0.w, pc.view1.w, pc.view2.w));
+}
+vec2 project(vec3 p) {
+    return (p.xy * pc.proj.xy / p.z * 0.5 + 0.5) * vec2(pc.size) + pc.jitter;
+}
+ivec2 texel_in(ivec2 p, ivec2 dim) {
+    return clamp(p, ivec2(0), dim - 1);
+}
+bool visible(ivec2 p) {
+    return all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, ivec2(pc.size)));
+}
+bool surface(ivec2 p, out vec3 location, out vec3 n) {
+    const float d = texelFetch(depth_tex, texel_in(p, textureSize(depth_tex, 0)), 0).x;
+    if (!(d > 0.0 && d < 1.0)) {
+        return false;
+    }
+    const float z = pc.proj.w / (d - pc.proj.z);
+    if (!(z > 0.0) || isinf(z)) {
+        return false;
+    }
+    const vec2 ndc = (vec2(p) + 0.5 - pc.jitter) / vec2(pc.size) * 2.0 - 1.0;
+    location = world(vec3(ndc * z / pc.proj.xy, z));
+    n = texelFetch(normal_tex, texel_in(p, textureSize(normal_tex, 0)), 0).xyz * 2.0 - 1.0;
+    if (dot(n, n) < 0.25 || !finite3(location)) {
+        return false;
+    }
+    n = normalize(n);
+    return true;
+}
+
+bool intersect(vec3 origin, vec3 direction, float minimum, float limit, uint mask, out Hit result) {
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray, scene, gl_RayFlagsOpaqueEXT, mask, view(origin), minimum, rotate(direction), limit);
+    while (rayQueryProceedEXT(ray)) {}
+    if (rayQueryGetIntersectionTypeEXT(ray, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+        return false;
+    }
+    result = Hit(uint(rayQueryGetIntersectionInstanceIdEXT(ray, true)),
+                 uint(rayQueryGetIntersectionPrimitiveIndexEXT(ray, true)),
+                 rayQueryGetIntersectionTEXT(ray, true));
+    return true;
+}
+
+int bottle_index(Hit hit) {
+    if (hit.instance_id != pc.ordinal) {
+        return -1;
+    }
+    uint offset = 0u;
+    for (int i = 0; i < 5; ++i) {
+        if (hit.primitive >= ranges[i].x && hit.primitive <= ranges[i].y) {
+            return int((offset + hit.primitive - ranges[i].x) * 3u);
+        }
+        offset += ranges[i].y - ranges[i].x + 1u;
+    }
+    return -1;
+}
+vec3 triangle_normal(int corner) {
+    const vec3 a = bottle.xyz[corner].xyz;
+    return normalize(cross(bottle.xyz[corner + 1].xyz - a, bottle.xyz[corner + 2].xyz - a));
+}
+// Schlick with exact equal-IOR transmission.
+float transmission(float cosine) {
+    const float r = (pc.ior - 1.0) / (pc.ior + 1.0);
+    return pc.ior == 1.0 ? 1.0 : (1.0 - r * r) * (1.0 - pow(1.0 - clamp(cosine, 0.0, 1.0), 5.0));
+}
+ivec3 cell(vec3 p) {
+    return ivec3(floor((p - data.center_active.xyz) / Kernel));
+}
+uint bucket(ivec3 p) {
+    return ((uint(p.x) * 73856093u) ^ (uint(p.y) * 19349663u) ^ (uint(p.z) * 83492791u)) & 4095u;
+}
+
+void setup() {
+    if (gl_LocalInvocationIndex != 0u) {
+        return;
+    }
+    data.center_active = vec4(0);
+    data.commands[0] = uvec4(0, 1, 1, 0);
+    data.commands[1] = uvec4(0, 0, 1, 0);
+    vec3 low = vec3(1e10);
+    vec3 high = -low;
+    for (uint i = 0; i < 798; ++i) {
+        const vec3 point = bottle.xyz[i].xyz;
+        if (!finite3(point)) {
+            return;
+        }
+        low = min(low, point);
+        high = max(high, point);
+    }
+    const vec3 origin = 0.5 * (low + high);
+    const vec3 extent = 0.5 * (high - low);
+    const float radius = length(extent);
+    if (!(radius > 0.01 && radius < 0.35)) {
+        return;
+    }
+    float best = 0.0;
+    vec3 lamp = vec3(0);
+    for (uint i = 0; i < pc.lamp_count; ++i) {
+        const Lamp candidate = data.lights[i];
+        const vec3 position = world(candidate.position_radius.xyz);
+        const vec3 lighting = max(candidate.color.rgb, vec3(0));
+        const float inv_radius2 = candidate.position_radius.w;
+        const vec3 along = position - origin;
+        const float dist = length(along);
+        const float near = max(dist - radius, 0.0);
+        const float falloff = 1.0 - near * near * inv_radius2;
+        if (dist <= radius + Epsilon || !(falloff > 0.0)) {
+            continue;
+        }
+        const float score = dot(lighting, vec3(0.2126, 0.7152, 0.0722)) * falloff * falloff /
+                            max(dist * dist, 0.01);
+        if (score > best || (score == best && position.x < lamp.x)) {
+            best = score;
+            lamp = position;
+            data.source_radius = vec4(lamp, inversesqrt(inv_radius2));
+            data.color = vec4(lighting, dist);
+        }
+    }
+    if (!(best > 0.0)) {
+        return;
+    }
+    const vec3 direction = normalize(origin - lamp);
+    const vec3 u = normalize(cross(direction, abs(direction.y) < 0.95 ? vec3(0, 1, 0) : vec3(1, 0, 0)));
+    const vec3 v = cross(direction, u);
+    // Expand the projected box for perspective, using the nearest possible bottle vertex.
+    const float cover = data.color.w / (data.color.w - radius);
+    if (cover > 4.0) {
+        return;
+    }
+    data.aperture_u = vec4(u, dot(abs(u), extent) * cover);
+    data.aperture_v = vec4(v, dot(abs(v), extent) * cover);
+    data.center_active = vec4(origin, radius);
+    data.commands[0].x = 16u;
+    vec2 screen_lo = vec2(1e10);
+    vec2 screen_hi = -screen_lo;
+    const float bound = radius + Travel + Kernel * 2.0;
+    for (uint c = 0; c < 8u; ++c) {
+        const vec3 sign3 = 2.0 * vec3(c & 1u, (c >> 1u) & 1u, c >> 2u) - 1.0;
+        const vec3 p = view(origin + sign3 * bound);
+        if (p.z < 0.1) {
+            screen_lo = vec2(0);
+            screen_hi = vec2(pc.size);
+            break;
+        }
+        const vec2 px = project(p);
+        screen_lo = min(screen_lo, px);
+        screen_hi = max(screen_hi, px);
+    }
+    const ivec2 lo_px = ivec2(clamp(floor(screen_lo), vec2(0), vec2(pc.size)));
+    const ivec2 hi_px = ivec2(clamp(ceil(screen_hi), vec2(0), vec2(pc.size)));
+    data.resolution = vec4(lo_px, hi_px);
+    const ivec2 groups = (max(hi_px - lo_px, ivec2(0)) + 7) / 8;
+    data.commands[1].xy = uvec2(groups);
+}
+
+void trace_sample(uint index) {
+    const float radius = data.center_active.w;
+    if (radius <= 0.0) {
+        return;
+    }
+    const vec2 uv = (vec2(index % 32u, index / 32u) + 0.5) / 16.0 - 1.0;
+    const vec3 aimed = data.center_active.xyz + data.aperture_u.xyz * data.aperture_u.w * uv.x +
+                      data.aperture_v.xyz * data.aperture_v.w * uv.y;
+    const vec3 lamp = data.source_radius.xyz;
+    const vec3 incoming = normalize(aimed - lamp);
+    Hit entry, exit_hit, receiver;
+    const float entry_limit = min(data.source_radius.w, data.color.w + radius);
+    if (entry_limit <= pc.emitter_clearance ||
+        !intersect(lamp, incoming, pc.emitter_clearance, entry_limit, CameraMask | LampMask, entry)) {
+        return;
+    }
+    const int entry_index = bottle_index(entry);
+    if (entry_index < 0) {
+        return;
+    }
+    vec3 n_enter = triangle_normal(entry_index);
+    if (dot(incoming, n_enter) > 0.0) {
+        n_enter = -n_enter;
+    }
+    const vec3 inside = refract(incoming, n_enter, 1.0 / pc.ior);
+    const vec3 first = lamp + incoming * entry.t;
+    if (!finite3(inside) || dot(inside, inside) < 0.5 ||
+        !intersect(first + inside * Epsilon, inside, Epsilon, 2.0 * radius, CameraMask | LampMask, exit_hit)) {
+        return;
+    }
+    const int exit_index = bottle_index(exit_hit);
+    if (exit_index < 0 || exit_index == entry_index) {
+        return;
+    }
+    vec3 n_exit = triangle_normal(exit_index);
+    if (dot(inside, n_exit) > 0.0) {
+        n_exit = -n_exit;
+    }
+    const vec3 outgoing = refract(inside, n_exit, pc.ior);
+    const float glass_distance = exit_hit.t + Epsilon;
+    const vec3 second = first + inside * glass_distance;
+    if (!finite3(outgoing) || dot(outgoing, outgoing) < 0.5 ||
+        !intersect(second + outgoing * Epsilon, outgoing, Epsilon, Travel, CameraMask | LampMask, receiver) ||
+        bottle_index(receiver) >= 0) {
+        return;
+    }
+    const vec3 point = second + outgoing * (receiver.t + Epsilon);
+    const vec3 p = view(point);
+    if (p.z <= 0.1) {
+        return;
+    }
+    const ivec2 pixel = ivec2(floor(project(p)));
+    vec3 native_point, native_normal;
+    if (!visible(pixel) || !surface(pixel, native_point, native_normal)) {
+        return;
+    }
+    const float pixel_world = 2.0 * p.z / min(float(pc.size.x) * abs(pc.proj.x),
+                                               float(pc.size.y) * abs(pc.proj.y));
+    const float incidence = max(dot(native_normal, -outgoing), 0.0);
+    if (length(native_point - point) > min(0.012, 0.0015 + 1.25 * pixel_world) || incidence <= 0.05) {
+        return;
+    }
+    const float attenuation = max(1.0 - pow(entry.t / data.source_radius.w, 2.0), 0.0);
+    const float ray_area = data.aperture_u.w * data.aperture_v.w * 4.0 / 1024.0;
+    const vec3 absorption = exp(-vec3(1.5, 4.0, 8.0) * glass_distance);
+    const float pass = transmission(-dot(incoming, n_enter)) * transmission(-dot(inside, n_exit));
+    const vec3 flux = data.color.rgb * absorption * (pass * attenuation * attenuation * ray_area);
+    const uint packed_normal = packSnorm4x8(vec4(native_normal, 0));
+    const uint head = atomicExchange(data.heads[bucket(cell(point))], index + 1u);
+    data.hits[index] = Record(vec4(point, uintBitsToFloat(packed_normal)), flux, head);
+}
+
+void composite(ivec2 p) {
+    if (data.center_active.w <= 0.0 || !visible(p) || any(lessThan(vec2(p), data.resolution.xy)) ||
+        any(greaterThan(vec2(p), data.resolution.zw))) {
+        return;
+    }
+    vec3 point, normal;
+    if (!surface(p, point, normal) || length(point - data.center_active.xyz) > data.center_active.w + Travel + Kernel * 2.0) {
+        return;
+    }
+    const ivec3 base = cell(point);
+    vec3 sum = vec3(0);
+    for (int z = -1; z <= 1; ++z) {
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                const ivec3 target = base + ivec3(x, y, z);
+                uint ptr = data.heads[bucket(target)];
+                for (uint n = 0; n < 48u && ptr != 0u; ++n) {
+                    const Record r = data.hits[ptr - 1u];
+                    ptr = r.next;
+                    if (any(notEqual(cell(r.position_normal.xyz), target))) {
+                        continue; // the same hash may represent several distinct cells
+                    }
+                    const vec3 difference = point - r.position_normal.xyz;
+                    const float d = length(difference);
+                    const vec3 hit_normal = unpackSnorm4x8(floatBitsToUint(r.position_normal.w)).xyz;
+                    if (d < Kernel && dot(hit_normal, normal) > 0.88 && abs(dot(difference, hit_normal)) < 0.0035) {
+                        const float weight = 1.0 - d / Kernel;
+                        sum += r.flux * (weight * 3.0 / (Pi * Kernel * Kernel));
+                    }
+                }
+            }
+        }
+    }
+    if (max(max(sum.r, sum.g), sum.b) > 0.0) {
+        const vec3 albedo = texelFetch(albedo_tex, texel_in(p, textureSize(albedo_tex, 0)), 0).rgb;
+        const vec4 current = imageLoad(color_img, p);
+        imageStore(color_img, p, vec4(current.rgb + min(sum, vec3(4.0)) * albedo, current.a));
+    }
+}
+
+void main() {
+    if (pc.phase == 0u) {
+        setup();
+    } else if (pc.phase == 1u) {
+        trace_sample(gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex);
+    } else {
+        composite(ivec2(gl_GlobalInvocationID.xy) + ivec2(data.resolution.xy));
+    }
+}

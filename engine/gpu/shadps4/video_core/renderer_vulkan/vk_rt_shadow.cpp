@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "video_core/renderer_vulkan/vk_reflection_ordinal3.h"
 #include "video_core/renderer_vulkan/vk_rt_shadow.h"
+#include "video_core/renderer_vulkan/vk_bottle_caustic.h"
+#include "../../../../tools/engine/sha256.h"
 
 #include <algorithm>
 #include <bit> // bbport (r54_leaf-stage2)
@@ -13,8 +16,10 @@
 #include <limits>
 #include <span>
 
+#include <fmt/format.h>
 #include <xxhash.h>
 
+#include "common/scope_exit.h"
 #include "bbport_sections.h"
 #include "bbport_settings.h"
 #include "bbport_sun_cascades.h"
@@ -22,6 +27,7 @@
 #include "bbport_wind_hang_probe.h" // bbport (r112b_hang-probe, TOOL)
 #include "shader_recompiler/ir/passes/cutout_analysis.h" // bbport (r50_leaf-stage1)
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/host_shaders/bottle_cold_validate_comp.h"
 #include "video_core/host_shaders/rt_shadow_coverage_comp.h"
 #include "video_core/host_shaders/rt_shadow_filter_r25_comp.h" // bbport (r25_rt-sun-trace)
 #include "video_core/host_shaders/rt_shadow_half_comp.h"       // bbport (r25_rt-sun-trace)
@@ -30,9 +36,15 @@
 #include "video_core/host_shaders/rt_still_sig_comp.h"         // bbport (r47_still-check)
 #include "video_core/host_shaders/rt_card_uv_comp.h"           // bbport (r54_leaf-stage2)
 #include "video_core/host_shaders/rt_unproject_comp.h"
+#include "video_core/host_shaders/rt_unproject_lamp_affine_comp.h"
 #include "video_core/host_shaders/rt_geometry_check_comp.h" // bbport (r62d_card-uv-diag)
 #include "video_core/host_shaders/rt_card_guard_comp.h" // bbport (r62e_leaf-cards-usable)
+#include "video_core/host_shaders/rt_shadow_cards_comp.h"      // bbport (r128c_lrt-cutout-props)
+#include "video_core/host_shaders/rt_shadow_half_cards_comp.h" // bbport (r128c_lrt-cutout-props)
+#include "video_core/host_shaders/rt_shadow_cards_foliage_comp.h"      // bbport (r131a_foliage-translucency)
+#include "video_core/host_shaders/rt_shadow_half_cards_foliage_comp.h" // bbport (r131a_foliage-translucency)
 #include "video_core/renderer_vulkan/lamp_shadow_tune.h" // bbport (r42_lamp-soft)
+#include "video_core/renderer_vulkan/bottle_cold_spans.h"
 #include "video_core/renderer_vulkan/rt_lamp_cards.h"    // bbport (r46_lamp-cards)
 #include "video_core/renderer_vulkan/rt_card_still.h" // bbport (r62e_leaf-cards-usable)
 #include "engine/engine_state.h" // bbport (r62n_cutout-skinned-blocker) TOOL: the hunter's position for the blocker lines
@@ -53,6 +65,13 @@
 #include "video_core/renderer_vulkan/rt_glass_find.h" // bbport (r86g_glint-find-bottles)
 #include "video_core/renderer_vulkan/rt_glass_pick.h" // bbport (r86l_glint-pick-glass, TOOL)
 #include "video_core/renderer_vulkan/rt_glass_tri.h" // bbport (r86m_glint-pane-from-triangle, TOOL)
+#include "video_core/renderer_vulkan/vk_lamp_pane_probe.h"
+#include "bbport_test_camera.h"
+#include "video_core/renderer_vulkan/glass_light.h" // bbport (r130c_glass-lamp-light)
+#include "video_core/renderer_vulkan/vk_interior_roof_probe.h"
+#include "video_core/renderer_vulkan/vk_window_path_scene.h"
+#include "video_core/renderer_vulkan/vk_window_path_pane_acquisition.h"
+#include "video_core/texture_cache/texture_cache.h"
 // bbport (r86f_glass-static-panes): the test tools' live knobs (branch dev/test-tools) when the build has
 // them: BB_GLASS_STATIC_PANES is then asked again at every use; without them it is always on.
 #if __has_include("bbport_live_knobs.h")
@@ -401,8 +420,12 @@ struct TracePush {
     float max_distance;
     s32 far_radius; // rt_shadow.comp COVERAGE_SKIP: the filter's radius, < 0 traces every pixel
     u32 r25_flags;  // bbport (r25_rt-sun-trace): R25Exact | R25Count | R25HalfFirst | R25HalfFill
+    // bbport (r131a_foliage-translucency): the FOLIAGE builds' T, hue mix and floor (rt_shadow.comp). The other builds' blocks end at r25_flags; the
+    // range pushed is wider, which is allowed.
+    float pass_share, pass_tint, pass_floor;
+    u32 pass_pad;
 };
-static_assert(sizeof(TracePush) == 40);
+static_assert(sizeof(TracePush) == 56);
 
 struct FilterPush {
     u32 buf_off;
@@ -423,6 +446,42 @@ struct UnprojectPush {
     u32 count;
 };
 static_assert(sizeof(UnprojectPush) == 56);
+
+struct BottleValidatePush {
+    std::array<float, 12> view;
+    u32 ordinal;
+    u32 mask;
+};
+static_assert(sizeof(BottleValidatePush) == 56);
+constexpr u32 BottleCornerBytes = BottleCaustic::BottleCorners * 16;
+constexpr u32 BottlePositionBytes = BottleCaustic::ColdVertices * 16;
+constexpr u32 BottleParamBytes = (BottleCaustic::ColdSpans.size() + 1) * 32;
+
+constexpr u32 LampAffineVertices = 10796;
+constexpr u32 LampAffineBitWords = (LampAffineVertices + 31) / 32;
+constexpr u64 LampAffineTopologyHash = 0x8a4174f8bb90a2ccull;
+
+struct LampAffinePush {
+    std::array<float, 12> legacy, relative;
+    std::array<float, 3> origin;
+    u32 first, count, vertices;
+    float a, b;
+};
+static_assert(sizeof(LampAffinePush) == 128 && offsetof(LampAffinePush, relative) == 48 &&
+              offsetof(LampAffinePush, origin) == 96 && offsetof(LampAffinePush, first) == 108 &&
+              offsetof(LampAffinePush, count) == 112 && offsetof(LampAffinePush, vertices) == 116 &&
+              offsetof(LampAffinePush, a) == 120 && offsetof(LampAffinePush, b) == 124);
+
+bool LampAffineProjection(const float* projection) {
+    const auto finite = [](float value) { return std::isfinite(value); };
+    return std::ranges::all_of(std::span{projection, 16}, finite) &&
+           projection[0] != 0.f && projection[5] != 0.f && projection[11] < 0.f &&
+           projection[1] == 0.f && projection[2] == 0.f && projection[3] == 0.f &&
+           projection[4] == 0.f && projection[6] == 0.f && projection[7] == 0.f &&
+           projection[8] == 0.f && projection[9] == 0.f &&
+           projection[12] == 0.f && projection[13] == 0.f &&
+           projection[14] == 1.f && projection[15] == 0.f;
+}
 
 // bbport (r47_still-check): rt_still_sig.comp's push constants: what takes a capture's clip
 // space positions to world space (StillClipToWorld), the mesh's first vertex in `positions`,
@@ -630,9 +689,35 @@ bool AppendTriangles(std::span<const Index> source, bool strip, bool restart, u3
 }
 }
 
+struct RtShadow::BottleCold {
+    BottleEndpoint endpoint;
+    Buffer positions{};
+    Buffer params{};
+    Buffer capture_addresses{};
+    Buffer both_addresses{};
+    Buffer order{};
+    Buffer corners{};
+    Buffer result{};
+    vk::UniqueDescriptorPool address_pool;
+    vk::DescriptorSet capture_set;
+    vk::DescriptorSet both_set;
+    vk::UniqueDescriptorSetLayout validate_set;
+    vk::UniquePipelineLayout validate_layout;
+    vk::UniquePipeline validate_pipeline;
+    std::array<u64, BottleCaustic::ColdSpans.size()> sample_frames{};
+    UnprojectPush unproject{};
+    u64 result_tick = 0;
+    u32 spans = 0;
+    bool recorded_span = false;
+    bool ready = false;
+};
+
 RtShadow::RtShadow(const Instance& instance_, Scheduler& scheduler_, CameraMotion& camera_motion_,
                    const ObjectMotion& object_motion)
     : instance{instance_}, scheduler{scheduler_}, camera_motion{camera_motion_} {
+    if (InteriorExposure::RoofEvidenceWanted()) {
+        roof_probe = std::make_unique<InteriorRoof::Probe>(instance, scheduler);
+    }
     if (!BbSettings::Get().startup_effects[BbSettings::EffectRayTracing]) {
         return;
     }
@@ -665,6 +750,13 @@ RtShadow::RtShadow(const Instance& instance_, Scheduler& scheduler_, CameraMotio
     }
     capturing = Setup(object_motion);
     if (capturing) {
+        const char* affine = std::getenv("BB_RT_LAMP_PANE_AFFINE");
+        if (affine && std::strcmp(affine, "1") == 0) {
+            using enum vk::DescriptorType;
+            EffectPass::Create(instance, lamp_affine_set, lamp_affine_layout, lamp_affine_pipeline,
+                               {eStorageBuffer, eStorageBuffer}, sizeof(LampAffinePush),
+                               RT_UNPROJECT_LAMP_AFFINE_COMP, "Ray tracing lamp affine positions");
+        }
         std::printf("Ray tracing: on, sun %u rays a pixel, lamps and bounced light\n", rays);
         // bbport (r83_glass-water-stage1): BB_RT_GLASS's state (rt_glass.h), said once
         static_assert((RtGlassMask & (ShadowMask | CameraMask | LampMask | CardLampMask)) == 0);
@@ -731,12 +823,240 @@ RtShadow::RtShadow(const Instance& instance_, Scheduler& scheduler_, CameraMotio
     } else {
         std::printf("Ray tracing: off - setup failed\n");
     }
+    GlassLightStart(); // bbport (r130c_glass-lamp-light): reads BB_GLASS_LIGHT once; unset: nothing
+    GlassForwardStart(); // bbport (r130g_glass-light-forward): its once line, only with BB_GLASS_LIGHT on
 }
 
+namespace {
+const char* LampReconstructionIndices(LampPaneProbe& p) {
+    auto& r = *p.reconstruction;
+    using namespace RtLampPane;
+    if ((r.index_size != 2 && r.index_size != 4) || r.strip || r.restart ||
+        r.indices != DrawIndices || r.instances != Instances ||
+        p.indices.size() != std::size_t(DrawIndices) * Instances ||
+        p.triangles != DrawIndices || s64(r.raw_min) + s32(p.base_vertex) != r.entry_first) {
+        return "unsupported index normalization";
+    }
+    const std::span first{p.indices.data(), DrawIndices};
+    if (*std::ranges::min_element(first) != 0) {
+        return "first RT slice is not normalized by minimum";
+    }
+    for (u32 i = 0; i < first.size(); ++i) {
+        const u32 index = first[i];
+        if (index >= p.vertices || p.indices[DrawIndices + i] != index + p.vertices ||
+            p.indices[2 * DrawIndices + i] != index + 2 * p.vertices) {
+            return "RT instance index slices disagree";
+        }
+    }
+    if constexpr (std::endian::native != std::endian::little) {
+        return "index fingerprint requires little-endian host";
+    }
+    r.fingerprint = XXH64(first.data(), first.size_bytes(), 0);
+
+    std::size_t count = 0;
+    for (std::size_t t = 0; t < r.triplets.size(); ++t) {
+        const auto at = LampReconstruction::Slice * DrawIndices + 3 * LampReconstruction::Ordinals[t];
+        for (std::size_t k = 0; k < r.triplets[t].size(); ++k) {
+            const u32 index = p.indices[at + k];
+            if (index / p.vertices != LampReconstruction::Slice) {
+                return "corner is outside its diagnostic instance";
+            }
+            r.triplets[t][k] = index;
+            const auto known_end = r.expanded.begin() + count;
+            if (std::find(r.expanded.begin(), known_end, index) == known_end) {
+                if (count == r.expanded.size()) {
+                    return "more than nine distinct diagnostic vertices";
+                }
+                r.expanded[count++] = index;
+            }
+        }
+    }
+    return count == r.expanded.size() ? nullptr : "fewer than nine distinct diagnostic vertices";
+}
+
+void LampReconJsonString(std::string& line, const char* text) {
+    if (!text) {
+        line += "null";
+        return;
+    }
+    line.push_back('"');
+    for (const unsigned char c : std::string_view(text)) {
+        if (c == '"' || c == '\\') line.push_back('\\');
+        if (c < 0x20) fmt::format_to(std::back_inserter(line), "\\u{:04x}", unsigned(c));
+        else line.push_back(char(c));
+    }
+    line.push_back('"');
+}
+
+void ReportLampReconstruction(const LampPaneProbe& p, const char* failure,
+                              const char* pick_status, const char* pick_reason,
+                              bool corners_emitted = false) {
+    if (!p.reconstruction) return;
+    const auto& r = *p.reconstruction;
+    const auto& id = p.capture;
+    const auto& phases = p.material.phases;
+    const char* why = failure ? failure : r.refusal;
+    if (!why && (!p.mapped || !p.allocation || !r.projection_saved || !r.viewport_after ||
+                 !id.request || id.request != p.request.id || !id.scene || !id.rt || !id.draw || !id.build ||
+                 id.image == std::numeric_limits<u32>::max() || !id.uid || !p.key || !p.param ||
+                 !r.clip_tick || r.clip_tick != p.world_tick || !p.depth_tick ||
+                 p.material.refusal || !phases.Complete(id) ||
+                 phases.before_tick > phases.after_tick || phases.after_tick > p.depth_tick)) {
+        why = "incomplete reconstruction identity, viewport or phase ordering";
+    }
+    if (!why && r.affine && (!r.vertex_stage_key || !r.raster_key_matched)) {
+        why = "delivered raster stage or motion flags not stable across A/B";
+    }
+    const auto finite = [](std::span<const float> values) {
+        return std::ranges::all_of(values, [](float v) { return std::isfinite(v); });
+    };
+    if (!why && (!finite(r.projection) || !finite(r.inverse_view) || !finite(r.rows) ||
+                 !finite(r.viewport) || !finite(r.jitter) || !finite(p.camera.view) ||
+                 !finite(p.camera.inverse) || !finite(p.camera.proj) ||
+                 r.viewport[2] <= 0.f || r.viewport[3] == 0.f ||
+                 r.viewport[4] < 0.f || r.viewport[4] > 1.f ||
+                 r.viewport[5] < 0.f || r.viewport[5] > 1.f)) {
+        why = "nonfinite or unsupported reconstruction projection";
+    }
+    std::array<std::array<float, 4>, LampReconstruction::Slots> clip{}, world{};
+    std::array<float, 2> b{}, c{};
+    if (!why) {
+        for (std::size_t i = 0; i < r.expanded.size(); ++i) {
+            if (r.expanded[i] >= r.count || u64(r.expanded[i] + 1) * 16 > p.WorldBytes()) {
+                why = "reconstruction staging vertex is out of range";
+                break;
+            }
+            std::memcpy(clip[i].data(), p.mapped + p.ClipOffset() + i * 16, 16);
+            std::memcpy(world[i].data(), p.mapped + u64(r.expanded[i]) * 16, 16);
+            if (!finite(clip[i]) || !finite(world[i]) || world[i][3] != 1.f) {
+                why = "nonfinite clip/world or incorrect output W";
+                break;
+            }
+        }
+        if (!why) {
+            using namespace RtLampPane;
+            for (u32 i = 0; i < b.size(); ++i) {
+                std::memcpy(&b[i], p.mapped + p.WorldBytes() + MaterialOffset(MaterialPhase::After, 3, i), 4);
+                std::memcpy(&c[i], p.mapped + p.WorldBytes() + i * 4, 4);
+            }
+            const auto d32 = [](float v) { return v >= 0.f && v <= 1.f; };
+            if (!std::ranges::all_of(b, d32) || !std::ranges::all_of(c, d32)) {
+                why = "invalid reconstruction depth values";
+            }
+        }
+    }
+
+    std::string line;
+    line.reserve(4096);
+    fmt::format_to(std::back_inserter(line),
+        "Lamp reconstruction (t132d): {{\"schema\":\"t132d-lamp-reconstruction-v{}\","
+        "\"capture_status\":\"{}\",\"identity\":{{\"request\":{},\"scene\":{},\"rt\":{},"
+        "\"draw\":{},\"build\":{},\"key\":\"{:016x}\",\"param\":{},\"present\":null}},"
+        "\"depth_attachment\":{{\"index\":{},\"uid\":{}}},"
+        "\"ticks\":{{\"a\":{},\"b\":{},\"c\":{},\"world\":{},\"clip\":{}}},"
+        "\"resource_generation\":null,\"reason\":",
+        r.affine ? 2 : 1, why ? "invalid" : "valid", p.request.id, id.scene, id.rt, id.draw,
+        id.build, p.key, p.param,
+        id.image, id.uid, phases.before_tick, phases.after_tick, p.depth_tick, p.world_tick, r.clip_tick);
+    LampReconJsonString(line, why);
+    line += ",\"pick\":{\"status\":";
+    LampReconJsonString(line, pick_status);
+    line += ",\"reason\":";
+    LampReconJsonString(line, pick_reason);
+    fmt::format_to(std::back_inserter(line), ",\"corners_v1_emitted\":{}}}", corners_emitted);
+    if (!why) {
+        const auto words = [&](std::span<const float> values) {
+            line.push_back('[');
+            for (std::size_t i = 0; i < values.size(); ++i) {
+                fmt::format_to(std::back_inserter(line), "{}\"{:08x}\"", i ? "," : "",
+                               std::bit_cast<u32>(values[i]));
+            }
+            line.push_back(']');
+        };
+        fmt::format_to(std::back_inserter(line),
+            ",\"mesh\":{{\"pair\":\"6a833138:bb10e440\",\"indices\":{},\"instances\":{},"
+            "\"index_size\":{},\"strip\":{},\"restart\":{},\"first_index\":{},\"base_vertex\":{},"
+            "\"first_instance\":{},\"entry_first\":{},\"raw_min\":{},\"vertices_per_instance\":{},"
+            "\"index_fingerprint\":\"{:016x}\"}},\"unproject\":{{\"first\":{},\"count\":{},\"rows\":",
+            r.indices, r.instances, r.index_size, r.strip, r.restart, p.first_index, s32(p.base_vertex),
+            p.first_instance, r.entry_first, r.raw_min, p.vertices, r.fingerprint, r.first, r.count);
+        words(r.rows);
+        if (r.affine) {
+            line += ",\"representation\":\"affine\",\"relative_rows\":";
+            words(r.relative_rows);
+            line += ",\"origin\":";
+            words(r.origin);
+            fmt::format_to(std::back_inserter(line),
+                           ",\"vertex_stage_key\":\"{:016x}\",\"raster_motion_flags\":{}",
+                           r.vertex_stage_key, r.raster_motion_flags);
+        }
+        line += "},\"draw_projection\":";
+        words(r.projection);
+        line += ",\"draw_inverse_view\":";
+        words(r.inverse_view);
+        line += ",\"pass_view\":";
+        words(p.camera.view);
+        line += ",\"pass_inverse_view\":";
+        words(p.camera.inverse);
+        line += ",\"pass_projection\":";
+        words(p.camera.proj);
+        line += ",\"viewport\":";
+        words(r.viewport);
+        line += ",\"jitter\":";
+        words(r.jitter);
+        fmt::format_to(std::back_inserter(line),
+            ",\"scissor\":[{},{},{},{}],\"request_extent\":[{},{}],\"raster\":[{},{}],"
+            "\"requested_texels\":[[{},{}],[{},{}]],\"native_texels\":[[{},{}],[{},{}]],\"depth_b\":",
+            r.scissor.offset.x, r.scissor.offset.y, r.scissor.extent.width, r.scissor.extent.height,
+            p.request.width, p.request.height, p.width, p.height, p.request.pixels[0].x,
+            p.request.pixels[0].y, p.request.pixels[1].x, p.request.pixels[1].y, p.samples[0].x,
+            p.samples[0].y, p.samples[1].x, p.samples[1].y);
+        words(b);
+        line += ",\"depth_c\":";
+        words(c);
+        line += ",\"triplets\":[";
+        for (std::size_t i = 0; i < r.triplets.size(); ++i) {
+            fmt::format_to(std::back_inserter(line), "{}{{\"local\":{},\"expanded\":[{},{},{}]}}",
+                           i ? "," : "", LampReconstruction::Ordinals[i],
+                           r.triplets[i][0], r.triplets[i][1], r.triplets[i][2]);
+        }
+        line += "],\"vertices\":[";
+        for (std::size_t i = 0; i < r.expanded.size(); ++i) {
+            fmt::format_to(std::back_inserter(line), "{}{{\"expanded\":{},\"clip\":",
+                           i ? "," : "", r.expanded[i]);
+            words(clip[i]);
+            line += ",\"world\":";
+            words(world[i]);
+            if (r.affine) {
+                // These nine indices are referenced by the captured triangles. The clip and
+                // world words let the reader independently check the actual shader output.
+                const float expected = std::fma(r.projection[10], clip[i][3], r.projection[11]);
+                const auto key = [](float v) {
+                    const u32 bits = std::bit_cast<u32>(v);
+                    return (bits & 0x80000000u) ? 0u - bits : bits ^ 0x80000000u;
+                };
+                const auto [z, fma_z] = std::pair{key(clip[i][2]), key(expected)};
+                const u32 steps = std::max(z, fma_z) - std::min(z, fma_z);
+                fmt::format_to(std::back_inserter(line), ",\"clip_contract\":{}",
+                               clip[i][3] > 0.f && std::isfinite(expected) && steps <= 1);
+            }
+            line.push_back('}');
+        }
+        line.push_back(']');
+    }
+    line += "}\n";
+    std::fwrite(line.data(), 1, line.size(), stdout);
+}
+} // namespace
+
 RtShadow::~RtShadow() {
+    if (lamp_pane && !lamp_pane->reported) {
+        ReportLampReconstruction(*lamp_pane, "shutdown before a completed report", "not-evaluated", nullptr);
+    }
     if (!tried) {
         return;
     }
+    DiscardBottleCold();
     scheduler.Finish();
     vsm.reset();
     const auto device = instance.GetDevice();
@@ -749,9 +1069,14 @@ RtShadow::~RtShadow() {
     if (tlas) {
         device.destroyAccelerationStructureKHR(tlas);
     }
+    Free(bottle_corners);
+    Free(lamp_affine_bits);
     Free(r25_counts); // bbport (r25_rt-sun-trace)
     Free(r25_readback);
     Free(probe_world); // bbport (r64b_surface-probe-more)
+    if (lamp_pane) {
+        lamp_pane->Free(instance.GetAllocator(), scheduler);
+    }
     Free(still_sigs); // bbport (r47_still-check)
     Free(still_readback);
     Free(geo_buffer); // bbport (r62d_card-uv-diag)
@@ -771,9 +1096,525 @@ RtShadow::~RtShadow() {
     if (raw_image) {
         vmaDestroyImage(instance.GetAllocator(), raw_image, raw_allocation);
     }
+    if (sun_hue_view) { // bbport (r131a_foliage-translucency)
+        device.destroyImageView(sun_hue_view);
+    }
+    if (sun_hue_image) {
+        vmaDestroyImage(instance.GetAllocator(), sun_hue_image, sun_hue_allocation);
+    }
     for (Buffer* b : {&capture_addresses, &both_addresses, &params, &positions, &scratch,
                       &instance_data, &tlas_storage, &tlas_scratch}) {
         Free(*b);
+    }
+}
+
+LampPaneProbe* RtShadow::ActiveLampPane() const noexcept {
+    return lamp_pane && !lamp_pane->refusal && !lamp_pane->sealed ? lamp_pane.get() : nullptr;
+}
+
+namespace {
+void ReportLampIndexLineage(const LampPaneProbe& p, VmaAllocator allocator) {
+    if (!p.lineage) return;
+    const auto& lineage = *p.lineage;
+    const auto& cfg = Round2ProbeSettings::Get();
+    const auto& selected = p.material.phases;
+    const char* why = lineage.refusal;
+    u64 raw_hash = 0;
+    u64 invalidate_ns = 0, hash_ns = 0, index_write_ns = 0;
+    if (!why && (p.refusal || !p.Captured() || !p.mapped || !lineage.tick || !lineage.after ||
+                 !selected.Complete(p.capture) || selected.before_tick != lineage.tick ||
+                 selected.after_tick < lineage.tick)) {
+        why = "incomplete_bound_index_witness";
+    }
+    if (!why) {
+        const u64 start = Round2CostStart(cfg.cost);
+        const auto result = vmaInvalidateAllocation(allocator, p.allocation, 0, VK_WHOLE_SIZE);
+        invalidate_ns = Round2CostElapsed(start);
+        if (result != VK_SUCCESS) why = "bound_index_invalidate";
+    }
+    if (!why) {
+        const auto* bytes = p.mapped + p.LineageOffset();
+        const auto size = LampIndexLineage::Bytes;
+        const u64 hash_start = Round2CostStart(cfg.cost);
+        raw_hash = XXH64(bytes, size, 0);
+        hash_ns = Round2CostElapsed(hash_start);
+        char path[1024];
+        const int n = std::snprintf(path, sizeof(path), "%s/%s-index-%u.u16", cfg.directory, cfg.session, p.request.id);
+        const bool valid_path = n > 0 && size_t(n) < sizeof(path);
+        const u64 write_start = Round2CostStart(cfg.cost && valid_path);
+        auto* out = valid_path ? std::fopen(path, "wbx") : nullptr;
+        if (!out) {
+            why = "bound_index_output_open";
+        } else {
+            const auto wrote = std::fwrite(bytes, 1, size, out);
+            if (std::fclose(out) || wrote != size) why = "bound_index_output_write";
+        }
+        index_write_ns = Round2CostElapsed(write_start);
+    }
+    const auto print = [](u64 x) { return static_cast<unsigned long long>(x); };
+    if (cfg.cost) {
+        std::printf("Round2 cost: {\"schema\":\"round2-host-cost-v1\",\"kind\":\"index\",\"op\":\"retire\","
+                    "\"session\":\"%s\",\"pid\":%d,\"request\":%u,\"scene\":%llu,\"rt\":%llu,\"tick\":%llu,"
+                    "\"invalidate_ns\":%llu,\"hash_ns\":%llu,\"index_write_ns\":%llu,"
+                    "\"index_payload_bytes\":%u,\"lineage_enabled\":true,\"status\":\"%s\"}\n",
+                    cfg.session, Round2ProbeSettings::Pid(), p.request.id, print(p.capture.scene),
+                    print(p.capture.rt), print(lineage.tick), print(invalidate_ns), print(hash_ns),
+                    print(index_write_ns), LampIndexLineage::Bytes, why ? why : "ok");
+    }
+    std::printf("Round2 index: {\"schema\":\"round2-bound-index-v1\",\"session\":\"%s\",\"pid\":%d,"
+                "\"status\":\"%s\",\"reason\":\"%s\",\"request\":%u,\"scene\":%llu,\"rt\":%llu,"
+                "\"draw\":%u,\"build\":%u,\"param\":%u,\"depth_id\":%u,\"depth_uid\":%llu,"
+                "\"pair\":\"6a833138:bb10e440\",\"source_offset\":%llu,\"source_capacity\":%llu,"
+                "\"count\":%u,\"index_bytes\":%u,\"raw_u16_xxh64\":\"%016llx\","
+                "\"cached_normalized_u32_xxh64\":\"%016llx\",\"index_tick\":%llu,\"after_tick\":%llu,"
+                "\"first_index\":%u,\"base_vertex\":%d,\"first_instance\":%u}\n",
+                cfg.session, Round2ProbeSettings::Pid(), why ? "invalid" : "ok", why ? why : "retired_actual_bind_span",
+                p.request.id, print(p.capture.scene), print(p.capture.rt), p.capture.draw, p.capture.build,
+                p.param, p.capture.image, print(p.capture.uid), print(lineage.before.offset), print(lineage.before.capacity),
+                RtLampPane::DrawIndices, LampIndexLineage::Bytes, print(raw_hash),
+                print(p.reconstruction ? p.reconstruction->fingerprint : 0), print(lineage.tick), print(selected.after_tick),
+                p.first_index, int(s32(p.base_vertex)), p.first_instance);
+}
+} // namespace
+
+void RtShadow::PollLampPane(u64 scene_frame) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("BB_LAMP_PANE_PROBE");
+        return value && std::string_view(value) == "1";
+    }();
+    if (!enabled) {
+        return;
+    }
+
+    if (lamp_pane) {
+        LampPaneProbe& p = *lamp_pane;
+        if (!p.refusal && !p.Captured() && scene_frame - p.armed_frame >= RtLampPane::FrameBudget) {
+            p.refusal = p.saw_target ? "target seen, no eligible ordinary RT capture"
+                                     : "exact target draw absent";
+        }
+        if (p.Captured() && !p.sealed && scene_frame >= p.capture.scene) {
+            p.sealed = true;
+            if (!p.refusal && (!p.depth_tick || !p.world_tick)) {
+                p.refusal = !p.world_tick ? "normal capture was not recorded"
+                                          : "same-frame depth trigger absent";
+            }
+        }
+        if (!p.refusal && p.Captured() && scene_frame - p.capture.scene >= RtLampPane::FrameBudget) {
+            p.refusal = "readback fence timeout";
+        }
+        if (p.refusal || p.sealed) {
+            if (p.refusal && !p.reported) {
+                std::printf("Lamp pane (t132d): request %u scene %llu draw %u build %u refused: %s\n",
+                            p.request.id, static_cast<unsigned long long>(p.capture.scene),
+                            p.capture.draw, p.capture.build, p.refusal);
+                if (p.material_enabled) {
+                    std::printf("Lamp material (t132d): req %u unknown: %s\n", p.request.id,
+                                p.material.refusal ? p.material.refusal : p.refusal);
+                }
+                ReportLampReconstruction(p, p.refusal, "not-evaluated", nullptr);
+                p.reported = true;
+            }
+            const bool material_ready = p.material.phases.Retired([&](u64 tick) { return scheduler.IsFree(tick); });
+            const bool world_ready = !p.world_tick || scheduler.IsFree(p.world_tick);
+            const bool depth_ready = !p.depth_tick || scheduler.IsFree(p.depth_tick);
+            const bool clip_ready = !p.reconstruction || !p.reconstruction->clip_tick ||
+                                    scheduler.IsFree(p.reconstruction->clip_tick);
+            const bool index_ready = !p.lineage || !p.lineage->tick || scheduler.IsFree(p.lineage->tick);
+            if (world_ready && depth_ready && material_ready && clip_ready && index_ready) {
+                ReportLampIndexLineage(p, instance.GetAllocator());
+                if (!p.refusal) {
+                    ReportLampPane(p);
+                }
+                p.Free(instance.GetAllocator(), scheduler);
+                lamp_pane.reset();
+            }
+        }
+    }
+
+    const u32 generation = BbLiveKnobs::Generation();
+    if (generation == lamp_pane_generation) {
+        return;
+    }
+    lamp_pane_generation = generation;
+    const auto text = BbLiveKnobs::Lookup("BB_LAMP_PANE_PICK");
+    const char* value = text.Get();
+    if (!value || !*value) {
+        return;
+    }
+    RtLampPane::Request request;
+    if (!RtLampPane::Parse(value, request)) {
+        std::printf("Lamp pane (t132d): refused invalid ID/W/H/PX/PY/MX/MY\n");
+        return;
+    }
+    if (request.id <= lamp_pane_last_request) {
+        return;
+    }
+    lamp_pane_last_request = request.id;
+    if (lamp_pane) {
+        std::printf("Lamp pane (t132d): request %u refused: previous request still active\n", request.id);
+        return;
+    }
+    lamp_pane = std::make_unique<LampPaneProbe>();
+    lamp_pane->request = request;
+    lamp_pane->armed_frame = scene_frame;
+    const char* reconstruct = std::getenv("BB_LAMP_PANE_RECON");
+    if (reconstruct && std::string_view(reconstruct) == "1") {
+        lamp_pane->reconstruction.emplace();
+    }
+    if (Round2ProbeSettings::Get().lineage) {
+        lamp_pane->lineage.emplace();
+    }
+    static const bool material = [] {
+        const char* text = std::getenv("BB_LAMP_PANE_MATERIAL");
+        return text && std::string_view(text) == "1";
+    }();
+    lamp_pane->material_enabled = material;
+    if (material) {
+        std::printf("Lamp material (t132d): req %u armed for two A/B texels\n", request.id);
+    }
+    std::printf("Lamp pane (t132d): armed %u at scene %llu, %ux%u pane %d,%d metal %d,%d\n",
+                request.id, static_cast<unsigned long long>(scene_frame), request.width,
+                request.height, request.pixels[0].x, request.pixels[0].y,
+                request.pixels[1].x, request.pixels[1].y);
+}
+
+namespace {
+// D265 TEST ONLY. The R323 draw and both depth seeds have already been witnessed by t132d.
+const char* ReportLampCorners(const LampPaneProbe& p, const RtGlassTri::Mesh& mesh,
+                              const RtGlassTri::Panel& panel,
+                              const std::array<RtLampPane::Hit, 2>& hits) {
+    constexpr std::array<u32, 4> panel_ids{2458, 2459, 2460, 2461};
+    constexpr u32 metal_id = 2074, instance = 1;
+    constexpr u32 tris_per_instance = RtLampPane::DrawIndices / 3;
+    const auto& id = p.capture;
+    const auto& phases = p.material.phases;
+    if (!id.request || id.request != p.request.id || !id.scene || !id.rt || !id.draw || !id.build ||
+        id.image == std::numeric_limits<u32>::max() || !id.uid ||
+        !p.world_tick || !p.depth_tick || !phases.Complete(id)) {
+        return "incomplete capture identity";
+    }
+    if (!RtLampPane::MeshSize(p.vertices, mesh.triangles, RtLampPane::Instances) ||
+        mesh.triangles != tris_per_instance * RtLampPane::Instances ||
+        mesh.vertices != p.vertices * RtLampPane::Instances || !mesh.world || !mesh.indices ||
+        p.indices.size() != std::size_t(mesh.triangles) * 3 ||
+        u64(p.first_instance) + instance > std::numeric_limits<u32>::max()) {
+        return "invalid R323 instance expansion";
+    }
+    if (!panel.ok || !std::ranges::equal(panel.tris, panel_ids) || RtLampPane::ValidatePair(hits) ||
+        hits[0].instance != instance || hits[1].instance != instance ||
+        !std::binary_search(panel_ids.begin(), panel_ids.end(), hits[0].local) ||
+        hits[1].local != metal_id ||
+        hits[0].expanded != instance * tris_per_instance + hits[0].local ||
+        hits[1].expanded != instance * tris_per_instance + metal_id) {
+        return "accepted triangles do not identify the R323 panel and control";
+    }
+    const auto finite = [](float value) { return std::isfinite(value); };
+    const auto& [view, inverse, proj] = p.camera;
+    if (!p.width || !p.height || p.width > 8192 || p.height > 8192 ||
+        u64(p.width) * p.height > 3840u * 2160u ||
+        !std::ranges::all_of(view, finite) || !std::ranges::all_of(inverse, finite) ||
+        !std::ranges::all_of(proj, finite) || !proj[0] || !proj[1] || !(proj[3] < 0.f) ||
+        !std::ranges::all_of(p.jitter, [](float j) { return std::abs(j) <= 1.f; })) {
+        return "invalid captured camera or raster";
+    }
+
+    constexpr std::array local{panel_ids[0], panel_ids[1], panel_ids[2], panel_ids[3], metal_id};
+    std::array<std::array<RtGlassTri::V3, 3>, local.size()> corners{};
+    const auto& [scissor_offset, scissor_extent] = p.material.scissor;
+    for (std::size_t t = 0; t < local.size(); ++t) {
+        const u32 expanded = instance * tris_per_instance + local[t];
+        std::array<RtGlassFind::ScreenPoint, 3> screen{};
+        for (std::size_t k = 0; k < 3; ++k) {
+            const u32 index = mesh.indices[std::size_t(expanded) * 3 + k];
+            if (index / p.vertices != instance) {
+                return "corner outside the accepted instance slice";
+            }
+            const auto world = RtGlassTri::At(mesh, index);
+            const auto q = RtGlassFind::ProjectToPicture(view, proj, world.x, world.y, world.z);
+            const float vz = view[8] * world.x + view[9] * world.y + view[10] * world.z + view[11];
+            const float z = proj[2] + proj[3] / vz;
+            const float x = q.x * float(p.width) / RtGlassFind::PictureWidth + p.jitter[0];
+            const float y = q.y * float(p.height) / RtGlassFind::PictureHeight + p.jitter[1];
+            if (!finite(world.x) || !finite(world.y) || !finite(world.z) || !finite(vz) ||
+                !q.front || !(z >= 0.f && z <= 1.f) ||
+                !(x >= 0.f && x < float(p.width) && y >= 0.f && y < float(p.height)) ||
+                !(x >= float(scissor_offset.x) && y >= float(scissor_offset.y) &&
+                  x < float(s64(scissor_offset.x) + scissor_extent.width) &&
+                  y < float(s64(scissor_offset.y) + scissor_extent.height))) {
+                return "non-finite or clipped projected corner";
+            }
+            corners[t][k] = world;
+            screen[k] = q;
+        }
+        const auto [a, b, c] = screen;
+        const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if (!finite(area) || std::abs(area) < 1e-6f) {
+            return "degenerate projected triangle";
+        }
+    }
+
+    // Format one complete event, with locale-independent, round-trip float values.
+    std::string line;
+    line.reserve(4096);
+    fmt::format_to(std::back_inserter(line),
+        "Lamp corners (t132d): {{\"schema\":\"t132d-lamp-corners-v1\",\"identity\":{{"
+        "\"request\":{},\"scene\":{},\"rt\":{},\"draw\":{},\"build\":{},\"key\":\"{:016x}\",\"present\":null}},"
+        "\"readback\":{{\"depth_image\":{},\"depth_uid\":{},\"world_tick\":{},\"a_tick\":{},\"b_tick\":{},\"c_tick\":{}}},"
+        "\"raster\":[{},{}],\"mesh\":{{\"pair\":\"6a833138:bb10e440\",\"index_count\":{},\"instances\":{},"
+        "\"first_index\":{},\"base_vertex\":{},\"first_instance\":{},\"instance\":{},"
+        "\"vertices_per_instance\":{},\"triangles_per_instance\":{}}},",
+        id.request, id.scene, id.rt, id.draw, id.build, p.key, id.image, id.uid,
+        p.world_tick, phases.before_tick, phases.after_tick, p.depth_tick, p.width, p.height,
+        RtLampPane::DrawIndices, RtLampPane::Instances, p.first_index, s32(p.base_vertex),
+        p.first_instance, instance, p.vertices, tris_per_instance);
+    const auto vector = [&](std::span<const float> values) {
+        line.push_back('[');
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            fmt::format_to(std::back_inserter(line), "{}{:.16e}", i ? "," : "", double(values[i]));
+        }
+        line.push_back(']');
+    };
+    line += "\"view\":";
+    vector(view);
+    line += ",\"inverse\":";
+    vector(inverse);
+    line += ",\"proj\":";
+    vector(proj);
+    line += ",\"jitter\":";
+    vector(p.jitter);
+    line += ",\"triangles\":[";
+    for (std::size_t t = 0; t < local.size(); ++t) {
+        fmt::format_to(std::back_inserter(line),
+            "{}{{\"role\":\"{}\",\"local\":{},\"expanded\":{},\"corners\":[",
+            t ? "," : "", t < panel_ids.size() ? "panel" : "metal", local[t],
+            instance * tris_per_instance + local[t]);
+        for (std::size_t k = 0; k < 3; ++k) {
+            if (k) line.push_back(',');
+            const auto [x, y, z] = corners[t][k];
+            vector(std::array{x, y, z});
+        }
+        line += "]}";
+    }
+    line += "]}\n";
+    std::fwrite(line.data(), 1, line.size(), stdout);
+    return nullptr;
+}
+} // namespace
+
+void RtShadow::ReportLampPane(const LampPaneProbe& p) {
+    const auto& id = p.capture;
+    struct ReconstructionReport {
+        const LampPaneProbe& probe;
+        const char* failure = "mapped readback was not validated";
+        const char* pick_status = "not-evaluated";
+        const char* pick_reason = nullptr;
+        bool corners_emitted = false;
+        ~ReconstructionReport() {
+            ReportLampReconstruction(probe, failure, pick_status, pick_reason, corners_emitted);
+        }
+    } reconstruction{p};
+    std::printf("Lamp pane (t132d): request %u scene %llu RT %llu draw %u build %u key %016llx depth %u/%llu ticks %llu/%llu\n",
+                id.request, static_cast<unsigned long long>(id.scene),
+                static_cast<unsigned long long>(id.rt), id.draw, id.build,
+                static_cast<unsigned long long>(p.key), id.image,
+                static_cast<unsigned long long>(id.uid), static_cast<unsigned long long>(p.world_tick),
+                static_cast<unsigned long long>(p.depth_tick));
+    std::printf("Lamp pane (t132d): request %u 6a833138:bb10e440 idx25296 x3 first %u base %d first instance %u "
+                "vertices/instance %u expanded tris %u raster %ux%u jitter %.4f,%.4f\n",
+                id.request, p.first_index, int(s32(p.base_vertex)), p.first_instance, p.vertices,
+                p.triangles, p.width, p.height, p.jitter[0], p.jitter[1]);
+    const auto material_unknown = [&](const char* why) {
+        reconstruction.pick_status = "refused";
+        reconstruction.pick_reason = why;
+        std::printf("Lamp material (t132d): req %u unknown: %s\n", id.request, why);
+    };
+    const auto refused = [&](const char* why) {
+        reconstruction.pick_status = "refused";
+        reconstruction.pick_reason = why;
+        std::printf("Lamp pane (t132d): request %u inconclusive: %s\n", id.request, why);
+        if (p.material_enabled) {
+            material_unknown(p.material.refusal ? p.material.refusal : why);
+        }
+    };
+    if (vmaInvalidateAllocation(instance.GetAllocator(), p.allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
+        reconstruction.failure = "could not invalidate mapped readback";
+        refused("could not invalidate mapped readback");
+        return;
+    }
+    const RtGlassTri::Mesh mesh{
+        reinterpret_cast<const float*>(p.mapped), p.vertices * RtLampPane::Instances,
+        p.indices.data(), p.triangles};
+    if (!RtLampPane::MeshValid(mesh, p.vertices)) {
+        reconstruction.failure = "invalid expanded indices or nonfinite captured vertices";
+        refused("invalid expanded indices or non-finite captured vertices");
+        return;
+    }
+    reconstruction.failure = nullptr;
+    std::array<RtLampPane::Hit, 2> hits{};
+    for (u32 i = 0; i < hits.size(); ++i) {
+        float raw = 0;
+        std::memcpy(&raw, p.mapped + p.WorldBytes() + sizeof(float) * i, sizeof raw);
+        const auto& sample = p.samples[i];
+        const auto depth = RtLampPane::ReadDepth(raw, p.camera, sample, BbTestCamera::WorldFromDepth);
+        const char* label = i == 0 ? "pane" : "metal";
+        if (depth.refusal) {
+            std::printf("Lamp pane (t132d): request %u %s texel %u,%u raw %.9g: %s\n",
+                        id.request, label, sample.x, sample.y, double(raw), depth.refusal);
+            refused(depth.refusal);
+            return;
+        }
+        const auto hit = RtLampPane::Pick(mesh, p.vertices, p.camera, sample, depth);
+        hits[i] = hit;
+        std::printf("Lamp pane (t132d): request %u %s texel %u,%u raw %.9g depth %.5f predicted %.5f "
+                    "residual %.5f tolerance %.5f inside %u fits %u slice %u instance %llu tri %u local %u\n",
+                    id.request, label, sample.x, sample.y, double(raw), double(depth.metres),
+                    double(hit.predicted), double(hit.residual), double(depth.tolerance),
+                    hit.inside, hit.consistent, hit.instance,
+                    static_cast<unsigned long long>(u64(p.first_instance) + hit.instance),
+                    hit.expanded, hit.local);
+    }
+    if (const char* why = RtLampPane::ValidatePair(hits)) {
+        refused(why);
+        return;
+    }
+    const auto panel = RtLampPane::Grow(mesh, p.vertices, hits[0]);
+    if (!panel.ok) {
+        refused(panel.why);
+        return;
+    }
+    if (std::binary_search(panel.tris.begin(), panel.tris.end(), hits[1].local)) {
+        refused("metal control is in the connected panel");
+        return;
+    }
+    std::printf("Lamp pane (t132d): request %u geometry candidate, %zu local tris, AABB "
+                "(%.4f %.4f %.4f)-(%.4f %.4f %.4f), %.4fx%.4f m, n=(%.4f %.4f %.4f) plane %.4f, "
+                "metal local %u outside panel; material unresolved\n",
+                id.request, panel.tris.size(), panel.box[0], panel.box[1], panel.box[2],
+                panel.box[3], panel.box[4], panel.box[5], panel.width, panel.height,
+                panel.normal[0], panel.normal[1], panel.normal[2], panel.offset, hits[1].local);
+    constexpr std::size_t PerLine = 12;
+    for (std::size_t first = 0; first < panel.tris.size(); first += PerLine) {
+        std::printf("Lamp pane (t132d): request %u panel IDs %zu:", id.request, first);
+        for (std::size_t i = first; i < std::min(first + PerLine, panel.tris.size()); ++i) {
+            std::printf(" %u", panel.tris[i]);
+        }
+        std::printf("\n");
+    }
+    if (!p.material_enabled) {
+        reconstruction.pick_status = "final-depth-pair";
+        return;
+    }
+    const auto& m = p.material;
+    if (m.refusal || !m.phases.Complete(p.capture)) {
+        material_unknown(m.refusal ? m.refusal : "exact draw did not deliver both A/B phases");
+        return;
+    }
+
+    using namespace RtLampPane;
+    using Bytes = std::array<std::uint8_t, MaterialTexelBytes>;
+    std::array<std::array<Bytes, 3>, MaterialPixels> a{}, b{};
+    bool distinct = false;
+    std::array<bool, MaterialPixels> changed{};
+    for (u32 i = 0; i < MaterialPixels; ++i) {
+        std::array<float, 2> z{};
+        for (u32 phase = 0; phase < z.size(); ++phase) {
+            std::memcpy(&z[phase], p.mapped + p.WorldBytes() + MaterialOffset(MaterialPhase(phase), 3, i),
+                        sizeof(float));
+        }
+        const auto& sample = p.samples[i];
+        const auto before = ReadDepth(z[0], p.camera, sample, BbTestCamera::WorldFromDepth);
+        const auto after = ReadDepth(z[1], p.camera, sample, BbTestCamera::WorldFromDepth);
+        const auto hit = Pick(mesh, p.vertices, p.camera, sample, after);
+        const char* label = i == 0 ? "pane-seed" : "metal-control";
+        std::printf("Lamp material (t132d): req %u %s texel %u,%u A-depth %.9g A-view-valid=%u A-view=%.6f "
+                    "B-depth %.9g B-view-valid=%u B-view=%.6f B-fits=%u B-tri=%u C-tri=%u\n",
+                    id.request, label, sample.x, sample.y, double(z[0]), unsigned(!before.refusal),
+                    before.refusal ? 0.0 : double(before.metres), double(z[1]), unsigned(!after.refusal),
+                    after.refusal ? 0.0 : double(after.metres), hit.consistent, hit.expanded, hits[i].expanded);
+        if (after.refusal || hit.consistent != 1 || hit.expanded != hits[i].expanded) {
+            material_unknown("immediate and final depth do not witness the same unique candidate");
+            return;
+        }
+        for (u32 target = 0; target < a[i].size(); ++target) {
+            std::memcpy(a[i][target].data(),
+                        p.mapped + p.WorldBytes() + MaterialOffset(MaterialPhase::Before, target, i), MaterialTexelBytes);
+            std::memcpy(b[i][target].data(),
+                        p.mapped + p.WorldBytes() + MaterialOffset(MaterialPhase::After, target, i), MaterialTexelBytes);
+            const u32 delta = MaterialChanged(a[i][target], b[i][target]);
+            if (delta & ~m.masks[target]) {
+                material_unknown("observed a changed byte outside the raster channel mask");
+                return;
+            }
+            changed[i] |= delta != 0;
+        }
+    }
+    const auto normalized = [](std::uint8_t c) { return double(c) / 255.0; };
+    const u32 rgb[] = {1u, 7u, 7u};
+    for (u32 target = 0; target < a[0].size(); ++target) {
+        const auto encoding = LampMaterialEncoding(m.sources[target].created_format);
+        const char* encoding_label = LampMaterialEncodingLabel(encoding);
+        const auto& p0 = b[0][target];
+        const auto& p1 = b[1][target];
+        const u32 difference = MaterialChanged(p0, p1);
+        distinct |= (difference & m.masks[target] & rgb[target]) != 0;
+        std::printf("Lamp material (t132d): req %u MRT %u encoding=%s immediate-post-draw pane-minus-metal bytes %d,%d,%d,%d mask=%x\n",
+                    id.request, target + 1, encoding_label, int(p0[0]) - int(p1[0]), int(p0[1]) - int(p1[1]),
+                    int(p0[2]) - int(p1[2]), int(p0[3]) - int(p1[3]), difference);
+        for (u32 i = 0; i < MaterialPixels; ++i) {
+            const char* label = i == 0 ? "pane-seed" : "metal-control";
+            const auto& x = a[i][target];
+            const auto& y = b[i][target];
+            std::printf("Lamp material (t132d): req %u %s MRT %u encoding=%s A=%u,%u,%u,%u B=%u,%u,%u,%u "
+                        "B-A=%d,%d,%d,%d changed=%x\n",
+                        id.request, label, target + 1, encoding_label,
+                        unsigned(x[0]), unsigned(x[1]), unsigned(x[2]), unsigned(x[3]),
+                        unsigned(y[0]), unsigned(y[1]), unsigned(y[2]), unsigned(y[3]),
+                        int(y[0]) - int(x[0]), int(y[1]) - int(x[1]), int(y[2]) - int(x[2]), int(y[3]) - int(x[3]),
+                        MaterialChanged(x, y));
+            // CopyImageToBuffer retains encoded sRGB bytes. Only UNORM gets the existing derived metrics.
+            if (encoding != LampMaterialColor::Unorm) {
+                continue;
+            }
+            const double r = normalized(y[0]), g = normalized(y[1]), b = normalized(y[2]);
+            if (target == 0) {
+                std::printf("Lamp material (t132d): req %u %s B gloss R=%.6f exponent estimate=%.4f\n",
+                            id.request, label, r, std::exp2(13.0 * r));
+            } else if (target == 1) {
+                std::printf("Lamp material (t132d): req %u %s B albedo RGB=%.6f,%.6f,%.6f\n",
+                            id.request, label, r, g, b);
+            } else {
+                std::printf("Lamp material (t132d): req %u %s B specular root RGB=%.6f,%.6f,%.6f F0 estimate=%.6f,%.6f,%.6f\n",
+                            id.request, label, r, g, b, r * r, g * g, b * b);
+            }
+        }
+    }
+    const bool composited = m.logic != u32(AmdGpu::ColorControl::LogicOp::Copy) ||
+                            std::ranges::any_of(m.blend, [](u32 raw) {
+                                return std::bit_cast<AmdGpu::BlendControl>(raw).enable;
+                            });
+    std::printf("Lamp material (t132d): req %u result=%s scene %llu draw %u build %u ticks A/B/C=%llu/%llu/%llu "
+                "pane_changed=%u metal_changed=%u response=%s material=unknown alpha=uninterpreted\n",
+                id.request, changed[0] || changed[1]
+                                ? (distinct ? "draw-changed-bytes; post-values-differ"
+                                            : "draw-changed-bytes; post-values-match")
+                                : "no-change-proven; post-values-unattributed",
+                static_cast<unsigned long long>(id.scene), id.draw, id.build,
+                static_cast<unsigned long long>(m.phases.before_tick), static_cast<unsigned long long>(m.phases.after_tick),
+                static_cast<unsigned long long>(p.depth_tick), unsigned(changed[0]), unsigned(changed[1]),
+                composited ? "composited" : "stored");
+    static const bool corners = [] {
+        const char* value = std::getenv("BB_LAMP_PANE_CORNERS");
+        return value && std::string_view(value) == "1";
+    }();
+    reconstruction.pick_status = "accepted";
+    if (corners) {
+        if (const char* why = ReportLampCorners(p, mesh, panel, hits)) {
+            std::printf("Lamp corner refusal (t132d): request %u: %s\n", id.request, why);
+            reconstruction.pick_status = "refused";
+            reconstruction.pick_reason = why;
+        } else {
+            reconstruction.corners_emitted = true;
+        }
     }
 }
 
@@ -810,12 +1651,48 @@ void RtShadow::Free(Buffer& buffer) {
     buffer = {};
 }
 
-void RtShadow::Destroy(Entry& entry) {
+InteriorRoof::WatchRow* RtShadow::RoofWatchEntry(const Entry& entry) {
+    auto* watch = roof_probe ? roof_probe->Watch() : nullptr;
+    if (!watch) {
+        return nullptr;
+    }
+    const auto live = entry_live.find(&entry);
+    if (live == entry_live.end() || !live->second || live->second != entry.address || !entry.handle) {
+        return nullptr;
+    }
+    return watch->Exact(entry.base, entry.mesh);
+}
+
+void RtShadow::Destroy(Entry& entry, const char* reason) {
+    if (reflection_native_tracked) {
+        for (auto& probe : reflection_native_entries) {
+            if (probe.entry == &entry) {
+                probe = {};
+                --reflection_native_tracked;
+                break;
+            }
+        }
+    }
+    if (reflection_tracker) {
+        ReflectionRetire(entry, reason);
+    }
+    InvalidateBottleGeometry(entry.address);
+    if (entry.address != 0 && entry.address == bottle_entry_address) {
+        bottle_entry = nullptr;
+        bottle_entry_address = 0;
+        bottle_ambiguous = true;
+    }
     // bbport (r121c_tlas-unbound-read): no record is written for it from here. When the TLAS last built still holds
     // its address (it was in the records of the last scene) the next scene is a build and the free is counted; the
     // free itself waits for the GPU below (DeferOperation: the tick of the command buffer being recorded, never
     // before a TLAS or BLAS build recorded earlier).
+    if (auto* row = RoofWatchEntry(entry)) {
+        row->Forget(entry.address, reason);
+    }
     entry_live.erase(&entry);
+    if (roof_probe) {
+        roof_probe->ForgetGeometry(entry.address);
+    }
     if (TlasGuardOn() && r17_tlas_valid && entry.address != 0 &&
         std::ranges::any_of(r17_tlas_records, [&](const vk::AccelerationStructureInstanceKHR& record) {
             return record.accelerationStructureReference == entry.address;
@@ -1254,10 +2131,10 @@ bool RtShadow::Complete() const {
            camera_motion.PassMatrices().valid;
 }
 
-void RtShadow::BindAddresses(vk::PipelineLayout layout, u32 mode) {
-    const vk::DescriptorSet set =
-        Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth ? both_set
-                                                                              : capture_set;
+void RtShadow::BindAddresses(vk::PipelineLayout layout, u32 mode, u32 bottle_param) {
+    const bool both = Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth;
+    const vk::DescriptorSet set = bottle_param ? (both ? bottle_cold->both_set : bottle_cold->capture_set)
+                                               : (both ? both_set : capture_set);
     scheduler.Record([layout, set](vk::CommandBuffer command) {
         command.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout,
                                    Shader::MotionVectors::DescriptorSet, set, {});
@@ -1437,6 +2314,21 @@ std::unique_ptr<RtShadow::Entry> RtShadow::MakeEntry(const Draw& draw, u8 mask) 
         ++missed;
         return nullptr;
     }
+    // Ordinary draw variants can share this entry. Shortlist by the common key
+    // fields and prove the ordered upload while it is still in CPU memory.
+    if (draw.index_count == BottleCaustic::IndexCount && entry->instances == 1 &&
+        list.size() == BottleCaustic::IndexCount) {
+        static const bool bottle_can_enable = [] {
+#if __has_include("bbport_live_knobs.h")
+            const char* live = std::getenv("BB_LIVE_KNOBS_FILE");
+            if (live && *live) {
+                return true;
+            }
+#endif
+            return BottleCaustic::On();
+        }();
+        entry->bottle_index_verified = bottle_can_enable && bottle_topology.Verify(list);
+    }
     std::memcpy(entry->indices.mapped, list.data(), list.size() * sizeof(u32));
     vk::AccelerationStructureGeometryKHR geometry{
         .geometryType = vk::GeometryTypeKHR::eTriangles,
@@ -1470,6 +2362,7 @@ std::unique_ptr<RtShadow::Entry> RtShadow::MakeEntry(const Draw& draw, u8 mask) 
     }
     entry->scratch = sizes.buildScratchSize;
     entry->update_scratch = sizes.updateScratchSize;
+    entry->reflection_creation_size = sizes.accelerationStructureSize;
     entry->scene_bytes = sizes.accelerationStructureSize + list.size() * sizeof(u32);
     entry->bytes = entry->scene_bytes;
     if (!Make(entry->storage, sizes.accelerationStructureSize, false,
@@ -1556,7 +2449,19 @@ bool RtShadow::Holds(const Entry& entry) const {
 void RtShadow::CollectHeld() {
     held_now.clear();
     for (Entry* entry : held) {
-        if (entry->seen_frame != frame && Holds(*entry)) {
+        const bool pick = entry->seen_frame != frame && Holds(*entry);
+        if (auto* row = RoofWatchEntry(*entry)) {
+            ++row->now.held_seen;
+            row->now.held_pick += pick;
+            row->now.hold_why = pick ? "cascade-held" :
+                entry->seen_frame == frame ? "already-in-current-draw-list" :
+                !hold_frames ? "cascade-hold-off" :
+                entry->shadow_frame == frame ? "cascade-current" :
+                frame - entry->shadow_frame > hold_frames ? "cascade-hold-expired" :
+                !(entry->cascades & ~frame_cascades & 0x0f) ? "no-undrawn-matching-cascade" :
+                entry->gone ? "entry-marked-gone" : "unknown";
+        }
+        if (pick) {
             held_now.push_back(entry);
         }
     }
@@ -1570,6 +2475,11 @@ void RtShadow::CollectHeld() {
         if (it != entries.end() && it->second && it->second->blas &&
             it->second->seen_frame != frame && RtGlassEntry(it->second->mask)) {
             held_now.push_back(it->second.get());
+            if (auto* row = RoofWatchEntry(*it->second)) {
+                ++row->now.held_seen;
+                ++row->now.held_pick;
+                row->now.hold_why = "existing-glass-carry";
+            }
         }
     }
 }
@@ -1597,6 +2507,10 @@ void RtShadow::UpdateHeld() {
                 continue; // drawn into a cascade this frame: taken below with the frame's entries
             }
             if (!Holds(*entry)) {
+                if (auto* row = RoofWatchEntry(*entry)) {
+                    row->now.hold_why = frame - entry->shadow_frame > hold_frames ? "cascade-hold-expired" :
+                                            entry->gone ? "entry-marked-gone" : "no-undrawn-matching-cascade";
+                }
                 if (frame - entry->shadow_frame > hold_frames) {
                     ++hold_stats.aged;
                 } else {
@@ -1611,16 +2525,25 @@ void RtShadow::UpdateHeld() {
             }
             if (frame + 1 - entry->shadow_frame > window) {
                 ++hold_stats.aged;
+                if (auto* row = RoofWatchEntry(*entry)) {
+                    row->now.hold_why = "next-cascade-window-expired";
+                }
                 continue;
             }
             entry->held = true;
             held_next.push_back(entry);
+            if (auto* row = RoofWatchEntry(*entry)) {
+                ++row->now.held_next;
+            }
         }
         if (window) {
             for (Entry* entry : frame_entries) {
                 if (!entry->held && entry->shadow_frame == frame && (entry->cascades & 0x0f)) {
                     entry->held = true;
                     held_next.push_back(entry);
+                    if (auto* row = RoofWatchEntry(*entry)) {
+                        ++row->now.held_next;
+                    }
                 }
             }
         }
@@ -1652,6 +2575,197 @@ void RtShadow::UpdateHeld() {
     }
     hold_frames = window;
     frame_cascades = 0;
+}
+
+// bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT, read once at start. Unset or empty: nothing (no line, no state). "0" without
+// the live knobs file is as unset. Otherwise the mode is made and the lamp pass (PointShadow::Ready) says the rest; off for a
+// reason here (not 0 or 1, no registry, no ray traced lamps) is said once. With the live file the knob is read each frame.
+void RtShadow::GlassLightStart() {
+    const char* text = std::getenv("BB_GLASS_LIGHT");
+    if (text == nullptr || text[0] == '\0') {
+        return;
+    }
+    const u8 parsed = GlassLight::ParseLight(text);
+    bool live = false;
+#if BB_GLASS_STATIC_LIVE
+    const char* file = std::getenv("BB_LIVE_KNOBS_FILE");
+    live = file != nullptr && file[0] != '\0';
+#endif
+    if (parsed == 0 && !live) {
+        return;
+    }
+    const char* why = parsed == 2                         ? "is neither 0 nor 1"
+                      : !GlassRegistryRules::Load().on ? "needs BB_GLASS_TABLE"
+                      : !capturing                      ? "no ray traced lamps"
+                                                        : nullptr;
+    if (why != nullptr) {
+        std::printf("Glass light (r130c): BB_GLASS_LIGHT=%.16s: off (%s)\n", text, why);
+        return;
+    }
+    glass_light_mode = 1;
+    glass_light_live = live;
+    glass_light_now = parsed == 1 || !live;
+    glass_counts.window_start = frame;
+}
+
+// bbport (r130c_glass-lamp-light): once a scene's records are written (PrepareScene, only while the mode is made): the knob now
+// (live: each frame), the live flips and the 600-frame line. True: this scene's glass entries get glass records (not with the
+// lamp cards on, whose CARDS builds have no glass form: the records stay as before, counted).
+bool RtShadow::GlassLightFrame(bool card_lamps) {
+    bool now = true;
+#if BB_GLASS_STATIC_LIVE
+    if (glass_light_live) {
+        static BbLiveKnobs::Knob<u8> knob{"BB_GLASS_LIGHT", GlassLight::ParseLight};
+        now = knob.Get() == 1;
+    }
+#endif
+    if (now != glass_light_now) {
+        std::printf("Glass light (r130c): live %s at frame %llu\n", now ? "on" : "off",
+                    static_cast<unsigned long long>(frame));
+        glass_light_now = now;
+    }
+    if (!now && glass_counts.off_frame != frame + 1) {
+        glass_counts.off_frame = frame + 1;
+        ++glass_counts.live_off;
+    }
+    if (frame - glass_counts.window_start >= 600) {
+        std::printf("Glass light (r130c): frames %llu-%llu: glass records %llu (twins %llu), kept blocking (lamp cards) %llu, "
+                    "passes with glass %llu of %llu, live off %llu frames\n",
+                    static_cast<unsigned long long>(glass_counts.window_start + 1), static_cast<unsigned long long>(frame),
+                    static_cast<unsigned long long>(glass_counts.records), static_cast<unsigned long long>(glass_counts.twins),
+                    static_cast<unsigned long long>(glass_counts.kept_cards),
+                    static_cast<unsigned long long>(glass_counts.passes_glass),
+                    static_cast<unsigned long long>(glass_counts.passes), static_cast<unsigned long long>(glass_counts.live_off));
+        glass_counts = {};
+        glass_counts.window_start = frame;
+    }
+    glass_light_records_now = 0;
+    return now && !card_lamps;
+}
+
+// bbport (r130c_glass-lamp-light): a draw reached its entry (PrepareDraw, only while the mode is made). A registry hit of a
+// transmitting kind marks the entry (sticky) and remembers the mesh; a sun shadow pass draw of a remembered mesh (the twin: the
+// pass that draws the pane for the sun) is marked with the same entry, so that both records carry the glass index.
+void RtShadow::GlassLightNote(Entry& entry, const Draw& draw) {
+    const u64 count = draw.index_count;
+    if (draw.glass_entry != 0) {
+        const auto& table = GlassRegistryRules::Load();
+        const u32 index = u32(draw.glass_entry) - 1u;
+        if (index >= table.count || !GlassLight::Transmits(table.entries[index].kind)) {
+            return;
+        }
+        entry.glass_light = draw.glass_entry;
+        const u64 packed = count | u64(draw.glass_entry) << 32;
+        for (u32 i = 0; i < glass_geo_n; ++i) {
+            if (glass_geo[i][0] == draw.geometry && glass_geo[i][1] == draw.indices && (glass_geo[i][2] & 0xffffffffull) == count) {
+                glass_geo[i][2] = packed;
+                return;
+            }
+        }
+        if (glass_geo_n < glass_geo.size()) {
+            glass_geo[glass_geo_n++] = {draw.geometry, draw.indices, packed};
+        }
+    } else if (draw.shadow_pass && entry.glass_light == 0) {
+        for (u32 i = 0; i < glass_geo_n; ++i) {
+            if (glass_geo[i][0] == draw.geometry && glass_geo[i][1] == draw.indices && (glass_geo[i][2] & 0xffffffffull) == count) {
+                entry.glass_light = u8(glass_geo[i][2] >> 32);
+                ++glass_counts.twins;
+                return;
+            }
+        }
+    }
+}
+
+// bbport (r130g_glass-light-forward): the once line (BB_GLASS_LIGHT on only).
+void RtShadow::GlassForwardStart() {
+    if (glass_light_mode == 0) {
+        return;
+    }
+    glass_fwd.window_start = frame;
+    std::printf("Glass light (r130g): forward panes %s (BB_RT_GLASS %s): a registered pane drawn with a GPU-placed palette is "
+                "taken when drawn %u frames in a row (at most %u a frame) and carried into the next frame's scene; the glass "
+                "query reaches %.2f m short of the lamp's centre (before: the solid ray's blind end, 0.18 m or more); counted in "
+                "half-resolution passes (one in 8; full resolution counts nothing)\n",
+                RtGlassOn() ? "possible" : "none", RtGlassOn() ? "on" : "off", GlassLight::SteadyFrames,
+                GlassLight::PlacedPerFrame, double(GlassLight::LampClear));
+}
+
+// bbport (r130g_glass-light-forward): the glass counter as text: `now` less `last` (the words of GlassRaysSeen), for the first
+// look and the 600-frame line.
+void RtShadow::GlassRaysText(char* out, std::size_t size, const std::array<u32, 10>& now, const std::array<u32, 10>& last) const {
+    const u32 counted = now[0] - last[0];
+    if (counted == 0) {
+        std::snprintf(out, size, "lamp rays: no counted pass (full resolution, or no half resolution pass was counted yet)");
+        return;
+    }
+    char lamp[160] = "no lamp met";
+    if (now[9] != 0) {
+        float v[3];
+        for (u32 i = 0; i < 3; ++i) {
+            const u32 bits = now[6 + i];
+            std::memcpy(&v[i], &bits, sizeof(float));
+        }
+        std::snprintf(lamp, sizeof(lamp), "a lamp met at %.2f m from the camera (view %.2f %.2f %.2f), its pane %.3f m from the "
+                      "lamp's centre", std::sqrt(double(v[0]) * v[0] + double(v[1]) * v[1] + double(v[2]) * v[2]), double(v[0]),
+                      double(v[1]), double(v[2]), double(now[9]) * 0.001);
+    }
+    std::snprintf(out, size, "lamp rays in %u counted passes: asked %u, met glass %u, tinted %u, met inside the old blind end %u; "
+                  "entries met 0x%x; %s", counted, now[1] - last[1], now[2] - last[2], now[3] - last[3], now[4] - last[4], now[5],
+                  lamp);
+}
+
+// bbport (r130g_glass-light-forward): called each scene while the mode is made, right after r130c's GlassLightFrame: the first look
+// at the glass counter (once, when four passes were counted) and, every 600 frames, the forward panes and the counter.
+void RtShadow::GlassForwardFrame() {
+    char text[480];
+    if (!glass_rays_early && glass_rays_now[0] >= 4u) {
+        glass_rays_early = true;
+        GlassRaysText(text, sizeof(text), glass_rays_now, std::array<u32, 10>{});
+        std::printf("Glass light (r130g): first look, since start: %s\n", text);
+    }
+    if (frame - glass_fwd.window_start < 600) {
+        return;
+    }
+    GlassRaysText(text, sizeof(text), glass_rays_now, glass_rays_last);
+    std::printf("Glass light (r130g): frames %llu-%llu: placed panes taken %llu, not steady %llu, over the cap %llu, moving left "
+                "out %llu; glass records carried %llu; %s\n",
+                static_cast<unsigned long long>(glass_fwd.window_start + 1), static_cast<unsigned long long>(frame),
+                static_cast<unsigned long long>(glass_fwd.placed_taken), static_cast<unsigned long long>(glass_fwd.placed_unsteady),
+                static_cast<unsigned long long>(glass_fwd.placed_cap), static_cast<unsigned long long>(glass_fwd.moving_left),
+                static_cast<unsigned long long>(glass_fwd.carried), text);
+    glass_rays_last = glass_rays_now;
+    glass_fwd = {};
+    glass_fwd.window_start = frame;
+}
+
+// bbport (r130g_glass-light-forward): may a pane draw with a palette the GPU wrote be taken? Only with BB_GLASS_LIGHT on and a
+// registry hit (Draw::glass_entry, index + 1) of a kind that lets light through. Off: false at the first test.
+bool RtShadow::GlassPlacedAllowed(u8 hit) const {
+    if (glass_light_mode == 0 || hit == 0) {
+        return false;
+    }
+    const auto& table = GlassRegistryRules::Load();
+    return hit <= table.count && GlassLight::Transmits(table.entries[hit - 1u].kind);
+}
+
+// bbport (r130g_glass-light-forward): the steady rule for such a pane instance (GlassLight::JudgeSteady: drawn on 3 frames in a
+// row), and at most PlacedPerFrame of them a frame. False: the draw is left out (PrepareDraw returns 0, as for r121b's verdicts).
+bool RtShadow::GlassPlacedSteady(u64 instance) {
+    if (!GlassLight::JudgeSteady(glass_steady, instance, frame)) {
+        ++glass_fwd.placed_unsteady;
+        return false;
+    }
+    if (glass_placed_frame != frame) {
+        glass_placed_frame = frame;
+        glass_placed_frame_n = 0;
+    }
+    if (glass_placed_frame_n >= GlassLight::PlacedPerFrame) {
+        ++glass_fwd.placed_cap;
+        return false;
+    }
+    ++glass_placed_frame_n;
+    ++glass_fwd.placed_taken;
+    return true;
 }
 
 // bbport (r83_glass-water-stage1): BB_RT_GLASS: a window pane's draw reached its entry
@@ -2388,18 +3502,996 @@ void RtShadow::GlassFindBox() {
     }
 }
 
+bool RtShadow::LampAffineTopology(const Draw& draw) {
+    static_assert(std::endian::native == std::endian::little);
+    const std::span raw{reinterpret_cast<const u16*>(draw.indices), RtLampPane::DrawIndices};
+    const u64 raw_hash = XXH64(raw.data(), raw.size_bytes(), 0);
+    if (lamp_affine_bits.buffer) {
+        return raw_hash == lamp_affine_raw_hash;
+    }
+    // Verify the normalized index list used by MakeEntry before a raw hash can be reused.
+    const auto [lo, hi] = std::ranges::minmax(raw);
+    if (lo != 0 || hi != LampAffineVertices - 1) {
+        return false;
+    }
+    std::vector<u32> normalized;
+    normalized.reserve(raw.size());
+    if (!AppendTriangles(raw, false, false, lo, normalized) || normalized.size() != raw.size() ||
+        XXH64(normalized.data(), normalized.size() * sizeof(u32), 0) != LampAffineTopologyHash) {
+        return false;
+    }
+    if (!Make(lamp_affine_bits, LampAffineBitWords * sizeof(u32), true,
+              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !lamp_affine_bits.mapped) {
+        Free(lamp_affine_bits);
+        lamp_affine_pipeline.reset();
+        return false;
+    }
+    std::array<u32, LampAffineBitWords> bits{};
+    for (const u32 index : normalized) {
+        bits[index / 32] |= 1u << (index % 32);
+    }
+    // This coherent allocation is immutable after publication. Queue submission makes the
+    // initial mapped writes visible to the affine compute shader.
+    std::memcpy(lamp_affine_bits.mapped, bits.data(), sizeof(bits));
+    lamp_affine_raw_hash = raw_hash;
+    return true;
+}
+
+void RtShadow::ResetBottlePass(const std::array<u64, 3>& targets) {
+    if (bottle_cold && (bottle_pass_frame == frame || bottle_targets != targets)) {
+        DiscardBottleCold();
+    }
+    bottle_targets = targets;
+    bottle_pass_frame = frame;
+    bottle_entry = nullptr;
+    bottle_entry_address = 0;
+    bottle_recorded_frame = ~u64{0};
+    bottle_scene_frame = ~u64{0};
+    bottle_ambiguous = false;
+    bottle_draw_seen = false;
+}
+
+namespace ReflectionFirstHit {
+bool PlacedLifecycleOn();
+void TracePlacedLifecycle(PlacedSource, std::string_view reason, u64 frame, u64 pass,
+                          u64 allocation, u64 revision, u64 cookie, u64 a, u64 b);
+}
+
+namespace {
+constexpr u32 ReflectionTrackLimit = 512;
+
+bool ExactMirror(u64 vs, u64 ps, u32 count, u32 first) {
+    return vs == 0x9da6aacb && ps == 0xca7226ec && count == 24 && first == 2440816;
+}
+
+bool ExactFireplace(u64 vs, u64 ps, u32 count, u32 first) {
+    return vs == 0x9da6aacb && ps == 0xbb10e440 && count == 18282 && first == 158744;
+}
+
+constexpr std::string_view ReflectionFireplaceDigest =
+    "be38ecf6afb2e8b90791cf61011ce8d5c7098fcd6ba3bb20b668cef4a73fd26f";
+constexpr std::string_view ReflectionWallDigest =
+    "00f7ea51aaf41a8ea9faffd22caee1da5bb04737f9fc0f6790f042af31d54e4f";
+constexpr std::string_view ReflectionMirrorDigest =
+    "c4ba3f63d6523b00006da56b37d1e4a93bcca6e6d6d73e3cc5d33d6cb0068773";
+
+template <typename Index>
+bool BoundReflectionIndices(const RtShadow::Draw& draw, u32 lo, std::span<const u32> built) {
+    const auto* raw = reinterpret_cast<const Index*>(draw.indices);
+    for (std::size_t i = 0; i < built.size(); ++i) {
+        if (u32(raw[i]) < lo || u32(raw[i]) - lo != built[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+u8 HexNybble(char c) {
+    return u8(c >= 'a' ? c - 'a' + 10 : c - '0');
+}
+} // namespace
+
+void RtShadow::ReflectionAttach(ReflectionFirstHit::Pass* pass) {
+    if (!pass) {
+        reflection_tracker.reset();
+    } else if (!reflection_tracker) {
+        reflection_tracker = std::make_unique<ReflectionTracker>();
+        reflection_tracker->pass = pass;
+        reflection_tracker->tracks.reserve(ReflectionTrackLimit);
+    }
+}
+
+void RtShadow::ReflectionCloseEpoch() {
+    auto& tracking = *reflection_tracker;
+    tracking.pass->CloseEpoch();
+    tracking.stamp.reset();
+    tracking.tracks.clear();
+    tracking.last_flushed = 0;
+}
+
+bool RtShadow::ReflectionBeginPass(const ReflectionFirstHit::Stamp& stamp) {
+    auto& tracking = *reflection_tracker;
+    if (tracking.stamp && tracking.stamp->generation != stamp.generation) {
+        ReflectionCloseEpoch();
+    }
+    if (!tracking.pass->BeginPass(stamp)) {
+        ReflectionCloseEpoch();
+        return false;
+    }
+    if (!tracking.stamp || tracking.stamp->pass != stamp.pass) {
+        tracking.stamp = stamp;
+        tracking.mirror_direct = 0;
+        tracking.mirror_joined = 0;
+        tracking.fireplace_direct = 0;
+        tracking.wall_shape_direct = 0;
+        tracking.placed_direct = {};
+        tracking.placed_joined = {};
+        tracking.direct = 0;
+        tracking.joined = 0;
+    }
+    return true;
+}
+
+bool RtShadow::ReflectionStatic(const Entry& entry, ReflectionFirstHit::PlacedSource source) {
+    const bool placed = source != ReflectionFirstHit::PlacedSource::None;
+    return entry.handle && entry.address && entry.reflection_creation_size && entry.instances == 1 &&
+           !entry.shadow && !entry.dynamic && !entry.rebuilt && !entry.copied &&
+           !entry.skinned && !entry.skeleton_bones && entry.palette_placed == placed &&
+           (placed ? entry.palette != 0 : (!entry.palette || entry.instance)) &&
+           !entry.card_shadow && !entry.card_camera && !entry.card_mesh && !entry.card_uv &&
+           !entry.glass_light && !entry.still_moved && !entry.still_doubt && !entry.gone;
+}
+
+void RtShadow::ReflectionObserve(Entry& entry, const Draw& draw, bool eligible) {
+    auto& tracking = *reflection_tracker;
+    auto found = tracking.tracks.find(&entry);
+    auto* token = draw.reflection;
+    const bool good = tracking.stamp && tracking.stamp->frame == frame && token && token->placement &&
+                      eligible && ReflectionStatic(entry, token->placed) && draw.indices && entry.indices.mapped &&
+                      draw.index_count == entry.triangles * 3 &&
+                      entry.first_vertex == u32(s64(token->min_index) + s32(draw.first_vertex)) &&
+                      entry.vertices == token->max_index - token->min_index + 1 &&
+                      entry.palette == draw.palette &&
+                      (draw.index_size == 2 || draw.index_size == 4);
+    if (!good) {
+        if (ReflectionFirstHit::PlacedLifecycleOn()) {
+            using ReflectionFirstHit::PlacedSource;
+            const auto* proof = found == tracking.tracks.end() ? nullptr : &found->second;
+            const auto role = proof && proof->observed.placed != PlacedSource::None ? proof->observed.placed
+                            : token ? token->placed : PlacedSource::None;
+            if (role != PlacedSource::None) {
+                // value_a: stamp, token, eligibility, static, ranges, count, base vertex, span,
+                // palette and index width. value_b: actual ordinary draw/entry state.
+                const u32 failures = u32(!tracking.stamp || tracking.stamp->frame != frame) |
+                    (u32(!token || !token->placement) << 1) | (u32(!eligible) << 2) |
+                    (u32(!ReflectionStatic(entry, role)) << 3) | (u32(!draw.indices || !entry.indices.mapped) << 4) |
+                    (u32(draw.index_count != entry.triangles * 3) << 5) |
+                    (u32(token && entry.first_vertex != u32(s64(token->min_index) + s32(draw.first_vertex))) << 6) |
+                    (u32(token && entry.vertices != token->max_index - token->min_index + 1) << 7) |
+                    (u32(entry.palette != draw.palette) << 8) |
+                    (u32(draw.index_size != 2 && draw.index_size != 4) << 9);
+                const u32 state = u32(draw.camera_pass) | (u32(draw.shadow_pass) << 1) |
+                    (u32(entry.built) << 2) | (u32(entry.blas) << 3) | (u32(entry.instance) << 4) |
+                    (u32(entry.shadow) << 5) | (u32(entry.dynamic) << 6) | (u32(entry.rebuilt) << 7) |
+                    (u32(entry.copied) << 8) | (u32(entry.skinned || entry.skeleton_bones) << 9) |
+                    (u32(entry.card_shadow || entry.card_camera || entry.card_mesh || entry.card_uv) << 10) |
+                    (u32(entry.glass_light) << 11) | (u32(entry.still_moved) << 12) |
+                    (u32(entry.still_doubt) << 13) | (u32(entry.gone) << 14) |
+                    (u32(entry.palette_placed) << 15) | (u32(entry.seen_frame == frame) << 16);
+                const char* why = !eligible && draw.shadow_pass ? "observe-ineligible-shadow" : "observe-refused";
+                ReflectionFirstHit::TracePlacedLifecycle(role, why, frame, tracking.stamp ? tracking.stamp->pass : 0,
+                    proof ? proof->observed.allocation : 0, proof ? proof->resident.revision : 0,
+                    proof ? proof->cookie : 0, failures, state);
+            }
+        }
+        if (found != tracking.tracks.end()) {
+            tracking.pass->InvalidateAllocation(found->second.observed.allocation);
+            found->second.resident = {};
+            found->second.cookie = 0;
+            ++tracking.changed;
+        }
+        return;
+    }
+    const auto built = std::span{static_cast<const u32*>(entry.indices.mapped), draw.index_count};
+    const bool topology = draw.index_size == 2
+        ? BoundReflectionIndices<u16>(draw, token->min_index, built)
+        : BoundReflectionIndices<u32>(draw, token->min_index, built);
+    if (!topology) {
+        const auto* proof = found == tracking.tracks.end() ? nullptr : &found->second;
+        ReflectionFirstHit::TracePlacedLifecycle(token->placed, "observe-normalized-indices", frame,
+            tracking.stamp->pass, proof ? proof->observed.allocation : 0,
+            proof ? proof->resident.revision : 0, proof ? proof->cookie : 0,
+            draw.index_count, draw.index_size);
+        if (found != tracking.tracks.end()) {
+            tracking.pass->InvalidateAllocation(found->second.observed.allocation);
+            found->second.resident = {};
+            found->second.cookie = 0;
+        }
+        ++tracking.changed;
+        return;
+    }
+    const std::array<u64, 5> source{entry.base, entry.mesh, draw.indices, draw.positions, token->first};
+    const u64 surface = XXH3_64bits(source.data(), sizeof(source));
+    if (surface == 0) {
+        return;
+    }
+    if (found == tracking.tracks.end()) {
+        if (tracking.tracks.size() == ReflectionTrackLimit) {
+            ++tracking.track_limit;
+            return;
+        }
+        found = tracking.tracks.try_emplace(&entry).first;
+        found->second.observed.allocation = ++tracking.allocation;
+    }
+    auto& attestation = found->second;
+    if (attestation.placement != token->placement || attestation.observed.surface != surface ||
+        attestation.observed.vs != draw.shader || attestation.observed.ps != draw.pixel_shader ||
+        attestation.observed.placed != token->placed || attestation.address != entry.address) {
+        const u64 allocation = attestation.observed.allocation;
+        if (token->placement_delta.enabled && attestation.resident.revision &&
+            attestation.placement != token->placement) {
+            auto& prior = token->placement_delta;
+            prior.key = attestation.placement;
+            prior.cookie = attestation.cookie;
+            prior.revision = attestation.resident.revision;
+            prior.pass = attestation.confirmed_pass;
+            prior.same_identity = attestation.observed.surface == surface &&
+                attestation.observed.vs == draw.shader && attestation.observed.ps == draw.pixel_shader &&
+                attestation.observed.placed == token->placed && attestation.address == entry.address;
+        }
+        ReflectionFirstHit::TracePlacedLifecycle(token->placed,
+            attestation.observed.surface ? "observe-identity-change" : "observe-track-created", frame,
+            tracking.stamp->pass, allocation, attestation.resident.revision, attestation.cookie,
+            attestation.observed.surface != surface, attestation.placement != token->placement);
+        tracking.pass->InvalidateAllocation(allocation);
+        tracking.pass->ObserveSurface(surface, token->placement);
+        attestation.resident = {};
+        attestation.address = entry.address;
+        attestation.placement = token->placement;
+        auto& id = attestation.observed;
+        id = {.surface = surface, .allocation = allocation, .placement = token->placement,
+              .vs = u32(draw.shader), .ps = u32(draw.pixel_shader), .count = draw.index_count,
+              .first = token->first,
+              .receiver = ExactMirror(draw.shader, draw.pixel_shader, draw.index_count, token->first),
+              .placed = token->placed};
+        const auto hash = sha256_hex(reinterpret_cast<const u8*>(built.data()), built.size_bytes());
+        id.wall_witness = id.count == 42441 && hash == ReflectionWallDigest;
+        for (u32 i = 0; i < id.topology_sha256.size(); ++i) {
+            id.topology_sha256[i] = u8((HexNybble(hash[2 * i]) << 4) | HexNybble(hash[2 * i + 1]));
+        }
+        if ((id.receiver && hash != ReflectionMirrorDigest) ||
+            (ExactFireplace(id.vs, id.ps, id.count, id.first) && hash != ReflectionFireplaceDigest) ||
+            (id.vs != 0x9da6aacb && !id.wall_witness)) {
+            ReflectionFirstHit::TracePlacedLifecycle(token->placed, "observe-topology-fingerprint", frame,
+                tracking.stamp->pass, allocation, 0, attestation.cookie, id.count, id.first);
+            attestation.observed.surface = 0;
+            ++tracking.refused;
+            return;
+        }
+    }
+    token->entry = &entry;
+    token->allocation = attestation.observed.allocation;
+    attestation.cookie = token->cookie = ++tracking.cookie;
+}
+
+void RtShadow::ReflectionQueue(Entry& entry, const Draw& draw, Build& build) {
+    const auto found = reflection_tracker->tracks.find(&entry);
+    if (found == reflection_tracker->tracks.end()) {
+        return;
+    }
+    auto& proof = found->second;
+    ++proof.pending;
+    if (proof.observed.placed != ReflectionFirstHit::PlacedSource::None) {
+        // A queued replacement makes the prior placement uncertain even if capture is later dropped.
+        const auto& stamp = reflection_tracker->stamp;
+        ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "ordinary-queue", frame,
+            stamp ? stamp->pass : 0, proof.observed.allocation, proof.resident.revision,
+            draw.reflection ? draw.reflection->cookie : 0, build.param, build.update);
+        reflection_tracker->pass->InvalidateAllocation(proof.observed.allocation);
+        proof.resident = {};
+    }
+    if (draw.reflection) {
+        build.reflection_cookie = draw.reflection->cookie;
+    }
+}
+
+void RtShadow::ReflectionDropCapture(const Build& build) {
+    const auto found = reflection_tracker->tracks.find(build.entry);
+    if (found != reflection_tracker->tracks.end() && found->second.pending) {
+        const auto& proof = found->second;
+        const auto& stamp = reflection_tracker->stamp;
+        const u32 state = u32(build.left_out) | (u32(build.probe) << 1) |
+                          (u32(build.uv_only) << 2) | (u32(need_scene) << 3);
+        ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "ordinary-build-dropped", frame,
+            stamp ? stamp->pass : 0, proof.observed.allocation, proof.resident.revision,
+            build.reflection_cookie, build.param, state);
+        --found->second.pending;
+        ++reflection_tracker->dropped;
+    }
+}
+
+void RtShadow::ReflectionBuild(Entry& entry, const Build& build) {
+    auto& tracking = *reflection_tracker;
+    const auto found = tracking.tracks.find(&entry);
+    if (found == tracking.tracks.end()) {
+        return;
+    }
+    auto& proof = found->second;
+    proof.pending -= proof.pending != 0;
+    // Runs only for a real native build/refit appended to the immutable ordinary job.
+    tracking.pass->InvalidateAllocation(proof.observed.allocation);
+    const u64 revision = ++tracking.revision;
+    proof.resident = {};
+    ++tracking.scheduled;
+    if (!tracking.stamp || !build.reflection_cookie || build.reflection_cookie != proof.confirmed ||
+        proof.confirmed_pass != tracking.stamp->pass || proof.direct_count != 1 ||
+        build.lamp_affine || build.uv_only || !ReflectionStatic(entry, proof.observed.placed) ||
+        proof.address != entry.address || !proof.observed.surface) {
+        if (proof.observed.placed != ReflectionFirstHit::PlacedSource::None && ReflectionFirstHit::PlacedLifecycleOn()) {
+            const u32 failures = u32(!tracking.stamp) | (u32(!build.reflection_cookie) << 1) |
+                (u32(build.reflection_cookie != proof.confirmed) << 2) |
+                (u32(tracking.stamp && proof.confirmed_pass != tracking.stamp->pass) << 3) |
+                (u32(proof.direct_count != 1) << 4) | (u32(build.lamp_affine) << 5) |
+                (u32(build.uv_only) << 6) | (u32(!ReflectionStatic(entry, proof.observed.placed)) << 7) |
+                (u32(proof.address != entry.address) << 8) | (u32(!proof.observed.surface) << 9);
+            ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "ordinary-build-attestation-refused",
+                frame, tracking.stamp ? tracking.stamp->pass : 0, proof.observed.allocation,
+                revision, build.reflection_cookie, failures, proof.confirmed);
+        }
+        return;
+    }
+    auto resident = proof.observed;
+    resident.revision = revision;
+    if (resident.placed != ReflectionFirstHit::PlacedSource::None) {
+        const u32 target = u32(resident.placed);
+        if (build.update || tracking.placed_direct[target] != 1 || tracking.placed_joined[target] != 1 ||
+            !tracking.pass->BuildPlaced(*tracking.stamp, resident, build.reflection_cookie)) {
+            ReflectionFirstHit::TracePlacedLifecycle(resident.placed, "ordinary-placed-build-refused",
+                frame, tracking.stamp->pass, resident.allocation, revision, build.reflection_cookie,
+                build.update, (u64(tracking.placed_direct[target]) << 32) | tracking.placed_joined[target]);
+            return;
+        }
+        ReflectionFirstHit::TracePlacedLifecycle(resident.placed, "ordinary-placed-build-attested",
+            frame, tracking.stamp->pass, resident.allocation, revision, build.reflection_cookie,
+            build.param, entry.instance);
+    }
+    proof.resident = resident;
+}
+
+bool RtShadow::ReflectionSubmitted(const ReflectionFirstHit::Stamp& stamp,
+                                   const ReflectionDrawToken& token, u64 vs, u64 ps, u32 count,
+                                   u32 first, const ReflectionNativeProbe::Binding* placed) {
+    auto& tracking = *reflection_tracker;
+    const u32 target = ReflectionFirstHit::PlacedOn()
+        ? ReflectionNativeProbe::Match({vs, ps, count, first}) : ReflectionNativeProbe::NoWitness;
+    bool joined_placed = false;
+    const char* placement_refusal = "submission-stamp-refused";
+    const ReflectionTrack* traced = nullptr;
+    // An unqualified exact submission invalidates retained geometry even when this pass
+    // has already flushed or never reaches the blended-scene hook.
+    SCOPE_EXIT {
+        if (target != ReflectionNativeProbe::NoWitness && !joined_placed) {
+            ReflectionFirstHit::TracePlacedLifecycle(ReflectionFirstHit::PlacedSource(target), placement_refusal,
+                stamp.frame, stamp.pass, traced ? traced->observed.allocation : token.allocation,
+                traced ? traced->resident.revision : 0, token.cookie, tracking.last_flushed,
+                tracking.stamp ? tracking.stamp->pass : 0);
+            tracking.pass->InvalidatePlaced(ReflectionFirstHit::PlacedSource(target));
+        }
+    };
+    if (!tracking.stamp || *tracking.stamp != stamp || tracking.last_flushed == stamp.pass) {
+        if (tracking.stamp && *tracking.stamp == stamp && tracking.last_flushed == stamp.pass) {
+            placement_refusal = "submission-after-flush";
+        }
+        return false;
+    }
+    ++tracking.direct;
+    const bool mirror = ExactMirror(vs, ps, count, first);
+    tracking.mirror_direct += mirror;
+    tracking.fireplace_direct += ExactFireplace(vs, ps, count, first);
+    tracking.wall_shape_direct += count == 42441;
+    if (target != ReflectionNativeProbe::NoWitness) {
+        ++tracking.placed_direct[target];
+    }
+    if (!token.cookie || !token.entry) {
+        placement_refusal = token.placement ? "submission-unjoined-entry" : "submission-no-placement-token";
+        return false;
+    }
+    const auto found = tracking.tracks.find(static_cast<const Entry*>(token.entry));
+    if (found == tracking.tracks.end()) {
+        placement_refusal = "submission-no-track";
+        return false;
+    }
+    auto& proof = found->second;
+    traced = &proof;
+    const auto& id = proof.observed;
+    if (id.allocation != token.allocation || proof.cookie != token.cookie || id.vs != vs ||
+        id.ps != ps || id.count != count || id.first != first || id.receiver != mirror) {
+        placement_refusal = "submission-identity";
+        return false;
+    }
+    placement_refusal = "submission-no-placed-identity";
+    if (id.placed != ReflectionFirstHit::PlacedSource::None) {
+        if (u32(id.placed) != target || tracking.placed_direct[target] != 1 || !placed ||
+            !tracking.pass->ObservePlaced(stamp, id, token.cookie, *placed->buffer,
+                                          placed->descriptor_offset)) {
+            placement_refusal = u32(id.placed) != target ? "submission-role" :
+                               tracking.placed_direct[target] != 1 ? "submission-duplicate" :
+                               !placed ? "submission-binding" : "submission-observation";
+            return false;
+        }
+        joined_placed = true;
+        ++tracking.placed_joined[target];
+    }
+    if (proof.confirmed_pass != stamp.pass) {
+        proof.confirmed_pass = stamp.pass;
+        proof.direct_count = 0;
+    }
+    ++proof.direct_count;
+    proof.confirmed = token.cookie;
+    ++tracking.joined;
+    tracking.mirror_joined += mirror;
+    return joined_placed;
+}
+
+void RtShadow::ReflectionFlush(const ReflectionFirstHit::Stamp& stamp) {
+    auto& tracking = *reflection_tracker;
+    if (!tracking.stamp || *tracking.stamp != stamp || tracking.last_flushed == stamp.pass) {
+        return;
+    }
+    tracking.last_flushed = stamp.pass;
+    if (tracking.mirror_direct != 1 || tracking.mirror_joined != 1) {
+        tracking.pass->RejectReceiver(stamp);
+    }
+    using Row = std::pair<const Entry*, const ReflectionTrack*>;
+    std::vector<Row> candidates;
+    candidates.reserve(tracking.tracks.size());
+    for (auto& [entry, proof] : tracking.tracks) {
+        const auto live = entry_live.find(entry);
+        if (live == entry_live.end() || proof.address != live->second ||
+            !ReflectionStatic(*entry, proof.observed.placed)) {
+            ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "flush-entry-ineligible",
+                stamp.frame, stamp.pass, proof.observed.allocation, proof.resident.revision,
+                proof.confirmed, live != entry_live.end(), live != entry_live.end() && proof.address == live->second);
+            tracking.pass->InvalidateAllocation(proof.observed.allocation);
+            proof.resident = {};
+            continue;
+        }
+        // The ordinary first build can precede promotion. Keep that exact build witness
+        // on the same allocation, but admit geometry only after ordinary promotion.
+        if (proof.observed.placed != ReflectionFirstHit::PlacedSource::None && !entry->instance) {
+            ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "flush-before-promotion",
+                stamp.frame, stamp.pass, proof.observed.allocation, proof.resident.revision,
+                proof.confirmed, entry->r17_capture_frame, entry->built && entry->blas);
+            continue;
+        }
+        if (proof.confirmed_pass == stamp.pass && proof.direct_count == 1 && !proof.pending &&
+            proof.resident.revision && entry->built && entry->blas &&
+            (proof.resident.placed == ReflectionFirstHit::PlacedSource::None ||
+             tracking.pass->CurrentPlaced(stamp, proof.resident, proof.confirmed))) {
+            tracking.pass->Submitted(stamp, proof.resident);
+            candidates.emplace_back(entry, &proof);
+        } else if (proof.observed.placed != ReflectionFirstHit::PlacedSource::None &&
+                   proof.confirmed_pass == stamp.pass) {
+            const u32 failures = u32(proof.direct_count != 1) | (u32(proof.pending != 0) << 1) |
+                                 (u32(!proof.resident.revision) << 2) | (u32(!entry->built) << 3) |
+                                 (u32(!entry->blas) << 4);
+            ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "flush-current-candidate-refused",
+                stamp.frame, stamp.pass, proof.observed.allocation, proof.resident.revision,
+                proof.confirmed, failures, entry->r17_capture_frame);
+        }
+    }
+    // The three independent geometry witnesses get a bounded first opportunity to clone.
+    // The ray always considers all admitted opaque geometry in its distance ordering.
+    const auto order = [](const Row& row) {
+        const auto& id = row.second->resident;
+        const int priority = id.receiver ? 0 : ExactFireplace(id.vs, id.ps, id.count, id.first) ?
+                             1 : id.wall_witness ? 2 : 3;
+        return std::pair{priority, id.surface};
+    };
+    std::ranges::sort(candidates, {}, order);
+    for (const auto& [entry, proof] : candidates) {
+        const auto result = tracking.pass->Clone(stamp, proof->resident, entry->handle,
+                                                 entry->reflection_creation_size);
+        if (result != ReflectionFirstHit::Status::AlreadyCloned) {
+            ReflectionFirstHit::TracePlacedLifecycle(proof->resident.placed,
+                result == ReflectionFirstHit::Status::Recorded ? "clone-created" : "clone-refused",
+                stamp.frame, stamp.pass, proof->resident.allocation, proof->resident.revision,
+                proof->confirmed, u32(result), entry->reflection_creation_size);
+        }
+        if (result == ReflectionFirstHit::Status::Recorded) {
+            ++tracking.cloned;
+        } else if (result != ReflectionFirstHit::Status::AlreadyCloned) {
+            ++tracking.refused;
+        }
+        if (result == ReflectionFirstHit::Status::NoRoom ||
+            (result == ReflectionFirstHit::Status::CloneLimit && tracking.pass->GetUsage().clones_this_frame >= 2)) {
+            break;
+        }
+    }
+
+    if (ReflectionOrdinal3::On()) ReflectionOrdinal3::FinishFlush(&scheduler, stamp.generation, stamp.frame, stamp.pass);
+}
+
+void RtShadow::ReflectionRetire(Entry& entry, const char* reason) {
+    auto& tracking = *reflection_tracker;
+    const auto it = tracking.tracks.find(&entry);
+    if (it == tracking.tracks.end()) {
+        return;
+    }
+    const std::string_view why = reason ? reason : "";
+    if (it->second.observed.placed == ReflectionFirstHit::PlacedSource::None &&
+        (why == "cache-age-expiry" || why == "scene-memory-budget-eviction" ||
+         why == "entry-memory-budget-eviction")) {
+        ++tracking.ordinary_evicted;
+        const auto& id = it->second.resident;
+        if (id.revision && (id.receiver || ExactFireplace(id.vs, id.ps, id.count, id.first) ||
+                            id.wall_witness)) {
+            std::printf("Reflection ordinary retire reason=%s frame=%llu surface=%016llx allocation=%llu revision=%llu\n",
+                        reason, static_cast<unsigned long long>(frame),
+                        static_cast<unsigned long long>(id.surface),
+                        static_cast<unsigned long long>(id.allocation),
+                        static_cast<unsigned long long>(id.revision));
+        }
+    } else {
+        const auto& proof = it->second;
+        ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, "ordinary-entry-retired", frame,
+            tracking.stamp ? tracking.stamp->pass : 0, proof.observed.allocation, proof.resident.revision,
+            proof.confirmed, entry.r17_capture_frame, why == "cache-age-expiry");
+        tracking.pass->InvalidateAllocation(it->second.observed.allocation);
+        ++tracking.invalidated;
+    }
+    tracking.tracks.erase(it);
+}
+
+void RtShadow::ReflectionAdmissions(u64 request) const {
+    const auto& t = *reflection_tracker;
+    const auto usage = t.pass->GetUsage();
+    const auto u = [](u64 x) { return static_cast<unsigned long long>(x); };
+    if (ReflectionFirstHit::PlacedOn()) {
+        std::printf("Reflection placed request=%llu mirror=%u/%u fireplace=%u/%u wall=%u/%u\n",
+                    u(request), t.placed_joined[0], t.placed_direct[0],
+                    t.placed_joined[1], t.placed_direct[1], t.placed_joined[2], t.placed_direct[2]);
+    }
+    std::printf("Reflection admission request=%llu direct=%llu joined=%llu mirror_direct=%u "
+                "mirror_joined=%u fireplace_direct=%u wall_count_direct=%u tracks=%zu "
+                "retained=%u bytes=%llu admitted_total=%llu refused_total=%llu changed_total=%llu "
+                "dropped_builds=%llu actual_builds=%llu ordinary_evicted=%llu invalidated=%llu "
+                "track_limit=%llu expiry=%llu pressure_evicted=%llu copy_count=%u copy_bytes=%llu\n",
+                u(request), u(t.direct), u(t.joined), t.mirror_direct, t.mirror_joined,
+                t.fireplace_direct, t.wall_shape_direct, t.tracks.size(), usage.records, u(usage.bytes),
+                u(t.cloned), u(t.refused), u(t.changed), u(t.dropped), u(t.scheduled),
+                u(t.ordinary_evicted), u(t.invalidated), u(t.track_limit), u(usage.expired),
+                u(usage.pressure_evicted), usage.clones_this_frame, u(usage.cloned_payload_this_frame));
+}
+
+void RtShadow::ReflectionNativeObserve(const Entry& entry, ReflectionNativeProbe::Draw& draw) {
+    if (!draw.stamped || draw.stamp.frame != frame) {
+        return;
+    }
+    if (reflection_native_epoch != draw.stamp.generation) {
+        reflection_native_epoch = draw.stamp.generation;
+        reflection_native_entries = {};
+        reflection_native_tracked = 0;
+    }
+    const auto live = entry_live.find(&entry);
+    if (live == entry_live.end() || !entry.address || !entry.handle || live->second != entry.address) {
+        return;
+    }
+    auto found = std::ranges::find(reflection_native_entries, &entry, &ReflectionNativeEntry::entry);
+    if (found == reflection_native_entries.end()) {
+        found = std::ranges::find(reflection_native_entries, nullptr, &ReflectionNativeEntry::entry);
+        if (found == reflection_native_entries.end()) {
+            return;
+        }
+        *found = {.entry = &entry, .address = entry.address,
+                  .allocation = ++reflection_native_allocation, .key = draw.key};
+        ++reflection_native_tracked;
+    }
+    if (found->key != draw.key || found->address != entry.address) {
+        return;
+    }
+    draw.native_entry = true;
+    draw.allocation = found->allocation;
+    if (entry.built && entry.blas) {
+        draw.resident_frame = entry.r17_capture_frame;
+        if (found->captured_frame == draw.resident_frame) {
+            draw.revision = found->revision;
+            draw.resident_cookie = found->cookie;
+        }
+    }
+}
+
+void RtShadow::ReflectionNativeSubmitted(const ReflectionNativeProbe::Draw& draw) {
+    if (!draw.native_entry || !draw.capture_param) {
+        return;
+    }
+    for (auto& watched : reflection_native_entries) {
+        if (watched.entry && watched.allocation == draw.allocation && watched.key == draw.key) {
+            watched.confirmed_cookie = draw.serial;
+            return;
+        }
+    }
+}
+
+void RtShadow::ReflectionNativeRecordBuild(const Entry& entry, const Build& build) {
+    const auto found = std::ranges::find(reflection_native_entries, &entry, &ReflectionNativeEntry::entry);
+    if (found == reflection_native_entries.end() || found->address != entry.address) {
+        return;
+    }
+    found->revision = ++reflection_native_revision;
+    found->captured_frame = frame;
+    found->cookie = build.reflection_native_allocation == found->allocation && build.reflection_native_cookie &&
+                    found->confirmed_cookie == build.reflection_native_cookie ? build.reflection_native_cookie : 0;
+    if (found->cookie && reflection_native_build_logs++ < 24) {
+        const auto u = [](u64 n) { return static_cast<unsigned long long>(n); };
+        const auto target = ReflectionNativeProbe::Match(found->key);
+        std::printf("Reflection native build target=%s generation=%llu allocation=%llu revision=%llu "
+                    "frame=%llu native_cookie=%llu param=%u update=%u build_tick=%llu\n",
+                    ReflectionNativeProbe::labels[target], u(reflection_native_epoch), u(found->allocation),
+                    u(found->revision), u(frame), u(found->cookie), build.param, u32(build.update),
+                    u(scheduler.CurrentTick()));
+    }
+}
+
+bool RtShadow::TryBottleDraw() {
+    if (std::exchange(bottle_draw_seen, true)) {
+        bottle_ambiguous = true;
+        DiscardBottleCold();
+        return false;
+    }
+    return true;
+}
+
+void RtShadow::InvalidateBottleGeometry(u64 address) {
+    if (address != 0 && bottle_cold && address == bottle_cold->endpoint.address) {
+        DiscardBottleCold();
+    }
+    if (address != 0 && address == bottle_failed.address) {
+        bottle_failed = {};
+    }
+    if (address != 0 && address == bottle_scene_endpoint.address) {
+        bottle_scene_frame = ~u64{0};
+    }
+    if (address != 0 && address == bottle_resident_address) {
+        bottle_resident_address = 0;
+        bottle_resident_capture = ~u64{0};
+        bottle_scene_frame = ~u64{0};
+    }
+}
+
+bool RtShadow::BottleObserved() const noexcept {
+    return bottle_entry && bottle_entry_address != 0 && bottle_observed_frame == frame && !bottle_ambiguous;
+}
+
+RtShadow::BottleEndpoint RtShadow::BottleGeneration(const Entry& entry) const {
+    return {&entry, entry.handle, entry.address, entry.r17_capture_frame, bottle_index, bottle_stream,
+            bottle_stream_bytes};
+}
+
+bool RtShadow::BottleColdEligible(const Entry& entry) const {
+    if (!BottleObserved() || bottle_entry != &entry || !entry.built || !entry.blas || !entry.handle ||
+        entry.r17_capture_frame >= frame || entry.instances != 1 || entry.dynamic || entry.rebuilt ||
+        entry.skinned || ((entry.palette != 0) != entry.palette_placed) || entry.still_doubt ||
+        entry.still_moved || entry.gone || !need_scene || r26_freeze || !TlasGuardOn() || camera_motion.PreviewFrame()) {
+        return false;
+    }
+    const auto live = entry_live.find(&entry);
+    return live != entry_live.end() && live->second == entry.address;
+}
+
+bool RtShadow::MakeBottleCold(BottleCold& cold, const Entry& entry) {
+    BottleCaustic::ColdCornerMap map{};
+    if (!BottleCaustic::MakeColdCornerMap(bottle_topology.Corners(), entry.vertices,
+                                        s32(entry.first_vertex), map) ||
+        !EffectPass::HasRoom(instance, BottlePositionBytes + BottleCornerBytes + sizeof(map) +
+                                              BottleParamBytes + 8 * sizeof(u64) + sizeof(u32))) {
+        return false;
+    }
+    constexpr auto Storage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    constexpr auto Uniform = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    if (!Make(cold.positions, BottlePositionBytes, false, Storage | VK_BUFFER_USAGE_TRANSFER_DST_BIT) ||
+        !Make(cold.params, BottleParamBytes, true, Storage) ||
+        !Make(cold.capture_addresses, 3 * sizeof(u64), true, Uniform) ||
+        !Make(cold.both_addresses, 5 * sizeof(u64), true, Uniform) ||
+        !Make(cold.order, sizeof(map), true, Storage)) {
+        return false;
+    }
+    std::memcpy(cold.order.mapped, map.data(), sizeof(map));
+    using ParamWords = std::array<u32, 8>;
+    std::array<ParamWords, BottleCaustic::ColdSpans.size() + 1> words{};
+    for (u32 i = 0; i < BottleCaustic::ColdSpans.size(); ++i) {
+        const auto& span = BottleCaustic::ColdSpans[i];
+        // This is EmitVertexCapture's existing 32-byte record. UV count/base are zero.
+        words[i + 1] = {span.store, 0, span.count, 0, entry.first_vertex + span.first,
+                        entry.first_instance, 1, 0};
+    }
+    static_assert(sizeof(words) == BottleParamBytes);
+    std::memcpy(cold.params.mapped, words.data(), sizeof(words));
+    const auto* motion = static_cast<const u64*>(both_addresses.mapped);
+    const std::array<u64, 3> capture_table{cold.params.address, cold.positions.address, card_ring.address};
+    const std::array<u64, 5> both_table{motion[0], motion[1], cold.params.address,
+                                       cold.positions.address, card_ring.address};
+    std::memcpy(cold.capture_addresses.mapped, capture_table.data(), sizeof(capture_table));
+    std::memcpy(cold.both_addresses.mapped, both_table.data(), sizeof(both_table));
+    const auto device = instance.GetDevice();
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eUniformBuffer, 2};
+    auto [pool_result, pool] = device.createDescriptorPoolUnique(
+        {.maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &pool_size});
+    if (pool_result != vk::Result::eSuccess) {
+        return false;
+    }
+    cold.address_pool = std::move(pool);
+    const std::array layouts{*address_layout, *address_layout};
+    const auto [set_result, sets] = device.allocateDescriptorSets(
+        {.descriptorPool = *cold.address_pool, .descriptorSetCount = 2, .pSetLayouts = layouts.data()});
+    if (set_result != vk::Result::eSuccess) {
+        return false;
+    }
+    cold.capture_set = sets[0];
+    cold.both_set = sets[1];
+    const std::array<vk::DescriptorBufferInfo, 2> infos{{
+        {cold.capture_addresses.buffer, 0, card_uv_on ? 24u : 16u},
+        {cold.both_addresses.buffer, 0, card_uv_on ? 40u : 32u},
+    }};
+    const std::array<vk::WriteDescriptorSet, 2> writes{{
+        {.dstSet = cold.capture_set, .dstBinding = Shader::MotionVectors::AddressBinding,
+         .descriptorCount = 1, .descriptorType = vk::DescriptorType::eUniformBuffer, .pBufferInfo = &infos[0]},
+        {.dstSet = cold.both_set, .dstBinding = Shader::MotionVectors::AddressBinding,
+         .descriptorCount = 1, .descriptorType = vk::DescriptorType::eUniformBuffer, .pBufferInfo = &infos[1]},
+    }};
+    device.updateDescriptorSets(writes, {});
+
+    // Any corner the original vertex draw failed to write must fail validation.
+    scheduler.EndRendering();
+    scheduler.Record([positions = cold.positions.buffer](vk::CommandBuffer cmd) {
+        cmd.fillBuffer(positions, 0, BottlePositionBytes, 0x7fc00000u);
+        EffectPass::MemoryBarrier(cmd, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                                  vk::PipelineStageFlagBits2::eVertexShader | Compute,
+                                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    });
+    return true;
+}
+
+void RtShadow::DiscardBottleCold() {
+    if (!bottle_cold) {
+        return;
+    }
+    scheduler.DeferOperation([allocator = instance.GetAllocator(), cold = std::move(bottle_cold)] {
+        for (const Buffer* buffer : {&cold->positions, &cold->params, &cold->capture_addresses,
+                                    &cold->both_addresses, &cold->order, &cold->corners, &cold->result}) {
+            if (buffer->buffer) {
+                vmaDestroyBuffer(allocator, buffer->buffer, buffer->allocation);
+            }
+        }
+    }, "bottle cold capture");
+}
+
+u32 RtShadow::NominateBottleSpan(const Entry& entry, const Draw& draw, const std::array<float, 12>& to_world) {
+    if (!BottleColdEligible(entry) || !draw.positions || !draw.positions_size ||
+        draw.first_vertex != entry.first_vertex || draw.first_instance != entry.first_instance ||
+        (bottle_resident_address == entry.address && bottle_resident_capture == entry.r17_capture_frame)) {
+        DiscardBottleCold();
+        return 0;
+    }
+    const auto endpoint = BottleGeneration(entry);
+    if (bottle_cold && bottle_cold->endpoint != endpoint) {
+        DiscardBottleCold();
+    }
+    if (bottle_failed == endpoint || (bottle_cold && bottle_cold->spans == BottleCaustic::ColdSpans.size())) {
+        return 0;
+    }
+    if (!bottle_cold) {
+        bottle_cold = std::make_unique<BottleCold>();
+        bottle_cold->endpoint = endpoint;
+        if (!MakeBottleCold(*bottle_cold, entry)) {
+            if (BottleCaustic::LogNow()) {
+                std::printf("Bottle caustics: cold capture bounds or allocation refused\n");
+            }
+            bottle_failed = endpoint;
+            DiscardBottleCold();
+            return 0;
+        }
+    }
+    const auto& span = BottleCaustic::ColdSpans[bottle_cold->spans];
+    bottle_cold->unproject = {to_world, span.store, span.count};
+    return bottle_cold->spans + 1;
+}
+
+void RtShadow::RecordBottleDraw(BottleDrawToken token) {
+    if (!token.observed || !BottleObserved()) {
+        return;
+    }
+    bottle_recorded_frame = frame;
+    if (token.private_param && bottle_cold && token.private_param == bottle_cold->spans + 1) {
+        bottle_cold->recorded_span = true;
+    }
+}
+
+bool RtShadow::BottleCapturePending(u32 param) const noexcept {
+    return BottleObserved() && bottle_cold && !bottle_cold->recorded_span &&
+           param == bottle_cold->spans + 1 && BottleGeneration(*bottle_entry) == bottle_cold->endpoint;
+}
+
+void RtShadow::ConsumeBottleSpan() {
+    if (!bottle_cold || !bottle_cold->recorded_span) {
+        return;
+    }
+    auto& cold = *bottle_cold;
+    if (!BottleCaustic::On() || !BottleObserved() || bottle_recorded_frame != frame ||
+        !BottleColdEligible(*bottle_entry) || BottleGeneration(*bottle_entry) != cold.endpoint) {
+        DiscardBottleCold();
+        return;
+    }
+    cold.recorded_span = false;
+    cold.sample_frames[cold.spans++] = frame;
+    scheduler.EndRendering();
+    scheduler.RecordCrumb({.name = "Bottle cold unproject"},
+        [push = cold.unproject, positions = cold.positions.buffer,
+         pipeline = *unproject_pipeline, layout = *unproject_layout](vk::CommandBuffer cmd) {
+            using enum vk::AccessFlagBits2;
+            EffectPass::MemoryBarrier(cmd, vk::PipelineStageFlagBits2::eVertexShader, eShaderWrite,
+                                      Compute, eShaderRead | eShaderWrite);
+            const vk::DescriptorBufferInfo position{positions, 0, BottlePositionBytes};
+            const vk::WriteDescriptorSet write{.dstBinding = 0, .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &position};
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, write);
+            cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+            cmd.dispatch((push.count + 63) / 64, 1, 1);
+            EffectPass::MemoryBarrier(cmd, Compute, eShaderWrite, Compute, eShaderRead);
+        });
+}
+
+void RtShadow::ValidateBottleCold() {
+    auto& cold = *bottle_cold;
+    if (cold.result_tick) {
+        if (scheduler.IsFree(cold.result_tick)) {
+            const u32 passed = *static_cast<const u32*>(cold.result.mapped);
+            cold.ready = passed == BottleCaustic::BottleTriangles;
+            if (BottleCaustic::LogNow()) {
+                std::printf("Bottle caustics: cold validated %u/%u triangles, BLAS capture %llu, samples %llu/%llu/%llu\n",
+                            passed, BottleCaustic::BottleTriangles, static_cast<unsigned long long>(cold.endpoint.capture),
+                            static_cast<unsigned long long>(cold.sample_frames[0]),
+                            static_cast<unsigned long long>(cold.sample_frames[1]),
+                            static_cast<unsigned long long>(cold.sample_frames[2]));
+            }
+            if (!cold.ready) {
+                bottle_failed = cold.endpoint;
+                DiscardBottleCold();
+            }
+        }
+        return;
+    }
+    using enum vk::DescriptorType;
+    const VkBufferCreateInfo ci{.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sizeof(u32),
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    const VmaAllocationCreateInfo ai{.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+    VkBuffer result{};
+    VmaAllocationInfo info{};
+    if (!EffectPass::Create(instance, cold.validate_set, cold.validate_layout, cold.validate_pipeline,
+                           {eAccelerationStructureKHR, eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer},
+                           sizeof(BottleValidatePush), BOTTLE_COLD_VALIDATE_COMP, "Bottle cold validate") ||
+        vmaCreateBuffer(instance.GetAllocator(), &ci, &ai, &result, &cold.result.allocation, &info) != VK_SUCCESS) {
+        bottle_failed = cold.endpoint;
+        DiscardBottleCold();
+        return;
+    }
+    cold.result.buffer = result;
+    cold.result.mapped = info.pMappedData;
+    // Natural copies can arrive before this validation retires. Each path owns its output.
+    if (!cold.result.mapped || !Make(cold.corners, BottleCornerBytes, false, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT)) {
+        bottle_failed = cold.endpoint;
+        DiscardBottleCold();
+        return;
+    }
+    const BottleValidatePush push{bottle_scene_view, bottle_scene_ordinal, bottle_scene_mask & CameraMask};
+    const std::array<vk::DescriptorBufferInfo, 4> buffers{{
+        {cold.positions.buffer, 0, BottlePositionBytes}, {cold.order.buffer, 0, sizeof(BottleCaustic::ColdCornerMap)},
+        {cold.corners.buffer, 0, BottleCornerBytes}, {cold.result.buffer, 0, sizeof(u32)},
+    }};
+    scheduler.EndRendering();
+    cold.result_tick = scheduler.CurrentTick();
+    scheduler.RecordCrumb({.name = "Bottle cold validate"},
+        [push, buffers, scene = tlas, layout = *cold.validate_layout,
+         pipeline = *cold.validate_pipeline](vk::CommandBuffer cmd) {
+            using enum vk::AccessFlagBits2;
+            constexpr auto Transfer = vk::PipelineStageFlagBits2::eTransfer;
+            cmd.fillBuffer(buffers.back().buffer, 0, sizeof(u32), 0);
+            // Order the prior position writes and result clear before this dispatch.
+            // PrepareScene already makes AS writes visible to compute.
+            EffectPass::MemoryBarrier(cmd, Compute | Transfer, eShaderRead | eShaderWrite | eTransferWrite,
+                                      Compute, eShaderRead | eShaderWrite);
+            const vk::WriteDescriptorSetAccelerationStructureKHR as{
+                .accelerationStructureCount = 1, .pAccelerationStructures = &scene};
+            std::array<vk::WriteDescriptorSet, 5> writes{};
+            writes[0] = {.pNext = &as, .dstBinding = 0, .descriptorCount = 1,
+                         .descriptorType = vk::DescriptorType::eAccelerationStructureKHR};
+            for (u32 i = 0; i < buffers.size(); ++i) {
+                writes[i + 1] = {.dstBinding = i + 1, .descriptorCount = 1,
+                    .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &buffers[i]};
+            }
+            cmd.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+            cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
+            cmd.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+            cmd.dispatch((BottleCaustic::BottleTriangles + 31) / 32, 1, 1);
+            EffectPass::MemoryBarrier(cmd, Compute, eShaderWrite, Compute | vk::PipelineStageFlagBits2::eHost,
+                                      eShaderRead | eHostRead);
+        });
+}
+
+RtShadow::BottleSceneView RtShadow::BottleScene(const std::array<float, 12>& view) {
+    if (!BottleObserved() || bottle_recorded_frame != frame || bottle_scene_frame != frame ||
+        bottle_scene_view != view || !tlas || r26_freeze || !TlasGuardOn() ||
+        bottle_scene_endpoint != BottleGeneration(*bottle_entry) || !BottleCaustic::On()) {
+        return {};
+    }
+    const bool warm = bottle_entry_address == bottle_resident_address &&
+                      bottle_entry->r17_capture_frame == bottle_resident_capture;
+    if (!warm) {
+        if (!bottle_cold || bottle_cold->spans != BottleCaustic::ColdSpans.size() ||
+            bottle_cold->endpoint != bottle_scene_endpoint || !BottleColdEligible(*bottle_entry)) {
+            return {};
+        }
+        if (!bottle_cold->ready) {
+            ValidateBottleCold();
+        }
+        if (!bottle_cold || !bottle_cold->ready) {
+            return {};
+        }
+        return {tlas, bottle_cold->corners.buffer, bottle_scene_ordinal};
+    }
+    return {tlas, bottle_corners.buffer, bottle_scene_ordinal};
+}
+
 u32 RtShadow::PrepareDraw(const Draw& draw) {
+    using WindowPathProbe::PaneStages;
+    auto* pane = draw.window_pane_observe ? window_pane_watch : nullptr;
+    auto* stage = pane ? &pane->stages : nullptr;
+    bool pane_new_entry = false;
+    if (stage) {
+        PaneStages::Count(stage->prepare);
+    }
+    const auto pane_result = [&](const char* why, bool refusal = false) {
+        if (stage) {
+            stage->PrepareResult(why);
+            if (refusal) {
+                stage->Refuse(why, pane->source_frame, frame);
+            }
+        }
+    };
     // bbport (r19_draw-cost): experiment 17592186044416 clear: the short paths marked r19 below,
     // each giving what the old code computes from the same inputs; set: the old code.
     const bool r19 = !BbToggle::Experiment(R19DrawCostOffBit);
     if (r19 && draw.r19_wanted) {
         ++r19_stats.wanted_skipped;
     } else if (!Wanted()) {
+        pane_result("rt-unwanted", true);
         return 0;
     }
     if (!draw.shadow_pass && !draw.camera_pass) {
+        pane_result("non-capture-pass", true);
         return 0;
     }
+    auto* watching = roof_probe ? roof_probe->Watch() : nullptr;
+    u64 observed_mesh = 0;
+    InteriorRoof::WatchRow* mesh_watch = nullptr;
+    if (watching) {
+        const std::array<u64, 4> parts{draw.geometry, draw.indices, draw.index_count, draw.first_vertex};
+        observed_mesh = XXH3_64bits(parts.data(), sizeof(parts));
+        mesh_watch = watching->ByMesh(observed_mesh);
+        if (mesh_watch) {
+            ++mesh_watch->now.mesh_draws;
+            if (std::string_view(mesh_watch->now.mesh_why) == "unknown") {
+                mesh_watch->now.mesh_why = "mesh-only-before-key";
+            }
+        }
+    }
+    const auto mesh_reason = [&](const char* why) {
+        if (mesh_watch) {
+            mesh_watch->now.mesh_why = why;
+        }
+    };
     r19_stats.calls += r19 ? 1u : 0u;
     // bbport (r86f_glass-static-panes): the vote for GlassCamera (BB_RT_GLASS on only)
     if (draw.camera_pass && !draw.glass && draw.constants && (RtGlassOn() || RtGlassFind::On())) { // (r86h: and the find alone)
@@ -2497,10 +4589,14 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
 
     // Camera pass casters only serve the ray traced scene (lamp shadows, bounced light).
     if (draw.camera_pass && !need_scene) {
+        mesh_reason("mesh-only-no-natural-camera-scene");
+        pane_result("no-natural-camera-scene", true);
         return 0;
     }
     draw.camera_pass ? ++stats.camera_draws : ++stats.draws;
     if (!draw.solid) {
+        mesh_reason("mesh-only-nonsolid");
+        pane_result("nonsolid", true);
         return 0;
     }
     // Sun shadow shaders discard even for opaque casters; camera-pass characters also need
@@ -2513,10 +4609,14 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             ++stats.alpha;
         }
         if (!draw.shadow_pass && !character) {
+            mesh_reason("mesh-only-alpha");
+            pane_result("alpha", true);
             return 0;
         }
     }
     if (!draw.constants) {
+        mesh_reason("mesh-only-missing-camera-constants");
+        pane_result("camera-constants-missing", true);
         ++stats.no_camera;
         if (draw.camera_pass && RtGlassFind::On()) { // bbport (r86j_glint-same-game): the bottles may be here
             RtGlassFind::Chain().no_constants.fetch_add(1, std::memory_order_relaxed);
@@ -2529,11 +4629,15 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     std::array<float, 12> to_world{};
     if (!R17ToWorld(draw.constants, draw.camera_pass, to_world)) { // bbport (r17_rt-upkeep)
         ++stats.not_ortho;
+        mesh_reason("mesh-only-clip-to-world-refused");
+        pane_result("clip-to-world", true);
         return 0;
     }
     if (!draw.triangles || !draw.indices || draw.instances == 0 ||
         draw.instances > MaxInstancesPerDraw) {
         draw.instances > MaxInstancesPerDraw ? ++stats.instanced : ++stats.unsupported;
+        mesh_reason("mesh-only-draw-topology-or-range-refused");
+        pane_result("capture-topology-or-range", true);
         return 0;
     }
     if (draw.glass) { // bbport (r83b_glass-pane-probe): a pane draw goes on to its entry
@@ -2556,6 +4660,30 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     if (draw.glass) { // bbport (r83_glass-water-stage1): apart from a pass's entry of the mesh
         key = RtGlassKey(key);
     }
+    auto* key_watch = watching ? watching->Exact(key, observed_mesh) : nullptr;
+    const auto watch_reason = [&](const char* why) {
+        if (key_watch) {
+            key_watch->now.draw_why = why;
+        }
+    };
+    const auto watch_list = [&](const char* why) {
+        if (key_watch) {
+            ++key_watch->now.listed;
+            key_watch->now.draw_why = why;
+        }
+    };
+    if (key_watch) {
+        ++key_watch->now.key_draws;
+        watch_reason("exact-key-selected-for-lookup");
+    }
+    // bbport (r130g_glass-light-forward): a registered pane let through with a GPU-placed palette must be steady (3 frames in a
+    // row, at most 16 a frame); the torch's palette alternates two addresses and never is. r121b's judge below runs as before.
+    // (draw.glass too: a draw a later r121b test refused keeps glass_placed but is no pane, and goes on as before.)
+    if (draw.glass && draw.glass_placed && !GlassPlacedSteady(draw.palette != 0 ? InstanceKey(key, draw.palette) : key)) {
+        watch_reason("glass-placement-guard");
+        pane_result("glass-placement-guard", true);
+        return 0;
+    }
     // bbport (r121b_glass-pane-hang): BB_RT_GLASS_STATIC: a pane is a still thing. The judge (rt_glass_static.h)
     // lets a pane instance (the key, mixed with the palette hash as InstanceKey keys a palette draw's entry)
     // through once it was drawn on RtGlassStatic::StableFrames frames; a new one (a held torch or a swinging
@@ -2566,6 +4694,8 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             glass_seen, draw.palette != 0 ? InstanceKey(key, draw.palette) : key, frame);
         RtGlassStatic::Add(verdict);
         if (verdict != RtGlassStatic::Taken) {
+            watch_reason("glass-static-guard");
+            pane_result("glass-static-guard", true);
             return 0;
         }
     }
@@ -2683,6 +4813,8 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         auto& slot = entries[entry_key];
         if (!slot) {
             if (new_triangles >= NewTrianglesPerFrame) {
+                watch_reason("new-entry-triangle-budget");
+                pane_result("new-entry-triangle-budget", true);
                 ++stats.over_budget;
                 ++missed;
                 entries.erase(entry_key);
@@ -2692,6 +4824,8 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             // bbport (r26_upkeep-probe): BLAS and TLAS frozen: no new caster (nothing would
             // build it, the TLAS traced as it was would not hold it), so no memory is taken.
             if (r26_freeze == 3u) {
+                watch_reason("new-entry-upkeep-freeze");
+                pane_result("new-entry-upkeep-freeze", true);
                 ++r26_stats.left_out;
                 entries.erase(entry_key);
                 ++r19_entries_gen; // bbport (r19_draw-cost)
@@ -2702,10 +4836,13 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             slot = MakeEntry(draw, mask);
             glass_tri_keep_now = nullptr;
             if (!slot) {
+                watch_reason("make-entry-refused-unspecified");
+                pane_result("make-entry-refused", true);
                 entries.erase(entry_key);
                 ++r19_entries_gen; // bbport (r19_draw-cost)
                 return 0;
             }
+            pane_new_entry = pane && pane->natural.Active();
             slot->rebuilt = shared;
             slot->mesh = r19 ? mesh_of() : mesh;
             slot->base = key;
@@ -2723,9 +4860,81 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
     }
     Entry& entry = *r19_entry;
+    const auto trace_reflection_reuse = [&](const char* why) {
+        if (!reflection_tracker || !ReflectionFirstHit::PlacedLifecycleOn()) {
+            return;
+        }
+        const auto& tracker = *reflection_tracker;
+        const auto found = tracker.tracks.find(&entry);
+        if (found == tracker.tracks.end()) {
+            return;
+        }
+        const auto& proof = found->second;
+        const u32 state = u32(draw.camera_pass) | (u32(draw.shadow_pass) << 1) |
+                          (u32(entry.built) << 2) | (u32(entry.blas) << 3) |
+                          (u32(entry.instance) << 4) | (u32(entry.palette == draw.palette) << 5);
+        ReflectionFirstHit::TracePlacedLifecycle(proof.observed.placed, why, frame,
+            tracker.stamp ? tracker.stamp->pass : 0, proof.observed.allocation, proof.resident.revision,
+            proof.confirmed, entry.r17_capture_frame, state);
+    };
+    if (draw.reflection_native && draw.reflection_native->trace && draw.camera_pass && mask == CameraMask) {
+        ReflectionNativeObserve(entry, *draw.reflection_native);
+    }
+    if (reflection_tracker && (draw.reflection || reflection_tracker->tracks.contains(&entry))) {
+        ReflectionObserve(entry, draw, !shared && mask == CameraMask && !draw.glass && !draw.skinned);
+    }
+    if (stage) {
+        stage->entry = entry_key;
+        stage->base = entry.base;
+    }
+    if (draw.bottle_candidate && need_scene && mask == CameraMask && entry.address &&
+        !entry.skinned && entry.instances == 1 && entry.triangles == BottleCaustic::IndexCount / 3 &&
+        entry.indices.mapped) {
+        if (bottle_entry_address != 0) {
+            bottle_ambiguous = true;
+            DiscardBottleCold();
+        } else {
+            const std::span raw{reinterpret_cast<const u32*>(draw.indices), BottleCaustic::IndexCount};
+            if (bottle_topology.Verify(raw) && entry.bottle_index_verified) {
+                bottle_entry = &entry;
+                bottle_entry_address = entry.address;
+                bottle_observed_frame = frame;
+                bottle_index = draw.indices;
+                bottle_stream = draw.positions;
+                bottle_stream_bytes = draw.positions_size;
+                if (draw.bottle_delivery) {
+                    draw.bottle_delivery->observed = true;
+                }
+            } else if (BottleCaustic::LogNow() && !bottle_refused_logged) {
+                bottle_refused_logged = true;
+                std::printf("Bottle caustics: refused ordered guest or BLAS topology\n");
+            }
+        }
+    }
+    const auto pane_entry = [&] {
+        if (stage) {
+            stage->entry_flags = (entry.built ? PaneStages::Built : 0u) |
+                                 (entry.dynamic ? PaneStages::Dynamic : 0u) |
+                                 (entry.rebuilt ? PaneStages::Rebuilt : 0u) |
+                                 (entry.blas ? PaneStages::Blas : 0u);
+        }
+    };
+    pane_entry();
+    if (key_watch) {
+        if (auto* row = RoofWatchEntry(entry)) {
+            row->Cache(entry.address, roof_probe->Geometry(entry.address), entry.r17_capture_frame, "guarded-cache");
+        } else {
+            key_watch->now.cache_why = "lookup-lifetime-unattested";
+        }
+    }
+    if (glass_light_mode != 0) { // bbport (r130c_glass-lamp-light): off: this byte test alone
+        GlassLightNote(entry, draw);
+    }
     if (draw.glass) { // bbport (r83_glass-water-stage1): for the log
         NoteGlassDraw(entry);
-        if (RtGlassCarryOn()) { // bbport (r86_glass-light-stage2a, r86b): carried into the next frame
+        if (draw.glass_placed && entry.dynamic) { // bbport (r130g_glass-light-forward): a moving placed pane is not carried
+            ++glass_fwd.moving_left;
+        } else if (RtGlassCarryOn() || (glass_light_mode != 0 && entry.glass_light != 0)) { // bbport (r86, r86b, r130g): carried
             glass_drawn.push_back(entry_key);
         }
     }
@@ -2864,6 +5073,8 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
         // bbport (r54_leaf-stage2): a second draw of the frame may capture the UVs alone (the
         // sun shadow pass's card of an entry the camera pass draws first on every frame)
+        pane_result("same-frame-entry-already-selected");
+        trace_reflection_reuse(draw.shadow_pass ? "ordinary-same-frame-reuse-shadow" : "ordinary-same-frame-reuse");
         return CardUvProbe(entry, draw);
     }
     entry.mask = mask;
@@ -3014,12 +5225,19 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             still_stats.probe_triangles += entry.triangles;
             entry.seen_frame = frame;
             frame_entries.push_back(&entry);
+            watch_list("still-signature-only");
+            if (stage) {
+                PaneStages::Count(stage->ordinary_reuse);
+            }
+            pane_result("still-signature-only");
             return probe.param;
         }
     }
     // Over budget, a caster built before keeps last frame's BLAS and world copy (exact for static
     // props drawn several times, a frame late for moving ones) rather than vanishing.
-    const auto skip = [&] {
+    const auto skip = [&](const char* why) {
+        pane_result(why, true);
+        watch_reason(why);
         ++stats.over_budget;
         if (!entry.built) {
             ++missed;
@@ -3054,9 +5272,14 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
         entry.seen_frame = frame;
         frame_entries.push_back(&entry);
+        watch_list(why);
         return 0u;
     };
     u32 param = 0;
+    pane_entry();
+    if (stage) {
+        PaneStages::Count(needs_data ? stage->ordinary_needs : stage->ordinary_reuse);
+    }
     if (needs_data) {
         // bbport (r47_still-check): still_refit: a refit whatever the age of the build
         const bool update = need_scene && entry.blas && entry.built && !entry.rebuilt &&
@@ -3067,16 +5290,18 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         // same as for the capture the BLAS holds. BB_RT_REFIT_EVERY: far only, refit recently.
         if (update && entry.dynamic) {
             const bool on = UpkeepOn();
-            const auto keep = [&] {
+            const auto keep = [&](const char* why) {
+                pane_result(why);
                 entry.seen_frame = frame;
                 frame_entries.push_back(&entry);
+                watch_list("upkeep-reused-capture");
                 return 0u;
             };
             if (draw.inputs != 0 && draw.inputs == entry.r17_inputs) {
                 if (on && UnchangedMode() == 2) {
                     ++r17_stats.same_skipped;
                     r17_stats.same_skipped_triangles += entry.triangles;
-                    return keep();
+                    return keep("unchanged-upkeep-reuse");
                 }
                 ++r17_stats.same_would;
                 r17_stats.same_would_triangles += entry.triangles;
@@ -3088,7 +5313,7 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
                 if (on && every > 1 && frame - entry.r17_capture_frame < every) {
                     ++r17_stats.far_skipped;
                     r17_stats.far_skipped_triangles += entry.triangles;
-                    return keep();
+                    return keep("far-upkeep-reuse");
                 }
                 ++r17_stats.far_refit;
                 r17_stats.far_refit_triangles += entry.triangles;
@@ -3116,7 +5341,8 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         const bool over = refresh ? refresh_over
                                   : !update && !recapture && new_triangles >= NewTrianglesPerFrame;
         if (positions_used + stored > MaxPositions || scratch_used + needed > ScratchBytes || over) {
-            return skip();
+            return skip(positions_used + stored > MaxPositions ? "positions-budget" :
+                        scratch_used + needed > ScratchBytes ? "scratch-budget" : "triangle-or-copy-turn-budget");
         }
         // bbport (r26_upkeep-probe): BB_RT_UPKEEP_FREEZE with BLAS work frozen: this refit or
         // build is left out. A caster with a BLAS keeps it as it is, as skip() does (no capture
@@ -3139,9 +5365,13 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
                 }
                 entry.seen_frame = frame;
                 frame_entries.push_back(&entry);
+                watch_list("upkeep-freeze-kept-capture");
+                pane_result("upkeep-freeze-kept-capture", true);
                 return 0;
             }
             if (r26_freeze == 3u) {
+                watch_reason("upkeep-freeze-dropped-build");
+                pane_result("upkeep-freeze-dropped-build", true);
                 ++r26_stats.left_out;
                 return 0;
             }
@@ -3149,10 +5379,79 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
         }
         param = Param(positions_used, entry);
         if (!param) {
-            return skip();
+            return skip("capture-params-budget");
         }
         builds.push_back({&entry, positions_used, update, to_world});
+        if (key_watch) {
+            ++key_watch->now.queued;
+        }
         builds.back().param = param; // bbport (r47_still-check): see CaptureLeftOut
+        if (draw.reflection_native && draw.reflection_native->native_entry) {
+            auto& proof = *draw.reflection_native;
+            proof.capture_param = param;
+            builds.back().reflection_native_cookie = proof.serial;
+            builds.back().reflection_native_allocation = proof.allocation;
+        }
+        if (reflection_tracker) {
+            ReflectionQueue(entry, draw, builds.back());
+        }
+        builds.back().bottle = draw.bottle_candidate && BottleObserved() && entry.address == bottle_entry_address;
+        if (stage) {
+            stage->param = param;
+            stage->build = u32(builds.size());
+            PaneStages::Count(stage->build_added);
+            pane_result("ordinary-build-added");
+        }
+        if (draw.window_pane_observe && window_pane_watch) {
+            auto& pane = *window_pane_watch;
+            if (pane.natural.Active()) {
+                pane.natural.Latch({pane.source_frame, frame, entry_key, entry.base, param,
+                                    u32(builds.size()), pane_new_entry});
+            }
+            if (entry.indices.mapped && entry.vertices &&
+                u64(entry.vertices) * entry.instances <= WindowPathProbe::PaneVerticesMost &&
+                entry.triangles <= WP_TRI_WORDS * 32 && entry.instances &&
+                u64(entry.triangles) * 3 == u64(draw.index_count) * entry.instances) {
+                pane.param = param;
+                pane.rt_frame = frame;
+                pane.key = entry.base;
+                pane.vertices = entry.vertices;
+                pane.instances = entry.instances;
+                pane.triangles = entry.triangles;
+                std::copy_n(static_cast<const u32*>(entry.indices.mapped),
+                            size_t(entry.triangles) * 3, pane.indices.begin());
+            } else {
+                pane.refusal = "expanded indices or ordinary build size unsupported";
+                pane.stages.Refuse(pane.refusal, pane.source_frame, frame);
+            }
+        }
+        if (draw.lamp_pane_observe) { // t132d: attach to this ordinary capture only
+            LampPaneProbe& p = *lamp_pane;
+            p.capture.build = u32(builds.size());
+            p.capture.rt = frame;
+            p.param = param;
+            p.key = key;
+            if (!entry.indices.mapped || !RtLampPane::MeshSize(entry.vertices, entry.triangles, entry.instances)) {
+                p.refusal = "invalid normal RT entry or world/index limits exceeded";
+            } else {
+                p.vertices = entry.vertices;
+                p.triangles = entry.triangles;
+                p.first_instance = entry.first_instance;
+                const auto* indices = static_cast<const u32*>(entry.indices.mapped);
+                p.indices.assign(indices, indices + std::size_t(p.triangles) * 3);
+                if (p.reconstruction) {
+                    auto& r = *p.reconstruction;
+                    r.indices = draw.index_count;
+                    r.instances = draw.instances;
+                    r.index_size = draw.index_size;
+                    r.strip = draw.strip;
+                    r.restart = draw.restart;
+                    r.entry_first = entry.first_vertex;
+                    r.raw_min = entry.first_vertex - draw.first_vertex;
+                    r.refusal = LampReconstructionIndices(p);
+                }
+            }
+        }
         if (probe_on) { // bbport (r64b_surface-probe-more): this draw builds the entry
             probe_draw.build = u32(builds.size());
         }
@@ -3181,6 +5480,20 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
             entry.still_checks = 0;
             still_stats.refits += still_refit ? 1 : 0;
             entry.still_next = frame + StillNext(0, entry.base, true);
+        }
+        // Keep the stock first capture and all of its later membership merges. Only an
+        // ordinary build admitted above can choose the affine position producer.
+        auto& build = builds.back();
+        if (draw.lamp_affine_candidate && LampAffineAvailable() &&
+            entry.first_vertex == 0 && entry.vertices == LampAffineVertices &&
+            entry.instances == RtLampPane::Instances && entry.first_instance == 0 &&
+            entry.triangles == RtLampPane::DrawIndices && entry.indices.mapped &&
+            LampAffineProjection(draw.constants + 52) &&
+            XXH64(entry.indices.mapped, RtLampPane::DrawIndices * sizeof(u32), 0) ==
+                LampAffineTopologyHash &&
+            (build.sig != 0 || StillWorld(draw.constants, build)) && LampAffineTopology(draw)) {
+            build.lamp_affine = true;
+            build.lamp_affine_depth = {draw.constants[62], draw.constants[63]};
         }
         positions_used += u32(stored);
         scratch_used += needed;
@@ -3218,10 +5531,22 @@ u32 RtShadow::PrepareDraw(const Draw& draw) {
     }
     entry.seen_frame = frame;
     frame_entries.push_back(&entry);
+    watch_list(key_watch && key_watch->now.queued ? "ordinary-capture-queued" : "listed-retained-or-auxiliary");
+    if (!needs_data) {
+        pane_result("ordinary-cached-reuse");
+        trace_reflection_reuse(draw.shadow_pass ? "ordinary-cached-reuse-shadow" : "ordinary-cached-reuse");
+        if (!param && draw.bottle_delivery && draw.bottle_delivery->observed) {
+            draw.bottle_delivery->private_param = NominateBottleSpan(entry, draw, to_world);
+        }
+    }
     return param;
 }
 
 void RtShadow::RecordBuilds() {
+    if (window_scene_active_serial) {
+        window_scene_active_serial = 0;
+    }
+    ConsumeBottleSpan();
     if (builds.empty()) {
         return;
     }
@@ -3235,11 +5560,22 @@ void RtShadow::RecordBuilds() {
         r17_blas_dirty = true; // bbport (r17_rt-upkeep): the TLAS cannot be skipped
     }
     struct Job {
+        struct ClipCopy {
+            vk::Buffer destination{};
+            std::array<vk::BufferCopy, LampReconstruction::Slots> regions{};
+        };
+        std::unique_ptr<ClipCopy> clip;
+        vk::Buffer bottle{};
+        std::vector<vk::BufferCopy> bottle_regions;
         std::vector<vk::AccelerationStructureGeometryKHR> geometries;
         std::vector<vk::AccelerationStructureBuildGeometryInfoKHR> infos;
         std::vector<vk::AccelerationStructureBuildRangeInfoKHR> ranges;
         std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> pointers;
         std::vector<UnprojectPush> unproject;
+        std::vector<LampAffinePush> lamp_affine;
+        vk::Pipeline lamp_affine_pipeline;
+        vk::PipelineLayout lamp_affine_layout;
+        vk::Buffer lamp_affine_bits;
         std::vector<std::pair<vk::Buffer, vk::BufferCopy>> copies;
         // bbport (r47_still-check): the captures whose bounds are measured, and their
         // signatures' bytes in still_sigs (source) and in the frame's part of still_readback
@@ -3275,12 +5611,31 @@ void RtShadow::RecordBuilds() {
     const u32 still_slot = u32(frame % 4);
     u32 sig_first = UINT32_MAX, sig_last = 0;
     for (const Build& build : builds) {
+        if (auto* pane = window_pane_watch; pane && pane->param && pane->rt_frame == frame &&
+            pane->param == build.param) {
+            WindowPathProbe::PaneStages::Count(pane->stages.matching_build);
+            if (build.left_out) {
+                WindowPathProbe::PaneStages::Count(pane->stages.build_left_out);
+                pane->stages.Refuse("record-build-left-out", pane->source_frame, frame);
+            }
+            if (build.probe) {
+                WindowPathProbe::PaneStages::Count(pane->stages.probe_only);
+            }
+        }
         Entry& e = *build.entry;
+        // The compact copy belongs to one actual ordinary BLAS generation. Drop it before
+        // any replacement attempt, even when an ordinary capture later fails its checks.
+        if (!build.probe) {
+            InvalidateBottleGeometry(e.address);
+        }
         // bbport (r47_still-check): the draw of this capture was left out (CaptureLeftOut): its
         // range of the positions was not written. Nothing is measured, built or copied from it;
         // like a build that was never recorded (OnFrameEnd), the entry is built at its next
         // draw.
         if (build.left_out) {
+            if (reflection_tracker) {
+                ReflectionDropCapture(build);
+            }
             if (probe_on) { // bbport (r64b_surface-probe-more): no copy for the surface probe
                 ProbeDropped(build);
             }
@@ -3337,7 +5692,39 @@ void RtShadow::RecordBuilds() {
         if (build.probe) {
             continue;
         }
-        job->unproject.push_back({build.to_world, build.store, e.vertices * e.instances});
+        const UnprojectPush unproject{build.to_world, build.store, e.vertices * e.instances};
+        if (build.bottle && need_scene && BottleObserved() && e.address == bottle_entry_address &&
+            (e.mask & CameraMask) != 0 && e.seen_frame == frame) {
+            const auto corners = bottle_topology.Corners();
+            if (std::ranges::all_of(corners, [&](u32 index) { return index < e.vertices; })) {
+                constexpr u64 CornerBytes = 16;
+                if (!bottle_corners.buffer) {
+                    Make(bottle_corners, corners.size() * CornerBytes, false,
+                         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                }
+                if (bottle_corners.buffer) {
+                    job->bottle = bottle_corners.buffer;
+                    job->bottle_regions.clear();
+                    job->bottle_regions.reserve(corners.size());
+                    for (std::size_t i = 0; i < corners.size(); ++i) {
+                        job->bottle_regions.push_back({(u64(build.store) + corners[i]) * CornerBytes,
+                                                       i * CornerBytes, CornerBytes});
+                    }
+                    bottle_resident_address = e.address;
+                    bottle_resident_capture = frame;
+                }
+            }
+        }
+        if (build.lamp_affine) {
+            job->lamp_affine.push_back({unproject.rows, build.still_rows, build.still_origin,
+                                        unproject.first, unproject.count, e.vertices,
+                                        build.lamp_affine_depth[0], build.lamp_affine_depth[1]});
+            job->lamp_affine_pipeline = *lamp_affine_pipeline;
+            job->lamp_affine_layout = *lamp_affine_layout;
+            job->lamp_affine_bits = lamp_affine_bits.buffer;
+        } else {
+            job->unproject.push_back(unproject);
+        }
         e.built = true;
         e.blas = need_scene;
         // bbport (r17_rt-upkeep): what the BLAS now holds and how it was built
@@ -3390,7 +5777,84 @@ void RtShadow::RecordBuilds() {
                 ProbeDropped(build);
             }
         }
+        if (auto* pane = window_pane_watch; pane && !pane->refusal && !pane->tick &&
+            pane->param && pane->rt_frame == frame && pane->param == build.param &&
+            (!pane->natural.Active() ||
+             (pane->natural.MatchBuild(frame, build.param, u32(&build - builds.data() + 1), e.base) &&
+              WindowPathProbe::NaturalPanePair::Clock::now() < pane->natural.deadline))) {
+            if (world_bytes != pane->WorldBytes()) {
+                pane->Refuse("ordinary build span changed");
+            } else {
+                WindowPathProbe::PaneStages::Count(pane->stages.span_ok);
+                if (pane->Allocate()) {
+                    job->copies.push_back({vk::Buffer{pane->buffer},
+                                           vk::BufferCopy{u64(build.store) * 16, 0, world_bytes}});
+                    job->probe_host = true;
+                    pane->tick = scheduler.CurrentTick();
+                    WindowPathProbe::PaneStages::Count(pane->stages.queued);
+                }
+            }
+        }
+        if (lamp_pane && !lamp_pane->refusal && lamp_pane->Captured() && !lamp_pane->world_tick &&
+            lamp_pane->capture.rt == frame && lamp_pane->param == build.param) {
+            auto& p = *lamp_pane;
+            if (p.reconstruction && p.capture.build == u32(&build - builds.data() + 1)) {
+                auto& r = *p.reconstruction;
+                r.affine = build.lamp_affine;
+                if (r.affine) {
+                    r.relative_rows = build.still_rows;
+                    r.origin = build.still_origin;
+                }
+            }
+            if (world_bytes != p.WorldBytes()) {
+                p.refusal = "recorded world span differs from capture";
+            } else if (p.Allocate(instance.GetAllocator(), scheduler)) {
+                job->copies.push_back({vk::Buffer{p.buffer},
+                                       vk::BufferCopy{u64(build.store) * 16, 0, world_bytes}});
+                job->probe_host = true;
+                p.world_tick = scheduler.CurrentTick();
+                if (p.reconstruction && !p.reconstruction->refusal) {
+                    auto& r = *p.reconstruction;
+                    const bool card_collapse = need_scene && card_guard_on && e.card_uv &&
+                                               job->guard.size() < CardGuardSlots;
+                    if (card_collapse) {
+                        r.refusal = "card collapse may overwrite the unprojected output";
+                    } else if (p.capture.build != u32(&build - builds.data() + 1) ||
+                               p.key != e.base || p.vertices != e.vertices ||
+                               p.triangles != e.triangles || p.first_instance != e.first_instance ||
+                               r.instances != e.instances || r.entry_first != e.first_vertex ||
+                               !p.world_tick || job->clip || unproject.first != build.store ||
+                               u64(unproject.count) * 16 != world_bytes ||
+                               u64(unproject.first) + unproject.count > MaxPositions) {
+                        r.refusal = "ordinary reconstruction build identity or position span changed";
+                    } else {
+                        auto copy = std::make_unique<Job::ClipCopy>();
+                        copy->destination = vk::Buffer{p.buffer};
+                        for (std::size_t i = 0; i < r.expanded.size(); ++i) {
+                            const u32 index = r.expanded[i];
+                            if (index >= unproject.count) {
+                                r.refusal = "pre-unproject corner index is out of bounds";
+                                break;
+                            }
+                            copy->regions[i] = vk::BufferCopy{
+                                (u64(unproject.first) + index) * 16,
+                                p.ClipOffset() + i * 16, 16};
+                        }
+                        if (!r.refusal) {
+                            r.rows = unproject.rows;
+                            r.first = unproject.first;
+                            r.count = unproject.count;
+                            r.clip_tick = p.world_tick;
+                            job->clip = std::move(copy);
+                        }
+                    }
+                }
+            }
+        }
         if (!need_scene) {
+            if (reflection_tracker) {
+                ReflectionDropCapture(build);
+            }
             continue;
         }
         job->geometries.push_back({
@@ -3427,6 +5891,34 @@ void RtShadow::RecordBuilds() {
         }
         job->ranges.push_back({.primitiveCount = e.triangles});
         job->pointers.push_back(&job->ranges.back());
+        if (reflection_native_tracked) {
+            ReflectionNativeRecordBuild(e, build);
+        }
+        if (reflection_tracker) {
+            ReflectionBuild(e, build);
+        }
+        if (roof_probe && roof_probe->Enabled()) {
+            const u64 legacy_hash = XXH3_64bits(build.to_world.data(), sizeof(build.to_world));
+            u64 geometry_hash = legacy_hash;
+            if (build.lamp_affine) {
+                // The only admitted topology was verified against this build's bound indices.
+                constexpr std::string_view representation = "lamp-affine-v1";
+                const std::array<u64, 6> parts{
+                    XXH3_64bits(representation.data(), representation.size()),
+                    legacy_hash,
+                    XXH3_64bits(build.still_rows.data(), sizeof(build.still_rows)),
+                    XXH3_64bits(build.still_origin.data(), sizeof(build.still_origin)),
+                    XXH3_64bits(build.lamp_affine_depth.data(), sizeof(build.lamp_affine_depth)),
+                    LampAffineTopologyHash,
+                };
+                geometry_hash = XXH3_64bits(parts.data(), sizeof(parts));
+            }
+            roof_probe->RecordGeometry(e.address, geometry_hash);
+            if (auto* row = RoofWatchEntry(e)) {
+                ++row->now.captured;
+                row->Cache(e.address, roof_probe->Geometry(e.address), e.r17_capture_frame, "guarded-cache");
+            }
+        }
         // bbport (r62d_card-uv-diag): the geometry check of what this build reads
         if (geo_on) {
             u32 serial = 0xffffffffu;
@@ -3665,6 +6157,16 @@ void RtShadow::RecordBuilds() {
                 EffectPass::MemoryBarrier(cmdbuf, Transfer, vk::AccessFlagBits2::eTransferWrite,
                                           Compute | Vertex, ShaderAccess);
             }
+            if (job->clip) {
+                constexpr auto Vertex = vk::PipelineStageFlagBits2::eVertexShader;
+                constexpr auto Copy = vk::PipelineStageFlagBits2::eCopy;
+                using Access = vk::AccessFlagBits2;
+                EffectPass::MemoryBarrier(cmdbuf, Vertex, Access::eShaderWrite, Copy,
+                                          Access::eTransferRead);
+                cmdbuf.copyBuffer(positions, job->clip->destination, job->clip->regions);
+                EffectPass::MemoryBarrier(cmdbuf, Copy, Access::eTransferRead, Compute,
+                                          Access::eShaderWrite);
+            }
             const vk::WriteDescriptorSet write{.dstBinding = 0,
                                                .descriptorCount = 1,
                                                .descriptorType = vk::DescriptorType::eStorageBuffer,
@@ -3675,6 +6177,22 @@ void RtShadow::RecordBuilds() {
                 cmdbuf.pushConstants(unproject_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
                                      &push);
                 cmdbuf.dispatch((push.count + 63) / 64, 1, 1);
+            }
+            if (!job->lamp_affine.empty()) {
+                const vk::DescriptorBufferInfo bit_info{job->lamp_affine_bits, 0, VK_WHOLE_SIZE};
+                const std::array<vk::WriteDescriptorSet, 2> writes{{
+                    write,
+                    {.dstBinding = 1, .descriptorCount = 1,
+                     .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &bit_info},
+                }};
+                cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, job->lamp_affine_pipeline);
+                cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, job->lamp_affine_layout,
+                                            0, writes);
+                for (const LampAffinePush& push : job->lamp_affine) {
+                    cmdbuf.pushConstants(job->lamp_affine_layout, vk::ShaderStageFlagBits::eCompute,
+                                         0, sizeof(push), &push);
+                    cmdbuf.dispatch((push.count + 63) / 64, 1, 1);
+                }
             }
             // bbport (r62e_leaf-cards-usable): the guard of the cut-out builds (rt_card_guard.comp):
             // their flags zeroed, DETECT over their triangles, COLLAPSE over their vertices; after the
@@ -3774,6 +6292,15 @@ void RtShadow::RecordBuilds() {
                        Compute | vk::PipelineStageFlagBits2::eVertexShader,
                        vk::AccessFlagBits2::eShaderRead);
             }
+            if (job->bottle) {
+                constexpr auto Copy = vk::PipelineStageFlagBits2::eCopy;
+                constexpr auto Write = vk::AccessFlagBits2::eTransferWrite;
+                EffectPass::MemoryBarrier(cmdbuf, Compute | Copy,
+                    vk::AccessFlagBits2::eShaderRead | Write, Copy, Write);
+                cmdbuf.copyBuffer(positions, job->bottle, job->bottle_regions);
+                EffectPass::MemoryBarrier(cmdbuf, Copy, Write, Compute, vk::AccessFlagBits2::eShaderRead);
+                EffectPass::MemoryBarrier(cmdbuf, Copy, {}, vk::PipelineStageFlagBits2::eVertexShader | Compute, {});
+            }
             if (job->probe_host) { // bbport (r64b_surface-probe-more): set only with the probe on
                 EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eCopy,
                                           vk::AccessFlagBits2::eTransferWrite,
@@ -3820,14 +6347,83 @@ bool RtShadow::PrepareCapture() {
     return Complete() && camera_motion.PassMatrices().valid;
 }
 
-bool RtShadow::PrepareScene() {
+WindowPathProbe::LampSceneIdentity RtShadow::LampPhysicalScene() const noexcept {
+    return {std::bit_cast<u64>(static_cast<VkAccelerationStructureKHR>(tlas)),
+            reinterpret_cast<std::uintptr_t>(tlas_storage.allocation),
+            tlas_guard.writes, u32(r17_tlas_records.size())};
+}
+
+bool RtShadow::LampSceneMatches(const WindowPathProbe::SceneObservation& observation,
+                               VideoCore::ImageId depth, u64 uid) const noexcept {
+    const auto matrices = camera_motion.PassMatrices();
+    const bool clean = matrices.valid && TlasGuardOn() && !r26_freeze &&
+                       r17_tlas_valid && !r17_blas_dirty;
+    return observation.MatchesLamp(LampPhysicalScene(), clean, frame,
+        {matrices.view, matrices.inv_view}, matrices.proj, depth, uid);
+}
+
+bool RtShadow::PrepareScene(WindowPathProbe::SceneObservation* window) {
+    auto* watching = roof_probe ? roof_probe->Watch() : nullptr;
+    const auto watch_scene = [&](const char* reason) {
+        if (watching) {
+            watching->SceneRefusal(reason);
+        }
+    };
+    if (window_scene_active_serial) {
+        window_scene_active_serial = 0;
+    }
+    if (!window) {
+        window = window_scene_watch;
+    }
+    if (window && !window->lamp_witness) {
+        window->Reset();
+    }
     if (!need_scene || !PrepareCapture()) {
+        watch_scene("natural-scene-preparation-unavailable");
+        if (roof_probe) {
+            roof_probe->Reject("normal scene preparation unavailable", true);
+        }
         return false;
     }
     const auto camera = camera_motion.PassMatrices();
+    auto* roof = roof_probe.get();
+    const InteriorRoof::Camera roof_camera = (roof || window)
+        ? InteriorRoof::Camera{camera.view, camera.inv_view} : InteriorRoof::Camera{};
+    u64 observed_depth_uid = 0;
+    if (window) {
+        if (r26_freeze || !TlasGuardOn() || !camera.valid || !camera_motion.Depth() ||
+            !InteriorRoof::Valid(roof_camera) || !window->textures) {
+            window = nullptr;
+        } else if (const auto* image = window->textures->TryGetImage(camera_motion.Depth(), 0)) {
+            observed_depth_uid = image->image_uid;
+        }
+        if (!observed_depth_uid) {
+            window = nullptr;
+        }
+    }
+    if (roof && (!roof->Enabled() || r26_freeze || !TlasGuardOn() || !camera.valid ||
+                 !camera_motion.Depth() || !InteriorRoof::Valid(roof_camera))) {
+        watch_scene(r26_freeze ? "upkeep-freeze" :
+                    !TlasGuardOn() ? "normal-liveness-guard-off" : "invalid-camera-or-depth");
+        roof->Reject(r26_freeze ? "RT upkeep/TLAS freeze" :
+                     !TlasGuardOn() ? "TLAS guard disabled, cannot attest emitted geometry" :
+                     "main-camera transform unavailable or inconsistent", true);
+        roof = nullptr;
+    }
+    const auto roof_use = [&] {
+        if (roof) {
+            roof->Use(tlas, roof_camera, frame, {r17_stats.tlas_built, r17_stats.tlas_updated,
+                r17_stats.tlas_skipped, tlas_guard.ring_full, tlas_guard.bad_view, tlas_guard.no_address,
+                tlas_live.dangling, tlas_live.moved, tlas_live.no_handle, stats.over_budget, stats.unsupported});
+        }
+    };
     // bbport (r121_tlas-hang-guard): a view that is not finite (every record's transform): no scene
     if (TlasGuardOn() && !TlasViewSane(camera.view)) {
         ++tlas_guard.bad_view;
+        watch_scene("normal-view-guard-refused");
+        if (roof) {
+            roof->Reject("normal TLAS view guard refused", true);
+        }
         return false;
     }
     // bbport (r14_cascade_rt): after the drawn entries, those held for cascades not drawn (none
@@ -3862,6 +6458,7 @@ bool RtShadow::PrepareScene() {
         }
         tlas_count = count;
         r26_tlas_kept = true;
+        watch_scene("frozen-tlas-no-new-publication");
         return true;
     }
     if (r26_freeze == 1u) {
@@ -3880,8 +6477,28 @@ bool RtShadow::PrepareScene() {
     }
     if (count == tlas_count && (!hold_frames || (tlas_drawn == frame_entries.size() &&
                                                  tlas_cascades == frame_cascades))) {
+        watch_scene("natural-scene-reuse-no-new-publication");
+        if (window && window->lamp_witness &&
+            LampSceneMatches(*window, camera_motion.Depth(), observed_depth_uid)) {
+            window->lamp_via_earlier = true;
+            window_scene_active_serial = window->scene->serial;
+            UnwatchWindowScene(window);
+        } else if (window) {
+            window->Reset(window->lamp_witness ? WindowPathProbe::SceneStatus::EarlierPreparationUnattested
+                                               : WindowPathProbe::SceneStatus::UnattestedReuse);
+        }
+        roof_use();
         return true;
     }
+    // This may be called between ordinary draw admission and draw delivery. A
+    // published ordinal is provisional until the exact direct draw is recorded.
+    const bool bottle_attest = BottleObserved();
+    if (bottle_attest) {
+        bottle_scene_frame = ~u64{0};
+    }
+    u32 bottle_ordinal = MaxInstances;
+    u32 bottle_mask = 0;
+    BottleEndpoint bottle_endpoint;
     tlas_drawn = frame_entries.size();
     // bbport (r26_upkeep-probe): from here the TLAS is built, refit or found the same as last
     // built: it holds only entries of this frame, so it may later be traced as it is.
@@ -3906,6 +6523,10 @@ bool RtShadow::PrepareScene() {
     const u32 sub = tlas_guard_on ? tlas_subs : 0u;
     if (sub >= TlasSubSlots) {
         ++tlas_guard.ring_full;
+        watch_scene("normal-ring-guard-refused");
+        if (roof) {
+            roof->Reject("normal TLAS ring guard refused", true);
+        }
         return true;
     }
     auto* ring = static_cast<vk::AccelerationStructureInstanceKHR*>(instance_data.mapped) +
@@ -3948,6 +6569,11 @@ bool RtShadow::PrepareScene() {
     const bool card_lamps = card_layers_on && CardLampsWanted() && card_lamp_user_seen &&
                             frame - card_lamp_user_frame <= CardLampHoldFrames;
     u32 lamp_cards = 0, lamp_plants = 0, lamp_moving = 0, lamp_flips = 0;
+    // bbport (r130c_glass-lamp-light): BB_GLASS_LIGHT: the knob now; true: the entries a registry hit marked get glass records
+    const bool glass_rec_on = glass_light_mode != 0 && GlassLightFrame(card_lamps);
+    if (glass_light_mode != 0) {
+        GlassForwardFrame(); // bbport (r130g_glass-light-forward): its lines come right after r130c's
+    }
     card_safe_now = {}; // bbport (r62e_leaf-cards-usable): of the records written now
     // bbport (r62n_cutout-skinned-blocker) FEATURE: which lone skinned cut-out cards may cast lamp shadows (BB_RT_CARD_LAMP_SKINNED: 0 only a
     // few-bones one, 1 every one, 2 none); only asked while the lamp rays read the cards
@@ -3965,6 +6591,48 @@ bool RtShadow::PrepareScene() {
         gate_table.clear();
         gate_caps.clear(); // bbport (r76c_sun-fog-shells): GateCaptures, beside it
     }
+    std::shared_ptr<InteriorRoof::Scene> roof_next;
+    if (window) {
+        window->Reset();
+        constexpr u32 AttemptsMost = 2;
+        if (++window->attempts > AttemptsMost ||
+            frame_entries.size() + held_now.size() > MaxInstances) {
+            window->status = WindowPathProbe::SceneStatus::Budget;
+            if (window_scene_watch == window) {
+                window_scene_watch = nullptr;
+            }
+            window = nullptr;
+        } else {
+            try {
+                window->facts.reserve(count);
+                if (!roof) {
+                    roof_next = std::make_shared<InteriorRoof::Scene>();
+                    roof_next->records.reserve(count);
+                }
+            } catch (const std::bad_alloc&) {
+                roof_next.reset();
+                window->status = WindowPathProbe::SceneStatus::Budget;
+                if (window_scene_watch == window) {
+                    window_scene_watch = nullptr;
+                }
+                window = nullptr;
+            }
+        }
+    }
+    if (roof || window) {
+        static_assert(InteriorRoof::MaxRecords == MaxInstances);
+        if (roof) {
+            roof_next = std::make_shared<InteriorRoof::Scene>();
+            roof_next->records.reserve(count);
+        }
+        roof_next->camera = roof_camera;
+        roof_next->tlas_view = XXH3_64bits(camera.view.data(), sizeof(camera.view));
+        roof_next->frame = frame;
+        roof_next->requested = u32(frame_entries.size() + held_now.size());
+        roof_next->flags = u32(RtGlassOn()) | (u32(glass_rec_on) << 1) | (u32(card_lamps) << 2) |
+                           (u32(card_layers_on) << 3) | (u32(gate_shell_rule.on) << 4) |
+                           (u32(glass_clear_now) << 5) | (u32(tlas_guard_on) << 6);
+    }
     for (u32 i = 0; i < count; ++i) {
         // bbport (r14_cascade_rt): a held entry, or a held one drawn only by the camera pass while
         // its cascades are not drawn, keeps casting the sun's shadow (rt_shadow.comp's ray mask 1).
@@ -3978,26 +6646,49 @@ bool RtShadow::PrepareScene() {
             ++tlas_live.checked;
             if (live_entry == entry_live.end()) {
                 ++tlas_live.dangling;
+                if (watching) {
+                    watching->UnassignedGuard();
+                }
                 continue;
             }
         }
         if (!entry->blas) {
+            if (auto* row = RoofWatchEntry(*entry)) {
+                ++row->now.scanned;
+                row->now.emit_why = "selected-without-blas";
+            }
             continue;
         }
         // bbport (r121_tlas-hang-guard): an entry whose BLAS was never made has no address to point at
         if (tlas_guard_on && entry->address == 0) {
             ++tlas_guard.no_address;
+            if (watching) {
+                watching->UnassignedGuard();
+            }
             continue;
         }
         // bbport (r121c_tlas-unbound-read): the address is the one the BLAS was made with, and its handle is there
         if (tlas_guard_on) {
             if (live_entry->second != entry->address) {
                 ++tlas_live.moved;
+                if (watching) {
+                    watching->UnassignedGuard();
+                }
                 continue;
             }
             if (!entry->handle) {
                 ++tlas_live.no_handle;
+                if (watching) {
+                    watching->UnassignedGuard();
+                }
                 continue;
+            }
+        }
+        if (watching && tlas_guard_on) {
+            if (auto* row = watching->Exact(entry->base, entry->mesh)) {
+                ++row->now.scanned;
+                row->Cache(entry->address, roof_probe->Geometry(entry->address), entry->r17_capture_frame,
+                           "guarded-cache");
             }
         }
         // bbport (r46_lamp-cards): an entry no camera pass draw of its own showed as a cut-out
@@ -4161,8 +6852,15 @@ bool RtShadow::PrepareScene() {
             ++(CardMaskTurn(entry->card_uv->lamp_once) ? card_safe.flips : card_safe.first_on); // (r62e)
             entry->card_uv->lamp_written = lamp_card;
         }
+        // bbport (r130c_glass-lamp-light): a transmitting registry entry's record (never a cut-out card, a stale copy, an old pose
+        // or one BB_RT_LAMP_LEAVE leaves out: their lamp bit is withheld already). Off: glass_rec_on and entry->glass_light are 0.
+        const bool glass_rec = glass_rec_on && entry->glass_light != 0 && mask != 0 && !card && !stale && !leave && !old_pose;
+        if (entry->glass_light != 0 && glass_light_now && !glass_rec_on) {
+            ++glass_counts.kept_cards; // the lamp cards are on: the record stays as before
+        }
         vk::AccelerationStructureInstanceKHR record{
-            .instanceCustomIndex = CardCustomIndex(*entry), // bbport (r62_leaf-stage3)
+            // bbport (r62_leaf-stage3); a glass record's index is its registry entry (bbport r130c_glass-lamp-light)
+            .instanceCustomIndex = glass_rec ? GlassLight::CustomIndex(u8(entry->glass_light - 1u)) : CardCustomIndex(*entry),
             // bbport (r83_glass-water-stage1): a window pane's record: RtGlassMask alone
             .mask = RtGlassRecordMask(mask, u8(mask | (card || stale || leave || old_pose ? 0 : LampMask) |
                                                (lamp_card ? CardLampMask : 0))), // bbport (r63_leaf-stage4)
@@ -4205,10 +6903,82 @@ bool RtShadow::PrepareScene() {
             gate_shells_now += shell ? 1 : 0;
             gate_shells_sun += shell && (bits & 1u) != 0 ? 1 : 0;
         }
+        // bbport (r130c_glass-lamp-light): the glass record drops the lamp bits and takes RtGlassMask (a pane has it alone already:
+        // glass_gain only where the mask changes, for the pane counts below)
+        const bool glass_gain = glass_rec && !RtGlassEntry(mask);
+        if (glass_rec) {
+            record.mask = u8((u32(record.mask) & ~u32(LampMask | CardLampMask)) | RtGlassMask);
+            ++glass_light_records_now;
+            ++glass_counts.records;
+        }
+        // bbport (r131c_cabinet-glass-clear): BB_GLASS_CLEAR on (glass_clear_now, set by the rasterizer each frame): the glass record of
+        // a clearing kind (the cabinet's pane) takes RtGlassMask alone: the sun, moon and camera rays pass it (they do not read
+        // GLASS_INDEX_BIT); the lamp glass query still finds it for its tint. Off: false, nothing here changes.
+        if (glass_rec && glass_clear_now &&
+            GlassRegistryRules::Clears(GlassRegistryRules::Load().entries[(entry->glass_light - 1u) % GlassRegistryRules::MaxEntries].kind)) {
+            record.mask = RtGlassMask;
+            ++glass_clear_records;
+        }
+        if (bottle_attest && entry == bottle_entry && !kept && !stale && !old_pose && entry->built &&
+            record.accelerationStructureReference == bottle_entry_address && (record.mask & CameraMask) != 0 && !card) {
+            const bool warm = entry->address == bottle_resident_address && entry->r17_capture_frame == bottle_resident_capture &&
+                              (bottle_resident_capture == frame || (!entry->rebuilt && !entry->dynamic));
+            const bool cold = BottleColdEligible(*entry) &&
+                              (record.flags & VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR) == 0;
+            if (warm || cold) {
+                bottle_ordinal = bottle_ordinal == MaxInstances ? built : MaxInstances + 1;
+                bottle_mask = record.mask;
+                bottle_endpoint = BottleGeneration(*entry);
+            }
+        }
         out[built++] = record;
+        if (roof_next) {
+            if ((record.flags & VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR) != 0) {
+                if (roof) {
+                    watch_scene("roof-observation-force-opaque");
+                    roof->Reject("force-opaque instance prevents candidate traversal", true);
+                    roof = nullptr;
+                }
+                roof_next.reset();
+            } else {
+                const u32 flags = InteriorRoof::Flags(record.mask,
+                    RtGlassEntry(record.mask) || entry->glass_light != 0,
+                    lamp_card || entry->shadow_card || entry->card_shadow || cutout,
+                    entry->skinned || entry->skeleton_bones != 0,
+                    entry->dynamic || entry->still_moved || entry->still_seen || entry->still_doubt,
+                    entry->palette != 0 || entry->palette_placed);
+                const InteriorRoof::Record evidence{
+                    .key = entry->base,
+                    .mesh = entry->mesh,
+                    .capture_frame = entry->r17_capture_frame,
+                    .flags = flags,
+                    .held = kept,
+                    .palette_nonzero = entry->palette != 0,
+                    .palette_placed = entry->palette_placed,
+                    .geometry = roof ? roof->Geometry(entry->address) : InteriorRoof::GeometryRevision{},
+                    .captured_inputs = entry->r17_inputs,
+                };
+                if (!InteriorRoof::Append(*roof_next, built - 1, evidence)) {
+                    if (roof) {
+                        watch_scene("roof-observation-emission-order-mismatch");
+                    roof->Reject("emitted instance order differs from sidecar", true);
+                        roof = nullptr;
+                    }
+                    roof_next.reset();
+                } else if (window) {
+                    window->facts.push_back({
+                        .key = evidence.key,
+                        .capture_frame = evidence.capture_frame,
+                        .triangles = entry->triangles,
+                        .custom_index = record.instanceCustomIndex,
+                    });
+                }
+            }
+        }
+        glass_fwd.carried += glass_rec && kept ? 1u : 0u; // bbport (r130g_glass-light-forward): a glass record of a carried pane
         // bbport (r86_glass-light-stage2a): the pane records (Record asks them only while one is
         // in)
-        if (RtGlassEntry(static_cast<u8>(record.mask))) {
+        if (!glass_gain && RtGlassEntry(static_cast<u8>(record.mask))) {
             ++glass_records;
             glass_records_carried += kept ? 1 : 0;
         }
@@ -4239,6 +7009,36 @@ bool RtShadow::PrepareScene() {
         stats.triangles += triangles;
         ++stats.frames;
     }
+    const auto publish_bottle = [&] {
+        if (bottle_ordinal < built && tlas_guard_on && !r26_freeze) {
+            bottle_scene_frame = frame;
+            bottle_scene_ordinal = bottle_ordinal;
+            bottle_scene_mask = bottle_mask;
+            bottle_scene_view = camera.view;
+            bottle_scene_endpoint = bottle_endpoint;
+        }
+    };
+    const auto publish_window = [&](WindowPathProbe::LampSceneSource source) {
+        if (!window || !roof_next || !built || window->facts.size() != built ||
+            roof_next->records.size() != built) {
+            return;
+        }
+        if (window->lamp_witness) {
+            const auto physical = LampPhysicalScene();
+            if (!r17_tlas_valid || r17_blas_dirty || !physical.Valid() || physical.emitted != built) {
+                return;
+            }
+            window->lamp_identity = physical;
+            window->lamp_source = source;
+        }
+        window->scene = roof_next;
+        window->projection = camera.proj;
+        window->depth = camera_motion.Depth();
+        window->depth_uid = observed_depth_uid;
+        window->status = WindowPathProbe::SceneStatus::Ready;
+        window_scene_active_serial = roof_next->serial;
+        UnwatchWindowScene(window);
+    };
     tlas_count = count;
     // bbport (r17_rt-upkeep): nothing changed since the TLAS was last built or refit (no BLAS
     // build or refit recorded since, the same records byte for byte): it is left as it is. Only
@@ -4262,6 +7062,20 @@ bool RtShadow::PrepareScene() {
         tlas_guard.later_differ += sub > 0 && !same_refs && !(same_all && !r17_blas_dirty) ? 1 : 0;
         if (same_all && !r17_blas_dirty) {
             ++r17_stats.tlas_skipped;
+            watch_scene("bytewise-normal-reuse-no-new-publication");
+            if (window && window->lamp_witness && roof_next && built) {
+                // The normal comparison just matched every ordered instance byte, and no BLAS
+                // build, refit or referenced retirement intervened. Keep the physical write ID.
+                roof_next->serial = ++observed_scene_serial;
+                roof_next->ms = InteriorRoof::Now();
+                publish_window(WindowPathProbe::LampSceneSource::ExactBytewise);
+            }
+            if (window && window->status != WindowPathProbe::SceneStatus::Ready) {
+                window->Reset(window->lamp_witness ? WindowPathProbe::SceneStatus::BytewiseReuseUnattested
+                                                   : WindowPathProbe::SceneStatus::UnattestedReuse);
+            }
+            publish_bottle(); // the matching current record occupies the same ordinal
+            roof_use(); // unchanged TLAS retains its original matching table
             return true;
         }
         tlas_flags |= vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
@@ -4332,6 +7146,24 @@ bool RtShadow::PrepareScene() {
                                                vk::AccessFlagBits2::eAccelerationStructureReadKHR};
             cmdbuf.pipelineBarrier2({.memoryBarrierCount = 1, .pMemoryBarriers = &after});
         });
+    publish_bottle();
+    if (roof_next && roof_next->records.size() == built) {
+        if (built) {
+            roof_next->serial = ++observed_scene_serial;
+            roof_next->ms = InteriorRoof::Now();
+            publish_window(WindowPathProbe::LampSceneSource::NativeWrite);
+        }
+        if (roof) {
+            roof->Publish(std::move(roof_next));
+            roof_use(); // the ordinary AS-build-to-compute dependency is already recorded
+        }
+    } else if (roof) {
+        watch_scene("roof-observation-emitted-count-mismatch");
+        roof->Reject("emitted count and diagnostic metadata differ", true);
+    }
+    if (window && window->status != WindowPathProbe::SceneStatus::Ready) {
+        window->Reset();
+    }
     return true;
 }
 
@@ -4380,6 +7212,55 @@ bool RtShadow::MakeRaw(u32 width, u32 height) {
     raw_view = view;
     raw_width = width;
     raw_height = height;
+    return true;
+}
+
+// bbport (r131a_foliage-translucency): the sun trace's hue image (rt_shadow.comp FOLIAGE builds, binding 11): RGBA8 at the trace's size, made (and
+// made again when the size changes) only with the light through leaves on for the sun. Each trace clears it before it writes.
+bool RtShadow::MakeSunHue(u32 width, u32 height) {
+    if (sun_hue_image && sun_hue_width == width && sun_hue_height == height) {
+        return true;
+    }
+    const auto device = instance.GetDevice();
+    const auto allocator = instance.GetAllocator();
+    if (sun_hue_image) {
+        scheduler.DeferOperation([device, allocator, image = sun_hue_image, memory = sun_hue_allocation, view = sun_hue_view] {
+            device.destroyImageView(view);
+            vmaDestroyImage(allocator, image, memory);
+        });
+        sun_hue_image = vk::Image{};
+        sun_hue_view = vk::ImageView{};
+    }
+    const VkImageCreateInfo image_ci{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = VK_FORMAT_R8G8B8A8_UNORM,
+        .extent = {width, height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo alloc_ci{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage raw{};
+    if (vmaCreateImage(allocator, &image_ci, &alloc_ci, &raw, &sun_hue_allocation, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    sun_hue_image = raw;
+    const auto [result, view] = device.createImageView({
+        .image = sun_hue_image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = vk::Format::eR8G8B8A8Unorm,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) {
+        return false;
+    }
+    sun_hue_view = view;
+    sun_hue_width = width;
+    sun_hue_height = height;
     return true;
 }
 
@@ -4539,6 +7420,7 @@ bool RtShadow::Record(const Inputs& in) {
     // counts; every 600 the means per counted frame (u32 differences survive the wrap; read while
     // the GPU may still copy a later frame's counters, which then fall in the next window).
     r25_half = R25HalfWanted(); // bbport (r37_menu-options)
+    const CardSunUse card_sun = CardSunNow(r25_half); // bbport (r128c_lrt-cutout-props): empty unless BB_RT_CARD_SUN=1
     if (probe_on) { // bbport (r64b_surface-probe-more): this frame's sun path, for the log
         probe_sun_path = use_vsm ? 1 : r25_half ? 3 : 2;
     }
@@ -4584,6 +7466,37 @@ bool RtShadow::Record(const Inputs& in) {
                         glass_late, counted, m[0], m[1], m[2], m[3], m[4], m[5]);
             glass_late = 0;
         }
+        // bbport (r128c_lrt-cutout-props) FEATURE: BB_RT_CARD_SUN=1: its counters, means per counted frame as r25's (u32 differences survive the wrap)
+        if (CardSunWanted()) {
+            std::array<u32, CardSunWords> got{};
+            std::memcpy(got.data(), static_cast<const u32*>(r25_readback.mapped) + CardSunFirstWord, sizeof(got));
+            std::array<double, CardSunWords> m{};
+            for (u32 i = 0; i < CardSunWords && counted != 0; ++i) {
+                m[i] = double(u32(got[i] - card_sun_last[i])) / double(counted);
+            }
+            card_sun_last = got;
+            std::printf("Ray traced sun cut-outs (r128c): %u sun traces ran the cut-out build, %u the plain one (cut-out cards in the scene %u); a counted "
+                        "frame (%u): pixels traced %.0f, with a ray that met a card %.0f, layer reads %.0f, rays stopped by a kept texel %.0f (pixels "
+                        "%.0f), candidates passed as the pixel's own surface %.0f, rays stopped at the cap %.0f, first-pass pixels marked %.0f\n",
+                        card_sun_cards, card_sun_plain, card_lamp_instances, counted, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+            card_sun_cards = card_sun_plain = 0;
+        }
+        // bbport (r131a_foliage-translucency): the sun's light through leaves: its four counters follow the CARDS ones (r25 words 24 to 27), means per
+        // counted frame as r25's
+        if (FoliageTranslucency::SunThrough()) {
+            std::array<u32, 4> got{};
+            std::memcpy(got.data(), static_cast<const u32*>(r25_readback.mapped) + CardSunFirstWord + CardSunWords, sizeof(got));
+            std::array<double, 4> m{};
+            for (u32 i = 0; i < 4 && counted != 0; ++i) {
+                m[i] = double(u32(got[i] - foliage_sun_last[i])) / double(counted);
+            }
+            foliage_sun_last = got;
+            std::printf("Foliage light (r131a): sun rays %.0f, passed a leaf %.0f (T=%.2f), ended at floor %.0f, grey (no colour) %.0f (a counted frame, %u of "
+                        "them); the sun and moon: %s\n",
+                        m[0], m[1], double(FoliageTranslucency::Tuning().pass), m[2], m[3], counted,
+                        FoliageTranslucency::Glow() ? "grey part through the game's light, hue added by the glow pass"
+                                                    : "grey (no tint without the glow pass)");
+        }
         r25_frames = 0;
     }
     // bbport (r86_glass-light-stage2a): BB_RT_GLASS_LIGHT on and a pane in the TLAS: its bits
@@ -4603,6 +7516,9 @@ bool RtShadow::Record(const Inputs& in) {
         .max_distance = 800.0f,
         .far_radius = BbToggle::Experiment(4194304) ? -1 : FilterRadius,
         .r25_flags = r25_flags,
+        .pass_share = FoliageTranslucency::LightNow() ? FoliageTranslucency::Tuning().pass : 0.0f, // bbport (r131a_foliage-translucency): 0 switched off live
+        .pass_tint = FoliageTranslucency::Tuning().tint,
+        .pass_floor = FoliageTranslucency::Tuning().floor,
     };
     const FilterPush filter{
         .buf_off = in.constants_offset_word,
@@ -4610,15 +7526,20 @@ bool RtShadow::Record(const Inputs& in) {
         .size = {float(in.width), float(in.height)},
         .r25_flags = r25_flags,
     };
+    if (card_sun.foliage && !use_vsm) { // bbport (r131a_foliage-translucency): the hue image of this trace (the glow pass reads it)
+        sun_hue_frame = frame;
+    }
     EffectPass::Mark(14, "ray traced sun");
     scheduler.RecordCrumb(
         {.name = "Ray traced sun"},
         [in, trace, filter, use_vsm, tlas = tlas, raw_image = raw_image, raw_view = raw_view,
-         sampler = *sampler, trace_pipeline = *trace_pipeline, trace_layout = *trace_layout,
+         sampler = *sampler, card_sun, // bbport (r128c_lrt-cutout-props): the cut-out build, or nothing
+         trace_pipeline = card_sun.pipeline ? card_sun.pipeline : *trace_pipeline,
+         trace_layout = card_sun.pipeline ? card_sun.layout : *trace_layout,
          filter_pipeline = *filter_pipeline, filter_layout = *filter_layout,
          r25_counts = r25_counts.buffer, r25_readback = r25_readback.buffer, r25_half = r25_half,
-         half_pipeline = r25_half ? *r25_half_pipeline : vk::Pipeline{},
-         half_layout = r25_half ? *r25_half_layout : vk::PipelineLayout{},
+         half_pipeline = r25_half ? (card_sun.pipeline ? card_sun.pipeline : *r25_half_pipeline) : vk::Pipeline{},
+         half_layout = r25_half ? (card_sun.pipeline ? card_sun.layout : *r25_half_layout) : vk::PipelineLayout{},
          r25_clear](vk::CommandBuffer cmdbuf) {
             const vk::ImageMemoryBarrier2 to_general{
                 .srcStageMask = Compute,
@@ -4632,6 +7553,25 @@ bool RtShadow::Record(const Inputs& in) {
             if (!use_vsm) {
                 cmdbuf.pipelineBarrier2(
                     {.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_general});
+            }
+            if (card_sun.foliage && !use_vsm) {
+                // bbport (r131a_foliage-translucency): the hue image: undefined to general and cleared to 0 (a pixel the trace does not shade has no leaf share)
+                const vk::ImageMemoryBarrier2 hue_to_general{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eGeneral,
+                    .image = card_sun.hue_image,
+                    .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                };
+                cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &hue_to_general});
+                const vk::ClearColorValue hue_zero{std::array<float, 4>{0.0f, 0.0f, 0.0f, 0.0f}};
+                const vk::ImageSubresourceRange hue_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+                cmdbuf.clearColorImage(card_sun.hue_image, vk::ImageLayout::eGeneral, hue_zero, hue_range);
+                EffectPass::MemoryBarrier(cmdbuf, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite, Compute,
+                                          vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
             }
             if (r25_clear) { // bbport (r25_rt-sun-trace): the counters start at zero
                 cmdbuf.fillBuffer(r25_counts, 0, VK_WHOLE_SIZE, 0);
@@ -4653,7 +7593,15 @@ bool RtShadow::Record(const Inputs& in) {
             const vk::DescriptorImageInfo target{{}, in.target, vk::ImageLayout::eGeneral};
             const vk::WriteDescriptorSetAccelerationStructureKHR scene{
                 .accelerationStructureCount = 1, .pAccelerationStructures = &tlas};
-            const std::array<vk::WriteDescriptorSet, 6> trace_writes{{
+            // bbport (r128c_lrt-cutout-props): bindings 6 to 9 are the cut-out build's card tables (pushed only with it)
+            const vk::DescriptorBufferInfo cs_rows{card_sun.rows, 0, VK_WHOLE_SIZE};
+            const vk::DescriptorBufferInfo cs_pool{card_sun.pool, 0, VK_WHOLE_SIZE};
+            const vk::DescriptorBufferInfo cs_info{card_sun.info, 0, VK_WHOLE_SIZE};
+            const vk::DescriptorImageInfo cs_alpha{card_sun.sampler, card_sun.layers, vk::ImageLayout::eGeneral};
+            // bbport (r131a_foliage-translucency): bindings 10 and 11 are the FOLIAGE builds' colour layers and hue image (pushed only with them)
+            const vk::DescriptorImageInfo cs_colour{card_sun.sampler, card_sun.colour, vk::ImageLayout::eGeneral};
+            const vk::DescriptorImageInfo cs_hue{{}, card_sun.hue, vk::ImageLayout::eGeneral};
+            const std::array<vk::WriteDescriptorSet, 12> trace_writes{{
                 {.dstBinding = 0, .descriptorCount = 1,
                  .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &constants},
                 {.dstBinding = 1, .descriptorCount = 1,
@@ -4666,11 +7614,26 @@ bool RtShadow::Record(const Inputs& in) {
                  .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &uniforms},
                 {.dstBinding = 5, .descriptorCount = 1, // r25: counters
                  .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &r25_info},
+                {.dstBinding = 6, .descriptorCount = 1, // r128c: the cut-out cards (rt_shadow_cards_comp)
+                 .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &cs_rows},
+                {.dstBinding = 7, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &cs_pool},
+                {.dstBinding = 8, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eStorageBuffer, .pBufferInfo = &cs_info},
+                {.dstBinding = 9, .descriptorCount = 1,
+                 .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &cs_alpha},
+                {.dstBinding = 10, .descriptorCount = 1, // r131a: the colour layers
+                 .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &cs_colour},
+                {.dstBinding = 11, .descriptorCount = 1, // r131a: the hue image
+                 .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &cs_hue},
             }};
+            // the plain build has six bindings, the cut-out build ten (a count and a pointer: no copy)
+            const vk::ArrayProxy<const vk::WriteDescriptorSet> trace_push(card_sun.foliage ? 12u : card_sun.pipeline ? 10u : 6u,
+                                                                          trace_writes.data()); // (r131a: 12 with the FOLIAGE build)
             if (!use_vsm) {
                 cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, trace_pipeline);
                 cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, trace_layout, 0,
-                                            trace_writes);
+                                            trace_push);
                 cmdbuf.pushConstants(trace_layout, vk::ShaderStageFlagBits::eCompute, 0,
                                      sizeof(trace), &trace);
                 if (!r25_half) {
@@ -4681,7 +7644,7 @@ bool RtShadow::Record(const Inputs& in) {
                     // rt_shadow_half_comp build (same bindings and push constants).
                     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, half_pipeline);
                     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, half_layout, 0,
-                                                trace_writes);
+                                                trace_push);
                     TracePush pass = trace;
                     pass.r25_flags = trace.r25_flags | R25HalfFirst;
                     cmdbuf.pushConstants(half_layout, vk::ShaderStageFlagBits::eCompute, 0,
@@ -4876,6 +7839,13 @@ void RtShadow::CaptureLeftOut(u32 motion_param, u32 mode) {
     const u32 param = Shader::MotionVectors::Kind(mode) == Shader::MotionVectors::VertexBoth
                           ? motion_param >> 16
                           : motion_param;
+    if (auto* pane = window_pane_watch; pane && param && pane->rt_frame == frame && param == pane->param) {
+        pane->Refuse("ordinary pane draw did not execute");
+    }
+    if (lamp_pane && lamp_pane->Captured() && lamp_pane->capture.rt == frame &&
+        param == lamp_pane->param && param != 0) {
+        lamp_pane->refusal = "matching draw was left out before rasterization";
+    }
     // bbport (r54_leaf-stage2): nor its card UVs: none are expanded, the entry stays Wanted.
     // A capture for the UVs alone (CardUvProbe) is nothing more: r47's looks never counted
     // it, so none of their state below changes for it.
@@ -6096,12 +9066,22 @@ void RtShadow::CardRows() {
 bool RtShadow::CardLampsWanted() {
     static const bool wanted = [] {
         const char* const env = std::getenv("BB_RT_CARD_LAMPS");
-        if (!env) {
+        // bbport (r131b_lrt-settings): a variable that is set and not empty decides (also "0" and text); else the setting
+        // graphics_rt_foliage_shadows (the start copy) 1 or 2 turns it on. Neither: off, as with the variable unset.
+        const int setting = BbSettings::Get().startup_rt_foliage_shadows;
+        const bool from_env = EnvGiven(env);
+        if (!from_env && setting < 1) {
             return false;
         }
-        const bool one = std::strcmp(env, "1") == 0;
+        const bool one = CardLampsOf(env, setting);
         const bool layers = Shader::Optimization::CardAlphaLevel() == 2;
-        std::printf("Ray traced lamps (r63): BB_RT_CARD_LAMPS=%s: %s\n", one ? "1" : "(not 1)",
+        char source[64];
+        if (from_env) {
+            std::snprintf(source, sizeof source, "BB_RT_CARD_LAMPS=%s", one ? "1" : "(not 1)");
+        } else {
+            std::snprintf(source, sizeof source, "the setting graphics_rt_foliage_shadows=%d", setting);
+        }
+        std::printf("Ray traced lamps (r63): %s: %s\n", source,
                     !one      ? "off (only 1 turns it on)"
                     : !layers ? "off - it needs BB_RT_CARD_ALPHA=2 (the alpha layers)"
                               : "the lamp rays cross a plant's or a static cut-out's card where the "
@@ -6118,7 +9098,130 @@ RtShadow::CardLampReaders RtShadow::CardLampReadersNow() const {
     }
     const auto layers = card_layers->ReaderBindings();
     return {card_rows.buffer, card_pool.buffer, layers.info, layers.layers, layers.sampler,
-            card_lamp_instances};
+            card_lamp_instances, layers.colour}; // bbport (r131a_foliage-translucency): the colour layers
+}
+
+// bbport (r128c_lrt-cutout-props) FEATURE: BB_RT_CARD_SUN, read once: exactly 1 turns on the sun side of the cut-out shadows (rt_card_sun.h). It needs
+// the cards in the scene (BB_RT_CARD_ALPHA=2 with BB_RT_CARD_LAMPS=1: the lamp card path gives an instance CARD_LAMP_MASK) and is not made with
+// BB_RT_GLASS_LIGHT (the sun trace's counter words 16 and up). Said once when the variable is set, with the reason when it stays off.
+bool RtShadow::CardSunWanted() {
+    static const bool wanted = [] {
+        const char* const env = std::getenv("BB_RT_CARD_SUN");
+        // bbport (r131b_lrt-settings): a variable that is set and not empty decides; else the setting 2 (lamps and sun).
+        const int setting = BbSettings::Get().startup_rt_foliage_shadows;
+        const bool from_env = EnvGiven(env);
+        if (!from_env && setting < 2) {
+            return false;
+        }
+        const bool one = CardSunOf(env, setting);
+        const bool cards = one && CardLampsWanted();
+        const bool glass = RtGlassLightOn();
+        char source[96];
+        if (from_env) {
+            std::snprintf(source, sizeof source, "BB_RT_CARD_SUN=%.40s", env);
+        } else {
+            std::snprintf(source, sizeof source, "the setting graphics_rt_foliage_shadows=%d", setting);
+        }
+        std::printf("Ray traced sun cut-outs (r128c): %s: %s\n", source,
+                    !one      ? "off (only 1 turns it on)"
+                    : !cards  ? "off - it needs BB_RT_CARD_ALPHA=2 and BB_RT_CARD_LAMPS=1 (the cards in the scene)"
+                    : glass   ? "off - it is not made with BB_RT_GLASS_LIGHT (the two share the sun trace's counter words)"
+                              : "the sun's rays cross the cut-out cards where the game's alpha test drops the texel and stop where it "
+                                "keeps it (rt_shadow.comp CARDS builds; the lamp rays' rule; a card within 3 cm of the ray's start is the "
+                                "pixel's own surface)");
+        return one && cards && !glass;
+    }();
+    return wanted;
+}
+
+// bbport (r128c_lrt-cutout-props) FEATURE: the cut-out build of the sun trace for this sun trace, or nothing (the plain build is pushed). While the
+// knob is on the scene is told that a reader of the cards exists (NoteCardLampUser, as the lamp pass does) so that the cards take CARD_LAMP_MASK; the
+// pipelines are made the first time (the full and the half form apart); nothing is returned while the live knob (test tools' knobs file) says off,
+// the pipeline could not be made, or the scene holds no card with the mask yet (CardLampReadersNow).
+RtShadow::CardSunUse RtShadow::CardSunNow(bool half) {
+    CardSunUse use{};
+    if (!CardSunWanted()) {
+        return use;
+    }
+    NoteCardLampUser();
+#ifdef BB_R62N_LIVE_KNOBS
+    // bbport (r131b_lrt-settings): unset or empty in the knobs file is -1 (CardSunWanted decided: the variable or the setting), so the
+    // setting's sun build runs in a slot build; "0" turns it off live, "1" on.
+    static BbLiveKnobs::Knob<int> live{"BB_RT_CARD_SUN", [](const char* text) -> int { return CardSunLive(text); }};
+    static bool told_on = true;
+    const int live_value = live.Get();
+    const bool on = live_value < 0 || live_value == 1;
+    if (on != told_on) {
+        told_on = on;
+        std::printf("Ray traced sun cut-outs (r128c): the cut-out build is now %s (live)\n", on ? "on" : "off");
+    }
+    if (!on) {
+        ++card_sun_plain;
+        return use;
+    }
+#endif
+    bool& tried = half ? card_sun_half_tried : card_sun_tried;
+    if (!tried) {
+        tried = true;
+        using enum vk::DescriptorType;
+        // bbport (r131a_foliage-translucency): with the light through leaves for the sun the FOLIAGE builds: bindings 10 (the colour layers) and 11
+        // (the hue image) more, and the leaf share in the push constants
+        const bool foliage = FoliageTranslucency::SunThrough();
+        const bool made =
+            foliage ? (half ? EffectPass::Create(instance, card_sun_half_set, card_sun_half_layout, card_sun_half_pipeline,
+                                                 {eStorageBuffer, eCombinedImageSampler, eStorageImage, eAccelerationStructureKHR,
+                                                  eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer,
+                                                  eCombinedImageSampler, eCombinedImageSampler, eStorageImage},
+                                                 sizeof(TracePush), std::span<const u32>{RT_SHADOW_HALF_CARDS_FOLIAGE_COMP},
+                                                 "Ray traced shadows (cut-outs, leaves, half resolution)")
+                            : EffectPass::Create(instance, card_sun_set, card_sun_layout, card_sun_pipeline,
+                                                 {eStorageBuffer, eCombinedImageSampler, eStorageImage, eAccelerationStructureKHR,
+                                                  eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer,
+                                                  eCombinedImageSampler, eCombinedImageSampler, eStorageImage},
+                                                 sizeof(TracePush), std::span<const u32>{RT_SHADOW_CARDS_FOLIAGE_COMP},
+                                                 "Ray traced shadows (cut-outs, leaves)"))
+            : half ? EffectPass::Create(instance, card_sun_half_set, card_sun_half_layout, card_sun_half_pipeline,
+                                      {eStorageBuffer, eCombinedImageSampler, eStorageImage, eAccelerationStructureKHR,
+                                       eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer,
+                                       eCombinedImageSampler},
+                                      sizeof(TracePush), std::span<const u32>{RT_SHADOW_HALF_CARDS_COMP},
+                                      "Ray traced shadows (cut-outs, half resolution)")
+                 : EffectPass::Create(instance, card_sun_set, card_sun_layout, card_sun_pipeline,
+                                      {eStorageBuffer, eCombinedImageSampler, eStorageImage, eAccelerationStructureKHR,
+                                       eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer, eStorageBuffer,
+                                       eCombinedImageSampler},
+                                      sizeof(TracePush), std::span<const u32>{RT_SHADOW_CARDS_COMP},
+                                      "Ray traced shadows (cut-outs)");
+        std::printf("Ray traced sun cut-outs (r128c): the %s build %s\n", half ? "half resolution" : "full resolution",
+                    made ? "made" : "could not be made: the sun trace runs its plain build");
+    }
+    const vk::Pipeline pipeline = half ? *card_sun_half_pipeline : *card_sun_pipeline;
+    const auto readers = CardLampReadersNow();
+    if (!pipeline || readers.instances == 0 || !readers.rows || !readers.pool || !readers.info || !readers.layers ||
+        !readers.sampler) {
+        ++card_sun_plain;
+        return use;
+    }
+    // bbport (r131a_foliage-translucency): the FOLIAGE builds need the colour layers and the hue image
+    if (FoliageTranslucency::SunThrough() && (!readers.colour || !MakeSunHue(raw_width, raw_height))) {
+        ++card_sun_plain;
+        return use;
+    }
+    ++card_sun_cards;
+    use.pipeline = pipeline;
+    use.layout = half ? *card_sun_half_layout : *card_sun_layout;
+    use.rows = readers.rows;
+    use.pool = readers.pool;
+    use.info = readers.info;
+    use.layers = readers.layers;
+    use.sampler = readers.sampler;
+    if (FoliageTranslucency::SunThrough()) { // bbport (r131a_foliage-translucency)
+        use.foliage = true;
+        use.colour = readers.colour;
+        use.hue = sun_hue_view;
+        use.hue_image = sun_hue_image;
+    }
+    return use;
 }
 
 // The mask's hold (CardLampHold): an entry's instance takes CardLampMask when its row has data
@@ -6140,8 +9243,26 @@ bool RtShadow::CardLampOn(Entry& entry) {
 }
 
 void RtShadow::OnFrameEnd() {
+    if (window_scene_active_serial) {
+        window_scene_active_serial = 0;
+    }
+    if (roof_probe) {
+        roof_probe->Poll(frame, !RayTracing() ? "RT off or unsupported" :
+                               !need_scene ? "no natural RT scene requested" : nullptr);
+    }
     if (!capturing) {
         return;
+    }
+    if (bottle_cold || bottle_failed.entry) {
+        if (!BottleCaustic::On()) {
+            bottle_failed = {};
+            DiscardBottleCold();
+        } else if (bottle_cold && (!BottleObserved() || bottle_recorded_frame != frame ||
+                                  !BottleColdEligible(*bottle_entry) || BottleGeneration(*bottle_entry) != bottle_cold->endpoint)) {
+            DiscardBottleCold();
+        } else {
+            ConsumeBottleSpan();
+        }
     }
     // bbport (r86_glass-light-stage2a): BB_RT_GLASS_LIGHT on: the game draws the window panes after
     // the frame's last reader of the scene (forward, after the sun's trace and the lamp pass), so
@@ -6150,7 +9271,7 @@ void RtShadow::OnFrameEnd() {
     // waiting captures are built here, as a later reader's PrepareScene builds them (with
     // BB_LAMP_FOG_SHAFTS), and CollectHeld carries the panes into the next frame's scene. Off:
     // nothing here.
-    if (RtGlassCarryOn() && need_scene && // bbport (r86b_glass-visible): or BB_GLASS_GLINT on
+    if ((RtGlassCarryOn() || (glass_light_mode != 0 && !glass_drawn.empty())) && need_scene && // bbport (r86b, r130g): or
         std::ranges::any_of(builds, [](const Build& b) {
             return !b.probe && !b.left_out && b.entry && RtGlassEntry(b.entry->mask);
         })) {
@@ -6176,6 +9297,10 @@ void RtShadow::OnFrameEnd() {
         }
         if (probe_on) { // bbport (r64b_surface-probe-more): no copy for the surface probe
             ProbeDropped(build);
+        }
+        InvalidateBottleGeometry(build.entry->address);
+        if (reflection_tracker) {
+            ReflectionDropCapture(build);
         }
         build.entry->built = build.entry->built && build.update;
         build.entry->r17_inputs = 0; // bbport (r17_rt-upkeep): its BLAS did not get this capture
@@ -6570,6 +9695,9 @@ void RtShadow::OnFrameEnd() {
             if (promoted_now.contains(XXH3_64bits(shadow_id.data(), sizeof(shadow_id))) ||
                 promoted_now.contains(XXH3_64bits(camera_id.data(), sizeof(camera_id)))) {
                 e.gone = true;
+                if (auto* row = RoofWatchEntry(e)) {
+                    row->now.hold_why = "marked-gone-by-existing-promotion";
+                }
             }
         }
         promoted_now.clear();
@@ -6583,6 +9711,9 @@ void RtShadow::OnFrameEnd() {
     // frame's entries and before the evictions below (no pointer to an entry is kept past it)
     PlanCopyTurns();
     UpdateHeld(); // bbport (r14_cascade_rt): before the evictions, which spare held entries
+    if (roof_probe) {
+        roof_probe->WatchEnd(frame);
+    }
     ++frame;
     if (BbWindHangProbe::On() && !wind_probe_done && ++wind_probe_frames >= 600 &&
         wind_probe_frames % 30 == 0) { // bbport (r112b_hang-probe, TOOL)
@@ -6659,7 +9790,8 @@ void RtShadow::OnFrameEnd() {
             if (entry.seen_frame >= keep_from || protected_vsm(entry) || entry.held) {
                 return false;
             }
-            Destroy(*item.second);
+            Destroy(*item.second, entry.seen_frame + UnusedFrames < frame ?
+                                          "cache-age-expiry" : "scene-memory-budget-eviction");
             ++stats.evicted;
             return true;
         });
@@ -6678,7 +9810,7 @@ void RtShadow::OnFrameEnd() {
                 break;
             }
             const auto it = entries.find(key);
-            Destroy(*it->second);
+            Destroy(*it->second, "entry-memory-budget-eviction");
             entries.erase(it);
             ++r19_entries_gen; // bbport (r19_draw-cost)
         }
@@ -6732,7 +9864,7 @@ void RtShadow::OnFrameEnd() {
     frame_entries.clear();
     // bbport (r86_glass-light-stage2a): BB_RT_GLASS_LIGHT on: this frame's pane keys, each once,
     // for the next frame's scene (CollectHeld). Off: both lists stay empty.
-    if (RtGlassCarryOn()) { // bbport (r86b_glass-visible): or BB_GLASS_GLINT on
+    if (RtGlassCarryOn() || glass_light_mode != 0) { // bbport (r86b_glass-visible; r130g_glass-light-forward): or BB_GLASS_GLINT on
         glass_carry.swap(glass_drawn);
         glass_drawn.clear();
         std::ranges::sort(glass_carry);

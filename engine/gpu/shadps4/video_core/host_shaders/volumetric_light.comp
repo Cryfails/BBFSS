@@ -87,11 +87,11 @@ layout(binding = 7) uniform sampler2D sun_gate_first;
 #endif
 #ifdef DUAL
 // bbport (r115_sun-fog-indoors): BB_VOLUMETRIC_AREA_GATE=2 on a march with the ray traced gate (a
-// build of the GATE+AREA march, never with the fog noise): the gate's wider answer, 1 where a ray
+// build of the GATE+AREA march, also with the fog noise): the gate's wider answer, 1 where a ray
 // from the cell toward the sun left the scene with the camera's geometry in it too
 // (volumetric_rt_gate.comp's DUAL build)
-#if !(defined(GATE) && defined(AREA)) || defined(NOISE)
-#error DUAL is a build of the GATE+AREA march without NOISE
+#if !(defined(GATE) && defined(AREA))
+#error DUAL is a build of the GATE+AREA march
 #endif
 #ifdef REPAIR
 layout(binding = 9) uniform sampler3D sun_gate_open;
@@ -198,8 +198,8 @@ vec3 local_splits;
 #ifdef DUAL
 // bbport (r115_sun-fog-indoors): every build that defines DUAL (the GATE block above holds the
 // first test; this one also catches a DUAL build without GATE)
-#if !(defined(GATE) && defined(AREA)) || defined(NOISE) || !(defined(INTEGRATE) || defined(REPAIR))
-#error DUAL is a build of the GATE+AREA march (INTEGRATE or REPAIR) without NOISE
+#if !(defined(GATE) && defined(AREA)) || !(defined(INTEGRATE) || defined(REPAIR))
+#error DUAL is a build of the GATE+AREA march (INTEGRATE or REPAIR)
 #endif
 #endif
 const uint OcclusionDarkest = 2u, OcclusionRobust = 4u;
@@ -448,6 +448,11 @@ void main() {
 #endif // (r115_sun-fog-indoors) not DUAL
         if (v > 0.0) v *= GateAt(uv, t, gate_range);
         float e = exp(-density * t) * density * ds * v;
+#if defined(NOISE) && defined(DUAL)
+        // bbport (r94c_fog-noise-dual-gate): m where lit, before the open share is split off, so
+        // near, far and the open energy all carry it
+        e *= fog_noise_weight(v, ray * t, t);
+#endif
 #ifdef DUAL
         // bbport (r115_sun-fog-indoors): the part of the sample the wider answer lets through (open
         // air, a beam through a real opening) in area_lit, kept whole; the rest (shut only by the
@@ -457,7 +462,7 @@ void main() {
         area_lit += open_e;
         e -= open_e;
 #endif
-#ifdef NOISE
+#if defined(NOISE) && !defined(DUAL) // bbport (r94c): a DUAL build took m above
         e *= fog_noise_weight(v, ray * t, t); // bbport (r94_fog-noise): m where lit
 #endif
         if (t < area_far_from) {
