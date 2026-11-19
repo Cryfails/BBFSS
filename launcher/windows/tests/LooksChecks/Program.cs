@@ -135,8 +135,12 @@ Console.WriteLine("PASS debug switches: Reset all sets " + EngineSwitches.DebugK
 foreach (var look in Looks.Presets)
 {
     Require(look.BuiltIn && look.Description.Length > 0, look.Name + ": a preset says what it costs");
-    Require(look.Values.Keys.All(knobs.Contains), look.Name + ": a preset sets a key outside the list");
+    Require(look.Values.Keys.All(key => knobs.Contains(key) || key == Looks.UpscalerKey),
+        look.Name + ": a preset sets a key outside the list");
 }
+var nativeResolutionPresets = Looks.Presets.Where(look => look.Values.ContainsKey(Looks.UpscalerKey)).ToArray();
+Require(nativeResolutionPresets.Length == 1 && nativeResolutionPresets[0].Values[Looks.UpscalerKey] == "off",
+    "A preset other than the native-resolution look changes the upscaler");
 
 var values = new Dictionary<string, string> { ["effect_gi"] = "1", ["graphics_gi_strength"] = "7.5" };
 var original = new Looks.Look("Mine", "Someone", values);
